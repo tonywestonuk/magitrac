@@ -1,0 +1,481 @@
+#include "PerformancePage.h"
+#include "ServerPairing.h"
+#include <string.h>
+#include <stdio.h>
+
+static const uint32_t FLASH_INTERVAL_MS = 400;  // toggle rate for queued pad
+
+PerformancePage::PerformancePage(EPD_PainterAdafruit& display,
+                                 GT911_Lite& touch, Song& song)
+    : _d(display)
+    , _touch(touch)
+    , _song(song)
+    , _wasDown(false)
+    , _playingPattern(0)
+    , _queuedPattern(-1)
+    , _flashState(false)
+    , _lastFlashMs(0)
+    , _patchPending(false)
+    , _holdTarget(HoldTarget::NONE)
+    , _holdStartMs(0)
+    , _holdFired(false)
+    , _editing(false)
+    , _keyboard(display, touch)
+    , _kbdPadIdx(-1)
+{}
+
+void PerformancePage::open(uint8_t currentPattern) {
+    _wasDown        = _touch.isTouched;
+    _playingPattern = currentPattern;
+    _queuedPattern  = -1;
+    _flashState     = false;
+    _lastFlashMs    = millis();
+    _holdTarget     = HoldTarget::NONE;
+    _holdFired      = false;
+    _editing        = false;
+    _patchPending   = false;
+    _kbdPadIdx      = -1;
+}
+
+void PerformancePage::draw() {
+    _d.fillScreen(COL_WHITE);
+    if (_editing) {
+        drawEditView();
+    } else {
+        drawPerfHeader();
+        drawPads();
+    }
+}
+
+void PerformancePage::setPlayingPattern(uint8_t pat) {
+    if (_editing) return;  // don't update pads while editing
+    if (pat == _playingPattern) return;
+    uint8_t oldPlaying = _playingPattern;
+    _playingPattern = pat;
+
+    // If the queued block just became the playing block, clear the queue
+    if (_queuedPattern >= 0 && (uint8_t)_queuedPattern == pat) {
+        int8_t oldQueued = _queuedPattern;
+        _queuedPattern = -1;
+        if (oldQueued < PP_PAD_COUNT) drawPad(oldQueued);
+    }
+
+    if (oldPlaying < PP_PAD_COUNT) drawPad(oldPlaying);
+    if (pat < PP_PAD_COUNT) drawPad(pat);
+    _d.paintLater();
+}
+
+bool PerformancePage::poll() {
+    if (_editing) {
+        // Keyboard popup takes over input
+        if (_keyboard.isOpen()) {
+            if (_keyboard.poll()) {
+                // Keyboard closed
+                if (_keyboard.isDone() && _kbdPadIdx >= 0) {
+                    _patchPending = true;
+                    drawEditRow(_kbdPadIdx);
+                }
+                _kbdPadIdx = -1;
+                // Redraw the edit view under the keyboard
+                _d.fillScreen(COL_WHITE);
+                drawEditView();
+                _d.paint();
+            }
+            return false;
+        }
+        if (pollEdit()) {
+            // Back to performance view
+            _editing = false;
+            _wasDown = _touch.isTouched;
+            _holdTarget = HoldTarget::NONE;
+            _d.fillScreen(COL_WHITE);
+            drawPerfHeader();
+            drawPads();
+            _d.paint();
+        }
+        return false;
+    }
+    return pollPerf();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ── Performance pad view ─────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+
+bool PerformancePage::pollPerf() {
+    // Flash animation for queued pad
+    if (_queuedPattern >= 0) {
+        uint32_t now = millis();
+        if (now - _lastFlashMs >= FLASH_INTERVAL_MS) {
+            _lastFlashMs = now;
+            _flashState = !_flashState;
+            drawPad(_queuedPattern);
+            _d.paintLater();
+        }
+    }
+
+    // ── Hold timer — checked every loop, independent of touch data ───────────
+    if (_holdTarget != HoldTarget::NONE && !_holdFired) {
+        if (millis() - _holdStartMs >= PP_HOLD_MS) {
+            _holdFired = true;
+            if (_holdTarget == HoldTarget::HOME) {
+                _holdTarget = HoldTarget::NONE;
+                return true;  // exit page
+            }
+            if (_holdTarget == HoldTarget::EDIT) {
+                _editing = true;
+                _wasDown = true;
+                _holdTarget = HoldTarget::NONE;
+                _d.fillScreen(COL_WHITE);
+                drawEditView();
+                _d.paint();
+                return false;
+            }
+        }
+    }
+
+    if (!_touch.read()) return false;
+
+    bool down = _touch.isTouched;
+    int sx, sy;
+    rawToScreen(_touch.x, _touch.y, sx, sy);
+
+    bool rising  = (down  && !_wasDown);
+    bool falling = (!down && _wasDown);
+    _wasDown = down;
+
+    // ── Start hold on finger-down over HOME / EDIT ───────────────────────────
+    if (rising) {
+        if (hitHome(sx, sy)) {
+            _holdTarget  = HoldTarget::HOME;
+            _holdStartMs = millis();
+            _holdFired   = false;
+        } else if (hitEdit(sx, sy)) {
+            _holdTarget  = HoldTarget::EDIT;
+            _holdStartMs = millis();
+            _holdFired   = false;
+        } else {
+            _holdTarget = HoldTarget::NONE;
+        }
+    }
+
+    // ── Cancel hold on finger-up ─────────────────────────────────────────────
+    if (falling) {
+        if (_holdTarget != HoldTarget::NONE) {
+            _holdTarget = HoldTarget::NONE;
+            return false;
+        }
+
+        // Pad tap
+        int padIdx = hitPad(sx, sy);
+        if (padIdx >= 0 && padIdx < _song.numPatterns) {
+            uint8_t pat = (uint8_t)padIdx;
+            uint8_t padMode = _song.perfPads[padIdx].mode;
+
+            if (padMode == 0) {
+                // IMMEDIATE
+                if (gServerPairing.isPaired()) {
+                    gServerPairing.sendSeek(pat, 0);
+                }
+                uint8_t oldPlaying = _playingPattern;
+                _playingPattern = pat;
+                if (oldPlaying < PP_PAD_COUNT) drawPad(oldPlaying);
+                drawPad(padIdx);
+                _d.paintLater();
+            } else {
+                // QUEUED
+                if (_queuedPattern == (int8_t)pat) {
+                    gServerPairing.sendCancelQueue();
+                    _queuedPattern = -1;
+                    drawPad(padIdx);
+                    _d.paintLater();
+                } else {
+                    if (gServerPairing.isPaired()) {
+                        gServerPairing.sendQueueBlock(pat);
+                    }
+                    int8_t oldQueued = _queuedPattern;
+                    _queuedPattern = (int8_t)pat;
+                    _flashState    = true;
+                    _lastFlashMs   = millis();
+                    if (oldQueued >= 0 && oldQueued < PP_PAD_COUNT) drawPad(oldQueued);
+                    drawPad(padIdx);
+                    _d.paintLater();
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+void PerformancePage::drawPerfHeader() {
+    _d.fillRect(0, 0, 960, PP_HDR_H, COL_BLACK);
+
+    // Title
+    _d.setTextSize(3);
+    _d.setTextColor(COL_WHITE);
+    int tw = 11 * 18;  // "PERFORMANCE"
+    _d.setCursor((PP_EDIT_X - tw) / 2, (PP_HDR_H - 24) / 2);
+    _d.print("PERFORMANCE");
+
+    // EDIT button (left-side extended action)
+    uiButton(_d, PP_EDIT_X, 0, PP_EDIT_W, PP_HDR_H, "EDIT",
+             COL_BLACK, COL_WHITE, 3);
+    // HOME button (right-side, white-on-black)
+    uiButton(_d, PP_HOME_X, 0, PP_HOME_W, PP_HDR_H, "HOME",
+             COL_BLACK, COL_WHITE, 3);
+}
+
+void PerformancePage::drawPads() {
+    for (int i = 0; i < PP_PAD_COUNT; i++) {
+        drawPad(i);
+    }
+}
+
+void PerformancePage::drawPad(int idx) {
+    int x = padX(idx);
+    int y = padY(idx);
+
+    bool isPlaying  = (idx == (int)_playingPattern);
+    bool isQueued   = (idx == (int)_queuedPattern);
+    bool isDisabled = (idx >= _song.numPatterns);
+
+    uint8_t bg, fg;
+
+    if (isDisabled) {
+        bg = COL_WHITE;
+        fg = COL_DKGREY;
+    } else if (isPlaying) {
+        bg = COL_BLACK;
+        fg = COL_WHITE;
+    } else if (isQueued) {
+        if (_flashState) {
+            bg = COL_BLACK;
+            fg = COL_WHITE;
+        } else {
+            bg = COL_WHITE;
+            fg = COL_BLACK;
+        }
+    } else {
+        bg = COL_WHITE;
+        fg = COL_BLACK;
+    }
+
+    _d.fillRect(x, y, PP_PAD_W, PP_PAD_H, bg);
+    _d.drawRect(x, y, PP_PAD_W, PP_PAD_H, fg);
+    _d.drawRect(x + 1, y + 1, PP_PAD_W - 2, PP_PAD_H - 2, fg);
+
+    // Pad label — use custom name if set, otherwise block number
+    const PerfPadConfig& cfg = _song.perfPads[idx];
+    bool hasName = (cfg.name[0] != '\0');
+
+    // Block number — large
+    char numStr[4];
+    snprintf(numStr, sizeof(numStr), "%d", idx + 1);
+    _d.setTextSize(5);
+    _d.setTextColor(fg);
+    int charW = 5 * 6;
+    int charH = 5 * 8;
+    int labelW = (int)strlen(numStr) * charW;
+
+    if (hasName) {
+        // Number above, name below
+        _d.setCursor(x + (PP_PAD_W - labelW) / 2, y + 25);
+        _d.print(numStr);
+
+        _d.setTextSize(3);
+        _d.setTextColor(fg);
+        int maxChars = (PP_PAD_W - 20) / 18;
+        char truncName[PERF_PAD_NAME_LEN];
+        strncpy(truncName, cfg.name, maxChars);
+        truncName[maxChars] = '\0';
+        int nw = (int)strlen(truncName) * 18;
+        _d.setCursor(x + (PP_PAD_W - nw) / 2, y + PP_PAD_H - 55);
+        _d.print(truncName);
+    } else {
+        // Just the number, centred
+        _d.setCursor(x + (PP_PAD_W - labelW) / 2, y + (PP_PAD_H - charH) / 2);
+        _d.print(numStr);
+    }
+
+    // Mode indicator — small text in bottom-right corner
+    if (!isDisabled && idx < _song.numPatterns) {
+        const char* modeStr = (cfg.mode == 0) ? "IMM" : "QUE";
+        _d.setTextSize(1);
+        _d.setTextColor(fg);
+        _d.setCursor(x + PP_PAD_W - 22, y + PP_PAD_H - 12);
+        _d.print(modeStr);
+    }
+}
+
+int PerformancePage::padX(int idx) const {
+    int col = idx % PP_PAD_COLS;
+    return PP_PAD_MARGIN + col * (PP_PAD_W + PP_PAD_GAP);
+}
+
+int PerformancePage::padY(int idx) const {
+    int row = idx / PP_PAD_COLS;
+    return PP_PAD_Y0 + row * (PP_PAD_H + PP_PAD_ROW_GAP);
+}
+
+bool PerformancePage::hitHome(int sx, int sy) const {
+    return sx >= PP_HOME_X && sx < PP_HOME_X + PP_HOME_W
+        && sy >= PP_BTN_Y && sy < PP_BTN_Y + PP_BTN_H;
+}
+
+bool PerformancePage::hitEdit(int sx, int sy) const {
+    return sx >= PP_EDIT_X && sx < PP_EDIT_X + PP_EDIT_W
+        && sy >= PP_BTN_Y && sy < PP_BTN_Y + PP_BTN_H;
+}
+
+int PerformancePage::hitPad(int sx, int sy) const {
+    for (int i = 0; i < PP_PAD_COUNT; i++) {
+        int x = padX(i);
+        int y = padY(i);
+        if (sx >= x && sx < x + PP_PAD_W && sy >= y && sy < y + PP_PAD_H)
+            return i;
+    }
+    return -1;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ── Pad edit view ────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+
+bool PerformancePage::pollEdit() {
+    if (!_touch.read()) return false;
+
+    bool down = _touch.isTouched;
+    int sx, sy;
+    rawToScreen(_touch.x, _touch.y, sx, sy);
+
+    bool falling = (!down && _wasDown);
+    if (down && !_wasDown) _wasDown = true;
+    if (!down) _wasDown = false;
+
+    if (!falling) return false;
+
+    // BACK button
+    if (hitBack(sx, sy)) return true;
+
+    // Name tap — open keyboard
+    int nameIdx = hitEditName(sx, sy);
+    if (nameIdx >= 0 && nameIdx < PERF_PAD_COUNT) {
+        _kbdPadIdx = (int8_t)nameIdx;
+        _keyboard.open(_song.perfPads[nameIdx].name, PERF_PAD_NAME_LEN - 1);
+        _d.fillScreen(COL_WHITE);
+        _keyboard.draw();
+        _d.paint();
+        return false;
+    }
+
+    // Mode toggle
+    int modeIdx = hitEditMode(sx, sy);
+    if (modeIdx >= 0 && modeIdx < PERF_PAD_COUNT) {
+        _song.perfPads[modeIdx].mode = (_song.perfPads[modeIdx].mode == 0) ? 1 : 0;
+        _patchPending = true;
+        drawEditRow(modeIdx);
+        _d.paintLater();
+        return false;
+    }
+
+    return false;
+}
+
+void PerformancePage::drawEditView() {
+    drawEditHeader();
+    for (int i = 0; i < PERF_PAD_COUNT; i++) {
+        drawEditRow(i);
+    }
+}
+
+void PerformancePage::drawEditHeader() {
+    _d.fillRect(0, 0, 960, PP_HDR_H, COL_BLACK);
+
+    _d.setTextSize(3);
+    _d.setTextColor(COL_WHITE);
+    int tw = 9 * 18;  // "PAD SETUP"
+    _d.setCursor((PP_HOME_X - tw) / 2, (PP_HDR_H - 24) / 2);
+    _d.print("PAD SETUP");
+
+    uiButton(_d, PP_HOME_X, 0, PP_HOME_W, PP_HDR_H, "HOME",
+             COL_BLACK, COL_WHITE, 3);
+}
+
+void PerformancePage::drawEditRow(int idx) {
+    int y = PE_ROW_Y0 + idx * PE_ROW_H;
+    bool disabled = (idx >= _song.numPatterns);
+
+    // Clear row area
+    _d.fillRect(0, y, 960, PE_ROW_H, COL_WHITE);
+
+    uint8_t fg = disabled ? COL_DKGREY : COL_BLACK;
+
+    // Pad number
+    char numStr[4];
+    snprintf(numStr, sizeof(numStr), "%d", idx + 1);
+    _d.setTextSize(3);
+    _d.setTextColor(fg);
+    _d.setCursor(PE_NUM_X + (PE_NUM_W - (int)strlen(numStr) * 18) / 2,
+                 y + (PE_ROW_H - 24) / 2);
+    _d.print(numStr);
+
+    // Name field — bordered box with text
+    uint8_t nameBg = disabled ? COL_WHITE : COL_WHITE;
+    uint8_t nameFg = disabled ? COL_DKGREY : COL_BLACK;
+    _d.fillRect(PE_NAME_X, y + 5, PE_NAME_W, PE_ROW_H - 10, nameBg);
+    _d.drawRect(PE_NAME_X, y + 5, PE_NAME_W, PE_ROW_H - 10, nameFg);
+
+    const char* displayName;
+    char defaultName[4];
+    if (_song.perfPads[idx].name[0] != '\0') {
+        displayName = _song.perfPads[idx].name;
+    } else {
+        snprintf(defaultName, sizeof(defaultName), "%d", idx + 1);
+        displayName = defaultName;
+    }
+    _d.setTextSize(3);
+    _d.setTextColor(nameFg);
+    _d.setCursor(PE_NAME_X + 10, y + (PE_ROW_H - 24) / 2);
+    _d.print(displayName);
+
+    // Mode toggle button
+    const char* modeLabel = (_song.perfPads[idx].mode == 0) ? "IMMEDIATE" : "QUEUED";
+    uint8_t modeBg = disabled ? COL_WHITE : COL_LTGREY;
+    uint8_t modeFg = disabled ? COL_DKGREY : COL_BLACK;
+    uiButton(_d, PE_MODE_X, y + 5, PE_MODE_W, PE_ROW_H - 10,
+             modeLabel, modeBg, modeFg, 2);
+
+    // Separator line
+    _d.drawFastHLine(20, y + PE_ROW_H - 1, 920, COL_LTGREY);
+}
+
+bool PerformancePage::hitBack(int sx, int sy) const {
+    return sx >= PP_HOME_X && sx < PP_HOME_X + PP_HOME_W
+        && sy >= PP_BTN_Y && sy < PP_BTN_Y + PP_BTN_H;
+}
+
+int PerformancePage::hitEditName(int sx, int sy) const {
+    if (sx < PE_NAME_X || sx >= PE_NAME_X + PE_NAME_W) return -1;
+    int row = (sy - PE_ROW_Y0) / PE_ROW_H;
+    if (row < 0 || row >= PERF_PAD_COUNT) return -1;
+    int rowY = PE_ROW_Y0 + row * PE_ROW_H;
+    if (sy < rowY + 5 || sy >= rowY + PE_ROW_H - 5) return -1;
+    return row;
+}
+
+int PerformancePage::hitEditMode(int sx, int sy) const {
+    if (sx < PE_MODE_X || sx >= PE_MODE_X + PE_MODE_W) return -1;
+    int row = (sy - PE_ROW_Y0) / PE_ROW_H;
+    if (row < 0 || row >= PERF_PAD_COUNT) return -1;
+    int rowY = PE_ROW_Y0 + row * PE_ROW_H;
+    if (sy < rowY + 5 || sy >= rowY + PE_ROW_H - 5) return -1;
+    return row;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+
+void PerformancePage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
+    sx = ry;
+    sy = 540 - rx;
+}

@@ -1,0 +1,130 @@
+# MagiTrac — Server (MIDI player)
+
+The playback half of MagiTrac, running on an **M5Stack Core Basic** (ESP32).
+Receives the song from the LilyGo client over ESP-NOW, runs the sequencer,
+and outputs MIDI on UART2 with sub-millisecond latency.  Has no display
+beyond a tiny status panel and a few buttons.
+
+The companion repo is `magitrac/` (the client / UI / song authoring device).
+
+## Hardware
+
+- **M5Stack Core Basic** — ESP32 classic, 320×240 LCD, three buttons.
+- **MIDI out**: UART2, accessed via direct LL FIFO writes
+  (`uart_ll_write_txfifo`) to bypass Arduino's software ring buffer —
+  saves ~50–200 µs per byte and matters for performer responsiveness.
+- **MIDI in**: separate UART, polled in `sequencerPollMidiIn()`.
+
+## Core innovation: performer-sync engine
+
+This is what makes MagiTrac different from a normal sequencer.  See the
+client's `CLAUDE.md` for the full spec.  Server-side highlights:
+
+- `seqOnPerformerNote()` (in `midi_player.cpp`) is the snap path.  When
+  the performer plays a MIDI note, it scans the input track (col 0) of the
+  current pattern for `WAIT`/`SYNC` rows whose pitch class matches.  On a
+  hit, it snaps `seqRow` to the cue row and fires `seqPlayRow()`
+  immediately — *zero latency* between key-down and MIDI-out.
+- BPM is **derived** from the time delta between snaps
+  (`seqRecordSnap` / `seqCurrentBPM`).  Clamped to song's `minBPM`/`maxBPM`.
+- `seqWaiting=true` halts playback at a `WAIT` row until the performer
+  resolves it.  500 ms timeout returns to row 0 of the (possibly queued)
+  block.
+
+Don't add inline `delay()` or anything that blocks `sequencerTick()`.
+
+## Sequencer file: `midi_player.cpp`
+
+This is the heart of the server.  Key functions:
+
+- `sequencerTick()` — call every loop.  Returns early if not yet time
+  to play the next row.  Detects `WAIT`, advances rows, handles
+  block-end navigation.
+- `seqPlayRow()` — walks the linked-list nodes at `seqRow` and emits
+  MIDI for output columns.  Col 0 nodes are skipped (handled by
+  tick/performer logic).
+- `seqSendColumnSetup()` — flushes bank / program / volume for every
+  column in a pattern.  Called at start, resume, block transition,
+  and WAIT timeout.
+- `seqOnPerformerNote()` — performer snap + transpose + block-switch.
+
+### Patch-change rules (important)
+
+The sequencer does **not** send program/bank changes inline with note-ons,
+because the live-performance nature of WAIT means the lead time before any
+given note can be near-zero.  Instead:
+
+1. **Block start / resume / WAIT timeout** → `seqSendColumnSetup()`
+   flushes any pending bank/program/volume for every column whose cache
+   doesn't match.
+2. **Mid-block** → a `NOTE_OFF` cell flushes bank/program/volume for that
+   column.  The composer places an OFF where they want a patch change to
+   happen, with enough room afterwards for the synth to load before the
+   next note-on.
+3. **NOTE_ON** → only the note-on is sent.  Never bank/program.
+
+`seqChanBank[16]` / `seqChanProg[16]` / `seqChanVol[16]` are the
+per-channel cache (init `0xFF` to force first send).
+
+## Communications
+
+- ESP-NOW transport — being abstracted behind `MagiComms` /
+  `MagiCommsTransport` (see `MagiComms.h`).
+- The server's API uses **Arduino 3.x ESP32_NOW peer classes**
+  (`MagiBroadcastPeer`, `MagiClientPeer`) — the client uses the legacy
+  `esp_now.h` C API.  This split is encapsulated inside `MagiCommsEspNow.cpp`
+  via `#ifdef MAGICOMMS_ESPNOW_ARDUINO3X`.
+- HMAC-based auto-reconnect via `PairNVS`.
+- Reliable transfer (song save, note-set bulk) uses ACK + retry with 200ms
+  timeout — see `commands_server.ino` for the receive side, and the client's
+  `sendSongToServer` / `sendNoteSetReliable` for the send side.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `magitrac_server.ino` | Entry point, `setup()`/`loop()`, panel UI |
+| `midi_player.cpp/.h` | Sequencer + performer-sync engine |
+| `commands_server.ino` | ESP-NOW message dispatch (load/save/patch/note-set) |
+| `pairing.ino` | Pairing state machine + auto-reconnect |
+| `PairNVS.cpp/.h` | NVS pairing storage + HMAC helpers |
+| `MagiComms.h` | Communications abstraction (shared with client) |
+| `MagiCommsEspNow.cpp/.h` | ESP-NOW transport impl |
+| `MagiMsg.h` | Wire message structs + types (shared with client) |
+| `TrackerData.h` | Song / Pattern / NoteNode structs (shared with client) |
+| `NoteGrid.cpp/.h` | Sparse-pool note grid abstraction (shared with client) |
+| `SongMigration.h` | File-format readers v11..v17 (shared with client) |
+| `debug_log.cpp/.h` | `debugPrintf` — same as client |
+| `SamplePlayer.cpp/.h` | Optional onboard sample playback (M5 speaker) |
+
+The shared files (`TrackerData.h`, `NoteGrid.*`, `SongMigration.h`,
+`MagiMsg.h`, `MagiComms*`, `debug_log.*`) are **literal copies** of the
+client's versions — they must stay byte-identical.  When you change one,
+copy to the other.
+
+## Key data layout
+
+Same as the client (`TrackerData.h` is identical):
+
+- `MAX_COLUMNS = 9` (col 0 = input, cols 1–8 = MIDI output).
+- `Song::columns[MAX_COLUMNS]` holds per-column MIDI config (channel,
+  bank, program, vol, transpose, mute, name).
+- Sparse `NoteNode` pool of 4000 nodes shared across patterns.
+- `SONG_FILE_VERSION = 17`.
+
+## Conventions
+
+- Prefer direct UART LL writes for MIDI — every microsecond between
+  performer-note and MIDI-out matters for feel.
+- `seqWriteStatus()` implements MIDI **running-status** — only emit a
+  status byte when it differs from the last one sent.  Reset
+  `seqOutStatus = 0` whenever you want to force a fresh status.
+- `seqChanBank/Prog/Vol` cache: keep in sync with what was actually sent.
+  Code that bypasses the cache (e.g. forced setup) must also update it.
+- No comments unless the *why* is non-obvious.
+
+## Build
+
+Arduino IDE / arduino-cli targeting ESP32 (M5Stack board).  No
+PlatformIO config in tree.  `.ino` files are compiled together with
+the `.cpp/.h` files.
