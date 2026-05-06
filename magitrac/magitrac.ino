@@ -16,6 +16,7 @@
 #include "NoteEditor.h"
 #include "PageManager.h"
 #include "BlockSettingsPage.h"
+#include "ColumnNoteEditorPage.h"
 #include "SongStorage.h"
 #include "SongPage.h"
 #include "ServerPairing.h"
@@ -68,6 +69,7 @@ TouchHandler  handler(touch, ui, engine, song);
 NoteEditor         noteEditor(display, touch);
 PageManager        pageManager(display, touch, song);
 BlockSettingsPage  blockSettings(display, touch, song);
+ColumnNoteEditorPage noteEditorPage(display, touch, song);
 SongPage           songPage(display, touch, song);
 BootMenu           bootMenu(display, touch);
 InstrumentsPage    instrumentsPage(display, touch, gInstruments);
@@ -214,6 +216,7 @@ static bool     songPageOpen        = false;
 static bool     instrumentsPageOpen = false;
 static bool     songConfigPageOpen  = false;
 static bool     columnEditorOpen    = false;
+static bool     noteEditorPageOpen  = false;
 static bool     settingsPageOpen    = false;
 static bool     backupRestorePageOpen = false;
 static bool     performancePageOpen   = false;
@@ -655,6 +658,17 @@ void loop() {
         return;
     }
 
+    // ── Column note editor page ───────────────────────────────────────────────
+    if (noteEditorPageOpen) {
+        if (noteEditorPage.poll()) {
+            noteEditorPageOpen = false;
+            display.clear();
+            ui.drawAll();
+            display.paintLater();
+        }
+        return;
+    }
+
     // ── Block settings page ───────────────────────────────────────────────────
     if (pageManager.currentPage() == Page::BLOCKS) {
         // First frame on this page — open and draw
@@ -891,6 +905,15 @@ void loop() {
             columnEditor.open(engine.currentPattern(), t.col);
             display.clear();
             columnEditor.draw();
+            display.paint();
+            return;
+
+        case TouchAction::COLUMN_HEADER_HOLD:
+            noteEditorPageOpen = true;
+            noteEditorPage.open(engine.currentPattern(), t.col,
+                                (uint8_t)ui.selectedRow());
+            display.clear();
+            noteEditorPage.draw();
             display.paint();
             return;
 

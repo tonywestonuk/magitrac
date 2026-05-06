@@ -19,6 +19,7 @@ enum class TouchAction {
     MENU_TAP,        // tap on MENU button → open/close menu
     MUTE_TAP,          // tap on mute icon in column header → toggle mute
     COLUMN_HEADER_TAP, // tap on column header (col 1+) → open column editor
+    COLUMN_HEADER_HOLD,// 500ms hold on column header (any col incl. 0) → open note editor page
     EDIT_MODE_TAP,     // tap on [e] edit mode toggle
     STEP_ADVANCE_TAP,  // tap on [+N] step advance button → cycle 1→2→3→4→1
     VEL_CAPTURE_TAP    // tap on [v] velocity capture toggle
@@ -71,6 +72,12 @@ private:
     uint8_t _dragStartColOffset;
     bool    _wasDown;
     bool    _suppressTap;    // true if finger-down cancelled inertia — tap should not open editor
+
+    // Column-header long-press: when finger goes down on a header, capture the
+    // moment; if it stays down for 500ms, fire COLUMN_HEADER_HOLD and consume
+    // the press so the falling edge does not also fire COLUMN_HEADER_TAP.
+    uint32_t _holdStart;
+    bool     _holdFired;
 
     // Velocity sampling for inertia launch
     int      _lastDragY;
