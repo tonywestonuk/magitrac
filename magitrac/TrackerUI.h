@@ -136,7 +136,7 @@ public:
     bool hitBlockLabel(int tx, int ty)  const;  // tap on BLK:xx/xx → block settings
     bool hitMenuButton(int tx, int ty)  const;  // tap on MENU button → open menu
     bool hitMuteButton(int tx, int ty, int8_t& col) const;     // tap on mute icon (right edge of col header)
-    bool hitColumnHeader(int tx, int ty, int8_t& col) const;  // tap on column header (not col 0)
+    bool hitColumnHeader(int tx, int ty, int8_t& col, bool inclInput = false) const;  // tap on column header; inclInput=true allows col 0 (long-press)
     bool hitEditMode(int tx, int ty)   const;   // tap on [e] edit mode toggle
     bool hitStepAdvance(int tx, int ty) const;   // tap on [+N] step advance button
     bool hitVelCapture(int tx, int ty)  const;   // tap on [v] velocity capture toggle

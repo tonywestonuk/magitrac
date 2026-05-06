@@ -365,13 +365,13 @@ bool TrackerUI::hitMuteButton(int tx, int ty, int8_t& col) const {
     return true;
 }
 
-bool TrackerUI::hitColumnHeader(int tx, int ty, int8_t& col) const {
+bool TrackerUI::hitColumnHeader(int tx, int ty, int8_t& col, bool inclInput) const {
     if (ty < CHAN_HDR_Y || ty >= CHAN_HDR_Y + COL_HDR_H) return false;
     if (tx < ROW_NUM_W) return false;
     int vi = (tx - ROW_NUM_W) / COL_W;
     if (vi < 0 || vi >= VISIBLE_COLUMNS) return false;
     int c = _colOffset + vi;
-    if (c == INPUT_COLUMN) return false;  // col 0 = MIDI IN, not editable here
+    if (c == INPUT_COLUMN && !inclInput) return false;  // col 0 only editable via long-press
     if (c >= MAX_COLUMNS) return false;
     // Exclude the mute button zone (right edge)
     int colRight = ROW_NUM_W + (vi + 1) * COL_W;
