@@ -1,5 +1,4 @@
 // MagiCommsEspNow.h — ESP-NOW transport for MagiComms
-// Copy this file to both magitrac_server and magitrac projects.
 //
 // The server project must define MAGICOMMS_ESPNOW_ARDUINO3X before including
 // this header (or in build flags) to select the Arduino 3.x ESP32_NOW.h API.
