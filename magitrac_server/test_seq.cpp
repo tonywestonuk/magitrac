@@ -2,7 +2,8 @@
 //
 // Run from Terminal — NOT through the Arduino IDE:
 //   cd /Users/tonyweston/Documents/Arduino/magitrac_server
-//   g++ -std=c++11 -DUNIT_TEST -I test_mocks -I . test_seq.cpp -o test_seq && ./test_seq
+//   g++ -std=c++11 -DUNIT_TEST -I test_mocks -I . -I ../magitrac_lib/src \
+//       test_seq.cpp -o test_seq && ./test_seq
 //
 // The #ifndef ARDUINO guard below makes this file a no-op when the Arduino IDE
 // accidentally tries to compile it as part of the sketch.

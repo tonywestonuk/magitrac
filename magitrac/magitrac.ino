@@ -6,11 +6,10 @@
 
 //#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
 
+#include <magitrac_lib.h>
 #include "EPD_Painter_presets.h"
 #include "EPD_Painter_Adafruit.h"
 #include "gt911_lite.h"
-#include "TrackerData.h"
-#include "NoteGrid.h"
 #include "TrackerEngine.h"
 #include "TrackerUI.h"
 #include "TouchHandler.h"

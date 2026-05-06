@@ -1,5 +1,4 @@
 // PairNVS.cpp — NVS pairing storage + HMAC-SHA256 helpers
-// Copy this file to both magitrac_server and magitrac projects.
 #include "PairNVS.h"
 #include <Preferences.h>
 #include <mbedtls/md.h>

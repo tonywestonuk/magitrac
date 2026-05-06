@@ -1,5 +1,4 @@
 // MagiComms.h — Transport abstraction + reliability layer
-// Copy this file to both magitrac_server and magitrac projects.
 #pragma once
 #include <Arduino.h>
 #include <stdint.h>

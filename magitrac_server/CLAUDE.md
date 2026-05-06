@@ -87,20 +87,26 @@ per-channel cache (init `0xFF` to force first send).
 | `midi_player.cpp/.h` | Sequencer + performer-sync engine |
 | `commands_server.ino` | ESP-NOW message dispatch (load/save/patch/note-set) |
 | `pairing.ino` | Pairing state machine + auto-reconnect |
-| `PairNVS.cpp/.h` | NVS pairing storage + HMAC helpers |
-| `MagiComms.h` | Communications abstraction (shared with client) |
-| `MagiCommsEspNow.cpp/.h` | ESP-NOW transport impl |
-| `MagiMsg.h` | Wire message structs + types (shared with client) |
-| `TrackerData.h` | Song / Pattern / NoteNode structs (shared with client) |
-| `NoteGrid.cpp/.h` | Sparse-pool note grid abstraction (shared with client) |
-| `SongMigration.h` | File-format readers v11..v17 (shared with client) |
-| `debug_log.cpp/.h` | `debugPrintf` — same as client |
+| `debug_log.cpp/.h` | `debugPrintf` (server-only) |
 | `SamplePlayer.cpp/.h` | Optional onboard sample playback (M5 speaker) |
 
-The shared files (`TrackerData.h`, `NoteGrid.*`, `SongMigration.h`,
-`MagiMsg.h`, `MagiComms*`, `debug_log.*`) are **literal copies** of the
-client's versions — they must stay byte-identical.  When you change one,
-copy to the other.
+## Shared core: `magitrac_lib`
+
+The shared types and transport now live in the sibling **`magitrac_lib`**
+Arduino library (`../magitrac_lib/src/`), pulled in via
+`#include <magitrac_lib.h>` at the top of `magitrac_server.ino`.  Files
+provided by the lib (don't add local copies):
+
+- `TrackerData.{h,cpp}` — Song / Pattern / NoteNode
+- `NoteGrid.{h,cpp}` — sparse note-pool abstraction
+- `SongMigration.h` — versioned file readers v11..v17
+- `MagiMsg.h` — wire message structs + types
+- `MagiComms.h` + `MagiCommsEspNow.{h,cpp}` — transport abstraction
+- `PairNVS.{h,cpp}` — NVS pairing storage + HMAC helpers
+
+Symlink `magitrac_lib/` into `~/Documents/Arduino/libraries/` so the
+Arduino IDE / arduino-cli finds it.  Edit shared files once in
+`magitrac_lib/src/`; both sketches pick the change up.
 
 ## Key data layout
 

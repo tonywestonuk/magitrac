@@ -1,5 +1,4 @@
 // PairNVS.h — persistent pairing storage and HMAC helpers
-// Copy this file to both magitrac_server and magitrac projects.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>

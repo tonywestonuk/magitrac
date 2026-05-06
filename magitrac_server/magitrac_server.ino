@@ -5,8 +5,7 @@
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include <SD.h>
-#include "MagiMsg.h"
-#include "MagiCommsEspNow.h"
+#include <magitrac_lib.h>
 #include "midi_player.h"
 #include "debug_log.h"
 #include "SamplePlayer.h"

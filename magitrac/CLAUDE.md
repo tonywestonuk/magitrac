@@ -45,8 +45,25 @@ This is *the* defining feature.  Don't break it.
   thereafter (`sendSongPatch` byte-offset patches; `sendNoteSet` per-cell).
 - ESP-NOW transport is being abstracted behind `MagiComms` /
   `MagiCommsTransport` — see `MagiComms.h`.  Both client and server share
-  the same `MagiComms.h` / `MagiCommsEspNow.h` / `MagiCommsEspNow.cpp` files.
+  the same code via the **`magitrac_lib`** Arduino library (sibling
+  directory; symlink it into `~/Documents/Arduino/libraries/`).
   A future UART transport will swap in via `MagiCommsTransport` subclass.
+
+## Shared core: `magitrac_lib`
+
+The files shared with the server live in **`../magitrac_lib/src/`** and are
+compiled in via Arduino library discovery (the `.ino` does
+`#include <magitrac_lib.h>`).  Currently shared:
+
+- `TrackerData.{h,cpp}` — Song / Pattern / NoteNode + helper formatters
+- `NoteGrid.{h,cpp}` — sparse note-pool abstraction
+- `SongMigration.h` — versioned file readers v11..v17
+- `MagiMsg.h` — wire message structs + types
+- `MagiComms.h` + `MagiCommsEspNow.{h,cpp}` — transport abstraction
+- `PairNVS.{h,cpp}` — NVS pairing storage + HMAC helpers
+
+When you need to change a shared struct or wire format, edit it once in
+`magitrac_lib/src/` and both sketches pick it up.
 
 ## Key data layout (`TrackerData.h`)
 
@@ -133,6 +150,7 @@ compiled together — `.ino` is the entry point.
 
 - No comments unless the *why* is non-obvious.
 - E-paper redraws are expensive — use `paintLater()` and minimise dirty
-  rects.  Don't full-repaint when a region update will do.
+  rects. paint() and paintLater() the full screen, with paintLater() doing this in the background.
+- When changing pages, use clear() then paintLater(), to minimise ghosting.  
 - All position/touch handlers do rising/falling edge detection — never
   trigger on level.

@@ -1,5 +1,4 @@
 // MagiCommsEspNow.cpp — ESP-NOW transport implementation
-// Copy this file to both magitrac_server and magitrac projects.
 
 #include "MagiCommsEspNow.h"
 #include "MagiMsg.h"

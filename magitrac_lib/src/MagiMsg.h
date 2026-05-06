@@ -1,6 +1,4 @@
 // MagiMsg.h — shared ESP-NOW message definitions
-// Copy this file to both magitrac_server and magitrac projects
-
 #pragma once
 #include <stdint.h>
 #include "TrackerData.h"
