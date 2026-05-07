@@ -507,7 +507,7 @@ bool NoteEditor::pollTouch() {
         } else {
             // [attr] — open hex editor for effect/param
             _d.clear();
-            _hexpad.open(_effect, _param);
+            _hexpad.open(_effect, _param, 4, "Set Effect");
             _hexpad.draw();
             _d.paint();
             return false;

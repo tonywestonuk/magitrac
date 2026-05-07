@@ -33,8 +33,17 @@ class HexpadPopup {
 public:
     HexpadPopup(EPD_PainterAdafruit& display, GT911_Lite& touch);
 
-    // Open with initial effect/param values
-    void open(uint8_t effect, uint8_t param);
+    // Open with initial value(s) and optional title.
+    //   numDigits = 2 → single-byte editor; preset is `hi`, `lo` is ignored.
+    //                   On SET, effect() returns the byte, param() returns 0.
+    //   numDigits = 4 → effect/param editor; preset is hi=effect, lo=param.
+    //                   On SET, effect() and param() return them.
+    // `title` shows at the top of the dark text-field (e.g. "Set Velocity").
+    // fingerDown: true if a finger is still pressing the screen at open time
+    // (caller invoked on rising edge / during press). When false, the popup
+    // does not swallow the first lift, so the first button tap registers.
+    void open(uint8_t hi, uint8_t lo, uint8_t numDigits, const char* title,
+              bool fingerDown = true);
 
     bool isOpen() const { return _open; }
     void draw();
@@ -60,6 +69,8 @@ private:
 
     char    _digits[HP_MAX_DIGITS + 1];
     int     _numDigits;
+    int     _maxDigits;     // 2 or 4 — set on open()
+    char    _title[16];
 
     uint8_t _resultEffect;
     uint8_t _resultParam;

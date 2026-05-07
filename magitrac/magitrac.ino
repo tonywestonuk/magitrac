@@ -660,6 +660,17 @@ void loop() {
 
     // ── Column note editor page ───────────────────────────────────────────────
     if (noteEditorPageOpen) {
+        if (gServerPairing.isPaired() && noteEditorPage.notePending()) {
+            uint8_t p = noteEditorPage.pendingPat();
+            uint8_t r = noteEditorPage.pendingRow();
+            uint8_t c = noteEditorPage.pendingCol();
+            gServerPairing.sendNoteSet(song, p, r, c);
+            noteEditorPage.clearPending();
+        }
+        if (gServerPairing.isPaired() && noteEditorPage.bulkPending()) {
+            gServerPairing.sendSongToServer("", &song);
+            noteEditorPage.clearBulkPending();
+        }
         if (noteEditorPage.poll()) {
             noteEditorPageOpen = false;
             display.clear();
