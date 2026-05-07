@@ -13,34 +13,55 @@ HexpadPopup::HexpadPopup(EPD_PainterAdafruit& display, GT911_Lite& touch)
     , _wasDown(false)
     , _swallowLift(false)
     , _numDigits(0)
+    , _maxDigits(HP_MAX_DIGITS)
     , _resultEffect(0)
     , _resultParam(0)
 {
     _digits[0] = '\0';
+    _title[0]  = '\0';
 }
 
-void HexpadPopup::open(uint8_t effect, uint8_t param) {
+void HexpadPopup::open(uint8_t hi, uint8_t lo, uint8_t numDigits, const char* title,
+                       bool fingerDown) {
     _open    = true;
     _done    = false;
     _cleared = false;
-    _wasDown     = true;   // assume finger is still down from opening tap
-    _swallowLift = true;   // ignore the first lift (belongs to the opening tap)
+    _wasDown     = fingerDown;
+    _swallowLift = fingerDown;
+    _maxDigits = (numDigits == 2) ? 2 : 4;
 
-    // Pre-fill with current values if non-zero
-    if (effect != 0 || param != 0) {
-        _digits[0] = HEX_KEYS[(effect >> 4) & 0xF];
-        _digits[1] = HEX_KEYS[effect & 0xF];
-        _digits[2] = HEX_KEYS[(param >> 4) & 0xF];
-        _digits[3] = HEX_KEYS[param & 0xF];
-        _digits[4] = '\0';
-        _numDigits = 4;
+    if (title) { strncpy(_title, title, sizeof(_title) - 1); _title[sizeof(_title) - 1] = '\0'; }
+    else       { _title[0] = '\0'; }
+
+    // Pre-fill the digit buffer.  In 2-digit mode `hi` carries the value; `lo`
+    // is ignored.
+    if (_maxDigits == 2) {
+        if (hi != 0) {
+            _digits[0] = HEX_KEYS[(hi >> 4) & 0xF];
+            _digits[1] = HEX_KEYS[hi & 0xF];
+            _digits[2] = '\0';
+            _numDigits = 2;
+        } else {
+            _digits[0] = '\0';
+            _numDigits = 0;
+        }
+        _resultEffect = hi;
+        _resultParam  = 0;
     } else {
-        _digits[0] = '\0';
-        _numDigits = 0;
+        if (hi != 0 || lo != 0) {
+            _digits[0] = HEX_KEYS[(hi >> 4) & 0xF];
+            _digits[1] = HEX_KEYS[hi & 0xF];
+            _digits[2] = HEX_KEYS[(lo >> 4) & 0xF];
+            _digits[3] = HEX_KEYS[lo & 0xF];
+            _digits[4] = '\0';
+            _numDigits = 4;
+        } else {
+            _digits[0] = '\0';
+            _numDigits = 0;
+        }
+        _resultEffect = hi;
+        _resultParam  = lo;
     }
-
-    _resultEffect = effect;
-    _resultParam  = param;
 }
 
 // ── Draw ─────────────────────────────────────────────────────────────────────
@@ -69,31 +90,25 @@ void HexpadPopup::draw() {
 void HexpadPopup::drawTextField() {
     _d.fillRect(0, 0, HP_W, HP_FIELD_H, COL_BLACK);
 
-    // Format hint
-    _d.setTextSize(2);
+    // Title (left-aligned, same size as the key labels)
+    _d.setTextSize(3);
     _d.setTextColor(COL_DKGREY);
     _d.setCursor(20, 8);
-    _d.print("EE PP");
+    _d.print(_title[0] ? _title : (_maxDigits == 2 ? "VV" : "EE PP"));
 
-    // Build display: EE PP with underscores for unfilled digits
-    char display[6]; // "EE PP" + null
-    for (int i = 0; i < HP_MAX_DIGITS; i++) {
-        display[i] = (i < _numDigits) ? _digits[i] : '_';
-    }
-    display[HP_MAX_DIGITS] = '\0';
-
-    // Insert space between effect and param for display
+    // Build the digit display: underscores for unfilled positions.
     char formatted[8];
-    formatted[0] = display[0];
-    formatted[1] = display[1];
-    formatted[2] = ' ';
-    formatted[3] = display[2];
-    formatted[4] = display[3];
-    formatted[5] = '\0';
+    int pos = 0;
+    for (int i = 0; i < _maxDigits; i++) {
+        formatted[pos++] = (i < _numDigits) ? _digits[i] : '_';
+        // Insert a space between effect and param in 4-digit mode.
+        if (_maxDigits == 4 && i == 1) formatted[pos++] = ' ';
+    }
+    formatted[pos] = '\0';
 
     _d.setTextSize(4);
     _d.setTextColor(COL_WHITE);
-    int tw = strlen(formatted) * 24;
+    int tw = pos * 24;
     _d.setCursor((HP_W - tw) / 2, HP_FIELD_H / 2 + 4);
     _d.print(formatted);
 }
@@ -165,15 +180,19 @@ bool HexpadPopup::poll() {
                 return true;
             }
             if (col == 3) {
-                // SET — parse digits into effect/param
-                // Pad with zeros if incomplete
+                // SET — parse digits, right-justified within _maxDigits.
                 char padded[5] = {'0','0','0','0','\0'};
-                int offset = HP_MAX_DIGITS - _numDigits;
+                int offset = _maxDigits - _numDigits;
                 for (int i = 0; i < _numDigits; i++)
                     padded[offset + i] = _digits[i];
 
-                _resultEffect = (hexVal(padded[0]) << 4) | hexVal(padded[1]);
-                _resultParam  = (hexVal(padded[2]) << 4) | hexVal(padded[3]);
+                if (_maxDigits == 2) {
+                    _resultEffect = (hexVal(padded[0]) << 4) | hexVal(padded[1]);
+                    _resultParam  = 0;
+                } else {
+                    _resultEffect = (hexVal(padded[0]) << 4) | hexVal(padded[1]);
+                    _resultParam  = (hexVal(padded[2]) << 4) | hexVal(padded[3]);
+                }
                 _cleared = false;
                 _done    = true;
                 _open    = false;
@@ -188,7 +207,7 @@ bool HexpadPopup::poll() {
             int col = sx / HP_COL_W;
             if (row >= 0 && row < 4 && col >= 0 && col < 4) {
                 int keyIdx = row * 4 + col;
-                if (_numDigits < HP_MAX_DIGITS) {
+                if (_numDigits < _maxDigits) {
                     _digits[_numDigits] = HEX_KEYS[keyIdx];
                     _numDigits++;
                     _digits[_numDigits] = '\0';

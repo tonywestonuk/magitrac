@@ -24,7 +24,7 @@ static const uint8_t COL_BLACK  = 3;
 
 // ── Inertia tuning ────────────────────────────────────────────────────────────
 // Controls the feel of momentum scrolling on the note grid.
-static const float INERTIA_DECAY    = 1.0f;  // velocity decay rate per second (exponential)
+static const float INERTIA_DECAY    = 2.0f;  // velocity decay rate per second (exponential)
 static const float INERTIA_MAX_VEL  = 40.0f; // rows/second cap on launch velocity
 static const float INERTIA_MIN_VEL  = 2.0f;  // below this, no inertia is started
 static const float INERTIA_STOP_VEL = 0.4f;  // rows/second threshold to stop coasting

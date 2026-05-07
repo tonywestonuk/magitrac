@@ -114,7 +114,13 @@ count at the value it had when they were written.
   inline keyboard via `KeyboardPopup`.
 - **ColumnEditor** — per-column MIDI settings (channel, bank, program, vol,
   transpose, name); also COPY / SWAP / CLEAR column actions with confirm
-  dialogs.
+  dialogs.  Opened by **tap** on a column header (cols 1–8).
+- **ColumnNoteEditorPage** — piano-roll-style note editor for one column
+  of one pattern: 13 visible pitches × 16 row-cells per segment, with
+  drag-scroll on the pitch axis, segment nav `[<] [>]`, VEL/ATTR popups,
+  selector-strip multi-select, COPY/PASTE.  Opened by **500 ms long-press**
+  on any column header (incl. col 0).  Col 0 swaps the OFF action for
+  ANY/WAIT/SYNC and hides ATTR (param=0 always).
 - **SongConfigPage** — song-level config (BPM, speed, MIDI-in channel,
   performer mask, slot enables).  *Mid-rewrite — `.h` updated, `.cpp`
   pending unification of row constants.*
@@ -122,7 +128,12 @@ count at the value it had when they were written.
   **PerfModePage**, etc.
 
 `UIHelpers.h` provides `uiButton()`, etc.  `HoldRepeat` powers ±value
-buttons.
+buttons.  `HexpadPopup` is a full-screen hex byte editor —
+`open(hi, lo, numDigits, title, fingerDown=true)`; `numDigits=2` for a
+single-byte editor (returned via `effect()`), `numDigits=4` for
+effect+param.  Pass `fingerDown=false` when opening on a falling edge
+(finger already lifted) so the first button tap inside the popup isn't
+swallowed.
 
 ## EPD colour rules (memorised)
 
@@ -154,3 +165,14 @@ compiled together — `.ino` is the entry point.
 - When changing pages, use clear() then paintLater(), to minimise ghosting.  
 - All position/touch handlers do rising/falling edge detection — never
   trigger on level.
+- **Long-press gestures** (e.g. column-header hold → ColumnNoteEditorPage)
+  fire mid-press from `TouchHandler::poll()` *before* the early-return on
+  no-new-event, since `_touch.read()` returns false on idle frames where
+  the finger is still down.  The fire path also resets `_state` to `IDLE`
+  and `_wasDown` to `false` because the page that opens does its own
+  touch polling — without this, `TouchHandler` keeps stale state and
+  swallows the next genuine tap after the page closes.
+- **Drag-scroll inertia** (rows on main screen, etc.) always **clamps**
+  at the pattern edges — no wrap-around, regardless of play state.
+  Tuning: `INERTIA_DECAY` (s⁻¹) controls deceleration rate; bump for
+  more "resistance".

@@ -65,6 +65,9 @@ static const int CNE_RP_CP_Y     = CNE_H - CNE_RP_CP_H - 6;   // anchored to bot
 // Hold threshold to fire COLUMN_HEADER_HOLD (set in TouchHandler, mirrored
 // here only for documentation): 500 ms.
 
+enum class CnePopup { NONE, VEL, ATTR };
+enum class CneDrag  { NONE, GRID_MAYBE, GRID_PITCH, SELECTOR };
+
 class ColumnNoteEditorPage {
 public:
     ColumnNoteEditorPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song);
@@ -73,10 +76,21 @@ public:
     void draw();
     bool poll();   // returns true on HOME exit
 
+    // Server sync — caller drains these between polls.
+    bool    notePending() const { return _dirtyRow != 0xFF; }
+    uint8_t pendingPat() const  { return _patIdx; }
+    uint8_t pendingRow() const  { return _dirtyRow; }
+    uint8_t pendingCol() const  { return _col; }
+    void    clearPending()      { _dirtyRow = 0xFF; }
+
+    bool    bulkPending() const { return _dirtyAll; }
+    void    clearBulkPending()  { _dirtyAll = false; }
+
 private:
     EPD_PainterAdafruit& _d;
     GT911_Lite&          _touch;
     Song&                _song;
+    HexpadPopup          _hexpad;
 
     uint8_t  _patIdx;
     uint8_t  _col;          // 0 = input track, 1..8 = MIDI out
@@ -85,11 +99,25 @@ private:
     uint8_t  _topPitch;     // pitch at the TOP of the visible grid (high pitch first)
     bool     _wasDown;
 
-    // Pending segment-clipboard (Slice 2 — declared now so layout is stable)
-    uint8_t  _selStartCol;  // first selected row-cell within segment (0..15)
-    uint8_t  _selEndCol;    // last selected row-cell within segment (inclusive)
+    // Selection / clipboard
+    uint8_t  _selStartCol;
+    uint8_t  _selEndCol;
     Note     _clip[CNE_COLS];
     uint8_t  _clipLen;
+
+    // Drag state
+    CneDrag  _drag;
+    int      _dragStartX, _dragStartY;
+    uint8_t  _dragStartTopPitch;
+    int8_t   _dragStartCellCol;     // initial selector or grid cell column
+    int8_t   _dragStartCellPitchIdx;// row index within visible pitches at touch-down
+
+    // Popup state
+    CnePopup _popup;
+
+    // Server-sync flags
+    uint8_t  _dirtyRow;     // 0xFF = clean; else last edited row in _patIdx, col=_col
+    bool     _dirtyAll;     // bulk edit (paste) — caller does full song resync
 
     // Drawing
     void drawHeader();
@@ -97,18 +125,37 @@ private:
     void drawGrid();
     void drawRightPanel();
     void drawNavRow();
-    void drawColLine();
     void drawRowLine();
     void drawVelAttrRow();
     void drawActionButton();
-    void drawCopyPasteRow();
+    void drawCopyPasteRow(int pressed = -1);   // pressed: -1 none, 0 COPY, 1 PASTE
 
     // Helpers
     NoteGrid    grid();
     Pattern&    pat()  { return _song.patterns[_patIdx]; }
     uint8_t     numSegments() const;          // ceil(pat().length / 16)
-    uint8_t     segmentRow(uint8_t i) const;  // _segment * 16 + i, clamped
+    uint8_t     segmentRow(uint8_t i) const;  // _segment * 16 + i, or 0xFF
     bool        isInputCol() const { return _col == 0; }
     void        rawToScreen(int rx, int ry, int& sx, int& sy) const;
-    bool        hitHome(int sx, int sy) const;
+
+    // Hit tests
+    bool hitHome(int sx, int sy) const;
+    bool hitNavPrev(int sx, int sy) const;
+    bool hitNavNext(int sx, int sy) const;
+    bool hitVelField(int sx, int sy) const;
+    bool hitAttrField(int sx, int sy) const;
+    bool hitAction(int sx, int sy, uint8_t& which) const;  // which: 0=OFF/single, 0=ANY,1=WAIT,2=SYNC
+    bool hitCopy(int sx, int sy) const;
+    bool hitPaste(int sx, int sy) const;
+    bool hitSelector(int sx, int sy, int8_t& col) const;
+    bool hitGridCell(int sx, int sy, int8_t& col, int8_t& pitchIdx) const;
+
+    // Edit operations
+    void applyCellTap(uint8_t segCol, uint8_t pitch);
+    void applyAction(uint8_t which);    // index into action button group
+    void applyCopy();
+    void applyPaste();
+    void stepSegment(int delta);        // +1 / -1 with pattern wrap
+    void clampTopPitch();
+    void markDirty(uint8_t row);
 };

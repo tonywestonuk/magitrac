@@ -47,15 +47,9 @@ TouchResult TouchHandler::poll() {
             _inertiaVel *= expf(-INERTIA_DECAY * dt);
 
             int patLen = _song.patterns[_engine.currentPattern()].length;
-            if (_engine.state() == PlayState::STOPPED && patLen > 0) {
-                // Wrap around in stop mode — continuous scroll through the pattern
-                while (_inertiaRow < 0.0f)           _inertiaRow += (float)patLen;
-                while (_inertiaRow >= (float)patLen)  _inertiaRow -= (float)patLen;
-            } else {
-                // Clamp in play mode — don't wrap
-                if (_inertiaRow < 0.0f)          { _inertiaRow = 0.0f;              _inertiaVel = 0.0f; }
-                if (_inertiaRow >= (float)patLen) { _inertiaRow = (float)(patLen-1); _inertiaVel = 0.0f; }
-            }
+            // Always clamp at the pattern edges — coast to a stop, never wrap.
+            if (_inertiaRow < 0.0f)           { _inertiaRow = 0.0f;              _inertiaVel = 0.0f; }
+            if (_inertiaRow >= (float)patLen) { _inertiaRow = (float)(patLen-1); _inertiaVel = 0.0f; }
 
             int newRow = (int)(_inertiaRow + 0.5f);
             if (newRow < 0)       newRow = 0;
