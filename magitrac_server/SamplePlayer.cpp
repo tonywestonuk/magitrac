@@ -44,10 +44,10 @@ static void wavTaskFn(void*) {
         s_stop    = false;
         s_playing = true;
 
-        i2s_driver_install(I2S_NUM_0, &s_i2s_cfg, 0, NULL);
-        i2s_set_pin(I2S_NUM_0, NULL);
-        i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN);
-
+        // All slow SD work happens BEFORE the DAC turns on, so the moment
+        // we enable it the first audio sample is queued and ready.  This
+        // eliminates the "garbage / zero output" window between DAC enable
+        // and first audio write that produced the previous start click.
         File f = SD.open(activePath);
         if (f) {
             int16_t  fbuf[256];
@@ -61,19 +61,37 @@ static void wavTaskFn(void*) {
                                 | ((uint32_t)hdr[26] << 16)
                                 | ((uint32_t)hdr[27] << 24);
             if (sampleRate < 8000 || sampleRate > 48000) sampleRate = 22050;
-            i2s_set_sample_rates(I2S_NUM_0, sampleRate);
 
+            // Pre-read and convert the first audio chunk while the DAC is
+            // still off.  The expensive SD read happens here, off the
+            // critical audio-start path.
             int bytesIn = f.readBytes(reinterpret_cast<char*>(fbuf), sizeof(fbuf));
-            while (bytesIn > 0 && !s_stop) {
-                for (int i = 0; i < bytesIn / 2; i++)
-                    obuf[i] = (uint32_t)((int32_t)fbuf[i] + 32768) << 16;
+            for (int i = 0; i < bytesIn / 2; i++)
+                obuf[i] = (uint32_t)((int32_t)fbuf[i] + 32768) << 16;
+
+            // Bring the I2S + DAC up now — first audio chunk goes into the
+            // DMA on the very next instruction, so the DAC never sees stale
+            // / zero data.
+            i2s_driver_install(I2S_NUM_0, &s_i2s_cfg, 0, NULL);
+            i2s_set_pin(I2S_NUM_0, NULL);
+            i2s_set_sample_rates(I2S_NUM_0, sampleRate);
+            i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN);
+
+            if (bytesIn > 0) {
                 i2s_write(I2S_NUM_0, obuf, (size_t)(bytesIn * 2), &bw, pdMS_TO_TICKS(200));
                 bytesIn = f.readBytes(reinterpret_cast<char*>(fbuf), sizeof(fbuf));
+                while (bytesIn > 0 && !s_stop) {
+                    for (int i = 0; i < bytesIn / 2; i++)
+                        obuf[i] = (uint32_t)((int32_t)fbuf[i] + 32768) << 16;
+                    i2s_write(I2S_NUM_0, obuf, (size_t)(bytesIn * 2), &bw, pdMS_TO_TICKS(200));
+                    bytesIn = f.readBytes(reinterpret_cast<char*>(fbuf), sizeof(fbuf));
+                }
             }
             f.close();
+
+            i2s_driver_uninstall(I2S_NUM_0);
         }
 
-        i2s_driver_uninstall(I2S_NUM_0);
         s_playing = false;
 
         portENTER_CRITICAL(&s_pathMux);
