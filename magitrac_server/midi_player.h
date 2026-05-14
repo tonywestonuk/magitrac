@@ -10,7 +10,23 @@ int8_t sequencerQueuedBlock();              // -1 if none, else queued pattern i
 void sequencerReset();    // snap to row 0 of current pattern without starting
 void sequencerPause();    // freeze position, keep all state — no state callback fired
 void sequencerUnpause();  // resume from frozen position
-void sequencerSeek(uint8_t pattern, uint8_t row);  // jump to position and play that row
+void sequencerSeek(uint8_t pattern, uint8_t row);  // jump to position and play that row (scrub)
+void sequencerGoto(uint8_t pattern, uint8_t row);  // position only; tick handles WAIT/play if running
+
+// ── Column preview ───────────────────────────────────────────────────────────
+// Loop one column of one pattern at song bpm/speed for audition while editing.
+// Mutually exclusive with normal playback — entering preview stops the song,
+// and starting the song stops preview.  Performer-MIDI is ignored while
+// previewing.
+void sequencerStartPreview(uint8_t pattern, uint8_t col);
+void sequencerStopPreview();
+bool sequencerPreviewActive();
+
+// ── Single-note audition ─────────────────────────────────────────────────────
+// Play the note at (pattern, row, col) for ~500ms then auto note-off.  No-op
+// if the song is running or preview is active (those modes are already audible).
+void sequencerAuditionNote(uint8_t pattern, uint8_t row, uint8_t col);
+
 bool     sequencerIsRunning();
 uint16_t sequencerCurrentBPM();  // live BPM — updated each performer snap
 void     sequencerSetBPM(uint16_t bpm);  // set live BPM immediately (e.g. from config edit)
@@ -33,6 +49,10 @@ void seqSetStateCallback(void (*cb)(bool playing));
 // Optional callback — called when a MIDI note-on is received while the sequencer is stopped.
 // Use this to forward the note to the client for step-entry editing.
 void seqSetMidiNoteInCallback(void (*cb)(uint8_t midiNote, uint8_t velocity));
+
+// Optional callback — fires once per row tick while preview is active.
+// `row` is the row that was just played.
+void seqSetPreviewRowCallback(void (*cb)(uint8_t row));
 
 #ifdef UNIT_TEST
 // White-box test hooks — not for production use

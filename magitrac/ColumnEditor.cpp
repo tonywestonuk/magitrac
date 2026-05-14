@@ -1,16 +1,41 @@
 #include "ColumnEditor.h"
 #include "SettingsPage.h"   // for gMaxBank, gMaxProgram
 #include "NoteGrid.h"
+#include "ServerPairing.h"  // for gServerPairing — sample list fetch
 #include <string.h>
+
+static inline bool isSfx(uint8_t ch) { return ch == SFX_CHANNEL; }
+
+// Strip ".wav" suffix and truncate to fit the column NAME field.
+static void copySampleNameToCol(const char* fname, char* nameField) {
+    char tmp[SAMPLE_NAME_LEN];
+    strncpy(tmp, fname, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+    int n = (int)strlen(tmp);
+    if (n > 4 && strcasecmp(tmp + n - 4, ".wav") == 0) tmp[n - 4] = '\0';
+    strncpy(nameField, tmp, INSTRUMENT_NAME_LEN - 1);
+    nameField[INSTRUMENT_NAME_LEN - 1] = '\0';
+}
+
+// Returns index in the cache of the entry with id == cs.program, or -1.
+static int sampleIndexForId(uint8_t id) {
+    int n = gServerPairing.sampleListCount();
+    for (int i = 0; i < n; i++) {
+        const SampleCacheEntry* e = gServerPairing.sampleListEntry(i);
+        if (e && e->id == id) return i;
+    }
+    return -1;
+}
 
 ColumnEditor::ColumnEditor(EPD_PainterAdafruit& display, GT911_Lite& touch,
                            Song& song, Instrument* instruments)
     : _d(display), _touch(touch), _song(song), _instruments(instruments)
     , _patIdx(0), _col(1), _wasDown(false), _patchPending(false)
-    , _picking(false), _naming(false), _pickPage(0)
+    , _picking(false), _pickingSample(false), _naming(false), _pickPage(0)
     , _keyboard(display, touch)
     , _action(Action::NONE), _actionDst(0), _resyncMask(0)
     , _pressedOnName(false)
+    , _sampleListSeenState(0)
 {}
 
 ColumnSettings& ColumnEditor::cs() {
@@ -18,17 +43,24 @@ ColumnSettings& ColumnEditor::cs() {
 }
 
 void ColumnEditor::open(uint8_t patternIdx, uint8_t col) {
-    _patIdx       = patternIdx;
-    _col          = col;
-    _wasDown      = false;
-    _patchPending = false;
-    _picking      = false;
-    _naming       = false;
-    _pickPage     = 0;
+    _patIdx        = patternIdx;
+    _col           = col;
+    _wasDown       = false;
+    _patchPending  = false;
+    _picking       = false;
+    _pickingSample = false;
+    _naming        = false;
+    _pickPage      = 0;
     _action        = Action::NONE;
     _actionDst     = 0;
     _resyncMask    = 0;
     _pressedOnName = false;
+    // If the column is on SFX, trigger a sample-list refresh now so the
+    // picker / PROG +/- has fresh data by the time the user reaches them.
+    // Spec: refresh every time the editor sees an SFX column.
+    if (isSfx(_song.columns[_col].midiChannel) && gServerPairing.isPaired()) {
+        gServerPairing.requestSampleList();
+    }
 }
 
 // ── Drawing ──────────────────────────────────────────────────────────────────
@@ -64,11 +96,22 @@ void ColumnEditor::fieldValue(int field, char* out) const {
     const ColumnSettings& c = _song.columns[_col];
     switch (field) {
         case 0:  // MIDI CH
-            if (c.midiChannel == 0) strcpy(out, "OFF");
-            else snprintf(out, 16, "%d", c.midiChannel);
+            if      (c.midiChannel == 0)            strcpy(out, "OFF");
+            else if (c.midiChannel == SFX_CHANNEL)  strcpy(out, "SFX");
+            else                                    snprintf(out, 16, "%d", c.midiChannel);
             break;
-        case 1: snprintf(out, 16, "%d", c.bankMSB + 1); break;
-        case 2: snprintf(out, 16, "%d", c.program + 1); break;
+        case 1:  // BANK — meaningless on SFX
+            if (isSfx(c.midiChannel)) strcpy(out, "--");
+            else                      snprintf(out, 16, "%d", c.bankMSB + 1);
+            break;
+        case 2:  // PROGRAM — on SFX shows sample id (0 = none)
+            if (isSfx(c.midiChannel)) {
+                if (c.program == 0) strcpy(out, "--");
+                else                snprintf(out, 16, "%d", c.program);
+            } else {
+                snprintf(out, 16, "%d", c.program + 1);
+            }
+            break;
         case 3: snprintf(out, 16, "%d", c.volume);     break;
         case 4: snprintf(out, 16, "%+d", c.transpose); break;
         case 5: snprintf(out, 16, "%s", c.name[0] ? c.name : "--"); break;
@@ -86,25 +129,37 @@ void ColumnEditor::drawFieldRow(int field) {
     fieldLabel(field, label);
     fieldValue(field, value);
 
+    bool sfx = isSfx(_song.columns[_col].midiChannel);
+    // BANK is meaningless on SFX channel — render greyed and disable +/-.
+    bool disabled = sfx && field == 1;
+    uint16_t fg = disabled ? COL_DKGREY : COL_BLACK;
+
     _d.setTextSize(3);
-    _d.setTextColor(COL_BLACK);
+    _d.setTextColor(fg);
     _d.setCursor(CE_LABEL_X, y + (CE_ROW_H - 24) / 2);
     _d.print(label);
 
     // Value box
     _d.fillRect(CE_VAL_X, btnY, CE_VAL_W, CE_BTN_H, COL_WHITE);
-    _d.drawRect(CE_VAL_X, btnY, CE_VAL_W, CE_BTN_H, COL_BLACK);
+    _d.drawRect(CE_VAL_X, btnY, CE_VAL_W, CE_BTN_H, disabled ? COL_LTGREY : COL_BLACK);
     int vw = strlen(value) * 18;
     _d.setCursor(CE_VAL_X + (CE_VAL_W - vw) / 2, btnY + (CE_BTN_H - 24) / 2);
+    _d.setTextColor(fg);
     _d.print(value);
 
-    // −/+ buttons (not for NAME field — NAME row hosts the PICK INSTR button instead)
+    // −/+ buttons (not for NAME field — NAME row hosts the PICK INSTR/SAMPLE
+    // button instead).  BANK +/- is hidden when on SFX.
     if (field < 5) {
-        uiButton(_d, CE_MINUS_X, btnY, CE_BTN_W, CE_BTN_H, "-", COL_WHITE, COL_BLACK, 3);
-        uiButton(_d, CE_PLUS_X,  btnY, CE_BTN_W, CE_BTN_H, "+", COL_WHITE, COL_BLACK, 3);
+        if (disabled) {
+            // No buttons drawn; row is purely informational.
+        } else {
+            uiButton(_d, CE_MINUS_X, btnY, CE_BTN_W, CE_BTN_H, "-", COL_WHITE, COL_BLACK, 3);
+            uiButton(_d, CE_PLUS_X,  btnY, CE_BTN_W, CE_BTN_H, "+", COL_WHITE, COL_BLACK, 3);
+        }
     } else {
+        const char* pickLabel = sfx ? "PICK SAMPLE" : "PICK INSTR";
         uiButton(_d, CE_PICK_X, btnY, CE_PICK_W, CE_BTN_H,
-                 "PICK INSTR", COL_WHITE, COL_BLACK, 2);
+                 pickLabel, COL_WHITE, COL_BLACK, 2);
     }
 }
 
@@ -184,6 +239,71 @@ void ColumnEditor::drawPickList() {
     uiButton(_d, CE_LIST_NEXT_X, navY, CE_LIST_NAV_W, CE_BTN_H, "NEXT", COL_WHITE, COL_BLACK, 3);
 
     // CANCEL button
+    uiButton(_d, (CE_W - 200) / 2, navY + CE_BTN_H + 8, 200, CE_BTN_H, "CANCEL", COL_DKGREY, COL_WHITE, 3);
+}
+
+// ── Sample picker overlay (SFX columns) ──────────────────────────────────────
+
+void ColumnEditor::drawPickSampleList() {
+    int y0 = CE_LBL_Y;
+    _d.fillRect(0, y0, CE_W, CE_H - y0, COL_WHITE);
+
+    _d.fillRect(0, y0, CE_W, CE_LBL_H, COL_DKGREY);
+    _d.setTextSize(2);
+    _d.setTextColor(COL_WHITE);
+    _d.setCursor(10, y0 + 2);
+    _d.print("SELECT SAMPLE");
+
+    int listY = y0 + CE_LBL_H;
+    int total = gServerPairing.sampleListCount();
+    SampleListState st = gServerPairing.sampleListState();
+
+    // Loading / empty messaging — centred over the list area.
+    const char* msg = nullptr;
+    if (st == SampleListState::WAITING || st == SampleListState::PARTIAL)
+        msg = "Loading samples...";
+    else if (total == 0)
+        msg = "No samples found in /samples";
+
+    if (msg) {
+        _d.setTextSize(3);
+        _d.setTextColor(COL_DKGREY);
+        int mw = (int)strlen(msg) * 18;
+        _d.setCursor((CE_W - mw) / 2, listY + (CE_LIST_ROWS * CE_LIST_ROW_H - 24) / 2);
+        _d.print(msg);
+    } else {
+        int start = _pickPage * CE_LIST_ROWS;
+        for (int i = 0; i < CE_LIST_ROWS; i++) {
+            int idx = start + i;
+            if (idx >= total) break;
+            const SampleCacheEntry* e = gServerPairing.sampleListEntry(idx);
+            if (!e) break;
+            int ry = listY + i * CE_LIST_ROW_H;
+
+            _d.drawFastHLine(0, ry + CE_LIST_ROW_H - 1, CE_W, COL_LTGREY);
+
+            char label[48];
+            snprintf(label, sizeof(label), "%3u: %s", e->id, e->name);
+            _d.setTextSize(2);
+            _d.setTextColor(COL_BLACK);
+            _d.setCursor(20, ry + (CE_LIST_ROW_H - 16) / 2);
+            _d.print(label);
+        }
+    }
+
+    int navY = listY + CE_LIST_ROWS * CE_LIST_ROW_H;
+    int totalPages = total > 0 ? (total + CE_LIST_ROWS - 1) / CE_LIST_ROWS : 1;
+    char pg[16];
+    snprintf(pg, sizeof(pg), "%d/%d", _pickPage + 1, totalPages);
+
+    uiButton(_d, CE_LIST_PREV_X, navY, CE_LIST_NAV_W, CE_BTN_H, "PREV", COL_WHITE, COL_BLACK, 3);
+    _d.setTextSize(3);
+    _d.setTextColor(COL_BLACK);
+    int pw = strlen(pg) * 18;
+    _d.setCursor((CE_W - pw) / 2, navY + (CE_BTN_H - 24) / 2);
+    _d.print(pg);
+    uiButton(_d, CE_LIST_NEXT_X, navY, CE_LIST_NAV_W, CE_BTN_H, "NEXT", COL_WHITE, COL_BLACK, 3);
+
     uiButton(_d, (CE_W - 200) / 2, navY + CE_BTN_H + 8, 200, CE_BTN_H, "CANCEL", COL_DKGREY, COL_WHITE, 3);
 }
 
@@ -414,19 +534,48 @@ void ColumnEditor::doClearColumn(uint8_t col) {
 void ColumnEditor::adjustField(int field, int delta) {
     ColumnSettings& c = cs();
     switch (field) {
-        case 0: {  // MIDI CH: 0(off)..16
+        case 0: {  // MIDI CH: 0(off)..16, 17=SFX
             int v = (int)c.midiChannel + delta;
             if (v < 0) v = 0;
-            if (v > 16) v = 16;
+            if (v > SFX_CHANNEL) v = SFX_CHANNEL;
+            bool entered = (v == SFX_CHANNEL && c.midiChannel != SFX_CHANNEL);
             c.midiChannel = (uint8_t)v;
+            // First entry into SFX — start fetching the sample list so the
+            // picker has something to show.
+            if (entered && gServerPairing.isPaired()) {
+                gServerPairing.requestSampleList();
+            }
             break;
         }
-        case 1: {  // BANK
+        case 1: {  // BANK — locked on SFX
+            if (isSfx(c.midiChannel)) return;
             int v = (int)c.bankMSB + delta;
             c.bankMSB = (uint8_t)constrain(v, 0, (int)gMaxBank);
             break;
         }
-        case 2: {  // PROGRAM — wraps into bank
+        case 2: {  // PROGRAM
+            if (isSfx(c.midiChannel)) {
+                // Walk through the cached sample list by index.  PROG holds
+                // the manifest id; PROG=0 = "no sample".  Map current id to
+                // an index, bump it, write back the new id and name.
+                int n = gServerPairing.sampleListCount();
+                if (n <= 0) return;
+                int curIdx = sampleIndexForId(c.program);
+                int newIdx;
+                if (curIdx < 0) {
+                    newIdx = (delta > 0) ? 0 : n - 1;
+                } else {
+                    newIdx = curIdx + delta;
+                    if (newIdx < 0)  newIdx = 0;
+                    if (newIdx >= n) newIdx = n - 1;
+                }
+                const SampleCacheEntry* e = gServerPairing.sampleListEntry(newIdx);
+                if (e) {
+                    c.program = e->id;
+                    copySampleNameToCol(e->name, c.name);
+                }
+                break;
+            }
             int v = (int)c.program + delta;
             if (v > (int)gMaxProgram) {
                 v = 0;
@@ -456,8 +605,20 @@ void ColumnEditor::fireHeld() {
     int f = _hold.field();
     if (f >= 0 && f < 5) {
         adjustField(f, _hold.delta());
-        drawFieldRow(f);
-        if (f == 2) drawFieldRow(1);  // program wrap may change bank
+        // CH can flip the column in/out of SFX, which changes how BANK / PROG
+        // / NAME render — repaint them.  PROG on SFX rewrites NAME.  PROG in
+        // MIDI mode may wrap into BANK.
+        if (f == 0) {
+            drawAllFields();
+            drawHeader();
+        } else if (f == 2) {
+            drawFieldRow(f);
+            if (isSfx(_song.columns[_col].midiChannel)) drawFieldRow(5);
+            else                                        drawFieldRow(1);
+            drawHeader();
+        } else {
+            drawFieldRow(f);
+        }
         _d.paint();
     }
 }
@@ -475,6 +636,16 @@ bool ColumnEditor::poll() {
             _d.paintLater();
         }
         return false;
+    }
+
+    // Repaint the sample picker when the async list arrives.
+    if (_pickingSample) {
+        uint8_t cur = (uint8_t)gServerPairing.sampleListState();
+        if (cur != _sampleListSeenState) {
+            _sampleListSeenState = cur;
+            drawPickSampleList();
+            _d.paint();
+        }
     }
 
     // Hold-repeat
@@ -550,6 +721,53 @@ bool ColumnEditor::poll() {
                 _d.paint();
                 return false;
             }
+        }
+        return false;
+    }
+
+    // ── Sample picker (SFX) ──────────────────────────────────────────────────
+    if (_pickingSample) {
+        if (!rising) return false;
+
+        int listY = CE_LBL_Y + CE_LBL_H;
+        int navY  = listY + CE_LIST_ROWS * CE_LIST_ROW_H;
+        int total = gServerPairing.sampleListCount();
+        int totalPages = total > 0 ? (total + CE_LIST_ROWS - 1) / CE_LIST_ROWS : 1;
+
+        // List rows — pick this sample
+        if (ty >= listY && ty < navY && total > 0) {
+            int row = (ty - listY) / CE_LIST_ROW_H;
+            int idx = _pickPage * CE_LIST_ROWS + row;
+            const SampleCacheEntry* e = gServerPairing.sampleListEntry(idx);
+            if (e) {
+                ColumnSettings& c = cs();
+                c.program = e->id;
+                copySampleNameToCol(e->name, c.name);
+                _patchPending = true;
+            }
+            _pickingSample = false;
+            draw();
+            _d.paint();
+            return false;
+        }
+
+        // PREV / NEXT
+        if (ty >= navY && ty < navY + CE_BTN_H) {
+            if (tx < CE_LIST_NAV_W) {
+                if (_pickPage > 0) _pickPage--;
+            } else if (tx >= CE_LIST_NEXT_X) {
+                if (_pickPage + 1 < totalPages) _pickPage++;
+            }
+            drawPickSampleList();
+            _d.paint();
+            return false;
+        }
+
+        // CANCEL
+        if (ty >= navY + CE_BTN_H + 8 && ty < navY + CE_BTN_H * 2 + 8) {
+            _pickingSample = false;
+            draw();
+            _d.paint();
         }
         return false;
     }
@@ -645,34 +863,46 @@ bool ColumnEditor::poll() {
         int btnY = ry + (CE_ROW_H - CE_BTN_H) / 2;
 
         if (f == 5) break;  // NAME handled above on falling edge
+        // Suppress +/- for BANK when on SFX (row is drawn disabled).
+        if (f == 1 && isSfx(cs().midiChannel)) break;
         // −/+ buttons (fields 0-4)
-        if (tx >= CE_MINUS_X && tx < CE_MINUS_X + CE_BTN_W) {
-            adjustField(f, -1);
+        int sign = 0;
+        if (tx >= CE_MINUS_X && tx < CE_MINUS_X + CE_BTN_W)     sign = -1;
+        else if (tx >= CE_PLUS_X && tx < CE_PLUS_X + CE_BTN_W)  sign = +1;
+        if (sign == 0) break;
+
+        adjustField(f, sign);
+        if (f == 0) {
+            // CH may have flipped to/from SFX — repaint whole panel.
+            drawAllFields();
+        } else if (f == 2) {
             drawFieldRow(f);
-            if (f == 2) drawFieldRow(1);  // program wrap may change bank
-            drawHeader();
-            _d.paint();
-            _hold.start(f, -1);
-            return false;
-        }
-        if (tx >= CE_PLUS_X && tx < CE_PLUS_X + CE_BTN_W) {
-            adjustField(f, 1);
+            if (isSfx(cs().midiChannel)) drawFieldRow(5);  // NAME overwritten by sample
+            else                         drawFieldRow(1);  // program wrap may change bank
+        } else {
             drawFieldRow(f);
-            if (f == 2) drawFieldRow(1);  // program wrap may change bank
-            drawHeader();
-            _d.paint();
-            _hold.start(f, 1);
-            return false;
         }
-        break;
+        drawHeader();
+        _d.paint();
+        _hold.start(f, sign);
+        return false;
     }
 
-    // PICK INSTRUMENT button
+    // PICK INSTRUMENT / SAMPLE button
     if (ty >= CE_PICK_Y && ty < CE_PICK_Y + CE_PICK_H) {
         if (tx >= CE_PICK_X && tx < CE_PICK_X + CE_PICK_W) {
-            _picking  = true;
             _pickPage = 0;
-            drawPickList();
+            if (isSfx(cs().midiChannel)) {
+                _pickingSample = true;
+                // Always refresh on open — server scans dir and rewrites
+                // samples.txt if anything changed.
+                if (gServerPairing.isPaired()) gServerPairing.requestSampleList();
+                _sampleListSeenState = (uint8_t)gServerPairing.sampleListState();
+                drawPickSampleList();
+            } else {
+                _picking = true;
+                drawPickList();
+            }
             _d.paint();
         }
         return false;

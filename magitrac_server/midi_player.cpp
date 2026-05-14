@@ -6,6 +6,8 @@
 #include "midi_player.h"
 #include "debug_log.h"
 #include "hal/uart_ll.h"
+#include "SamplePlayer.h"
+#include "SampleManifest.h"
 
 // Direct UART2 hardware FIFO access — bypasses Arduino's software ring buffer
 // to minimise performer-note latency (saves ~50-200 µs per byte).
@@ -58,6 +60,23 @@ static uint32_t seqTestNextMs     = 0;
 // Used for KEY-CHG detection — fires when pitch class changes (octave-independent).
 static uint8_t  seqLastPitchClass    = 0xFF;
 
+// Noise-marker consumption — col-0 notes without WAIT/SYNC effect ("expected
+// noise") swallow a matching performer note instead of letting it snap forward.
+// Once consumed in the current pattern pass, the marker is skipped on subsequent
+// walks so a later real WAIT can still be reached.  High-water mark by row;
+// reset when seqRow decreases (wrap/jump/timeout) or seqPattern changes.
+//
+// seqLastSnapRow anchors the walk start to the SECTION (the span between two
+// WAIT/SYNC snaps), not the playhead.  Without this, once the tick advances
+// past a noise marker the walk starts past it and the marker becomes invisible
+// — so noise consumption only worked while the performer was ahead of the
+// tick.  By walking from the row after the last snap, noise markers remain
+// visible to the walk for the whole section, regardless of where the tick is.
+static uint8_t  seqNoiseConsumedRow  = 0xFF;   // 0xFF = nothing consumed yet
+static uint8_t  seqLastSnapRow       = 0xFF;   // 0xFF = no snap in this pass
+static uint8_t  seqLastSeenPat       = 0xFF;
+static uint8_t  seqLastSeenRow       = 0xFF;
+
 // Persistent position in the active pattern's note list.
 // Always points to the next node to be processed (row >= seqRow).
 // NOTE_NULL means we are past the last note in the pattern — no notes will
@@ -85,6 +104,22 @@ static void (*seqStateCallback)(bool playing) = nullptr;
 
 // Optional MIDI-note-in callback — fires when note-on arrives while stopped
 static void (*seqMidiNoteInCallback)(uint8_t midiNote, uint8_t velocity) = nullptr;
+
+// ── Preview state ─────────────────────────────────────────────────────────────
+// Single-column looping audition for the column-note editor.  Mutually
+// exclusive with normal playback.  Performer-MIDI is ignored while active.
+static bool     seqPreview         = false;
+static uint8_t  seqPreviewPat      = 0;
+static uint8_t  seqPreviewCol      = 0;
+static uint8_t  seqPreviewRow      = 0;
+static uint32_t seqPreviewNextMs   = 0;
+static void   (*seqPreviewRowCallback)(uint8_t row) = nullptr;
+
+// ── Audition state ────────────────────────────────────────────────────────────
+// Single-note feedback for cell-tap entry.  Only one audition runs at a time;
+// a new audition cancels any previous one.
+static uint8_t  seqAuditionCol  = 0xFF;     // 0xFF = no audition active
+static uint32_t seqAuditionEndMs = 0;
 
 // ── External references ───────────────────────────────────────────────────────
 extern uint8_t        srvActiveBuf[];
@@ -117,15 +152,22 @@ static inline const Song* seqSong() {
     return reinterpret_cast<const Song*>(srvActiveBuf + sizeof(SongFileHeader));
 }
 
+// Chan sentinel marking a column as currently playing a sample (SFX).
+// Distinct from any real 0..15 midi channel.
+#define SEQ_CHAN_SFX 0xFF
+
 static void seqNoteOff(int col) {
-    if (seqActiveNote[col] != 0) {
+    if (seqActiveNote[col] == 0) return;
+    if (seqActiveChan[col] == SEQ_CHAN_SFX) {
+        samplePlayerStop();
+    } else {
         uint8_t note = seqActiveNote[col];
         seqWriteStatus((uint8_t)(0x80 | seqActiveChan[col]));
         midiTx(note);
         midiTx((uint8_t)0);
-        seqActiveNote[col] = 0;
-        seqActiveChan[col] = 0;
     }
+    seqActiveNote[col] = 0;
+    seqActiveChan[col] = 0;
 }
 
 // Scan the active pattern's circular list from its head and position
@@ -169,8 +211,10 @@ static void seqPlayRow() {
             // This gives the synth time to load the new patch before the
             // next note-on (which the composer placed at the desired offset
             // after the OFF).  Note-ons themselves never send patch changes.
+            // SFX columns don't use MIDI patch changes; the OFF already
+            // stopped the sample above.
             const ColumnSettings& cs = s->columns[nn.col];
-            if (cs.midiChannel != 0 && !cs.mute) {
+            if (cs.midiChannel != 0 && cs.midiChannel != SFX_CHANNEL && !cs.mute) {
                 uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
                 uint8_t vol    = cs.volume > 0 ? cs.volume : 100;
                 if (seqChanBank[midiCh] != cs.bankMSB || seqChanProg[midiCh] != cs.program) {
@@ -197,6 +241,18 @@ static void seqPlayRow() {
             if (cs.midiChannel == 0 || cs.mute) continue;
 
             seqNoteOff(col);
+
+            if (cs.midiChannel == SFX_CHANNEL) {
+                const char* fname = sampleManifestNameFor(cs.program);
+                if (fname) {
+                    char path[64];
+                    snprintf(path, sizeof(path), "/samples/%s", fname);
+                    samplePlayerPlay(path);
+                    seqActiveNote[col] = 1;               // any non-zero marks "active"
+                    seqActiveChan[col] = SEQ_CHAN_SFX;    // route stop to SamplePlayer
+                }
+                continue;
+            }
 
             uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
             int8_t  colXp  = cs.transpose;
@@ -243,6 +299,7 @@ static void seqRecordSnap(uint32_t now) {
 
 // ── Performer note handler ────────────────────────────────────────────────────
 static void seqOnPerformerNote(uint8_t midiNote) {
+    if (seqPreview) return;
     if (!srvHasActive || !seqRunning) return;
     uint32_t now       = millis();
     uint8_t pitchClass = midiNote % 12;
@@ -310,11 +367,21 @@ static void seqOnPerformerNote(uint8_t midiNote) {
         }
     }
 
-    // Snap cooldown — if a snap just fired, ignore further snaps for one row-duration.
-    // Transpose above has already been applied; that always takes effect.
-    if (now < seqSnapCooldownUntil) return;
+    // Reset consumed-noise / section-anchor state if the playhead has wrapped,
+    // jumped backwards, or the pattern has changed since the last performer
+    // note.  The noise high-water mark and section anchor are only meaningful
+    // within a single forward pass.
+    if (seqPattern != seqLastSeenPat ||
+        (seqLastSeenRow != 0xFF && seqRow < seqLastSeenRow)) {
+        seqNoiseConsumedRow = 0xFF;
+        seqLastSnapRow      = 0xFF;
+    }
+    seqLastSeenPat = seqPattern;
+    seqLastSeenRow = seqRow;
 
-    // Now find the cue row to snap to (using updated seqPattern/seqTranspose).
+    // Find the cue row to snap to (using updated seqPattern/seqTranspose).
+    // Walk runs even during snap cooldown so noise markers still get consumed;
+    // cooldown only suppresses the snap itself.
     uint8_t cueRow = 0xFF;
     if (seqWaiting) {
         // Halted — seqNextNoteIdx is parked at the WAIT node (tick peeked but didn't consume).
@@ -332,27 +399,54 @@ static void seqOnPerformerNote(uint8_t midiNote) {
             }
         }
     } else {
-        // Running — walk the list from the current pointer position to find the
-        // first col-0 node (SYNC or WAIT).  One rotation covers the full pattern.
+        // Running — walk forward through col-0 nodes from the SECTION START
+        // (the row after the last WAIT/SYNC snap), not from the playhead.
+        // This keeps noise markers visible for the whole section, even if the
+        // tick has advanced past them.  WAIT/SYNC stops the search (cue row).
+        // A no-effect col-0 ("expected noise") swallows a matching pitch so
+        // it doesn't snap to the next WAIT; non-matching pitches walk past it
+        // to find the real cue.  Already-consumed noise markers are skipped
+        // so a subsequent same-pitch note can still reach the WAIT.
         const Pattern& curPat = s->patterns[seqPattern];
         uint16_t head     = curPat.noteHead;
-        uint16_t startIdx = (seqNextNoteIdx != NOTE_NULL) ? seqNextNoteIdx : head;
+        uint16_t startIdx = NOTE_NULL;
+        if (head != NOTE_NULL) {
+            uint16_t idx = head;
+            do {
+                if (seqLastSnapRow == 0xFF ||
+                    s->notePool[idx].row > seqLastSnapRow) {
+                    startIdx = idx;
+                    break;
+                }
+                idx = s->notePool[idx].next;
+            } while (idx != head);
+            if (startIdx == NOTE_NULL) startIdx = head;  // wrap if all behind
+        }
         if (startIdx != NOTE_NULL) {
             uint16_t idx = startIdx;
             do {
                 const NoteNode& nn = s->notePool[idx];
-                if (nn.col == INPUT_COLUMN) {
-                    if (nn.note != NOTE_EMPTY &&
-                        (nn.effect == EFFECT_SYNC || nn.effect == EFFECT_WAIT)) {
-                        if (nn.note == NOTE_ANY) {
-                            cueRow = nn.row;
-                        } else {
-                            int semi = ((int)(nn.note - 1) % 12) + seqTranspose;
-                            uint8_t pc = (uint8_t)((semi % 12 + 12) % 12);
-                            if (pc == pitchClass) cueRow = nn.row;
-                        }
+                if (nn.col == INPUT_COLUMN && nn.note != NOTE_EMPTY) {
+                    bool pitchMatches;
+                    if (nn.note == NOTE_ANY) {
+                        pitchMatches = true;
+                    } else {
+                        int semi = ((int)(nn.note - 1) % 12) + seqTranspose;
+                        uint8_t pc = (uint8_t)((semi % 12 + 12) % 12);
+                        pitchMatches = (pc == pitchClass);
                     }
-                    break;   // first col-0 node stops the search regardless
+                    bool isWaitSync = (nn.effect == EFFECT_SYNC || nn.effect == EFFECT_WAIT);
+                    if (isWaitSync) {
+                        if (pitchMatches) cueRow = nn.row;
+                        break;   // WAIT/SYNC stops the search regardless of match
+                    }
+                    bool consumedAlready = (seqNoiseConsumedRow != 0xFF) &&
+                                           (nn.row <= seqNoiseConsumedRow);
+                    if (!consumedAlready && pitchMatches) {
+                        seqNoiseConsumedRow = nn.row;
+                        return;  // swallow — no snap, no tempo, no action
+                    }
+                    // else: consumed noise OR non-matching marker — keep walking
                 }
                 idx = s->notePool[idx].next;
             } while (idx != startIdx);
@@ -361,10 +455,17 @@ static void seqOnPerformerNote(uint8_t midiNote) {
 
     if (cueRow == 0xFF) return;
 
+    // Snap cooldown — suppress snap itself while still letting noise markers
+    // be consumed by the walk above.
+    if (now < seqSnapCooldownUntil) return;
+
     // Play MIDI first — zero overhead between snap detection and note output
     seqRow               = cueRow;
     seqReposition(cueRow);
     seqPlayRow();
+    seqNoiseConsumedRow  = 0xFF;   // new section starts after a WAIT/SYNC snap
+    seqLastSnapRow       = seqRow; // anchor next walk to the post-snap row
+    seqLastSeenRow       = seqRow; // keep lastSeen in sync with the post-snap row
     uint32_t afterPlay   = millis();
 
     // BPM derivation after MIDI is out (uses pre-increment absRow)
@@ -421,7 +522,7 @@ void sequencerPollMidiIn() {
                     uint8_t ch = midiStatus & 0x0F;  // 0-based channel
                     bool chanOk = (s->midiInChannel == 0) || (ch == s->midiInChannel - 1);
                     bool noteOk = (midiByte1 >= s->midiInNoteMin) && (midiByte1 <= s->midiInNoteMax);
-                    if (chanOk && noteOk) {
+                    if (chanOk && noteOk && !seqPreview) {
                         if (seqRunning) {
                             seqOnPerformerNote(midiByte1);
                         } else if (seqMidiNoteInCallback) {
@@ -451,6 +552,7 @@ static void seqSendColumnSetup(uint8_t pattern, bool force) {
     for (int col = 1; col < MAX_COLUMNS; col++) {
         const ColumnSettings& cs = s->columns[col];
         if (cs.midiChannel == 0 || cs.mute) continue;        // unset or muted — skip
+        if (cs.midiChannel == SFX_CHANNEL) continue;        // SFX has no MIDI patch
         uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
         if (chanDone[midiCh]) continue;                     // already set this pass
         chanDone[midiCh] = true;
@@ -488,9 +590,60 @@ static void seqSendColumnSetup(uint8_t pattern, bool force) {
     }
 }
 
+// ── Preview helpers ───────────────────────────────────────────────────────────
+// Walk the preview pattern's note list looking for the cell at
+// (seqPreviewRow, seqPreviewCol).  Plays at most one note (NOTE_OFF, pitched,
+// or no-op for empty / NOTE_ANY).
+static void seqPlayPreviewRow() {
+    const Song* s = seqSong();
+    if (seqPreviewPat >= s->numPatterns) return;
+    const ColumnSettings& cs = s->columns[seqPreviewCol];
+    if (cs.midiChannel == 0 || cs.mute) return;
+
+    uint16_t head = s->patterns[seqPreviewPat].noteHead;
+    if (head == NOTE_NULL) return;
+
+    uint16_t idx = head;
+    do {
+        const NoteNode& nn = s->notePool[idx];
+        if (nn.row == seqPreviewRow && nn.col == seqPreviewCol) {
+            if (nn.note == NOTE_OFF) {
+                seqNoteOff(seqPreviewCol);
+            } else if (nn.note != NOTE_EMPTY && nn.note != NOTE_ANY) {
+                seqNoteOff(seqPreviewCol);
+                if (cs.midiChannel == SFX_CHANNEL) {
+                    const char* fname = sampleManifestNameFor(cs.program);
+                    if (fname) {
+                        char path[64];
+                        snprintf(path, sizeof(path), "/samples/%s", fname);
+                        samplePlayerPlay(path);
+                        seqActiveNote[seqPreviewCol] = 1;
+                        seqActiveChan[seqPreviewCol] = SEQ_CHAN_SFX;
+                    }
+                    return;
+                }
+                uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
+                int raw = (int)nn.note + TRACKER_TO_MIDI_OFFSET + (int)cs.transpose;
+                if (raw < 0)   raw = 0;
+                if (raw > 127) raw = 127;
+                uint8_t midiNote = (uint8_t)raw;
+                uint8_t noteVel  = (nn.velocity & 0x80) ? 100 : nn.velocity;
+                seqWriteStatus((uint8_t)(0x90 | midiCh));
+                midiTx(midiNote);
+                midiTx(noteVel);
+                seqActiveNote[seqPreviewCol] = midiNote;
+                seqActiveChan[seqPreviewCol] = midiCh;
+            }
+            return;
+        }
+        idx = nn.next;
+    } while (idx != head);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 void sequencerStart() {
     if (!srvHasActive) return;
+    if (seqPreview) sequencerStopPreview();
 
     for (int c = 0; c < MAX_COLUMNS; c++) seqNoteOff(c);
     memset(seqActiveChan, 0, sizeof(seqActiveChan));
@@ -526,6 +679,7 @@ void sequencerStart() {
 
 void sequencerResume() {
     if (!srvHasActive) return;
+    if (seqPreview) sequencerStopPreview();
     seqPaused    = false;
     seqWaiting   = false;
     seqRunning   = true;
@@ -550,6 +704,110 @@ void sequencerStop() {
     seqOutStatus = 0;  // force full status byte on next start
     debugPrintf("[SEQ] stop t=%lu\n", millis());
     if (seqStateCallback) seqStateCallback(false);
+}
+
+void sequencerStartPreview(uint8_t pat, uint8_t col) {
+    if (!srvHasActive) return;
+    const Song* s = seqSong();
+    if (pat >= s->numPatterns)  return;
+    if (col >= MAX_COLUMNS) return;               // col 0 is silent but still animates the playhead
+
+    if (seqRunning) sequencerStop();              // mutually exclusive
+    if (seqPreview) seqNoteOff(seqPreviewCol);    // restart on same/different col — avoid stuck notes
+
+    seqPreview       = true;
+    seqPreviewPat    = pat;
+    seqPreviewCol    = col;
+    seqPreviewRow    = 0;
+    seqPreviewNextMs = millis();
+    memset(seqChanBank, 0xFF, sizeof(seqChanBank));
+    memset(seqChanProg, 0xFF, sizeof(seqChanProg));
+    memset(seqChanVol,  0xFF, sizeof(seqChanVol));
+    seqSendColumnSetup(seqPreviewPat, /*force=*/true);
+    debugPrintf("[SEQ] preview start pat=%u col=%u\n", pat, col);
+}
+
+void sequencerStopPreview() {
+    if (!seqPreview) return;
+    seqPreview = false;
+    seqNoteOff(seqPreviewCol);
+    seqOutStatus = 0;
+    debugPrintf("[SEQ] preview stop\n");
+}
+
+bool sequencerPreviewActive() {
+    return seqPreview;
+}
+
+void sequencerAuditionNote(uint8_t pat, uint8_t row, uint8_t col) {
+    if (!srvHasActive)              return;
+    if (seqRunning)                 return;   // song would mask anyway, skip
+    if (seqPreview)                 return;   // preview is already auditioning
+    if (col == 0 || col >= MAX_COLUMNS) return;
+
+    const Song* s = seqSong();
+    if (pat >= s->numPatterns)      return;
+
+    const ColumnSettings& cs = s->columns[col];
+    if (cs.midiChannel == 0 || cs.mute) return;
+
+    // Walk the pattern's note list looking for the cell at (row, col).
+    uint16_t head = s->patterns[pat].noteHead;
+    if (head == NOTE_NULL)          return;
+    Note nn = { NOTE_EMPTY, 0, 0, 0 };
+    {
+        uint16_t idx = head;
+        do {
+            const NoteNode& n = s->notePool[idx];
+            if (n.row == row && n.col == col) {
+                nn.note = n.note; nn.velocity = n.velocity;
+                nn.effect = n.effect; nn.param = n.param;
+                break;
+            }
+            idx = n.next;
+        } while (idx != head);
+    }
+    if (nn.note == NOTE_EMPTY || nn.note == NOTE_OFF || nn.note == NOTE_ANY) return;
+
+    // Cancel any prior audition (possibly on a different column).
+    if (seqAuditionCol != 0xFF) seqNoteOff(seqAuditionCol);
+
+    // Make sure bank/program/volume are flushed before the note-on.  No-op
+    // for columns whose cache is already current.
+    seqSendColumnSetup(pat, /*force=*/false);
+
+    seqNoteOff(col);   // silence anything stale on this column
+
+    if (cs.midiChannel == SFX_CHANNEL) {
+        const char* fname = sampleManifestNameFor(cs.program);
+        if (fname) {
+            char path[64];
+            snprintf(path, sizeof(path), "/samples/%s", fname);
+            samplePlayerPlay(path);
+            seqActiveNote[col] = 1;
+            seqActiveChan[col] = SEQ_CHAN_SFX;
+            seqAuditionCol   = col;
+            seqAuditionEndMs = millis() + 500;
+            debugPrintf("[SEQ] audition col=%u SFX=%s\n", col, fname);
+        }
+        return;
+    }
+
+    uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
+    int raw = (int)nn.note + TRACKER_TO_MIDI_OFFSET + (int)cs.transpose;
+    if (raw < 0)   raw = 0;
+    if (raw > 127) raw = 127;
+    uint8_t midiNote = (uint8_t)raw;
+    uint8_t noteVel  = (nn.velocity & 0x80) ? 100 : nn.velocity;
+    seqWriteStatus((uint8_t)(0x90 | midiCh));
+    midiTx(midiNote);
+    midiTx(noteVel);
+    seqActiveNote[col] = midiNote;
+    seqActiveChan[col] = midiCh;
+
+    seqAuditionCol   = col;
+    seqAuditionEndMs = millis() + 500;
+    debugPrintf("[SEQ] audition col=%u note=%u\n", col, midiNote);
 }
 
 void sequencerPanic() {
@@ -626,6 +884,34 @@ void sequencerSeek(uint8_t pattern, uint8_t row) {
     if (seqRowCallback) seqRowCallback(seqPattern, seqRow);
 }
 
+void sequencerGoto(uint8_t pat, uint8_t row) {
+    if (!srvHasActive) return;
+    const Song* s = seqSong();
+    if (pat >= s->numPatterns) return;
+    if (row >= s->patterns[pat].length) return;
+
+    bool patChanged = (pat != seqPattern);
+
+    if (patChanged) {
+        for (int c = 0; c < MAX_COLUMNS; c++) seqNoteOff(c);
+        seqSendColumnSetup(pat);
+    }
+
+    seqPattern = pat;
+    seqRow     = row;
+    seqWaiting = false;
+    seqReposition(row);
+
+    // When running, kick the tick to fire immediately — WAIT detection and
+    // row playback live in sequencerTick, so we don't duplicate them here.
+    // When stopped, no tick runs, no audio.
+    if (seqRunning) seqNextRowMs = millis();
+
+    debugPrintf("[SEQ] goto t=%lu pat=%u row=%u running=%d\n",
+                  millis(), seqPattern, seqRow, (int)seqRunning);
+    if (seqRowCallback) seqRowCallback(seqPattern, seqRow);
+}
+
 bool sequencerIsRunning() {
     return seqRunning;
 }
@@ -654,6 +940,36 @@ void sequencerUnpause() {
 }
 
 void sequencerTick() {
+    // Audition timeout — fires regardless of play / preview state, so a
+    // stranded audition note never sits on indefinitely.
+    if (seqAuditionCol != 0xFF && (int32_t)(millis() - seqAuditionEndMs) >= 0) {
+        seqNoteOff(seqAuditionCol);
+        seqAuditionCol = 0xFF;
+        seqOutStatus = 0;
+    }
+
+    if (seqPreview) {
+        if (!srvHasActive) return;
+        uint32_t now = millis();
+        if (now < seqPreviewNextMs) return;
+
+        seqPlayPreviewRow();
+
+        const Song* s = seqSong();
+        uint16_t bpm   = s->bpm   > 0 ? s->bpm   : 100;
+        uint8_t  speed = s->speed > 0 ? s->speed : 6;
+        uint32_t rowMs = (uint32_t)speed * 2500UL / bpm;
+        uint32_t after = millis();
+
+        if (seqPreviewRowCallback) seqPreviewRowCallback(seqPreviewRow);
+
+        uint8_t plen = s->patterns[seqPreviewPat].length;
+        if (plen == 0) plen = 1;
+        seqPreviewRow = (seqPreviewRow + 1) % plen;
+        seqPreviewNextMs = after + rowMs;
+        return;
+    }
+
     if (!seqRunning || seqPaused || !srvHasActive) return;
     uint32_t now = millis();
 
@@ -753,6 +1069,10 @@ void seqSetStateCallback(void (*cb)(bool playing)) {
 
 void seqSetMidiNoteInCallback(void (*cb)(uint8_t midiNote, uint8_t velocity)) {
     seqMidiNoteInCallback = cb;
+}
+
+void seqSetPreviewRowCallback(void (*cb)(uint8_t row)) {
+    seqPreviewRowCallback = cb;
 }
 
 void sequencerSetTestMode(uint32_t intervalMs) {

@@ -259,7 +259,7 @@ void setup() {
     }
 
     TwoWire* wire = display.getConfig().i2c.wire;
-    touch.begin(wire);
+    touch.begin(wire, 20);
 
     // RTC — BM8563 shares the display's I2C bus
     if (wire) {
@@ -296,10 +296,13 @@ void setup() {
     gServerPairing.begin();
     loadMidiLimits();
 
-    // Battery — ADC fallback first, then BQ25896 overrides if I2C is present
-    battery_begin_adc(4, 2.0f);
-    if (display.getConfig().i2c.wire)
-        battery_begin_bq25896(display.getConfig().i2c.wire);
+    // Battery — LilyGo T5 S3 has BQ25896 PMIC on I2C with ADC fallback;
+    // M5PaperS3 has neither, so leave battery backend as NONE.
+    if (!m5paper) {
+        battery_begin_adc(4, 2.0f);
+        if (display.getConfig().i2c.wire)
+            battery_begin_bq25896(display.getConfig().i2c.wire);
+    }
 
     initSong(&song);
 
@@ -389,6 +392,8 @@ void loop() {
             gLastBattChg = chg;
             ui.setBattery(pct, chg);
             needsHeaderRedraw = true;
+        } else if (pct < 0 && gLastBattPct == -2) {
+            gLastBattPct = -1;   // mark first attempt complete; stop spamming retries
         }
     }
 
@@ -451,6 +456,9 @@ void loop() {
                 }
                 break;
             case BootMenuResult::PERFORM:
+                if (gServerPairing.isPaired() && !gServerPairing.serverPlaying()) {
+                    gServerPairing.sendControl(MSG_PLAY);
+                }
                 performancePageOpen = true;
                 performancePage.open(engine.currentPattern());
                 display.clear();
@@ -667,11 +675,33 @@ void loop() {
             gServerPairing.sendNoteSet(song, p, r, c);
             noteEditorPage.clearPending();
         }
+        if (gServerPairing.isPaired() && noteEditorPage.auditionPending()) {
+            gServerPairing.sendAuditionNote(noteEditorPage.auditionPat(),
+                                            noteEditorPage.auditionRow(),
+                                            noteEditorPage.auditionCol());
+            noteEditorPage.clearAuditionPending();
+        }
         if (gServerPairing.isPaired() && noteEditorPage.bulkPending()) {
             gServerPairing.sendSongToServer("", &song);
             noteEditorPage.clearBulkPending();
         }
-        if (noteEditorPage.poll()) {
+        uint8_t prevRow;
+        if (gServerPairing.pollPreviewRow(&prevRow)) {
+            noteEditorPage.setPreviewRow(prevRow);
+        }
+        bool exiting = noteEditorPage.poll();
+        // Drain preview pending flags AFTER poll() — taps, HOME, and segment
+        // navigation all set these from inside poll().
+        if (gServerPairing.isPaired() && noteEditorPage.previewStartPending()) {
+            gServerPairing.sendPreviewStart(noteEditorPage.previewStartPat(),
+                                            noteEditorPage.previewStartCol());
+            noteEditorPage.clearPreviewStartPending();
+        }
+        if (gServerPairing.isPaired() && noteEditorPage.previewStopPending()) {
+            gServerPairing.sendPreviewStop();
+            noteEditorPage.clearPreviewStopPending();
+        }
+        if (exiting) {
             noteEditorPageOpen = false;
             display.clear();
             ui.drawAll();
@@ -845,7 +875,7 @@ void loop() {
             if (engine.currentPattern() > 0) {
                 engine.setPattern(engine.currentPattern() - 1);
                 if (gServerPairing.isPaired())
-                    gServerPairing.sendSeek(engine.currentPattern(), engine.currentRow());
+                    gServerPairing.sendGoto(engine.currentPattern(), engine.currentRow());
                 ui.setSelected(0, ui.selectedCol());
                 needsHeaderRedraw = true;
                 needsGridRedraw   = true;
@@ -857,7 +887,7 @@ void loop() {
             if (engine.currentPattern() + 1 < song.numPatterns) {
                 engine.setPattern(engine.currentPattern() + 1);
                 if (gServerPairing.isPaired())
-                    gServerPairing.sendSeek(engine.currentPattern(), engine.currentRow());
+                    gServerPairing.sendGoto(engine.currentPattern(), engine.currentRow());
                 ui.setSelected(0, ui.selectedCol());
                 needsHeaderRedraw = true;
                 needsGridRedraw   = true;

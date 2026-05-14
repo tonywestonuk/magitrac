@@ -51,7 +51,8 @@ static const int CNE_RP_NAV_Y    = 50;
 static const int CNE_RP_NAV_H    = 50;
 static const int CNE_RP_PREV_W   = 65;
 static const int CNE_RP_NEXT_W   = 65;
-static const int CNE_RP_COL_Y    = 110;
+static const int CNE_RP_PREVIEW_Y = 110;
+static const int CNE_RP_PREVIEW_H = 35;
 static const int CNE_RP_ROW_Y    = 150;
 static const int CNE_RP_VEL_Y    = 195;
 static const int CNE_RP_ATTR_Y   = 245;
@@ -86,6 +87,27 @@ public:
     bool    bulkPending() const { return _dirtyAll; }
     void    clearBulkPending()  { _dirtyAll = false; }
 
+    // Audition pending — set when a freshly entered note should be played
+    // through MIDI for ~500ms.  Drained by main sketch.
+    bool    auditionPending() const { return _auditionRow != 0xFF; }
+    uint8_t auditionRow()     const { return _auditionRow; }
+    uint8_t auditionPat()     const { return _patIdx; }
+    uint8_t auditionCol()     const { return _col; }
+    void    clearAuditionPending()  { _auditionRow = 0xFF; }
+
+    // ── Preview pending (drained by main sketch into ServerPairing) ──────────
+    bool    previewStartPending() const { return _previewStartPending; }
+    uint8_t previewStartPat()     const { return _patIdx; }
+    uint8_t previewStartCol()     const { return _col; }
+    void    clearPreviewStartPending()  { _previewStartPending = false; }
+
+    bool    previewStopPending()  const { return _previewStopPending; }
+    void    clearPreviewStopPending()   { _previewStopPending = false; }
+
+    // Caller routes inbound MSG_PREVIEW_ROW through this.  Updates _selRow
+    // (cursor follows playhead) and triggers a partial repaint.
+    void setPreviewRow(uint8_t row);
+
 private:
     EPD_PainterAdafruit& _d;
     GT911_Lite&          _touch;
@@ -118,6 +140,13 @@ private:
     // Server-sync flags
     uint8_t  _dirtyRow;     // 0xFF = clean; else last edited row in _patIdx, col=_col
     bool     _dirtyAll;     // bulk edit (paste) — caller does full song resync
+    uint8_t  _auditionRow;  // 0xFF = no audition; else row to audition (col=_col)
+
+    // Preview state
+    bool     _previewing;
+    bool     _previewStartPending;
+    bool     _previewStopPending;
+    uint8_t  _previewRow;   // 0xFF = no playhead; else absolute pattern row
 
     // Drawing
     void drawHeader();
@@ -129,6 +158,7 @@ private:
     void drawVelAttrRow();
     void drawActionButton();
     void drawCopyPasteRow(int pressed = -1);   // pressed: -1 none, 0 COPY, 1 PASTE
+    void drawPreviewButton();
 
     // Helpers
     NoteGrid    grid();
@@ -147,6 +177,7 @@ private:
     bool hitAction(int sx, int sy, uint8_t& which) const;  // which: 0=OFF/single, 0=ANY,1=WAIT,2=SYNC
     bool hitCopy(int sx, int sy) const;
     bool hitPaste(int sx, int sy) const;
+    bool hitPreview(int sx, int sy) const;
     bool hitSelector(int sx, int sy, int8_t& col) const;
     bool hitGridCell(int sx, int sy, int8_t& col, int8_t& pitchIdx) const;
 

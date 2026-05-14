@@ -1,6 +1,7 @@
 #include "SamplePlayer.h"
 #include <Arduino.h>
 #include <SD.h>
+#include <string.h>
 #include "driver/i2s.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -18,14 +19,27 @@ static const i2s_config_t s_i2s_cfg = {
     .use_apll             = 0,
 };
 
-static volatile bool      s_stop    = false;
-static volatile bool      s_playing = false;
-static SemaphoreHandle_t  s_trigger = nullptr;
-static char               s_path[64];
+static volatile bool      s_stop       = false;
+static volatile bool      s_playing    = false;
+static SemaphoreHandle_t  s_trigger    = nullptr;
+static portMUX_TYPE       s_pathMux    = portMUX_INITIALIZER_UNLOCKED;
+static char               s_pendingPath[64];
+static volatile bool      s_havePending = false;
 
 static void wavTaskFn(void*) {
+    char activePath[64];
     for (;;) {
         xSemaphoreTake(s_trigger, portMAX_DELAY);
+
+        bool havePath;
+        portENTER_CRITICAL(&s_pathMux);
+        havePath = s_havePending;
+        if (havePath) {
+            memcpy(activePath, s_pendingPath, sizeof(activePath));
+            s_havePending = false;
+        }
+        portEXIT_CRITICAL(&s_pathMux);
+        if (!havePath) continue;
 
         s_stop    = false;
         s_playing = true;
@@ -34,13 +48,12 @@ static void wavTaskFn(void*) {
         i2s_set_pin(I2S_NUM_0, NULL);
         i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN);
 
-        File f = SD.open(s_path);
+        File f = SD.open(activePath);
         if (f) {
             int16_t  fbuf[256];
             uint32_t obuf[256];
             size_t   bw;
 
-            // Read 44-byte WAV header and extract sample rate (bytes 24-27, little-endian)
             uint8_t hdr[44];
             f.read(hdr, 44);
             uint32_t sampleRate = (uint32_t)hdr[24]
@@ -54,7 +67,6 @@ static void wavTaskFn(void*) {
             while (bytesIn > 0 && !s_stop) {
                 for (int i = 0; i < bytesIn / 2; i++)
                     obuf[i] = (uint32_t)((int32_t)fbuf[i] + 32768) << 16;
-                // Bounded timeout so stop signal is seen promptly
                 i2s_write(I2S_NUM_0, obuf, (size_t)(bytesIn * 2), &bw, pdMS_TO_TICKS(200));
                 bytesIn = f.readBytes(reinterpret_cast<char*>(fbuf), sizeof(fbuf));
             }
@@ -63,6 +75,11 @@ static void wavTaskFn(void*) {
 
         i2s_driver_uninstall(I2S_NUM_0);
         s_playing = false;
+
+        portENTER_CRITICAL(&s_pathMux);
+        bool more = s_havePending;
+        portEXIT_CRITICAL(&s_pathMux);
+        if (more) xSemaphoreGive(s_trigger);
     }
 }
 
@@ -71,19 +88,23 @@ void samplePlayerInit() {
     xTaskCreatePinnedToCore(wavTaskFn, "WAV", 4096, nullptr, 5, nullptr, 0);  // Core 0
 }
 
+// Non-blocking: queues `path` for playback.  If a sample is already playing
+// it is interrupted; the new one starts as soon as the task picks up the
+// queued path.
 void samplePlayerPlay(const char* path) {
-    samplePlayerStop();  // wait for any current playback to finish
-    strncpy(s_path, path, sizeof(s_path) - 1);
-    s_path[sizeof(s_path) - 1] = '\0';
-    xSemaphoreGive(s_trigger);
+    portENTER_CRITICAL(&s_pathMux);
+    strncpy(s_pendingPath, path, sizeof(s_pendingPath) - 1);
+    s_pendingPath[sizeof(s_pendingPath) - 1] = '\0';
+    s_havePending = true;
+    portEXIT_CRITICAL(&s_pathMux);
+    s_stop = true;                 // interrupt any current play
+    xSemaphoreGive(s_trigger);     // wake task (no-op if already pending)
 }
 
+// Non-blocking: signals the task to abort the current play.  Audio stops
+// within ~200 ms (the i2s_write timeout); s_playing flips false soon after.
 void samplePlayerStop() {
-    if (!s_playing) return;
     s_stop = true;
-    uint32_t deadline = millis() + 400;
-    while (s_playing && (int32_t)(millis() - deadline) < 0)
-        vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 bool samplePlayerIsPlaying() {

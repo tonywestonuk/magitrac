@@ -126,8 +126,9 @@ private:
     bool    _wasDown;
     bool    _patchPending;
     bool    _picking;       // true when instrument list overlay is shown
+    bool    _pickingSample; // true when sample-picker overlay is shown
     bool    _naming;        // true when keyboard popup is open for NAME
-    int     _pickPage;      // 0-based page of instrument list
+    int     _pickPage;      // 0-based page of instrument / sample list
     KeyboardPopup _keyboard;
 
     // COPY / SWAP destination-picker + confirm overlay
@@ -137,6 +138,7 @@ private:
         PICK_SWAP_DST,
         CONFIRM_COPY,
         CONFIRM_CLEAR,
+        PICK_SAMPLE,
     };
     Action   _action;
     uint8_t  _actionDst;    // remembered destination column for CONFIRM_COPY
@@ -144,6 +146,9 @@ private:
     bool     _pressedOnName; // true if last touch-down landed in the NAME row
                              // (gates the falling-edge keyboard popup so other
                              //  overlays' YES/NO buttons don't trigger it)
+    uint8_t  _sampleListSeenState; // last observed sample list state — used to
+                                   // trigger a repaint when WAITING → READY
+                                   // while the picker overlay is open
 
     HoldRepeat _hold;
 
@@ -153,6 +158,7 @@ private:
     void drawAllFields();
     void drawPickButton();
     void drawPickList();               // instrument list overlay
+    void drawPickSampleList();         // sample list overlay (SFX columns)
     void drawActionBar();              // COPY / SWAP buttons (bottom of normal view)
     void drawColumnPicker();           // overlay: pick destination column
     void drawCopyConfirm();            // overlay: confirm destructive copy

@@ -128,6 +128,15 @@ bool ServerPairing::sendSeek(uint8_t pattern, uint8_t row) {
     return gComms.send(&msg, sizeof(msg));
 }
 
+bool ServerPairing::sendGoto(uint8_t pattern, uint8_t row) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgGoto msg;
+    msg.type    = MSG_GOTO;
+    msg.pattern = pattern;
+    msg.row     = row;
+    return gComms.send(&msg, sizeof(msg));
+}
+
 bool ServerPairing::sendQueueBlock(uint8_t pattern) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgQueueBlock msg;
@@ -140,6 +149,28 @@ bool ServerPairing::sendCancelQueue() {
     if (_pairState != PairClientState::SUCCESS) return false;
     uint8_t msg = (uint8_t)MSG_CANCEL_QUEUE;
     return gComms.send(&msg, 1);
+}
+
+bool ServerPairing::sendPreviewStart(uint8_t pattern, uint8_t col) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgPreviewStart msg;
+    msg.type    = MSG_PREVIEW_START;
+    msg.pattern = pattern;
+    msg.col     = col;
+    return gComms.send(&msg, sizeof(msg));
+}
+
+bool ServerPairing::sendPreviewStop() {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    uint8_t msg = (uint8_t)MSG_PREVIEW_STOP;
+    return gComms.send(&msg, 1);
+}
+
+bool ServerPairing::pollPreviewRow(uint8_t* row) {
+    if (!_previewRowPending) return false;
+    *row                = _previewRow;
+    _previewRowPending  = false;
+    return true;
 }
 
 bool ServerPairing::sendMidi(const uint8_t* bytes, uint8_t len) {
@@ -173,6 +204,16 @@ bool ServerPairing::sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, 
     msg.col     = col;
     NoteGrid grid(song.notePool, &song.patterns[pattern].noteHead);
     msg.note = grid.get(row, col);
+    return gComms.send(&msg, sizeof(msg));
+}
+
+bool ServerPairing::sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgNoteAudition msg;
+    msg.type    = MSG_NOTE_AUDITION;
+    msg.pattern = pattern;
+    msg.row     = row;
+    msg.col     = col;
     return gComms.send(&msg, sizeof(msg));
 }
 
@@ -417,6 +458,33 @@ void ServerPairing::resetBrowse() {
     _chunksTotal = 0;
 }
 
+// ── Sample list ────────────────────────────────────────────────────────────
+void ServerPairing::resetSampleList() {
+    _sampleListState  = SampleListState::IDLE;
+    _sampleCount      = 0;
+    _sampleTotal      = 0;
+    _samplePage       = 0;
+    _sampleTotalPages = 0;
+}
+
+void ServerPairing::requestSampleList() {
+    if (_pairState != PairClientState::SUCCESS) return;
+    resetSampleList();
+    MsgSampleListReq req;
+    req.type = MSG_SAMPLE_LIST_REQ;
+    req.page = 0;
+    gComms.send(&req, sizeof(req));
+    _sampleListState = SampleListState::WAITING;
+}
+
+const char* ServerPairing::sampleListNameFor(uint8_t id) const {
+    if (id == 0) return nullptr;
+    for (int i = 0; i < _sampleCount; i++) {
+        if (_sampleCache[i].id == id) return _sampleCache[i].name;
+    }
+    return nullptr;
+}
+
 bool ServerPairing::copySong(Song* out) const {
     if (_browseState != BrowseState::SONG_READY) return false;
     const SongFileHeader* hdr = (const SongFileHeader*)_songBuf;
@@ -556,6 +624,40 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
             }
             break;
 
+        case MSG_SAMPLE_LIST_RESP:
+            if (_pairState != PairClientState::SUCCESS) return;
+            if (memcmp(senderMac, _serverMac, 6) != 0) return;
+            if (len < (int)sizeof(MsgSampleListResp)) return;
+            if (_sampleListState != SampleListState::WAITING &&
+                _sampleListState != SampleListState::PARTIAL) return;
+            {
+                const MsgSampleListResp* r = (const MsgSampleListResp*)data;
+                _samplePage       = r->page;
+                _sampleTotalPages = r->totalPages > 0 ? r->totalPages : 1;
+                _sampleTotal      = r->totalEntries;
+
+                int n = r->count <= SAMPLES_PER_PKT ? r->count : SAMPLES_PER_PKT;
+                for (int i = 0; i < n && _sampleCount < SAMPLE_CACHE_MAX; i++) {
+                    _sampleCache[_sampleCount].id = r->entries[i].id;
+                    strncpy(_sampleCache[_sampleCount].name,
+                            r->entries[i].name, SAMPLE_NAME_LEN - 1);
+                    _sampleCache[_sampleCount].name[SAMPLE_NAME_LEN - 1] = '\0';
+                    _sampleCount++;
+                }
+
+                if (_samplePage + 1 < _sampleTotalPages) {
+                    // Request next page
+                    _sampleListState = SampleListState::PARTIAL;
+                    MsgSampleListReq req;
+                    req.type = MSG_SAMPLE_LIST_REQ;
+                    req.page = (uint8_t)(_samplePage + 1);
+                    gComms.send(&req, sizeof(req));
+                } else {
+                    _sampleListState = SampleListState::READY;
+                }
+            }
+            break;
+
         case MSG_INSTRUMENTS_DATA:
             if (_pairState != PairClientState::SUCCESS) return;
             if (memcmp(senderMac, _serverMac, 6) != 0) return;
@@ -622,6 +724,17 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
                 _midiNoteIn        = m->midiNote;
                 _midiVelocityIn    = m->velocity;
                 _midiNoteInPending = true;
+            }
+            break;
+
+        case MSG_PREVIEW_ROW:
+            if (_pairState != PairClientState::SUCCESS) return;
+            if (memcmp(senderMac, _serverMac, 6) != 0) return;
+            if (len < (int)sizeof(MsgPreviewRow)) return;
+            {
+                const MsgPreviewRow* m = (const MsgPreviewRow*)data;
+                _previewRow        = m->row;
+                _previewRowPending = true;
             }
             break;
 
