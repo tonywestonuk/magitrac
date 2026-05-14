@@ -6,6 +6,7 @@
 #include "NoteGrid.h"
 #include "SongMigration.h"
 #include "midi_player.h"
+#include "SampleManifest.h"
 
 extern HardwareSerial midi;
 
@@ -186,6 +187,42 @@ static void sendSongList(uint8_t page) {
         resp.names[i][SL_NAME_LEN - 1] = '\0';
         int len = (int)strlen(resp.names[i]);
         if (len > 4 && resp.names[i][len - 4] == '.') resp.names[i][len - 4] = '\0';
+    }
+
+    gComms.send(&resp, sizeof(resp));
+}
+
+// ── Send sample list page to client ────────────────────────────────────────────
+// Each request runs a full manifest sync first: scans /samples/*.wav, appends
+// any new files to /samples/samples.txt with the next free id, then pages the
+// updated list out.  This means the picker on the client is always fresh
+// without needing a separate "refresh samples" command.
+static void sendSampleList(uint8_t page) {
+    sampleManifestSync();
+    int total = sampleManifestCount();
+
+    int totalPages = total > 0 ? (total + SAMPLES_PER_PKT - 1) / SAMPLES_PER_PKT : 1;
+    if (page >= totalPages) page = totalPages - 1;
+
+    int start  = page * SAMPLES_PER_PKT;
+    int inPage = total - start;
+    if (inPage > SAMPLES_PER_PKT) inPage = SAMPLES_PER_PKT;
+    if (inPage < 0)               inPage = 0;
+
+    MsgSampleListResp resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.type         = MSG_SAMPLE_LIST_RESP;
+    resp.page         = page;
+    resp.totalPages   = (uint8_t)totalPages;
+    resp.count        = (uint8_t)inPage;
+    resp.totalEntries = (uint8_t)(total > 255 ? 255 : total);
+
+    for (int i = 0; i < inPage; i++) {
+        const SmEntry* e = sampleManifestAt(start + i);
+        if (!e) break;
+        resp.entries[i].id = e->id;
+        strncpy(resp.entries[i].name, e->name, SAMPLE_NAME_LEN - 1);
+        resp.entries[i].name[SAMPLE_NAME_LEN - 1] = '\0';
     }
 
     gComms.send(&resp, sizeof(resp));
@@ -755,6 +792,11 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             sendSongList(((const MsgSongListReq*)data)->page);
             break;
 
+        case MSG_SAMPLE_LIST_REQ:
+            if (len < (int)sizeof(MsgSampleListReq)) return;
+            sendSampleList(((const MsgSampleListReq*)data)->page);
+            break;
+
         case MSG_SONG_LOAD_REQ:
             if (len < (int)sizeof(MsgSongLoadReq)) return;
             {
@@ -894,6 +936,14 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             }
             break;
 
+        case MSG_GOTO:
+            if (len < (int)sizeof(MsgGoto)) return;
+            {
+                const MsgGoto* g = (const MsgGoto*)data;
+                sequencerGoto(g->pattern, g->row);
+            }
+            break;
+
         case MSG_QUEUE_BLOCK:
             if (len < (int)sizeof(MsgQueueBlock)) return;
             sequencerQueueBlock(((const MsgQueueBlock*)data)->pattern);
@@ -901,6 +951,26 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
 
         case MSG_CANCEL_QUEUE:
             sequencerCancelQueue();
+            break;
+
+        case MSG_PREVIEW_START:
+            if (len < (int)sizeof(MsgPreviewStart)) return;
+            {
+                const MsgPreviewStart* p = (const MsgPreviewStart*)data;
+                sequencerStartPreview(p->pattern, p->col);
+            }
+            break;
+
+        case MSG_PREVIEW_STOP:
+            sequencerStopPreview();
+            break;
+
+        case MSG_NOTE_AUDITION:
+            if (len < (int)sizeof(MsgNoteAudition)) return;
+            {
+                const MsgNoteAudition* a = (const MsgNoteAudition*)data;
+                sequencerAuditionNote(a->pattern, a->row, a->col);
+            }
             break;
 
         case MSG_BACKUP_LIST_REQ:

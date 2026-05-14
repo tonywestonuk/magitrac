@@ -9,6 +9,7 @@
 #include "midi_player.h"
 #include "debug_log.h"
 #include "SamplePlayer.h"
+#include "SampleManifest.h"
 #include "hal/uart_ll.h"
 
 // ── Communications ───────────────────────────────────────────────────────────
@@ -455,6 +456,14 @@ static volatile struct {
     bool    dirty;
 } sMidiNoteInNotify = {};
 
+// Column-preview row tick — forward to client so the editor can highlight
+// the playhead.  Coalescing is fine: missed rows just mean the highlight
+// momentarily lags, and the next tick catches up.
+static volatile struct {
+    uint8_t row;
+    bool    dirty;
+} sPreviewRowNotify = {};
+
 // ── MIDI task — Core 1, high priority ─────────────────────────────────────────
 // Handles all MIDI input and sequencer timing independently of the display loop.
 static void midiTaskFn(void* /*pv*/) {
@@ -501,6 +510,7 @@ void setup() {
     Serial.println("[SETUP] commandsInit");
     commandsInit();
     samplePlayerInit();  // SD init after WiFi/ESP-NOW is fully up
+    sampleManifestSync();  // load /samples/samples.txt + register any new wavs
     loadSongList();  // populate list from SD
 
     // Row advance — set dirty flag; main loop sends the ESP-NOW message
@@ -522,6 +532,12 @@ void setup() {
         sMidiNoteInNotify.midiNote  = midiNote;
         sMidiNoteInNotify.velocity  = velocity;
         sMidiNoteInNotify.dirty     = true;
+    });
+
+    // Column-preview row tick — same deferred-send approach
+    seqSetPreviewRowCallback([](uint8_t row) {
+        sPreviewRowNotify.row   = row;
+        sPreviewRowNotify.dirty = true;
     });
 
     // Launch MIDI task on Core 1 at priority 10 (above loop()'s priority 1)
@@ -576,6 +592,15 @@ void loop() {
         msg.type     = MSG_MIDI_NOTE_IN;
         msg.midiNote = sMidiNoteInNotify.midiNote;
         msg.velocity = sMidiNoteInNotify.velocity;
+        pairingSendToClient(&msg, sizeof(msg));
+    }
+
+    // Forward column-preview row position to the client
+    if (sPreviewRowNotify.dirty) {
+        sPreviewRowNotify.dirty = false;
+        MsgPreviewRow msg;
+        msg.type = MSG_PREVIEW_ROW;
+        msg.row  = sPreviewRowNotify.row;
         pairingSendToClient(&msg, sizeof(msg));
     }
 

@@ -50,11 +50,17 @@ enum MagiMsgType : uint8_t {
     MSG_SEQ_POS        = 0x31,  // server → client: current pattern + row
 
     // Scrub seek — client → server
-    MSG_SEEK           = 0x32,  // client → server: jump to pattern+row and play it
+    MSG_SEEK           = 0x32,  // client → server: jump to pattern+row and play it (audible scrub)
+    MSG_GOTO           = 0x33,  // client → server: jump to pattern+row, do NOT play (block switch)
 
     // Performance mode — block queueing
     MSG_QUEUE_BLOCK    = 0x35,  // client → server: queue block to play after current ends
     MSG_CANCEL_QUEUE   = 0x36,  // client → server: cancel queued block
+
+    // Column preview — single-column looping playback for the column-note editor
+    MSG_PREVIEW_START  = 0x37,  // client → server: start preview of (pattern, column)
+    MSG_PREVIEW_STOP   = 0x38,  // client → server: stop preview
+    MSG_PREVIEW_ROW    = 0x39,  // server → client: preview playhead is at this row
 
     // Instruments — bidirectional
     MSG_INSTRUMENTS_REQ   = 0x40,  // client → server: request full instruments array
@@ -63,6 +69,9 @@ enum MagiMsgType : uint8_t {
 
     // Note edit
     MSG_NOTE_SET = 0x50,  // client → server: set or clear one note by (pattern, row, col)
+
+    // Audition — play a freshly-entered note through MIDI for ~500ms
+    MSG_NOTE_AUDITION = 0x3A,  // client → server: play (pattern, row, col) briefly
 
     // Backup/Restore — bidirectional
     MSG_BACKUP_LIST_REQ    = 0x70,  // client → server: request file list with sizes
@@ -78,6 +87,11 @@ enum MagiMsgType : uint8_t {
 
     // Server → client: MIDI note-on received while sequencer is stopped
     MSG_MIDI_NOTE_IN = 0x61,
+
+    // Sample list (SFX column support) — server enumerates /samples/, maintains
+    // /samples/samples.txt manifest with stable IDs, returns paged list.
+    MSG_SAMPLE_LIST_REQ  = 0x62,  // client → server: request page of sample list
+    MSG_SAMPLE_LIST_RESP = 0x63,  // server → client: one page of (id, filename) entries
 };
 
 #pragma pack(push, 1)
@@ -226,10 +240,31 @@ struct MsgSeek {
     uint8_t     row;
 };
 
+// Client → Server: position only (no audible play).  When running, tick
+// fires on the next iteration and the existing WAIT/play logic kicks in.
+struct MsgGoto {
+    MagiMsgType type;    // MSG_GOTO
+    uint8_t     pattern;
+    uint8_t     row;
+};
+
 // Client → Server: queue a block to play after current block ends
 struct MsgQueueBlock {
     MagiMsgType type;    // MSG_QUEUE_BLOCK
     uint8_t     pattern; // block index to queue
+};
+
+// Client → Server: start column preview
+struct MsgPreviewStart {
+    MagiMsgType type;     // MSG_PREVIEW_START
+    uint8_t     pattern;  // pattern to loop
+    uint8_t     col;      // 1..MAX_COLUMNS-1 — col 0 makes no MIDI sound
+};
+
+// Server → Client: preview playhead position (row within the previewed pattern)
+struct MsgPreviewRow {
+    MagiMsgType type;  // MSG_PREVIEW_ROW
+    uint8_t     row;
 };
 
 // Server → Client: one chunk of instruments array (same wire layout as MsgSongData)
@@ -256,6 +291,16 @@ struct MsgNoteSet {
     uint8_t     row;
     uint8_t     col;
     Note        note;       // all-zero = clear the cell
+};
+
+// Client → Server: audition the note at (pattern, row, col) for ~500ms.
+// Server reads the cell from the active song so transpose/velocity/program
+// stay in sync without duplicating logic on the client.
+struct MsgNoteAudition {
+    MagiMsgType type;       // MSG_NOTE_AUDITION
+    uint8_t     pattern;
+    uint8_t     row;
+    uint8_t     col;
 };
 
 // ── Backup / Restore ──────────────────────────────────────────────────────────
@@ -324,5 +369,34 @@ struct MsgMidiNoteIn {
     uint8_t     midiNote;    // raw MIDI note number 0–127
     uint8_t     velocity;    // MIDI velocity 0–127
 };
+
+// ── Sample list (SFX column) ──────────────────────────────────────────────────
+//
+// IDs are 1-based, stable, and persisted in /samples/samples.txt on the server.
+// On each MSG_SAMPLE_LIST_REQ the server scans /samples/*.wav, appends any new
+// files to the manifest with the next free ID, then returns paged results.
+
+#define SAMPLE_NAME_LEN  24    // includes .wav extension, null-terminated
+#define SAMPLES_PER_PKT   8    // entries per response packet
+
+struct MsgSampleListReq {
+    MagiMsgType type;    // MSG_SAMPLE_LIST_REQ
+    uint8_t     page;    // 0-based page
+};
+
+struct MsgSampleListEntry {
+    uint8_t id;                          // 1..127, stable
+    char    name[SAMPLE_NAME_LEN];       // filename including .wav
+};
+
+struct MsgSampleListResp {
+    MagiMsgType        type;             // MSG_SAMPLE_LIST_RESP
+    uint8_t            page;
+    uint8_t            totalPages;
+    uint8_t            count;            // entries in this packet
+    uint8_t            totalEntries;     // total across all pages
+    MsgSampleListEntry entries[SAMPLES_PER_PKT];
+};
+// 5 + 8 * 25 = 205 bytes — fits ESP-NOW 250-byte limit
 
 #pragma pack(pop)

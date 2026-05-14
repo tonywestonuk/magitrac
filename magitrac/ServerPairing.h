@@ -34,6 +34,23 @@ enum class BackupState : uint8_t {
     ERROR,
 };
 
+enum class SampleListState : uint8_t {
+    IDLE,
+    WAITING,    // request sent, waiting for first MSG_SAMPLE_LIST_RESP
+    PARTIAL,    // got some pages, more to come
+    READY,      // all pages received
+    ERROR,
+};
+
+// Upper bound on samples we cache client-side.  Sized for the editor picker;
+// matches PROG range (1..127) + 1 reserved slot for "no sample".
+#define SAMPLE_CACHE_MAX 128
+
+struct SampleCacheEntry {
+    uint8_t id;
+    char    name[SAMPLE_NAME_LEN];  // includes .wav
+};
+
 // Max file transfer size: SongFileHeader (8) + Song struct (~35 KB)
 #define SONG_TRANSFER_MAX (sizeof(SongFileHeader) + sizeof(Song) + 64)
 
@@ -72,6 +89,7 @@ public:
     bool sendSongPatch(const Song& song, const void* fieldPtr, uint8_t length);
     bool sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, uint8_t col);
     bool sendNoteSetReliable(const Song& song, uint8_t pattern, uint8_t row, uint8_t col);
+    bool sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col);
 
     // ── Instruments sync ─────────────────────────────────────────────────────
     void requestInstruments();
@@ -79,6 +97,22 @@ public:
     bool instrumentsReady() const { return _instReady; }
     bool copyInstruments(Instrument* out) const;
     void resetInstruments();
+
+    // ── Sample list (SFX column) ─────────────────────────────────────────────
+    // Server-side this triggers a manifest sync (scan + samples.txt update),
+    // then pages results back.  Cache is paged in incrementally; check
+    // sampleListState() == READY before consuming.
+    void requestSampleList();
+    void resetSampleList();
+    SampleListState     sampleListState()        const { return _sampleListState; }
+    int                 sampleListCount()        const { return _sampleCount; }
+    int                 sampleListTotalExpected() const { return _sampleTotal; }
+    const SampleCacheEntry* sampleListEntry(int i) const {
+        return (i >= 0 && i < _sampleCount) ? &_sampleCache[i] : nullptr;
+    }
+    // Look up filename for a stable id (1..127) in the cache.  Returns nullptr
+    // if not present (id 0 = "no sample", or cache not fetched).
+    const char* sampleListNameFor(uint8_t id) const;
 
     // ── Backup / Restore ──────────────────────────────────────────────────────
     void requestBackupFileList(uint8_t page = 0);
@@ -107,10 +141,17 @@ public:
 
     // ── Scrub seek ────────────────────────────────────────────────────────────
     bool sendSeek(uint8_t pattern, uint8_t row);
+    bool sendGoto(uint8_t pattern, uint8_t row);
 
     // ── Performance mode — block queueing ────────────────────────────────────
     bool sendQueueBlock(uint8_t pattern);
     bool sendCancelQueue();
+
+    // ── Column preview ───────────────────────────────────────────────────────
+    bool sendPreviewStart(uint8_t pattern, uint8_t col);
+    bool sendPreviewStop();
+    // Drain the latest preview-row update.  Returns false if no update pending.
+    bool pollPreviewRow(uint8_t* row);
 
     // ── Sequencer position (received from server) ─────────────────────────────
     bool remoteSeqPos(uint8_t* pattern, uint8_t* row);
@@ -174,6 +215,10 @@ private:
     uint8_t  _midiVelocityIn = 0;
     bool     _midiNoteInPending = false;
 
+    // Latest preview-row position from server
+    uint8_t  _previewRow         = 0;
+    bool     _previewRowPending  = false;
+
     // Song receive buffer
     uint8_t* _songBuf      = nullptr;
     uint32_t _songBufLen   = 0;
@@ -194,6 +239,14 @@ private:
     uint8_t  _instChunksGot   = 0;
     uint8_t  _instChunksTotal = 0;
     bool     _instReady       = false;
+
+    // Sample list cache (SFX column picker)
+    SampleListState  _sampleListState = SampleListState::IDLE;
+    SampleCacheEntry _sampleCache[SAMPLE_CACHE_MAX];
+    int              _sampleCount     = 0;
+    int              _sampleTotal     = 0;
+    uint8_t          _samplePage      = 0;
+    uint8_t          _sampleTotalPages = 0;
 
     // Keepalive
     uint32_t _lastPingMs = 0;

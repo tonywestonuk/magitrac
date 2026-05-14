@@ -29,6 +29,11 @@ ColumnNoteEditorPage::ColumnNoteEditorPage(EPD_PainterAdafruit& display,
     , _popup(CnePopup::NONE)
     , _dirtyRow(0xFF)
     , _dirtyAll(false)
+    , _previewing(false)
+    , _previewStartPending(false)
+    , _previewStopPending(false)
+    , _previewRow(0xFF)
+    , _auditionRow(0xFF)
 {}
 
 NoteGrid ColumnNoteEditorPage::grid() {
@@ -62,6 +67,11 @@ void ColumnNoteEditorPage::open(uint8_t patIdx, uint8_t col, uint8_t row) {
     _popup       = CnePopup::NONE;
     _dirtyRow    = 0xFF;
     _dirtyAll    = false;
+    _previewing            = false;
+    _previewStartPending   = false;
+    _previewStopPending    = false;
+    _previewRow            = 0xFF;
+    _auditionRow           = 0xFF;
     // Leave _topPitch at its existing value across opens — feels less jarring.
 }
 
@@ -110,11 +120,18 @@ void ColumnNoteEditorPage::drawSelectorStrip() {
     int h = CNE_SEL_H;
     _d.fillRect(CNE_GRID_X, y, CNE_GRID_W, h, COL_WHITE);
     uint8_t selIdx = _selRow % 16;
+    bool playheadVis = (_previewRow != 0xFF) && (_previewRow / 16 == _segment);
+    uint8_t playIdx  = playheadVis ? (uint8_t)(_previewRow % 16) : 0xFF;
     for (int i = 0; i < CNE_COLS; i++) {
         int x = CNE_GRID_X + i * CNE_CELL;
         bool isSelected = (i >= _selStartCol && i <= _selEndCol);
         bool isCursor   = (i == selIdx);
-        if (isSelected) _d.fillRect(x + 2, y + 2, CNE_CELL - 4, h - 4, COL_LTGREY);
+        bool isPlayhead = (i == playIdx);
+        if (isPlayhead) {
+            _d.fillRect(x + 2, y + 2, CNE_CELL - 4, h - 4, COL_BLACK);
+        } else if (isSelected) {
+            _d.fillRect(x + 2, y + 2, CNE_CELL - 4, h - 4, COL_LTGREY);
+        }
         _d.drawRect(x + 2, y + 2, CNE_CELL - 4, h - 4,
                     isCursor ? COL_BLACK : COL_DKGREY);
     }
@@ -217,6 +234,7 @@ void ColumnNoteEditorPage::drawGrid() {
 
 void ColumnNoteEditorPage::drawRightPanel() {
     drawNavRow();
+    drawPreviewButton();
     drawRowLine();
     drawVelAttrRow();
     drawActionButton();
@@ -308,6 +326,17 @@ void ColumnNoteEditorPage::drawActionButton() {
     }
 }
 
+void ColumnNoteEditorPage::drawPreviewButton() {
+    int x = CNE_RP_X;
+    int y = CNE_RP_PREVIEW_Y;
+    int w = CNE_RP_W;
+    int h = CNE_RP_PREVIEW_H;
+    _d.fillRect(x, y, w, h, COL_WHITE);
+    uint8_t bg = _previewing ? COL_BLACK : COL_WHITE;
+    uint8_t fg = _previewing ? COL_WHITE : COL_BLACK;
+    uiButton(_d, x, y, w, h, "PREVIEW", bg, fg, 3);
+}
+
 void ColumnNoteEditorPage::drawCopyPasteRow(int pressed) {
     int w = (CNE_RP_W - 10) / 2;
     uint8_t cBg = (pressed == 0) ? COL_BLACK : COL_WHITE;
@@ -372,6 +401,9 @@ bool ColumnNoteEditorPage::hitPaste(int sx, int sy) const {
     int w = (CNE_RP_W - 10) / 2;
     return inRect(sx, sy, CNE_RP_X + w + 10, CNE_RP_CP_Y, w, CNE_RP_CP_H);
 }
+bool ColumnNoteEditorPage::hitPreview(int sx, int sy) const {
+    return inRect(sx, sy, CNE_RP_X, CNE_RP_PREVIEW_Y, CNE_RP_W, CNE_RP_PREVIEW_H);
+}
 bool ColumnNoteEditorPage::hitSelector(int sx, int sy, int8_t& col) const {
     // Generous touch zone: title-bar bottom down to the bottom of the visual
     // tab strip. The strip itself is only 18 px tall, hard to hit precisely.
@@ -413,10 +445,12 @@ void ColumnNoteEditorPage::applyCellTap(uint8_t segCol, uint8_t pitch) {
     _selStartCol = segCol;
     _selEndCol   = segCol;
 
+    bool entered = false;
     if (n.note == NOTE_EMPTY) {
         // Empty cell → set pitched note with default velocity.
         Note nn = { pitch, VEL_DEFAULT, 0, 0 };
         g.set(row, _col, nn);
+        entered = true;
     } else if (n.note == pitch) {
         // Tap-on-match clears the note (velocity/effect/param go too).
         g.clear(row, _col);
@@ -427,8 +461,15 @@ void ColumnNoteEditorPage::applyCellTap(uint8_t segCol, uint8_t pitch) {
         nn.note = pitch;
         if (nn.velocity == 0 && !(nn.velocity & 0x80)) nn.velocity = VEL_DEFAULT;
         g.set(row, _col, nn);
+        entered = true;
     }
     markDirty(row);
+    // Audition — only when a fresh pitched note ends up in the cell, and
+    // only outside preview (preview will play it on the next loop).  Input
+    // column makes no MIDI sound, so skip there too.
+    if (entered && !_previewing && !isInputCol()) {
+        _auditionRow = row;
+    }
 }
 
 void ColumnNoteEditorPage::applyAction(uint8_t which) {
@@ -493,7 +534,24 @@ void ColumnNoteEditorPage::applyPaste() {
     _dirtyAll = true;   // bulk edit — caller resyncs the song
 }
 
+void ColumnNoteEditorPage::setPreviewRow(uint8_t row) {
+    if (!_previewing) return;
+    if (row == _previewRow) return;
+    _previewRow = row;
+    // While a popup (VEL / ATTR) is up, the strip is hidden behind it —
+    // skip the redraw or we'd punch the playhead through the popup.  The
+    // popup's close path does a full draw() which will pick up the latest
+    // _previewRow.
+    if (_popup != CnePopup::NONE) return;
+    // Only the selector strip needs to redraw — the playhead is shown there
+    // as a single black-filled cell.  EPD can't keep up with a per-row grid
+    // redraw, so the grid stays static.
+    drawSelectorStrip();
+    _d.paintLater();
+}
+
 void ColumnNoteEditorPage::stepSegment(int delta) {
+    uint8_t prevPat = _patIdx;
     int s = (int)_segment + delta;
     int p = (int)_patIdx;
     int nSeg = numSegments();
@@ -521,6 +579,13 @@ void ColumnNoteEditorPage::stepSegment(int delta) {
         r = segmentRow(0);
     }
     _selRow = (r == 0xFF) ? 0 : r;
+
+    // Preview follows pattern changes — re-fire START with the new pattern,
+    // and hide the stale playhead until the server reports a fresh row.
+    if (_previewing && _patIdx != prevPat) {
+        _previewStartPending = true;
+        _previewRow          = 0xFF;
+    }
 }
 
 // ── Poll — full Slice 2 state machine ────────────────────────────────────────
@@ -660,7 +725,29 @@ bool ColumnNoteEditorPage::poll() {
         }
 
         // Other tap targets
-        if (hitHome(sx, sy)) return true;
+        if (hitHome(sx, sy)) {
+            if (_previewing) {
+                _previewing         = false;
+                _previewStopPending = true;
+                _previewRow         = 0xFF;
+            }
+            return true;
+        }
+        if (hitPreview(sx, sy)) {
+            if (_previewing) {
+                _previewing          = false;
+                _previewStopPending  = true;
+                _previewRow          = 0xFF;
+            } else {
+                _previewing          = true;
+                _previewStartPending = true;
+                _previewRow          = 0xFF;
+            }
+            drawPreviewButton();
+            drawSelectorStrip();   // clear stale playhead if any
+            _d.paintLater();
+            return false;
+        }
 
         if (hitNavPrev(sx, sy)) {
             stepSegment(-1);

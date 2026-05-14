@@ -113,6 +113,11 @@ struct PerfPadConfig {
 // Column 0 is always the input (MIDI-in) track. Columns 1..N-1 are MIDI output.
 #define INPUT_COLUMN 0
 
+// Special "channel" used by ColumnSettings::midiChannel to route a column's
+// output to the server's onboard sample player instead of UART MIDI.  Sample
+// is selected by ColumnSettings::program (id into /samples/samples.txt).
+#define SFX_CHANNEL  17
+
 // ── Per-column MIDI output settings (one per column per pattern) ─────────────
 
 struct ColumnSettings {
