@@ -7,6 +7,7 @@
 //#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
 
 #include <magitrac_lib.h>
+#include <WiFi.h>
 #include "EPD_Painter_presets.h"
 #include "EPD_Painter_Adafruit.h"
 #include "gt911_lite.h"
@@ -295,6 +296,10 @@ void setup() {
 
     gServerPairing.begin();
     loadMidiLimits();
+    loadWifiChannel();
+    WiFi.setChannel(magiWifiChannelFromIdx(gWifiChannelIdx));
+    Serial.printf("[WIFI] boot channel: %u\n",
+                  (unsigned)magiWifiChannelFromIdx(gWifiChannelIdx));
 
     // Battery — LilyGo T5 S3 has BQ25896 PMIC on I2C with ADC fallback;
     // M5PaperS3 has neither, so leave battery backend as NONE.

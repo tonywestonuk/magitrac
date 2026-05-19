@@ -1,4 +1,7 @@
 #include "SettingsPage.h"
+#include "ServerPairing.h"     // for gComms
+#include "MagiMsg.h"
+#include <WiFi.h>
 #include <Preferences.h>
 #include <string.h>
 #include <stdio.h>
@@ -22,6 +25,26 @@ void saveMidiLimits() {
     prefs.begin(MIDI_NVS_NS, false);
     prefs.putUChar("maxBank",    gMaxBank);
     prefs.putUChar("maxProgram", gMaxProgram);
+    prefs.end();
+}
+
+// ── Global WiFi channel ──────────────────────────────────────────────────────
+uint8_t gWifiChannelIdx = 0;   // 0/1/2 → 1/6/11
+
+static const char* WIFI_NVS_NS = "magitrac_wifi";
+
+void loadWifiChannel() {
+    Preferences prefs;
+    prefs.begin(WIFI_NVS_NS, true);
+    gWifiChannelIdx = prefs.getUChar("idx", 0);
+    if (gWifiChannelIdx > 2) gWifiChannelIdx = 0;
+    prefs.end();
+}
+
+void saveWifiChannel() {
+    Preferences prefs;
+    prefs.begin(WIFI_NVS_NS, false);
+    prefs.putUChar("idx", gWifiChannelIdx);
     prefs.end();
 }
 
@@ -52,6 +75,7 @@ void SettingsPage::draw() {
     drawTimeRow();
     drawDateRow();
     drawMidiSection();
+    drawWifiSection();
 }
 
 // ── RTC ───────────────────────────────────────────────────────────────────────
@@ -230,6 +254,69 @@ void SettingsPage::fireMidiHeld() {
     }
 }
 
+// ── WIFI section ─────────────────────────────────────────────────────────
+
+void SettingsPage::drawWifiSection() {
+    _d.fillRect(0, SP_WIFI_LBL_Y, SP_W, SP_WIFI_LBL_H, COL_LTGREY);
+    _d.setTextSize(2);
+    _d.setTextColor(COL_BLACK);
+    _d.setCursor(10, SP_WIFI_LBL_Y + (SP_WIFI_LBL_H - 16) / 2);
+    _d.print("WIFI");
+    drawWifiRow();
+}
+
+void SettingsPage::drawWifiRow() {
+    int btnY = SP_WIFI_Y + (SP_WIFI_ROW_H - SP_WIFI_BTN_H) / 2;
+
+    _d.fillRect(0, SP_WIFI_Y, SP_W, SP_WIFI_ROW_H, COL_WHITE);
+    _d.drawFastHLine(0, SP_WIFI_Y + SP_WIFI_ROW_H - 1, SP_W, COL_BLACK);
+
+    _d.setTextSize(3);
+    _d.setTextColor(COL_BLACK);
+    _d.setCursor(SP_LABEL_X, SP_WIFI_Y + (SP_WIFI_ROW_H - 24) / 2);
+    _d.print("CHANNEL");
+
+    static const char* LBL[3] = { "1", "6", "11" };
+    for (int i = 0; i < 3; i++) {
+        bool sel = (gWifiChannelIdx == (uint8_t)i);
+        uint16_t bg   = sel ? COL_BLACK : COL_WHITE;
+        uint16_t text = sel ? COL_WHITE : COL_BLACK;
+        uiButton(_d, SP_WIFI_BTN_X[i], btnY, SP_WIFI_BTN_W, SP_WIFI_BTN_H,
+                 LBL[i], bg, text, 3);
+    }
+}
+
+int SettingsPage::hitWifiBtn(int sx, int sy) const {
+    int btnY = SP_WIFI_Y + (SP_WIFI_ROW_H - SP_WIFI_BTN_H) / 2;
+    if (sy < btnY || sy >= btnY + SP_WIFI_BTN_H) return -1;
+    for (int i = 0; i < 3; i++) {
+        if (sx >= SP_WIFI_BTN_X[i] && sx < SP_WIFI_BTN_X[i] + SP_WIFI_BTN_W) return i;
+    }
+    return -1;
+}
+
+void SettingsPage::changeWifiChannel(uint8_t idx) {
+    if (idx > 2) return;
+    gWifiChannelIdx = idx;
+    saveWifiChannel();
+
+    MsgSetWifiChannel msg;
+    msg.type = MSG_SET_WIFI_CHANNEL;
+    msg.idx  = idx;
+
+    // Sweep across all 3 channels so a mismatched server still gets it.
+    static const uint8_t SWEEP[3] = { 1, 6, 11 };
+    for (int i = 0; i < 3; i++) {
+        WiFi.setChannel(SWEEP[i]);
+        delay(50);
+        gComms.send(&msg, sizeof(msg));
+        delay(50);
+    }
+    // Settle on the requested channel.
+    WiFi.setChannel(magiWifiChannelFromIdx(idx));
+    Serial.printf("[WIFI] channel → %u\n", (unsigned)magiWifiChannelFromIdx(idx));
+}
+
 // ── Hit tests — MIDI rows ─────────────────────────────────────────────────
 
 int SettingsPage::hitMidiMinus(int sx, int sy) const {
@@ -333,6 +420,14 @@ bool SettingsPage::poll() {
             _d.fillScreen(COL_WHITE);
             _numpad.draw();
             _d.paint();
+            return false;
+        }
+
+        int wifiBtn = hitWifiBtn(sx, sy);
+        if (wifiBtn >= 0 && (uint8_t)wifiBtn != gWifiChannelIdx) {
+            changeWifiChannel((uint8_t)wifiBtn);
+            drawWifiRow();
+            _d.paintLater();
             return false;
         }
 

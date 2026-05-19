@@ -38,6 +38,7 @@ NoteEditor::NoteEditor(EPD_PainterAdafruit& display, GT911_Lite& touch)
     , _waitSet(false)
     , _syncSet(false)
     , _hexpad(display, touch)
+    , _picker(display, touch)
     , _pendingSync(false)
     , _syncPattern(0)
     , _syncRow(0)
@@ -244,33 +245,50 @@ void NoteEditor::drawActionButtons() {
     int actY  = PE_ACT_Y;
     int actH  = PE_H - actY;
     int textY = actY + (actH - 24) / 2;
-    int w     = PE_ACT_BTN_W;
+
+    bool pxl   = (_col != INPUT_COLUMN &&
+                  _song->columns[_col].midiChannel == PIXELPOST_CHANNEL);
+    int  w     = pxl ? PE_ACT_PXL_BTN_W : PE_ACT_BTN_W;
+    int  copyX  = pxl ? PE_ACT_PXL_COPY_X  : PE_ACT_COPY_X;
+    int  pasteX = pxl ? PE_ACT_PXL_PASTE_X : PE_ACT_PASTE_X;
+    int  okX    = pxl ? PE_ACT_PXL_OK_X    : PE_ACT_OK_X;
+
+    if (pxl) {
+        // PXL — light grey, opens pixel-post picker
+        _d.fillRect(PE_ACT_PXL_X, actY, w, actH, 1);
+        _d.drawRect(PE_ACT_PXL_X, actY, w, actH, 3);
+        _d.setTextSize(3);
+        _d.setTextColor(3);
+        int lw = 3 * 18;  // "PXL"
+        _d.setCursor(PE_ACT_PXL_X + (w - lw) / 2, textY);
+        _d.print("PXL");
+    }
 
     // COPY — light grey, always available
-    _d.fillRect(PE_ACT_COPY_X,  actY, w, actH, 1);
-    _d.drawRect(PE_ACT_COPY_X,  actY, w, actH, 3);
+    _d.fillRect(copyX,  actY, w, actH, 1);
+    _d.drawRect(copyX,  actY, w, actH, 3);
     _d.setTextSize(3);
     _d.setTextColor(3);
     int lw = 4 * 18;  // "COPY"
-    _d.setCursor(PE_ACT_COPY_X + (w - lw) / 2, textY);
+    _d.setCursor(copyX + (w - lw) / 2, textY);
     _d.print("COPY");
 
     // PASTE — light grey if clipboard available, dark grey + lighter text if empty
     uint8_t pasteBg = _clipValid ? 1 : 2;
     uint8_t pasteFg = _clipValid ? 3 : 1;
-    _d.fillRect(PE_ACT_PASTE_X, actY, w, actH, pasteBg);
-    _d.drawRect(PE_ACT_PASTE_X, actY, w, actH, 3);
+    _d.fillRect(pasteX, actY, w, actH, pasteBg);
+    _d.drawRect(pasteX, actY, w, actH, 3);
     _d.setTextColor(pasteFg);
     lw = 5 * 18;  // "PASTE"
-    _d.setCursor(PE_ACT_PASTE_X + (w - lw) / 2, textY);
+    _d.setCursor(pasteX + (w - lw) / 2, textY);
     _d.print("PASTE");
 
     // OK — black background
-    _d.fillRect(PE_ACT_OK_X,    actY, w, actH, 3);
-    _d.drawRect(PE_ACT_OK_X,    actY, w, actH, 3);
+    _d.fillRect(okX,    actY, w, actH, 3);
+    _d.drawRect(okX,    actY, w, actH, 3);
     _d.setTextColor(0);
     lw = 2 * 18;  // "OK"
-    _d.setCursor(PE_ACT_OK_X + (w - lw) / 2, textY);
+    _d.setCursor(okX + (w - lw) / 2, textY);
     _d.print("OK");
 }
 
@@ -325,10 +343,10 @@ void NoteEditor::commit() {
         }
     }
     NoteGrid grid(_song->notePool, &_song->noteFreeHead, &_song->patterns[_patternIdx].noteHead);
-    if (n.note == NOTE_EMPTY)
-        grid.clear(_row, _col);
-    else
-        grid.set(_row, _col, n);
+    // Always set — NoteGrid::set internally clears when *all* fields are empty,
+    // but persists when only effect/param/velocity are set (no note).  Going
+    // straight to clear() here would lose attr-only edits.
+    grid.set(_row, _col, n);
     _pendingSync = true;
     _syncPattern = _patternIdx;
     _syncRow     = _row;
@@ -353,6 +371,33 @@ bool NoteEditor::pollTouch() {
                 }
             }
             // Redraw note editor
+            _d.clear();
+            draw();
+            _d.paint();
+        }
+        return false;
+    }
+
+    // If pixel-post picker is open, delegate to it
+    if (_picker.isOpen()) {
+        if (_picker.poll()) {
+            switch (_picker.resultKind()) {
+                case PixelPostPicker::RES_NOTE:
+                    _offNote  = false;
+                    _hasNote  = true;
+                    _semitone = _picker.resultSemitone();
+                    _octave   = _picker.resultOctave();
+                    break;
+                case PixelPostPicker::RES_VELOCITY:
+                    _velocity = _picker.resultVelocity();   // high-bit clear
+                    break;
+                case PixelPostPicker::RES_ATTR:
+                    _effect = _picker.resultEffect();
+                    _param  = _picker.resultParam();
+                    break;
+                case PixelPostPicker::RES_NONE:
+                    break;  // BACK
+            }
             _d.clear();
             draw();
             _d.paint();
@@ -549,10 +594,26 @@ bool NoteEditor::pollTouch() {
         return false;
     }
 
-    // ── COPY / PASTE — activate on press for quick repeat workflow ───────────
+    // ── PXL / COPY / PASTE — activate on press for quick repeat workflow ─────
     int actY = PE_ACT_Y;
+    bool pxlMode = (_col != INPUT_COLUMN &&
+                    _song->columns[_col].midiChannel == PIXELPOST_CHANNEL);
+    int  copyX  = pxlMode ? PE_ACT_PXL_COPY_X  : PE_ACT_COPY_X;
+    int  pasteX = pxlMode ? PE_ACT_PXL_PASTE_X : PE_ACT_PASTE_X;
+    int  okX    = pxlMode ? PE_ACT_PXL_OK_X    : PE_ACT_OK_X;
+
     if (rising && ty >= actY) {
-        if (tx >= PE_ACT_COPY_X && tx < PE_ACT_PASTE_X) {
+        // PXL — only in pixel-post mode; left of COPY
+        if (pxlMode && tx >= PE_ACT_PXL_X && tx < copyX) {
+            _d.clear();
+            _picker.open(/*fingerDown=*/true);
+            _picker.draw();
+            _d.paint();
+            Serial.println("[NoteEditor] PXL — opening picker");
+            return false;
+        }
+
+        if (tx >= copyX && tx < pasteX) {
             // COPY — snapshot working copy into clipboard
             _clipHasNote   = _hasNote;
             _clipSemitone  = _semitone;
@@ -572,7 +633,7 @@ bool NoteEditor::pollTouch() {
             return false;
         }
 
-        if (tx >= PE_ACT_PASTE_X && tx < PE_ACT_OK_X && _clipValid) {
+        if (tx >= pasteX && tx < okX && _clipValid) {
             // PASTE — load clipboard into working copy
             _hasNote   = _clipHasNote;
             _semitone  = _clipSemitone;
@@ -597,7 +658,7 @@ bool NoteEditor::pollTouch() {
     }
 
     // ── OK — activate on release ──────────────────────────────────────────────
-    if (falling && ty >= actY && tx >= PE_ACT_OK_X) {
+    if (falling && ty >= actY && tx >= okX) {
         Serial.println("[NoteEditor] OK");
         commit();
         _open = false;

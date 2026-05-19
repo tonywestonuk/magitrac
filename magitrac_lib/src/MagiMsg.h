@@ -30,6 +30,7 @@ enum MagiMsgType : uint8_t {
     MSG_SET_SONG_DATA    = 0x13,  // client → server: generic song memory patch
     MSG_PAUSE            = 0x14,  // client → server: freeze position, keep state
     MSG_UNPAUSE          = 0x15,  // client → server: resume from frozen position
+    MSG_SET_WIFI_CHANNEL = 0x16,  // client → server: switch WiFi channel (idx 0/1/2 → 1/6/11)
 
     // Song transfer — server → client (load)
     MSG_SONG_LIST_REQ  = 0x20,
@@ -118,9 +119,16 @@ struct MsgConnectAck {
 
 // ── Pairing ceremony messages ─────────────────────────────────────────────────
 
+// 8-byte magic prefix that pair-ceremony frames carry to distinguish a real
+// magitrac MsgPairRequest from a stray 7+8-byte ESP-NOW broadcast that
+// happens to start with the right type byte.  Not security — just a sanity
+// guard against random traffic on shared channels.
+#define MAGI_PAIR_MAGIC  "MAGITRAC"   // 8 chars, no terminator
+
 // Client → broadcast: initiate one-time pairing
 struct MsgPairRequest {
     MagiMsgType type;         // MSG_PAIR_REQUEST
+    char        magic[8];     // must equal MAGI_PAIR_MAGIC
     uint8_t     senderMac[6]; // client's own MAC (broadcast has no sender info)
 };
 
@@ -146,6 +154,20 @@ struct MsgPairComplete {
 struct MsgDisconnect {
     MagiMsgType type;     // MSG_DISCONNECT
 };
+
+// Client → server: switch WiFi channel.
+// idx is encoded the same way as pixel_post's MSG_CHG_WIFI_CHANNEL so we can
+// later send the same payload bytes to both magitrac server and pixel_post.
+struct MsgSetWifiChannel {
+    MagiMsgType type;     // MSG_SET_WIFI_CHANNEL
+    uint8_t     idx;      // 0, 1, 2 → channels 1, 6, 11
+};
+
+// Map a channel index (0..2) to the WiFi channel number (1, 6, or 11).
+// Any other input maps to 1 as a safe fallback.
+inline uint8_t magiWifiChannelFromIdx(uint8_t idx) {
+    return (idx == 1) ? 6 : (idx == 2) ? 11 : 1;
+}
 
 // Client → server: patch any bytes in the Song struct
 // Sent as 4 header bytes + length data bytes (not the full SONG_PATCH_MAX payload).

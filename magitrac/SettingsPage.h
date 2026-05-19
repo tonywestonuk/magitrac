@@ -51,6 +51,15 @@ static const int SP_MIDI_PLUS_X  = 825;
 static const int SP_MIDI_BTN_W   = 75;
 static const int SP_MIDI_BTN_H   = 38;
 
+// ── WIFI section ──────────────────────────────────────────────────────────────
+static const int SP_WIFI_LBL_Y = SP_MIDI_Y + SP_NUM_MIDI * SP_MIDI_ROW_H;  // 430
+static const int SP_WIFI_LBL_H = 20;
+static const int SP_WIFI_Y     = SP_WIFI_LBL_Y + SP_WIFI_LBL_H;            // 450
+static const int SP_WIFI_ROW_H = 50;
+static const int SP_WIFI_BTN_W = 100;
+static const int SP_WIFI_BTN_H = 38;
+static const int SP_WIFI_BTN_X[3] = { 590, 720, 850 };
+
 // ── Global MIDI limits (persisted via NVS) ────────────────────────────────────
 // Loaded on boot, saved when changed on SettingsPage.
 // ColumnEditor uses these for program/bank wrap-around.
@@ -59,6 +68,15 @@ extern uint8_t gMaxProgram;    // 1-based display (stored as 0-based internally)
 
 void loadMidiLimits();         // call once in setup()
 void saveMidiLimits();         // called by SettingsPage after change
+
+// ── Global WiFi channel (persisted via NVS) ───────────────────────────────────
+// Loaded on boot and applied to WiFi.setChannel() after gComms.begin().
+// Updated on SettingsPage WIFI row tap, which also sweep-sends MSG_SET_WIFI_CHANNEL
+// across all three channels so a mismatched server gets re-aligned.
+extern uint8_t gWifiChannelIdx;   // 0, 1, 2 → channels 1, 6, 11
+
+void loadWifiChannel();
+void saveWifiChannel();
 
 class SettingsPage {
 public:
@@ -90,15 +108,24 @@ private:
     void drawDateRow();
     void drawMidiSection();
     void drawMidiRow(int field);
+    void drawWifiSection();
+    void drawWifiRow();
     void adjustMidi(int field, int delta);
     void fireMidiHeld();
     void readRTC();
     void applyNumpadResult();
+
+    // Send MSG_SET_WIFI_CHANNEL three times (once per channel) so a
+    // server on the wrong channel still gets the message, then settle
+    // on the requested channel locally.  Blocks for ~350ms.
+    void changeWifiChannel(uint8_t idx);
 
     bool hitHome(int sx, int sy) const;
     bool hitTime(int sx, int sy) const;
     bool hitDate(int sx, int sy) const;
     int  hitMidiMinus(int sx, int sy) const;
     int  hitMidiPlus(int sx, int sy) const;
+    // Returns 0/1/2 if a WIFI channel button was hit, else -1.
+    int  hitWifiBtn(int sx, int sy) const;
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

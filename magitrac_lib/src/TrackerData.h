@@ -118,6 +118,16 @@ struct PerfPadConfig {
 // is selected by ColumnSettings::program (id into /samples/samples.txt).
 #define SFX_CHANNEL  17
 
+// Special "channel" routing a column to pixel_post broadcasts (no MIDI).
+//   note.note      → MSG_SELECT_EFFECT effect index = note - 1 (C-0=0, C#0=1, …)
+//                    Deduped per column; only sent when it changes.  NOTE_OFF
+//                    does NOT reset the last-sent record.
+//   note            → also sets the per-column "pressed" state to ON
+//   NOTE_OFF        → sets per-column "pressed" state to OFF
+//   note.velocity   → MSG_SLIDER value (mapped 0-127 → 0-254), rides pressed
+//   note.effect/param → MSG_MOVE X/Y, rides pressed
+#define PIXELPOST_CHANNEL  18
+
 // ── Per-column MIDI output settings (one per column per pattern) ─────────────
 
 struct ColumnSettings {

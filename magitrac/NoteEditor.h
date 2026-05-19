@@ -5,6 +5,7 @@
 #include "TrackerData.h"
 #include "HexpadPopup.h"
 #include "HoldRepeat.h"
+#include "PixelPostPicker.h"
 
 // ── Full-screen popup layout (960×540) ───────────────────────────────────────
 //
@@ -56,6 +57,13 @@ static const int PE_ACT_BTN_W  = 320;
 static const int PE_ACT_COPY_X  = 0;
 static const int PE_ACT_PASTE_X = 320;
 static const int PE_ACT_OK_X    = 640;
+
+// Pixel-post variant — 4 buttons at 240px each: PXL | COPY | PASTE | OK
+static const int PE_ACT_PXL_BTN_W  = 240;
+static const int PE_ACT_PXL_X      = 0;
+static const int PE_ACT_PXL_COPY_X  = 240;
+static const int PE_ACT_PXL_PASTE_X = 480;
+static const int PE_ACT_PXL_OK_X    = 720;
 
 // Row navigation buttons sit inside the header bar
 static const int PE_HDR_NAVBTN_W = 100;  // width of [<] and [>] in header
@@ -120,6 +128,9 @@ private:
 
     // Hex editor for attributes
     HexpadPopup _hexpad;
+
+    // Pixel-post picker (only opened for PIXELPOST_CHANNEL columns)
+    PixelPostPicker _picker;
 
     // Hold-repeat for velocity +/-
     HoldRepeat _hold;

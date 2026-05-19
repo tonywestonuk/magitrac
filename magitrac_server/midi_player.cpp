@@ -86,6 +86,14 @@ static uint16_t seqNextNoteIdx       = NOTE_NULL;
 
 // Last note playing per output column (0 = none)
 static uint8_t  seqActiveNote[MAX_COLUMNS] = {};
+// Per-column pixel_post "pressed" state. A NOTE row sets it on, NOTE_OFF
+// turns it off, in-between rows (velocity-only / attr-only) ride the current
+// state when emitting MSG_SLIDER / MSG_MOVE.
+static bool     seqPpPressed[MAX_COLUMNS] = {};
+// Per-column last-sent pixel_post effect index (0..95 = note - 1).
+// 0xFF = "never sent yet, fire SELECT_EFFECT on next note".  NOTE_OFF does
+// NOT touch this — effect choice persists across releases.
+static uint8_t  seqPpLastEffect[MAX_COLUMNS];   // initialised at sequencerStart
 // MIDI channel (0-based) for each column's active note — needed for correct note-off
 static uint8_t  seqActiveChan[MAX_COLUMNS] = {};
 // Per-channel bank/program/volume state — 0xFF = not set (force send on next note)
@@ -204,6 +212,22 @@ static void seqPlayRow() {
         if (nn.col == INPUT_COLUMN) {
             // WAIT/SYNC effects are handled by tick/performer logic, not here
         } else if (nn.note == NOTE_OFF) {
+            const ColumnSettings& cs = s->columns[nn.col];
+
+            // PIXELPOST: "lift finger".  Send MOVE + SLIDER with pressed=0
+            // using whatever values are on the OFF row (typically zeros, but
+            // composer can also set a final position to release at).
+            if (cs.midiChannel == PIXELPOST_CHANNEL) {
+                extern void pixelpostSendSlider(uint8_t value, bool pressed);
+                extern void pixelpostSendMove(uint8_t x, uint8_t y, bool pressed);
+                seqPpPressed[nn.col] = false;
+                uint8_t vel = (nn.velocity & 0x80) ? 0 : nn.velocity;
+                uint8_t slider = (vel <= 127) ? (uint8_t)(vel * 2) : 255;
+                pixelpostSendSlider(slider, /*pressed=*/false);
+                pixelpostSendMove(nn.effect, nn.param, /*pressed=*/false);
+                continue;
+            }
+
             seqNoteOff(nn.col);
 
             // Patch-change point — when the composer places an OFF, also
@@ -213,8 +237,8 @@ static void seqPlayRow() {
             // after the OFF).  Note-ons themselves never send patch changes.
             // SFX columns don't use MIDI patch changes; the OFF already
             // stopped the sample above.
-            const ColumnSettings& cs = s->columns[nn.col];
-            if (cs.midiChannel != 0 && cs.midiChannel != SFX_CHANNEL && !cs.mute) {
+            if (cs.midiChannel != 0 && cs.midiChannel != SFX_CHANNEL &&
+                cs.midiChannel != PIXELPOST_CHANNEL && !cs.mute) {
                 uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
                 uint8_t vol    = cs.volume > 0 ? cs.volume : 100;
                 if (seqChanBank[midiCh] != cs.bankMSB || seqChanProg[midiCh] != cs.program) {
@@ -254,6 +278,30 @@ static void seqPlayRow() {
                 continue;
             }
 
+            if (cs.midiChannel == PIXELPOST_CHANNEL) {
+                // PIXELPOST: a real note means "finger down at this XY with
+                // this slider value, on this effect".  Effect index = note - 1
+                // (so C-0 = 0, C#0 = 1, ...).  SELECT_EFFECT is deduped per
+                // column — only sent when the effect index changes.
+                // Skip non-pitched notes (NOTE_ANY etc.); they have no
+                // sensible effect mapping.
+                if (nn.note < 1 || nn.note > NOTE_MAX) continue;
+                extern void pixelpostSendSelectEffect(uint8_t idx);
+                extern void pixelpostSendSlider(uint8_t value, bool pressed);
+                extern void pixelpostSendMove(uint8_t x, uint8_t y, bool pressed);
+                seqPpPressed[col] = true;
+                uint8_t effectIdx = (uint8_t)(nn.note - 1);
+                if (effectIdx != seqPpLastEffect[col]) {
+                    pixelpostSendSelectEffect(effectIdx);
+                    seqPpLastEffect[col] = effectIdx;
+                }
+                uint8_t vel = (nn.velocity & 0x80) ? 100 : nn.velocity;
+                uint8_t slider = (vel <= 127) ? (uint8_t)(vel * 2) : 255;
+                pixelpostSendSlider(slider, /*pressed=*/true);
+                pixelpostSendMove(nn.effect, nn.param, /*pressed=*/true);
+                continue;
+            }
+
             uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
             int8_t  colXp  = cs.transpose;
 
@@ -268,6 +316,25 @@ static void seqPlayRow() {
             midiTx(noteVel);
             seqActiveNote[col] = midiNote;
             seqActiveChan[col] = midiCh;
+        } else {
+            // NOTE_EMPTY — only meaningful on PIXELPOST columns: velocity-only
+            // rows fire MSG_SLIDER, attribute-only rows fire MSG_MOVE.  Both
+            // ride the column's current "pressed" state (set by the last NOTE
+            // or NOTE_OFF row).
+            const ColumnSettings& cs = s->columns[nn.col];
+            if (cs.midiChannel == PIXELPOST_CHANNEL) {
+                extern void pixelpostSendSlider(uint8_t value, bool pressed);
+                extern void pixelpostSendMove(uint8_t x, uint8_t y, bool pressed);
+                bool pressed = seqPpPressed[nn.col];
+                if (!(nn.velocity & 0x80)) {
+                    uint8_t slider = (nn.velocity <= 127)
+                                     ? (uint8_t)(nn.velocity * 2) : 255;
+                    pixelpostSendSlider(slider, pressed);
+                }
+                if (nn.effect != 0 || nn.param != 0) {
+                    pixelpostSendMove(nn.effect, nn.param, pressed);
+                }
+            }
         }
     }
 }
@@ -553,6 +620,7 @@ static void seqSendColumnSetup(uint8_t pattern, bool force) {
         const ColumnSettings& cs = s->columns[col];
         if (cs.midiChannel == 0 || cs.mute) continue;        // unset or muted — skip
         if (cs.midiChannel == SFX_CHANNEL) continue;        // SFX has no MIDI patch
+        if (cs.midiChannel == PIXELPOST_CHANNEL) continue;  // pixel_post has no MIDI patch
         uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
         if (chanDone[midiCh]) continue;                     // already set this pass
         chanDone[midiCh] = true;
@@ -622,6 +690,22 @@ static void seqPlayPreviewRow() {
                     }
                     return;
                 }
+                if (cs.midiChannel == PIXELPOST_CHANNEL) {
+                    // Audition path — always send SELECT_EFFECT (no dedup —
+                    // the user explicitly asked for this preview).
+                    if (nn.note < 1 || nn.note > NOTE_MAX) return;
+                    extern void pixelpostSendSelectEffect(uint8_t idx);
+                    extern void pixelpostSendSlider(uint8_t value, bool pressed);
+                    extern void pixelpostSendMove(uint8_t x, uint8_t y, bool pressed);
+                    uint8_t effectIdx = (uint8_t)(nn.note - 1);
+                    pixelpostSendSelectEffect(effectIdx);
+                    seqPpLastEffect[seqPreviewCol] = effectIdx;
+                    uint8_t vel = (nn.velocity & 0x80) ? 100 : nn.velocity;
+                    uint8_t slider = (vel <= 127) ? (uint8_t)(vel * 2) : 255;
+                    pixelpostSendSlider(slider, /*pressed=*/true);
+                    pixelpostSendMove(nn.effect, nn.param, /*pressed=*/true);
+                    return;
+                }
                 uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
                 int raw = (int)nn.note + TRACKER_TO_MIDI_OFFSET + (int)cs.transpose;
                 if (raw < 0)   raw = 0;
@@ -646,10 +730,12 @@ void sequencerStart() {
     if (seqPreview) sequencerStopPreview();
 
     for (int c = 0; c < MAX_COLUMNS; c++) seqNoteOff(c);
-    memset(seqActiveChan, 0, sizeof(seqActiveChan));
-    memset(seqChanBank,  0xFF, sizeof(seqChanBank));  // 0xFF = force first send
-    memset(seqChanProg,  0xFF, sizeof(seqChanProg));
-    memset(seqChanVol,   0xFF, sizeof(seqChanVol));
+    memset(seqActiveChan,   0,    sizeof(seqActiveChan));
+    memset(seqChanBank,     0xFF, sizeof(seqChanBank));  // 0xFF = force first send
+    memset(seqChanProg,     0xFF, sizeof(seqChanProg));
+    memset(seqChanVol,      0xFF, sizeof(seqChanVol));
+    memset(seqPpPressed,    0,    sizeof(seqPpPressed));
+    memset(seqPpLastEffect, 0xFF, sizeof(seqPpLastEffect));  // 0xFF = force first SELECT_EFFECT
 
     const Song* s = seqSong();
     uint8_t startPat = s->startPattern < s->numPatterns ? s->startPattern : 0;
