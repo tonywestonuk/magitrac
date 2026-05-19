@@ -299,7 +299,7 @@ void pairingLoop() {
         case SERVER_STANDALONE:
             break;
 
-        case SERVER_PAIRING:
+        case SERVER_PAIRING: {
             if (!sCancelArmed && digitalRead(BTN_C) == HIGH) sCancelArmed = true;
             if (sCancelArmed && BtnC.wasPressed()) {
                 serverMode = SERVER_STANDALONE;
@@ -311,7 +311,17 @@ void pairingLoop() {
                 serverMode = SERVER_STANDALONE;
                 needsFullRedraw = true;
             }
+            // Also broadcast a pixel_post pairing beacon every 1 s while
+            // the magitrac pair screen is open. Any pixel_post that's in its
+            // own BOOT-hold pairing mode at the same time will capture our
+            // MAC as its secondary controller.
+            static uint32_t sLastPixelPostPairMs = 0;
+            if (now - sLastPixelPostPairMs >= 1000) {
+                sLastPixelPostPairMs = now;
+                pixelpostSendPairingBeacon();
+            }
             break;
+        }
 
         case SERVER_CONNECTED:
             // Keepalive ping

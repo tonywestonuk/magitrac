@@ -2,11 +2,42 @@
 // Depends on: MagiComms (gComms), MagiMsg.h
 
 #include <SD.h>
+#include <WiFi.h>
+#include <Preferences.h>
 #include "TrackerData.h"
 #include "NoteGrid.h"
 #include "SongMigration.h"
 #include "midi_player.h"
 #include "SampleManifest.h"
+
+// ── WiFi channel persistence ──────────────────────────────────────────────────
+// Shared namespace name with the client side ("magitrac_wifi") so the channel
+// setting is conceptually one thing across both devices, just stored locally.
+static const char* WIFI_NVS_NS = "magitrac_wifi";
+static uint8_t     sWifiChannelIdx = 0;   // 0/1/2 → 1/6/11
+
+void wifiChannelInit() {
+    Preferences prefs;
+    prefs.begin(WIFI_NVS_NS, true);
+    sWifiChannelIdx = prefs.getUChar("idx", 0);
+    if (sWifiChannelIdx > 2) sWifiChannelIdx = 0;
+    prefs.end();
+    uint8_t ch = magiWifiChannelFromIdx(sWifiChannelIdx);
+    WiFi.setChannel(ch);
+    Serial.printf("[WIFI] boot channel: %u\n", (unsigned)ch);
+}
+
+static void wifiChannelApply(uint8_t idx) {
+    if (idx > 2) return;
+    sWifiChannelIdx = idx;
+    Preferences prefs;
+    prefs.begin(WIFI_NVS_NS, false);
+    prefs.putUChar("idx", idx);
+    prefs.end();
+    uint8_t ch = magiWifiChannelFromIdx(idx);
+    WiFi.setChannel(ch);
+    Serial.printf("[WIFI] channel → %u\n", (unsigned)ch);
+}
 
 extern HardwareSerial midi;
 
@@ -824,10 +855,9 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 if (m->pattern < song->numPatterns) {
                     NoteGrid grid(song->notePool, &song->noteFreeHead,
                                   &song->patterns[m->pattern].noteHead);
-                    if (m->note.note == NOTE_EMPTY)
-                        grid.clear(m->row, m->col);
-                    else
-                        grid.set(m->row, m->col, m->note);
+                    // Always set — NoteGrid::set clears internally when *all*
+                    // fields are empty, but persists attr-only / vel-only rows.
+                    grid.set(m->row, m->col, m->note);
                 }
                 // ACK so client can pace bulk sends (e.g. block duplicate)
                 uint8_t ack[2] = { (uint8_t)MSG_CHUNK_ACK, m->row };
@@ -926,6 +956,11 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
 
         case MSG_UNPAUSE:
             sequencerUnpause();
+            break;
+
+        case MSG_SET_WIFI_CHANNEL:
+            if (len < (int)sizeof(MsgSetWifiChannel)) return;
+            wifiChannelApply(((const MsgSetWifiChannel*)data)->idx);
             break;
 
         case MSG_SEEK:

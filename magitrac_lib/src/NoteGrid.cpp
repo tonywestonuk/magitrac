@@ -57,8 +57,11 @@ bool NoteGrid::has(uint8_t row, uint8_t col) const {
 // ── set ───────────────────────────────────────────────────────────────────────
 
 bool NoteGrid::set(uint8_t row, uint8_t col, const Note& n) {
-    // All-zero note means clear.
-    if (n.note == 0 && n.effect == 0 && n.param == 0) {
+    // All-default note means clear.  Velocity counts as "set" only when its
+    // high bit is clear (0–127 = explicit) — 0x80+ means "use default" and is
+    // semantically empty.  This lets PIXELPOST columns persist velocity-only
+    // and attr-only rows for slider/move updates.
+    if (n.note == 0 && n.effect == 0 && n.param == 0 && (n.velocity & 0x80)) {
         clear(row, col);
         return true;
     }

@@ -1,8 +1,9 @@
 // MagiCommsEspNow.h — ESP-NOW transport for MagiComms
 //
-// The server project must define MAGICOMMS_ESPNOW_ARDUINO3X before including
-// this header (or in build flags) to select the Arduino 3.x ESP32_NOW.h API.
-// The client project uses the legacy esp_now.h API by default.
+// Uses the legacy esp_now.h C API.  An older variant of this file once
+// supported the Arduino 3.x ESP32_NOW class API behind a #ifdef, but the
+// sketch-level #define never propagated to library compilation so the class
+// branch never actually ran.  Removed.
 #pragma once
 #include "MagiComms.h"
 
@@ -23,12 +24,6 @@ public:
     uint8_t _lastSender[6] = {};
 
 private:
-    uint8_t _peerMac[6]    = {};
-    bool    _hasPeer        = false;
-
-#ifdef MAGICOMMS_ESPNOW_ARDUINO3X
-    // Arduino 3.x: peer objects allocated on heap
-    void* _broadcastPeer = nullptr;
-    void* _clientPeer    = nullptr;
-#endif
+    uint8_t _peerMac[6] = {};
+    bool    _hasPeer   = false;
 };

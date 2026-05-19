@@ -96,9 +96,10 @@ void ColumnEditor::fieldValue(int field, char* out) const {
     const ColumnSettings& c = _song.columns[_col];
     switch (field) {
         case 0:  // MIDI CH
-            if      (c.midiChannel == 0)            strcpy(out, "OFF");
-            else if (c.midiChannel == SFX_CHANNEL)  strcpy(out, "SFX");
-            else                                    snprintf(out, 16, "%d", c.midiChannel);
+            if      (c.midiChannel == 0)                strcpy(out, "OFF");
+            else if (c.midiChannel == SFX_CHANNEL)      strcpy(out, "SFX");
+            else if (c.midiChannel == PIXELPOST_CHANNEL) strcpy(out, "PXL");
+            else                                         snprintf(out, 16, "%d", c.midiChannel);
             break;
         case 1:  // BANK — meaningless on SFX
             if (isSfx(c.midiChannel)) strcpy(out, "--");
@@ -534,10 +535,10 @@ void ColumnEditor::doClearColumn(uint8_t col) {
 void ColumnEditor::adjustField(int field, int delta) {
     ColumnSettings& c = cs();
     switch (field) {
-        case 0: {  // MIDI CH: 0(off)..16, 17=SFX
+        case 0: {  // MIDI CH: 0(off)..16, 17=SFX, 18=PXL (pixel_post)
             int v = (int)c.midiChannel + delta;
             if (v < 0) v = 0;
-            if (v > SFX_CHANNEL) v = SFX_CHANNEL;
+            if (v > PIXELPOST_CHANNEL) v = PIXELPOST_CHANNEL;
             bool entered = (v == SFX_CHANNEL && c.midiChannel != SFX_CHANNEL);
             c.midiChannel = (uint8_t)v;
             // First entry into SFX — start fetching the sample list so the

@@ -1,15 +1,16 @@
 // MagiTrac Server — M5Stack Core Basic
 // Requires: LovyanGFX, ESP-NOW (built-in)
 
-#define MAGICOMMS_ESPNOW_ARDUINO3X
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include <SD.h>
+#include <WiFi.h>
 #include <magitrac_lib.h>
 #include "midi_player.h"
 #include "debug_log.h"
 #include "SamplePlayer.h"
 #include "SampleManifest.h"
+#include "mic_spectrum.h"
 #include "hal/uart_ll.h"
 
 // ── Communications ───────────────────────────────────────────────────────────
@@ -506,11 +507,22 @@ void setup() {
         pairingHandleMessage(data, len);
     });
     gComms.begin();
+    {
+        uint8_t mac[6];
+        WiFi.macAddress(mac);
+        Serial.printf("[SETUP] my MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    extern void wifiChannelInit();   // defined in commands_server.ino
+    wifiChannelInit();               // load + apply persisted WiFi channel
+    extern void pixelpostInit();     // defined in pixelpost_send.ino
+    pixelpostInit();                 // queue + worker for outgoing pixel_post traffic
     pairingInit();   // load stored pairing from NVS
     Serial.println("[SETUP] commandsInit");
     commandsInit();
     samplePlayerInit();  // SD init after WiFi/ESP-NOW is fully up
     sampleManifestSync();  // load /samples/samples.txt + register any new wavs
+    spectrumInit();        // PDM mic + FFT task (suspended until effect 13 active)
     loadSongList();  // populate list from SD
 
     // Row advance — set dirty flag; main loop sends the ESP-NOW message

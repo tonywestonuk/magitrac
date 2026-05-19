@@ -66,6 +66,7 @@ void ServerPairing::_tryAutoConnect() {
 void ServerPairing::startPairCeremony() {
     MsgPairRequest req;
     req.type = MSG_PAIR_REQUEST;
+    memcpy(req.magic, MAGI_PAIR_MAGIC, sizeof(req.magic));
     gComms.localAddr(req.senderMac);
     gComms.sendBroadcast(&req, sizeof(req));
     Serial.println("[SP] sent MSG_PAIR_REQUEST");

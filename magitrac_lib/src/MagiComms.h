@@ -8,6 +8,13 @@
 // First byte of data is always MagiMsgType.
 using MagiRecvCb = void (*)(const uint8_t* data, int len);
 
+// ── Broadcast spy ────────────────────────────────────────────────────────────
+// Fires for *every* raw broadcast that arrives, before any message-type
+// filtering.  Used by pixelpost_send to sync its logical clock from
+// pixel_post's HMAC'd MSG_TICK_SYNC broadcasts.  Keep the callback short —
+// queue and process elsewhere if you need to verify HMACs.
+using MagiBroadcastSpyCb = void (*)(const uint8_t* data, int len);
+
 // ── MagiCommsTransport — abstract raw wire layer ─────────────────────────────
 //
 // Subclasses implement the actual transport (ESP-NOW, UART, etc.).
@@ -49,8 +56,15 @@ public:
         if (_recvCb) _recvCb(data, len);
     }
 
+    // Broadcast spy — fires for every raw broadcast that lands, pre-filter.
+    void setOnBroadcastSpy(MagiBroadcastSpyCb cb) { _spyCb = cb; }
+    void invokeSpyCb(const uint8_t* data, int len) {
+        if (_spyCb) _spyCb(data, len);
+    }
+
 protected:
-    MagiRecvCb _recvCb = nullptr;
+    MagiRecvCb         _recvCb = nullptr;
+    MagiBroadcastSpyCb _spyCb  = nullptr;
 };
 
 // ── MagiComms — concrete reliability + session layer ─────────────────────────

@@ -68,12 +68,12 @@ per-channel cache (init `0xFF` to force first send).
 
 ## Communications
 
-- ESP-NOW transport — being abstracted behind `MagiComms` /
-  `MagiCommsTransport` (see `MagiComms.h`).
-- The server's API uses **Arduino 3.x ESP32_NOW peer classes**
-  (`MagiBroadcastPeer`, `MagiClientPeer`) — the client uses the legacy
-  `esp_now.h` C API.  This split is encapsulated inside `MagiCommsEspNow.cpp`
-  via `#ifdef MAGICOMMS_ESPNOW_ARDUINO3X`.
+- ESP-NOW transport — abstracted behind `MagiComms` /
+  `MagiCommsTransport` (see `MagiComms.h`).  Both client and server use the
+  legacy `esp_now.h` C API in `MagiCommsEspNow.cpp` (an Arduino-3.x
+  `ESP32_NOW` class variant once existed behind `#ifdef
+  MAGICOMMS_ESPNOW_ARDUINO3X` but the sketch-level define never propagated to
+  library compilation so the branch never ran — removed).
 - HMAC-based auto-reconnect via `PairNVS`.
 - Reliable transfer (song save, note-set bulk) uses ACK + retry with 200ms
   timeout — see `commands_server.ino` for the receive side, and the client's
