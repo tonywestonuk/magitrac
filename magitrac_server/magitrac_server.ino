@@ -684,9 +684,16 @@ void loop() {
                             dir.close();
                         }
                         if (fname[0]) {
-                            char path[64];
-                            snprintf(path, sizeof(path), "%s/%s", SRV_SAMPLES_DIR, fname);
-                            samplePlayerPlay(path);
+                            // BTN-A toggles: stop if currently playing, else start.
+                            // Stops the previous "press-A-while-playing-restarts-it"
+                            // behaviour which made previewing samples awkward.
+                            if (samplePlayerIsPlaying()) {
+                                samplePlayerStop();
+                            } else {
+                                char path[64];
+                                snprintf(path, sizeof(path), "%s/%s", SRV_SAMPLES_DIR, fname);
+                                samplePlayerPlay(path);
+                            }
                             drawSampleFooter();
                         }
                     }
