@@ -1,15 +1,19 @@
 // pairing.ino — Client-Server session state machine
 //
+// Pure ESP-NOW unicast: pairing exchanges MACs (and a now-unused secret
+// kept in NVS for future signing), then sessions rely on the link-layer
+// ACK for reliability and on MAC filtering for "is this our peer".  No
+// per-frame HMAC, no LMK encryption.
+//
 // Normal operation (SERVER_STANDALONE):
-//   Server always plays.  When a paired client sends MSG_CONNECT with a valid
-//   HMAC the server verifies it (deferred to main loop) and transitions to
-//   SERVER_CONNECTED automatically — no user interaction needed.
+//   Server always plays.  When the paired client sends MSG_CONNECT the
+//   server matches the sender MAC against the stored paired MAC and
+//   transitions to SERVER_CONNECTED.
 //
 // One-time pairing ceremony (SERVER_PAIRING):
 //   A+C held 2 s → 60-second window for the client to broadcast MSG_PAIR_REQUEST.
 //   Server shows a 4-digit code; operator confirms both screens match.
-//   Generates a random 16-byte secret stored in NVS; client stores the same.
-//   After the ceremony the server returns to STANDALONE and the client auto-connects.
+//   Random 16-byte secret persisted to NVS on both sides (currently unused).
 //
 // C button ends an active session; also cancels a pairing ceremony.
 
@@ -31,6 +35,8 @@ static uint32_t    serverModeMs = 0;
        uint8_t     clientMac[6] = {};   // exposed so commands_server.ino can use it
 
 // ── NVS-stored pairing ────────────────────────────────────────────────────────
+// sStoredSecret is loaded but unused — kept on disk so packet signing can be
+// re-added later without re-pairing every device.
 #define SRV_NVS_NS "magitrac_srv"
 
 static bool    sHasPairing         = false;
@@ -42,11 +48,6 @@ static uint8_t  sPairPendingMac[6] = {};
 static uint8_t  sPairCode[4]       = {};
 static uint32_t sPairingWindowMs   = 0;
 static const uint32_t PAIR_WINDOW_MS = 60000;
-
-// ── Deferred MSG_CONNECT (HMAC verify runs in main loop, not WiFi task) ───────
-static bool    sPendingConnect        = false;
-static uint8_t sPendingConnectMac[6]  = {};
-static uint8_t sPendingConnectHmac[8] = {};
 
 // ── Song push (set here on connect; consumed by commandsTick in commands_server.ino)
 bool sSongPushPending = false;
@@ -148,17 +149,32 @@ void pairingHandleMessage(const uint8_t* data, int len) {
     switch (type) {
 
         case MSG_CONNECT:
-            // Accept only from the stored paired client
+            // Accept only from the stored paired client.  Pure ESP-NOW —
+            // sender MAC is the only authentication.
             if (!sHasPairing) return;
             if (len < (int)sizeof(MsgConnect)) return;
             if (memcmp(senderMac, sStoredClientMac, 6) != 0) return;
-            if (serverMode == SERVER_CONNECTED) return;  // already connected
+            if (serverMode == SERVER_CONNECTED) return;
             {
-                // Defer HMAC verification to main loop — avoids mbedtls on WiFi task
-                const MsgConnect* req = (const MsgConnect*)data;
-                memcpy(sPendingConnectMac,  senderMac,    6);
-                memcpy(sPendingConnectHmac, req->hmac8,   8);
-                sPendingConnect = true;
+                memcpy(clientMac, senderMac, 6);
+                gComms.addPeer(clientMac);
+
+                MsgConnectAck ack;
+                ack.type = MSG_CONNECT_ACK;
+                memset(ack.nonce, 0, sizeof(ack.nonce));   // reserved
+                gComms.send(&ack, sizeof(ack));
+
+                serverMode       = SERVER_CONNECTED;
+                serverModeMs     = millis();
+                lastPingMs       = millis();
+                lastPongMs       = millis();
+                sSongPushPending = true;
+                sCancelArmed     = false;
+
+                needsFullRedraw  = true;
+                Serial.printf("[PAIR] client connected: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    clientMac[0], clientMac[1], clientMac[2],
+                    clientMac[3], clientMac[4], clientMac[5]);
             }
             break;
 
@@ -212,10 +228,10 @@ void pairingHandleMessage(const uint8_t* data, int len) {
                 gComms.localAddr(complete.serverMac);
                 gComms.send(&complete, sizeof(complete));
 
-                Serial.println("[PAIR] ceremony complete — secret saved");
+                Serial.println("[PAIR] ceremony complete");
                 needsFullRedraw = true;
 
-                // Remove temp peer; client will reconnect via MSG_CONNECT + HMAC
+                // Remove temp peer; client will reconnect via MSG_CONNECT.
                 gComms.removePeer(sPairPendingMac);
                 serverMode   = SERVER_STANDALONE;
                 serverModeMs = millis();
@@ -249,50 +265,6 @@ void pairingHandleMessage(const uint8_t* data, int len) {
 // ── Main loop tick ────────────────────────────────────────────────────────────
 void pairingLoop() {
     uint32_t now = millis();
-
-    // ── Deferred HMAC verification for MSG_CONNECT ────────────────────────────
-    if (sPendingConnect && serverMode == SERVER_STANDALONE) {
-        sPendingConnect = false;
-
-        // Compute expected HMAC: HMAC-SHA256(secret, "CONNECT" || clientMAC)[0..7]
-        uint8_t hmacInput[13];
-        memcpy(hmacInput,     "CONNECT", 7);
-        memcpy(hmacInput + 7, sPendingConnectMac, 6);
-
-        if (hmacVerify8(sStoredSecret, hmacInput, sizeof(hmacInput), sPendingConnectHmac)) {
-            memcpy(clientMac, sPendingConnectMac, 6);
-            // Send ACK unencrypted — client hasn't set up encrypted peer yet.
-            // Encryption starts after both sides have re-added peers with LMK.
-            gComms.addPeer(clientMac);
-
-            MsgConnectAck ack;
-            ack.type = MSG_CONNECT_ACK;
-            esp_fill_random(ack.nonce, sizeof(ack.nonce));
-            gComms.send(&ack, sizeof(ack));
-
-            // Now re-add with LMK — all subsequent traffic is encrypted
-            gComms.addPeer(clientMac, sStoredSecret);
-
-            serverMode       = SERVER_CONNECTED;
-            serverModeMs     = millis();
-            lastPingMs       = millis();
-            lastPongMs       = millis();
-            now              = millis();   // refresh — HMAC took ~20ms, stale `now` causes underflow
-            sSongPushPending = true;
-            sCancelArmed     = false;
-
-            needsFullRedraw = true;
-            {
-                char macStr[20];
-                snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                    clientMac[0], clientMac[1], clientMac[2],
-                    clientMac[3], clientMac[4], clientMac[5]);
-                Serial.printf("[PAIR] client authenticated: %s\n", macStr);
-            }
-        } else {
-            Serial.println("[PAIR] HMAC verify FAILED — ignoring connect");
-        }
-    }
 
     switch (serverMode) {
 

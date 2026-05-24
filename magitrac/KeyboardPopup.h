@@ -60,15 +60,17 @@ private:
     bool    _open;
     bool    _done;
     bool    _wasDown;
-    bool    _symLayer;   // true = number/symbol layer
+    bool    _symLayer;     // true = number/symbol layer
+    bool    _upperCase;    // alpha layer case (true = QWERTY..., false = qwerty...)
 
     void drawTextField();
     void drawKeyRow(int y, const char* keys, int count, int xOffset);
     void drawKey(int x, int y, int w, const char* label);
+    void toggleCase();
 
     // Map screen coords to a key.  Returns the char, or 0 for no key.
-    // Sets bksp/done/cancel for those special keys.
-    char hitKey(int sx, int sy, bool& bksp, bool& done, bool& cancel) const;
+    // Sets bksp/done/cancel/shift for those special keys.
+    char hitKey(int sx, int sy, bool& bksp, bool& done, bool& cancel, bool& shift) const;
 
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

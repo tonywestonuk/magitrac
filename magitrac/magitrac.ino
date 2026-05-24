@@ -29,6 +29,7 @@
 #include "SettingsPage.h"
 #include "BackupRestorePage.h"
 #include "PerformancePage.h"
+#include "SetlistPage.h"
 #include "Battery.h"
 #include <SD.h>
 #include <I2C_BM8563.h>
@@ -77,6 +78,7 @@ InstrumentsPage    instrumentsPage(display, touch, gInstruments);
 SongConfigPage     songConfigPage(display, touch, song);
 ColumnEditor       columnEditor(display, touch, song, gInstruments);
 PerformancePage    performancePage(display, touch, song);
+SetlistPage        setlistPage(display, touch, song);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
 BackupRestorePage* backupRestorePage = nullptr;
@@ -221,6 +223,7 @@ static bool     noteEditorPageOpen  = false;
 static bool     settingsPageOpen    = false;
 static bool     backupRestorePageOpen = false;
 static bool     performancePageOpen   = false;
+static bool     setlistPageOpen       = false;
 
 // ── Grid pause state ─────────────────────────────────────────────────────
 // When the user touches the grid while the server is playing we PAUSE (not STOP)
@@ -512,7 +515,9 @@ void loop() {
     }
 
     // ── Unsolicited song push (server pushed song on connect or song change) ──
-    if (!songPageOpen &&
+    // Skip when SongPage or SetlistPage is open — those pages own the SONG_READY
+    // handling themselves and will copy the song into place.
+    if (!songPageOpen && !setlistPageOpen &&
         gServerPairing.browseState() == BrowseState::SONG_READY) {
         if (gServerPairing.copySong(&song)) {
             engine.stop();
@@ -533,6 +538,44 @@ void loop() {
             display.clear();
             ui.drawAll();
             display.paintLater();
+        }
+        return;
+    }
+
+    // ── Setlist page (overlay on PerformancePage) ────────────────────────────
+    if (setlistPageOpen) {
+        SetlistResult sres = setlistPage.poll();
+        if (sres == SetlistResult::BACK) {
+            setlistPageOpen = false;
+            display.clear();
+            performancePage.draw();
+            display.paint();
+        } else if (sres == SetlistResult::SONG_LOADED) {
+            setlistPageOpen = false;
+            engine.stop();
+            ui.setSelected(0, 0);
+            ui.setNoSong(false);
+            if (gServerPairing.isPaired()) {
+                gSongSource = SongSource::SERVER;
+                songPage.setServerLoadedName(song.name);
+            } else {
+                gSongSource = SongSource::SD;
+                songPage.clearLoadedFile();
+            }
+            // Stay on PerformancePage with the freshly-loaded song.
+            performancePage.open(engine.currentPattern());
+            performancePage.setTitleOverride(setlistPage.loadedDisplayName());
+            display.clear();
+            performancePage.draw();
+            display.paint();
+        } else if (sres == SetlistResult::TITLE_ONLY) {
+            // OK with no file attached — keep current song, just update the
+            // PerformancePage title to the setlist entry's display name.
+            setlistPageOpen = false;
+            performancePage.setTitleOverride(setlistPage.loadedDisplayName());
+            display.clear();
+            performancePage.draw();
+            display.paint();
         }
         return;
     }
@@ -559,11 +602,18 @@ void loop() {
             }
             performancePage.clearPatch();
         }
-        if (performancePage.poll()) {
+        PerformancePage::Result pres = performancePage.poll();
+        if (pres == PerformancePage::Result::HOME) {
             performancePageOpen = false;
             display.clear();
             ui.drawAll();
             display.paintLater();
+        } else if (pres == PerformancePage::Result::SETLIST) {
+            setlistPageOpen = true;
+            setlistPage.open();
+            display.clear();
+            setlistPage.draw();
+            display.paint();
         }
         return;
     }

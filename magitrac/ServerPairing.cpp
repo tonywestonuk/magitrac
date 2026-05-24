@@ -39,21 +39,16 @@ void ServerPairing::begin() {
     }
 }
 
-// ── Auto-connect (unicast MSG_CONNECT with HMAC) ──────────────────────────────
+// ── Auto-connect (pure ESP-NOW unicast — no HMAC) ─────────────────────────────
 void ServerPairing::_tryAutoConnect() {
-    // Build HMAC input: "CONNECT" || myMac
     uint8_t myMac[6];
     gComms.localAddr(myMac);
-    uint8_t hmacInput[13];
-    memcpy(hmacInput,     "CONNECT", 7);
-    memcpy(hmacInput + 7, myMac,     6);
 
     MsgConnect msg;
     msg.type = MSG_CONNECT;
     memcpy(msg.senderMac, myMac, 6);
-    hmacSha256_8(_storedSecret, hmacInput, sizeof(hmacInput), msg.hmac8);
+    memset(msg.hmac8, 0, sizeof(msg.hmac8));   // reserved — formerly HMAC
 
-    // Send CONNECT unencrypted — server hasn't added us as encrypted peer yet.
     gComms.addPeer(_storedServerMac);
 
     bool ok = gComms.send(&msg, sizeof(msg));
@@ -451,6 +446,19 @@ void ServerPairing::requestSongLoad(uint8_t page, uint8_t index) {
     _setBrowseState(BrowseState::WAITING_SONG);
 }
 
+void ServerPairing::requestSongLoadByName(const char* name) {
+    if (_pairState != PairClientState::SUCCESS) return;
+    _songBufLen   = 0;
+    _chunksGot    = 0;
+    _chunksTotal  = 0;
+    MsgSongLoadNameReq req;
+    req.type = MSG_SONG_LOAD_NAME;
+    memset(req.name, 0, sizeof(req.name));
+    if (name) strncpy(req.name, name, sizeof(req.name) - 1);
+    gComms.send(&req, sizeof(req));
+    _setBrowseState(BrowseState::WAITING_SONG);
+}
+
 void ServerPairing::resetBrowse() {
     _setBrowseState(BrowseState::IDLE);
     _listCount   = 0;
@@ -497,7 +505,6 @@ bool ServerPairing::copySong(Song* out) const {
 }
 
 // ── Receive ───────────────────────────────────────────────────────────────────
-// Note: MSG_CHUNK_ACK is consumed by MagiComms before reaching here.
 void ServerPairing::_onReceive(const uint8_t* data, int len) {
     if (len < 1) return;
     MagiMsgType type = (MagiMsgType)data[0];
@@ -510,9 +517,7 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
                 _pairState != PairClientState::AUTO_CONNECTING) return;
             if (len < (int)sizeof(MsgConnectAck)) return;
             {
-                const MsgConnectAck* ack = (const MsgConnectAck*)data;
-                memcpy(_sessionNonce, ack->nonce, 8);
-                gComms.addPeer(_serverMac, _storedSecret);
+                gComms.addPeer(_serverMac);
                 Serial.printf("[SP] connected to %02X:%02X:%02X:%02X:%02X:%02X\n",
                     _serverMac[0], _serverMac[1], _serverMac[2],
                     _serverMac[3], _serverMac[4], _serverMac[5]);
@@ -617,9 +622,6 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
                     if (offset + d->dataLen > _songBufLen)
                         _songBufLen = offset + d->dataLen;
                 }
-                // ACK this chunk back to server
-                uint8_t ack[2] = { (uint8_t)MSG_CHUNK_ACK, d->chunk };
-                gComms.send(ack, 2);
                 if (_chunksGot >= _chunksTotal && _chunksTotal > 0)
                     _setBrowseState(BrowseState::SONG_READY);
             }
@@ -678,9 +680,6 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
                     if (offset + d->dataLen > _instBufLen)
                         _instBufLen = offset + d->dataLen;
                 }
-                // ACK this chunk back to server
-                uint8_t ack[2] = { (uint8_t)MSG_CHUNK_ACK, d->chunk };
-                gComms.send(ack, 2);
                 if (_instChunksGot >= _instChunksTotal && _instChunksTotal > 0)
                     _instReady = true;
             }
@@ -777,8 +776,6 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
                     if (offset + d->dataLen > _songBufLen)
                         _songBufLen = offset + d->dataLen;
                 }
-                uint8_t ack[2] = { (uint8_t)MSG_CHUNK_ACK, d->chunk };
-                gComms.send(ack, 2);
                 if (_chunksGot >= _chunksTotal && _chunksTotal > 0)
                     _backupState = BackupState::FILE_RECEIVED;
             }

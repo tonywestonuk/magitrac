@@ -1,4 +1,9 @@
-// PairNVS.h — persistent pairing storage and HMAC helpers
+// PairNVS.h — persistent pairing storage
+//
+// Per-frame signing was removed when the transport switched to pure ESP-NOW
+// (link-layer ACK + MAC filtering only).  The 16-byte secret is still
+// exchanged during the pairing ceremony and stored here so signing can be
+// re-added later without forcing every device to re-pair.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -15,14 +20,3 @@ void pairNvsSave(const char* ns, const uint8_t* mac6, const uint8_t* secret16);
 
 // Forget pairing (clear paired flag).
 void pairNvsClear(const char* ns);
-
-// ── HMAC helpers ──────────────────────────────────────────────────────────────
-// Compute HMAC-SHA256(secret16, data, dataLen) → first 8 bytes → out8.
-void hmacSha256_8(const uint8_t* secret16,
-                  const uint8_t* data, size_t dataLen,
-                  uint8_t* out8);
-
-// Constant-time comparison. Returns true if first 8 bytes of HMAC match expected8.
-bool hmacVerify8(const uint8_t* secret16,
-                 const uint8_t* data, size_t dataLen,
-                 const uint8_t* expected8);

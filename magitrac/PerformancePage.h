@@ -23,6 +23,8 @@
 
 // Header
 static const int PP_HDR_H      = 50;
+static const int PP_SETLIST_X  = 540;
+static const int PP_SETLIST_W  = 140;
 static const int PP_EDIT_X     = 700;
 static const int PP_EDIT_W     = 120;
 static const int PP_HOME_X     = 830;
@@ -59,12 +61,22 @@ public:
     PerformancePage(EPD_PainterAdafruit& display, GT911_Lite& touch,
                     Song& song);
 
+    enum class Result : uint8_t {
+        NONE,
+        HOME,       // HOME held — exit performance page
+        SETLIST,    // SETLIST held — open setlist page
+    };
+
     void open(uint8_t currentPattern);
     void draw();
-    bool poll();   // returns true when HOME held (exit page)
+    Result poll();
 
     // Called by main loop to update playing pattern from server position
     void setPlayingPattern(uint8_t pat);
+
+    // Override the header title (e.g. with the setlist entry's display name).
+    // Pass nullptr or "" to revert to "PERFORMANCE".  Cleared on every open().
+    void setTitleOverride(const char* name);
 
     // True if any pad config changed (caller should sync to server)
     bool patchPending() const { return _patchPending; }
@@ -83,7 +95,7 @@ private:
     bool     _patchPending;     // perfPad config changed, needs server sync
 
     // Hold tracking for header buttons
-    enum class HoldTarget : uint8_t { NONE, HOME, EDIT };
+    enum class HoldTarget : uint8_t { NONE, HOME, EDIT, SETLIST };
     HoldTarget _holdTarget;
     uint32_t   _holdStartMs;
     bool       _holdFired;
@@ -93,6 +105,8 @@ private:
     KeyboardPopup _keyboard;
     int8_t   _kbdPadIdx;        // which pad is being renamed (-1 = none)
 
+    char     _titleOverride[40] = {};  // empty = use "PERFORMANCE"
+
     // ── Performance pad view ─────────────────────────────────────────────────
     void drawPerfHeader();
     void drawPads();
@@ -101,8 +115,9 @@ private:
     int  padY(int idx) const;
     bool hitHome(int sx, int sy) const;
     bool hitEdit(int sx, int sy) const;
+    bool hitSetlist(int sx, int sy) const;
     int  hitPad(int sx, int sy) const;
-    bool pollPerf();    // returns true = exit page
+    Result pollPerf();
 
     // ── Pad edit view ────────────────────────────────────────────────────────
     void drawEditView();

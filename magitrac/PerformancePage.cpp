@@ -35,6 +35,16 @@ void PerformancePage::open(uint8_t currentPattern) {
     _editing        = false;
     _patchPending   = false;
     _kbdPadIdx      = -1;
+    _titleOverride[0] = '\0';
+}
+
+void PerformancePage::setTitleOverride(const char* name) {
+    if (!name || !*name) {
+        _titleOverride[0] = '\0';
+        return;
+    }
+    strncpy(_titleOverride, name, sizeof(_titleOverride) - 1);
+    _titleOverride[sizeof(_titleOverride) - 1] = '\0';
 }
 
 void PerformancePage::draw() {
@@ -65,26 +75,23 @@ void PerformancePage::setPlayingPattern(uint8_t pat) {
     _d.paintLater();
 }
 
-bool PerformancePage::poll() {
+PerformancePage::Result PerformancePage::poll() {
     if (_editing) {
         // Keyboard popup takes over input
         if (_keyboard.isOpen()) {
             if (_keyboard.poll()) {
-                // Keyboard closed
                 if (_keyboard.isDone() && _kbdPadIdx >= 0) {
                     _patchPending = true;
                     drawEditRow(_kbdPadIdx);
                 }
                 _kbdPadIdx = -1;
-                // Redraw the edit view under the keyboard
                 _d.fillScreen(COL_WHITE);
                 drawEditView();
                 _d.paint();
             }
-            return false;
+            return Result::NONE;
         }
         if (pollEdit()) {
-            // Back to performance view
             _editing = false;
             _wasDown = _touch.isTouched;
             _holdTarget = HoldTarget::NONE;
@@ -93,7 +100,7 @@ bool PerformancePage::poll() {
             drawPads();
             _d.paint();
         }
-        return false;
+        return Result::NONE;
     }
     return pollPerf();
 }
@@ -102,7 +109,7 @@ bool PerformancePage::poll() {
 // ── Performance pad view ─────────────────────────────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════════
 
-bool PerformancePage::pollPerf() {
+PerformancePage::Result PerformancePage::pollPerf() {
     // Flash animation for queued pad
     if (_queuedPattern >= 0) {
         uint32_t now = millis();
@@ -120,7 +127,11 @@ bool PerformancePage::pollPerf() {
             _holdFired = true;
             if (_holdTarget == HoldTarget::HOME) {
                 _holdTarget = HoldTarget::NONE;
-                return true;  // exit page
+                return Result::HOME;
+            }
+            if (_holdTarget == HoldTarget::SETLIST) {
+                _holdTarget = HoldTarget::NONE;
+                return Result::SETLIST;
             }
             if (_holdTarget == HoldTarget::EDIT) {
                 _editing = true;
@@ -129,12 +140,12 @@ bool PerformancePage::pollPerf() {
                 _d.fillScreen(COL_WHITE);
                 drawEditView();
                 _d.paint();
-                return false;
+                return Result::NONE;
             }
         }
     }
 
-    if (!_touch.read()) return false;
+    if (!_touch.read()) return Result::NONE;
 
     bool down = _touch.isTouched;
     int sx, sy;
@@ -144,7 +155,7 @@ bool PerformancePage::pollPerf() {
     bool falling = (!down && _wasDown);
     _wasDown = down;
 
-    // ── Start hold on finger-down over HOME / EDIT ───────────────────────────
+    // ── Start hold on finger-down over header buttons ────────────────────────
     if (rising) {
         if (hitHome(sx, sy)) {
             _holdTarget  = HoldTarget::HOME;
@@ -152,6 +163,10 @@ bool PerformancePage::pollPerf() {
             _holdFired   = false;
         } else if (hitEdit(sx, sy)) {
             _holdTarget  = HoldTarget::EDIT;
+            _holdStartMs = millis();
+            _holdFired   = false;
+        } else if (hitSetlist(sx, sy)) {
+            _holdTarget  = HoldTarget::SETLIST;
             _holdStartMs = millis();
             _holdFired   = false;
         } else {
@@ -163,7 +178,7 @@ bool PerformancePage::pollPerf() {
     if (falling) {
         if (_holdTarget != HoldTarget::NONE) {
             _holdTarget = HoldTarget::NONE;
-            return false;
+            return Result::NONE;
         }
 
         // Pad tap
@@ -205,23 +220,32 @@ bool PerformancePage::pollPerf() {
         }
     }
 
-    return false;
+    return Result::NONE;
 }
 
 void PerformancePage::drawPerfHeader() {
     _d.fillRect(0, 0, 960, PP_HDR_H, COL_BLACK);
 
-    // Title
+    // Title — squeezed to the left to make room for SETLIST/EDIT/HOME.
+    // _titleOverride wins when set (e.g. setlist entry display name).
     _d.setTextSize(3);
     _d.setTextColor(COL_WHITE);
-    int tw = 11 * 18;  // "PERFORMANCE"
-    _d.setCursor((PP_EDIT_X - tw) / 2, (PP_HDR_H - 24) / 2);
-    _d.print("PERFORMANCE");
+    const char* title = _titleOverride[0] ? _titleOverride : "PERFORMANCE";
+    int maxChars = (PP_SETLIST_X - 20) / 18;   // = 28 at textSize 3
+    char buf[40];
+    int n = (int)strlen(title);
+    if (n > maxChars) n = maxChars;
+    if (n > (int)sizeof(buf) - 1) n = sizeof(buf) - 1;
+    memcpy(buf, title, n);
+    buf[n] = '\0';
+    int tw = n * 18;
+    _d.setCursor((PP_SETLIST_X - tw) / 2, (PP_HDR_H - 24) / 2);
+    _d.print(buf);
 
-    // EDIT button (left-side extended action)
+    uiButton(_d, PP_SETLIST_X, 0, PP_SETLIST_W, PP_HDR_H, "SETLIST",
+             COL_BLACK, COL_WHITE, 3);
     uiButton(_d, PP_EDIT_X, 0, PP_EDIT_W, PP_HDR_H, "EDIT",
              COL_BLACK, COL_WHITE, 3);
-    // HOME button (right-side, white-on-black)
     uiButton(_d, PP_HOME_X, 0, PP_HOME_W, PP_HDR_H, "HOME",
              COL_BLACK, COL_WHITE, 3);
 }
@@ -325,6 +349,11 @@ bool PerformancePage::hitHome(int sx, int sy) const {
 
 bool PerformancePage::hitEdit(int sx, int sy) const {
     return sx >= PP_EDIT_X && sx < PP_EDIT_X + PP_EDIT_W
+        && sy >= PP_BTN_Y && sy < PP_BTN_Y + PP_BTN_H;
+}
+
+bool PerformancePage::hitSetlist(int sx, int sy) const {
+    return sx >= PP_SETLIST_X && sx < PP_SETLIST_X + PP_SETLIST_W
         && sy >= PP_BTN_Y && sy < PP_BTN_Y + PP_BTN_H;
 }
 

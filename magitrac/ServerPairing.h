@@ -79,6 +79,7 @@ public:
     // ── Server file browse ────────────────────────────────────────────────────
     void requestSongList(uint8_t page = 0);
     void requestSongLoad(uint8_t page, uint8_t index);
+    void requestSongLoadByName(const char* name);   // bare name, no extension
     void resetBrowse();
 
     // ── Server file write / delete ────────────────────────────────────────────
@@ -187,11 +188,11 @@ private:
     char            _serverName[17] = {};
     bool            _ready          = false;
 
-    // NVS-stored pairing
-    bool    _hasPairing       = false;
+    // NVS-stored pairing.  _storedSecret is loaded but unused — kept on
+    // disk so packet signing can be re-added later without re-pairing.
+    bool    _hasPairing          = false;
     uint8_t _storedServerMac[6]  = {};
     uint8_t _storedSecret[16]    = {};
-    uint8_t _sessionNonce[8]     = {};
 
     // Pairing ceremony
     uint8_t _pairCode[4] = {};

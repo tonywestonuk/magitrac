@@ -42,7 +42,8 @@ enum MagiMsgType : uint8_t {
     MSG_SONG_SAVE      = 0x24,  // client → server: save-start (name + total chunks)
     MSG_SONG_SAVE_DATA = 0x25,  // client → server: one upload chunk
     MSG_SONG_DELETE    = 0x26,  // client → server: delete file by name
-    MSG_CHUNK_ACK      = 0x27,  // server → client: chunk received OK (2 bytes: type + chunk#)
+    MSG_CHUNK_ACK      = 0x27,  // reserved — formerly per-chunk app ACK; link-layer ACK is the only reliability now
+    MSG_SONG_LOAD_NAME = 0x28,  // client → server: request song by bare name (no .mgt)
 
     // MIDI passthrough — client → server
     MSG_MIDI_DATA      = 0x30,  // client → server: raw MIDI bytes to forward to MIDI out
@@ -204,6 +205,14 @@ struct MsgSongLoadReq {
     MagiMsgType type;
     uint8_t     page;
     uint8_t     index;
+};
+
+// Client → Server: request a specific song by name (no extension).
+// Server appends ".mgt" to build the SD path.  Used by the setlist feature
+// where the client stores a bare song name rather than a positional ref.
+struct MsgSongLoadNameReq {
+    MagiMsgType type;
+    char        name[SL_NAME_LEN];   // null-terminated, no extension
 };
 
 // Server → Client: one chunk of song file data (download)
