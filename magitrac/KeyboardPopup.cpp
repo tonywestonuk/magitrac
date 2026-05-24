@@ -27,17 +27,19 @@ KeyboardPopup::KeyboardPopup(EPD_PainterAdafruit& display, GT911_Lite& touch)
     , _done(false)
     , _wasDown(false)
     , _symLayer(false)
+    , _upperCase(true)
 {}
 
 // ── Public ────────────────────────────────────────────────────────────────────
 
 void KeyboardPopup::open(char* buf, uint8_t maxLen) {
-    _buf      = buf;
-    _maxLen   = maxLen;
-    _open     = true;
-    _done     = false;
-    _symLayer = false;
-    _wasDown  = _touch.isTouched;  // swallow any lingering touch
+    _buf       = buf;
+    _maxLen    = maxLen;
+    _open      = true;
+    _done      = false;
+    _symLayer  = false;
+    _upperCase = true;
+    _wasDown   = _touch.isTouched;  // swallow any lingering touch
 }
 
 void KeyboardPopup::draw() {
@@ -51,6 +53,13 @@ void KeyboardPopup::draw() {
     drawKeyRow(KBD_ROW1_Y, r1, 10, 0);
     drawKeyRow(KBD_ROW2_Y, r2, 9,  KBD_SLOT_W / 2);
     drawKeyRow(KBD_ROW3_Y, r3, 7,  KBD_SLOT_W);
+
+    // SHIFT key — row 3 slot 0 (replaces the dead 96px left offset).
+    // Label shows the *target* case so it's obvious what tapping will do.
+    // In symbol layer the slot is empty (case has no meaning).
+    if (!_symLayer) {
+        drawKey(0, KBD_ROW3_Y, KBD_KEY_W, _upperCase ? "abc" : "ABC");
+    }
 
     // BKSP — occupies 2 slots at the right of row 3
     {
@@ -82,8 +91,8 @@ bool KeyboardPopup::poll() {
             return false;
         }
 
-        bool bksp = false, done = false, cancel = false;
-        char ch = hitKey(sx, sy, bksp, done, cancel);
+        bool bksp = false, done = false, cancel = false, shift = false;
+        char ch = hitKey(sx, sy, bksp, done, cancel, shift);
 
         if (cancel) {
             _open = false;
@@ -94,6 +103,10 @@ bool KeyboardPopup::poll() {
             _open = false;
             _done = true;
             return true;
+        }
+        if (shift) {
+            toggleCase();
+            return false;
         }
         if (bksp) {
             int len = strlen(_buf);
@@ -140,7 +153,11 @@ void KeyboardPopup::drawTextField() {
 void KeyboardPopup::drawKeyRow(int y, const char* keys, int count, int xOffset) {
     char label[2] = { 0, 0 };
     for (int i = 0; i < count; i++) {
-        label[0] = keys[i];
+        char k = keys[i];
+        if (!_symLayer && !_upperCase && k >= 'A' && k <= 'Z') {
+            k = (char)(k - 'A' + 'a');
+        }
+        label[0] = k;
         drawKey(xOffset + i * KBD_SLOT_W, y, KBD_KEY_W, label);
     }
 }
@@ -160,8 +177,9 @@ void KeyboardPopup::drawKey(int x, int y, int w, const char* label) {
 }
 
 char KeyboardPopup::hitKey(int sx, int sy,
-                            bool& bksp, bool& done, bool& cancel) const {
-    bksp = done = cancel = false;
+                            bool& bksp, bool& done, bool& cancel,
+                            bool& shift) const {
+    bksp = done = cancel = shift = false;
 
     const char* r1 = _symLayer ? KBD_ROW1_SYM : KBD_ROW1;
     const char* r2 = _symLayer ? KBD_ROW2_SYM : KBD_ROW2;
@@ -169,18 +187,25 @@ char KeyboardPopup::hitKey(int sx, int sy,
 
     if (sy < KBD_ROW1_Y) return 0;
 
+    auto caseOf = [&](char k) -> char {
+        if (_symLayer || _upperCase) return k;
+        if (k >= 'A' && k <= 'Z') return (char)(k - 'A' + 'a');
+        return k;
+    };
+
     if (sy < KBD_ROW2_Y) {
         int slot = sx / KBD_SLOT_W;
-        if (slot >= 0 && slot < 10) return r1[slot];
+        if (slot >= 0 && slot < 10) return caseOf(r1[slot]);
 
     } else if (sy < KBD_ROW3_Y) {
         int slot = (sx - KBD_SLOT_W / 2) / KBD_SLOT_W;
-        if (slot >= 0 && slot < 9) return r2[slot];
+        if (slot >= 0 && slot < 9) return caseOf(r2[slot]);
 
     } else if (sy < KBD_ROW4_Y) {
         if (sx >= KBD_SLOT_W * 8) { bksp = true; return 0; }
+        if (!_symLayer && sx < KBD_SLOT_W) { shift = true; return 0; }
         int slot = (sx - KBD_SLOT_W) / KBD_SLOT_W;
-        if (slot >= 0 && slot < 7) return r3[slot];
+        if (slot >= 0 && slot < 7) return caseOf(r3[slot]);
 
     } else if (sy < KBD_ROW4_Y + KBD_KEY_H) {
         if (sx < 320)  { cancel = true; return 0; }
@@ -198,6 +223,12 @@ void KeyboardPopup::rawToScreen(int rx, int ry, int& sx, int& sy) const {
 
 void KeyboardPopup::toggleSymbolLayer() {
     _symLayer = !_symLayer;
+    draw();
+    _d.paintLater();
+}
+
+void KeyboardPopup::toggleCase() {
+    _upperCase = !_upperCase;
     draw();
     _d.paintLater();
 }

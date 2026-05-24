@@ -135,6 +135,10 @@ static bool     srvDeletePending  = false;
 static bool    srvLoadPending   = false;
 static uint8_t srvLoadPendingPage   = 0;
 static uint8_t srvLoadPendingIdx    = 0;
+static bool    srvLoadByNamePending = false;
+static char    srvLoadByNameStr[SL_NAME_LEN] = {};
+static bool    srvListPending       = false;
+static uint8_t srvListPendingPage   = 0;
 
 // ── Deferred backup file send ──────────────────────────────────────────────────
 static bool    srvBackupFilePending = false;
@@ -261,18 +265,9 @@ static void sendSampleList(uint8_t page) {
 
 // ── Send song file in chunks ───────────────────────────────────────────────────
 // Loads/migrates the song into srvActiveBuf first, then sends from memory.
-// This handles legacy v7/v8/v9 files transparently — the client always
-// receives a v10-format payload regardless of the on-disk format.
-static void sendSongData(uint8_t page, uint8_t index) {
-    char files[SRV_MAX_FILES][SRV_FNAME_MAX];
-    int total = srvListSongs(files, SRV_MAX_FILES);
-
-    int fileIdx = (int)page * SL_PER_PKT + (int)index;
-    if (fileIdx < 0 || fileIdx >= total) return;
-
-    char path[48];
-    snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, files[fileIdx]);
-
+// This handles legacy v7..v16 files transparently — the client always
+// receives a current-version payload regardless of the on-disk format.
+static void sendSongDataFromPath(const char* path, const char* displayName) {
     File f = SD.open(path);
     if (!f) {
         Serial.printf("[CMD] sendSongData: open failed '%s'\n", path);
@@ -314,18 +309,16 @@ static void sendSongData(uint8_t page, uint8_t index) {
         return;
     }
 
-    // Stamp the in-memory header for wire transfer
     SongFileHeader* h2 = (SongFileHeader*)srvActiveBuf;
     h2->magic = SONG_FILE_MAGIC;
     h2->version = SONG_FILE_VERSION;
     h2->_pad[0] = h2->_pad[1] = h2->_pad[2] = 0;
     srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
 
-    strncpy(srvActiveName, files[fileIdx], sizeof(srvActiveName) - 1);
+    strncpy(srvActiveName, displayName, sizeof(srvActiveName) - 1);
     srvActiveName[sizeof(srvActiveName) - 1] = '\0';
     srvHasActive = true;
 
-    // Send from srvActiveBuf in chunks
     uint32_t totalBytes  = srvActiveBufLen;
     uint8_t  totalChunks = (uint8_t)((totalBytes + SONG_CHUNK_SIZE - 1) / SONG_CHUNK_SIZE);
     Serial.printf("[CMD] sending '%s' %u bytes %u chunks\n", path, totalBytes, totalChunks);
@@ -344,6 +337,26 @@ static void sendSongData(uint8_t page, uint8_t index) {
         gComms.sendReliable(&msg, 4 + n, chunk);
     }
     Serial.println("[CMD] sendSongData done");
+}
+
+static void sendSongData(uint8_t page, uint8_t index) {
+    char files[SRV_MAX_FILES][SRV_FNAME_MAX];
+    int total = srvListSongs(files, SRV_MAX_FILES);
+
+    int fileIdx = (int)page * SL_PER_PKT + (int)index;
+    if (fileIdx < 0 || fileIdx >= total) return;
+
+    char path[48];
+    snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, files[fileIdx]);
+    sendSongDataFromPath(path, files[fileIdx]);
+}
+
+static void sendSongDataByName(const char* name) {
+    char path[48];
+    snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, name);
+    char display[SRV_FNAME_MAX];
+    snprintf(display, sizeof(display), "%s.mgt", name);
+    sendSongDataFromPath(path, display);
 }
 
 // ── Apply a generic song memory patch to the active song buffer ───────────────
@@ -752,6 +765,10 @@ void commandsTick() {
         }
     }
 
+    if (srvLoadByNamePending) {
+        srvLoadByNamePending = false;
+        sendSongDataByName(srvLoadByNameStr);
+    }
     if (srvLoadPending) {
         srvLoadPending = false;
         int fileIdx = (int)srvLoadPendingPage * SL_PER_PKT + (int)srvLoadPendingIdx;
@@ -812,6 +829,12 @@ void commandsTick() {
         srvRestoreFinaliseNeeded = false;
         finaliseRestore();
     }
+    // Process list request AFTER finalize/delete so a save-then-list or
+    // delete-then-list sequence returns the up-to-date directory.
+    if (srvListPending) {
+        srvListPending = false;
+        sendSongList(srvListPendingPage);
+    }
 }
 
 // ── Dispatch incoming commands ─────────────────────────────────────────────────
@@ -820,7 +843,10 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
 
         case MSG_SONG_LIST_REQ:
             if (len < (int)sizeof(MsgSongListReq)) return;
-            sendSongList(((const MsgSongListReq*)data)->page);
+            // Deferred to main loop — runs after any pending save finalize so
+            // a save-then-list sequence returns the file the user just saved.
+            srvListPendingPage = ((const MsgSongListReq*)data)->page;
+            srvListPending     = true;
             break;
 
         case MSG_SAMPLE_LIST_REQ:
@@ -835,6 +861,16 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 srvLoadPendingPage = req->page;
                 srvLoadPendingIdx  = req->index;
                 srvLoadPending     = true;
+            }
+            break;
+
+        case MSG_SONG_LOAD_NAME:
+            if (len < (int)sizeof(MsgSongLoadNameReq)) return;
+            {
+                const MsgSongLoadNameReq* req = (const MsgSongLoadNameReq*)data;
+                strncpy(srvLoadByNameStr, req->name, sizeof(srvLoadByNameStr) - 1);
+                srvLoadByNameStr[sizeof(srvLoadByNameStr) - 1] = '\0';
+                srvLoadByNamePending = true;
             }
             break;
 
@@ -859,9 +895,6 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                     // fields are empty, but persists attr-only / vel-only rows.
                     grid.set(m->row, m->col, m->note);
                 }
-                // ACK so client can pace bulk sends (e.g. block duplicate)
-                uint8_t ack[2] = { (uint8_t)MSG_CHUNK_ACK, m->row };
-                gComms.send(ack, 2);
             }
             break;
 
@@ -892,9 +925,6 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                     srvSaveFile.write(d->payload, d->dataLen);
                     srvSaveGot++;
                 }
-                // ACK this chunk so the client can send the next one
-                { uint8_t ack[2] = { (uint8_t)MSG_CHUNK_ACK, d->chunk };
-                  gComms.send(ack, 2); }
                 if (srvSaveGot >= srvSaveTotal && srvSaveTotal > 0) {
                     srvSaveFile.close();
                     srvFinaliseNeeded = true;
@@ -1054,9 +1084,6 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                     srvRestoreFile.write(d->payload, d->dataLen);
                     srvRestoreGot++;
                 }
-                // ACK this chunk
-                { uint8_t ack[2] = { (uint8_t)MSG_CHUNK_ACK, d->chunk };
-                  gComms.send(ack, 2); }
                 if (srvRestoreGot >= srvRestoreTotal && srvRestoreTotal > 0) {
                     srvRestoreFile.close();
                     srvRestoreFinaliseNeeded = true;

@@ -5,6 +5,7 @@
 #include <string.h>
 
 static inline bool isSfx(uint8_t ch) { return ch == SFX_CHANNEL; }
+static inline bool isPxl(uint8_t ch) { return ch == PIXELPOST_CHANNEL; }
 
 // Strip ".wav" suffix and truncate to fit the column NAME field.
 static void copySampleNameToCol(const char* fname, char* nameField) {
@@ -101,14 +102,16 @@ void ColumnEditor::fieldValue(int field, char* out) const {
             else if (c.midiChannel == PIXELPOST_CHANNEL) strcpy(out, "PXL");
             else                                         snprintf(out, 16, "%d", c.midiChannel);
             break;
-        case 1:  // BANK — meaningless on SFX
-            if (isSfx(c.midiChannel)) strcpy(out, "--");
-            else                      snprintf(out, 16, "%d", c.bankMSB + 1);
+        case 1:  // BANK — meaningless on SFX and PXL
+            if (isSfx(c.midiChannel) || isPxl(c.midiChannel)) strcpy(out, "--");
+            else                                              snprintf(out, 16, "%d", c.bankMSB + 1);
             break;
-        case 2:  // PROGRAM — on SFX shows sample id (0 = none)
+        case 2:  // PROGRAM — on SFX shows sample id (0 = none); PXL has none
             if (isSfx(c.midiChannel)) {
                 if (c.program == 0) strcpy(out, "--");
                 else                snprintf(out, 16, "%d", c.program);
+            } else if (isPxl(c.midiChannel)) {
+                strcpy(out, "--");
             } else {
                 snprintf(out, 16, "%d", c.program + 1);
             }
@@ -131,8 +134,10 @@ void ColumnEditor::drawFieldRow(int field) {
     fieldValue(field, value);
 
     bool sfx = isSfx(_song.columns[_col].midiChannel);
-    // BANK is meaningless on SFX channel — render greyed and disable +/-.
-    bool disabled = sfx && field == 1;
+    bool pxl = isPxl(_song.columns[_col].midiChannel);
+    // BANK is meaningless on SFX and PXL; PROGRAM is meaningless on PXL.
+    // Render greyed and disable +/-.
+    bool disabled = (sfx && field == 1) || (pxl && (field == 1 || field == 2));
     uint16_t fg = disabled ? COL_DKGREY : COL_BLACK;
 
     _d.setTextSize(3);
@@ -157,7 +162,8 @@ void ColumnEditor::drawFieldRow(int field) {
             uiButton(_d, CE_MINUS_X, btnY, CE_BTN_W, CE_BTN_H, "-", COL_WHITE, COL_BLACK, 3);
             uiButton(_d, CE_PLUS_X,  btnY, CE_BTN_W, CE_BTN_H, "+", COL_WHITE, COL_BLACK, 3);
         }
-    } else {
+    } else if (!pxl) {
+        // PXL has no instrument/sample picker — name is fixed to "PIXEL POST".
         const char* pickLabel = sfx ? "PICK SAMPLE" : "PICK INSTR";
         uiButton(_d, CE_PICK_X, btnY, CE_PICK_W, CE_BTN_H,
                  pickLabel, COL_WHITE, COL_BLACK, 2);
@@ -539,22 +545,30 @@ void ColumnEditor::adjustField(int field, int delta) {
             int v = (int)c.midiChannel + delta;
             if (v < 0) v = 0;
             if (v > PIXELPOST_CHANNEL) v = PIXELPOST_CHANNEL;
-            bool entered = (v == SFX_CHANNEL && c.midiChannel != SFX_CHANNEL);
+            bool enteredSfx = (v == SFX_CHANNEL       && c.midiChannel != SFX_CHANNEL);
+            bool enteredPxl = (v == PIXELPOST_CHANNEL && c.midiChannel != PIXELPOST_CHANNEL);
             c.midiChannel = (uint8_t)v;
             // First entry into SFX — start fetching the sample list so the
             // picker has something to show.
-            if (entered && gServerPairing.isPaired()) {
+            if (enteredSfx && gServerPairing.isPaired()) {
                 gServerPairing.requestSampleList();
+            }
+            // First entry into PXL — fix the column name to "PIXEL POST".
+            // PXL columns have no per-column picker; the name is the label.
+            if (enteredPxl) {
+                strncpy(c.name, "PIXEL POST", INSTRUMENT_NAME_LEN - 1);
+                c.name[INSTRUMENT_NAME_LEN - 1] = '\0';
             }
             break;
         }
-        case 1: {  // BANK — locked on SFX
-            if (isSfx(c.midiChannel)) return;
+        case 1: {  // BANK — locked on SFX and PXL
+            if (isSfx(c.midiChannel) || isPxl(c.midiChannel)) return;
             int v = (int)c.bankMSB + delta;
             c.bankMSB = (uint8_t)constrain(v, 0, (int)gMaxBank);
             break;
         }
-        case 2: {  // PROGRAM
+        case 2: {  // PROGRAM — locked on PXL
+            if (isPxl(c.midiChannel)) return;
             if (isSfx(c.midiChannel)) {
                 // Walk through the cached sample list by index.  PROG holds
                 // the manifest id; PROG=0 = "no sample".  Map current id to
@@ -844,7 +858,8 @@ bool ColumnEditor::poll() {
         if (falling) {
             bool wasOnName = _pressedOnName;
             _pressedOnName = false;
-            if (wasOnName && inName) {
+            // PXL columns have a fixed name ("PIXEL POST") — no keyboard.
+            if (wasOnName && inName && !isPxl(cs().midiChannel)) {
                 _keyboard.open(cs().name, INSTRUMENT_NAME_LEN);
                 _naming = true;
                 _d.fillScreen(COL_WHITE);
@@ -864,8 +879,10 @@ bool ColumnEditor::poll() {
         int btnY = ry + (CE_ROW_H - CE_BTN_H) / 2;
 
         if (f == 5) break;  // NAME handled above on falling edge
-        // Suppress +/- for BANK when on SFX (row is drawn disabled).
-        if (f == 1 && isSfx(cs().midiChannel)) break;
+        // Suppress +/- on disabled rows: BANK is locked on SFX and PXL,
+        // PROGRAM is locked on PXL.
+        if (f == 1 && (isSfx(cs().midiChannel) || isPxl(cs().midiChannel))) break;
+        if (f == 2 && isPxl(cs().midiChannel)) break;
         // −/+ buttons (fields 0-4)
         int sign = 0;
         if (tx >= CE_MINUS_X && tx < CE_MINUS_X + CE_BTN_W)     sign = -1;
@@ -889,8 +906,9 @@ bool ColumnEditor::poll() {
         return false;
     }
 
-    // PICK INSTRUMENT / SAMPLE button
-    if (ty >= CE_PICK_Y && ty < CE_PICK_Y + CE_PICK_H) {
+    // PICK INSTRUMENT / SAMPLE button — no picker on PXL.
+    if (!isPxl(cs().midiChannel) &&
+        ty >= CE_PICK_Y && ty < CE_PICK_Y + CE_PICK_H) {
         if (tx >= CE_PICK_X && tx < CE_PICK_X + CE_PICK_W) {
             _pickPage = 0;
             if (isSfx(cs().midiChannel)) {

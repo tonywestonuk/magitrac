@@ -18,13 +18,12 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <arduinoFFT.h>
+#include <pixelpost_proto.h>
 
 #define PDM_CLK_PIN     22     // Grove Port A — G22 → PDM clock (out, ~2 MHz)
 #define PDM_DATA_PIN    21     // Grove Port A — G21 → PDM data  (in from mic)
 #define SAMPLE_RATE     32000
 #define SAMPLES_PER_READ 2048
-
-#define PIXELPOST_MSG_SPECTRUM 207
 
 extern void pixelpostEnqueue(const uint8_t* payload, size_t len);
 
@@ -110,8 +109,48 @@ static void spectrumTask(void*) {
         FFT.compute(FFTDirection::Forward);
         FFT.complexToMagnitude();
 
+        // ── Beat detection (Patin-style energy threshold on bass band) ───
+        // Raw 50–200 Hz magnitude — captures kick fundamental + 1st harmonic
+        // without hi-hat noise.  Computed pre-AGC so peaks aren't compressed
+        // away.  Rolling 32-frame history (~2 s at the 15.6 Hz frame rate).
+        // Threshold = 1.4× rolling mean, refractory = 200 ms (300 BPM ceiling).
+        // Counting beats mod 4 happens on the pixel_post side.
+        static float    sBeatHistory[32] = {0};
+        static int      sBeatHistIdx  = 0;
+        static bool     sBeatHistFull = false;
+        static uint32_t sLastBeatMs   = 0;
+
+        float bassMag = bandMagnitude(50.0f, 200.0f);
+
+        int histN = sBeatHistFull ? 32 : sBeatHistIdx;
+        float histSum = 0.0f;
+        for (int i = 0; i < histN; i++) histSum += sBeatHistory[i];
+        float histMean = histN > 0 ? histSum / (float)histN : 0.0f;
+
+        uint32_t nowMs = millis();
+        const float    BEAT_THRESHOLD = 1.4f;
+        const uint32_t BEAT_REFRACTORY_MS = 200;
+        const float    BEAT_SQUELCH = 0.0008f;  // silence shouldn't trigger
+
+        if (histMean > BEAT_SQUELCH &&
+            bassMag > histMean * BEAT_THRESHOLD &&
+            nowMs - sLastBeatMs > BEAT_REFRACTORY_MS) {
+            sLastBeatMs = nowMs;
+            // Strength = how many × over the mean, scaled to 0–255.
+            // 1.4× → 51, 3× → 256 (clamped).
+            int strength = (int)((bassMag / histMean - 1.0f) * 128.0f);
+            if (strength < 32)  strength = 32;
+            if (strength > 255) strength = 255;
+            uint8_t beatMsg[2] = { PP_MSG_BEAT, (uint8_t)strength };
+            pixelpostEnqueue(beatMsg, sizeof(beatMsg));
+        }
+
+        sBeatHistory[sBeatHistIdx] = bassMag;
+        sBeatHistIdx = (sBeatHistIdx + 1) % 32;
+        if (sBeatHistIdx == 0) sBeatHistFull = true;
+
         uint8_t msg[6];
-        msg[0] = PIXELPOST_MSG_SPECTRUM;
+        msg[0] = PP_MSG_SPECTRUM;
         const float startFreq = 130.0f;
         for (int i = 0; i < 5; i++) {
             float lowFreq  = startFreq * powf(2.0f, (float)i);

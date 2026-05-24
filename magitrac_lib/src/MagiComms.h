@@ -1,4 +1,8 @@
-// MagiComms.h — Transport abstraction + reliability layer
+// MagiComms.h — Transport abstraction
+//
+// Reliability is provided by the ESP-NOW link-layer ACK (the transport's
+// sendRaw() blocks until the per-frame ACK callback fires).  No app-level
+// ACK, no retries, no per-frame crypto.
 #pragma once
 #include <Arduino.h>
 #include <stdint.h>
@@ -18,7 +22,9 @@ using MagiBroadcastSpyCb = void (*)(const uint8_t* data, int len);
 // ── MagiCommsTransport — abstract raw wire layer ─────────────────────────────
 //
 // Subclasses implement the actual transport (ESP-NOW, UART, etc.).
-// No reliability logic here — just raw send/receive.
+// sendRaw() / sendBroadcast() block the caller until the underlying
+// transport has finished the send (for ESP-NOW: until the link-layer
+// ACK callback fires).
 
 class MagiCommsTransport {
 public:
@@ -27,13 +33,18 @@ public:
     // Initialize transport hardware (WiFi + ESP-NOW, UART pins, etc.)
     virtual bool begin() = 0;
 
-    // Send raw bytes to the connected peer.
+    // Send raw bytes to the connected peer.  Blocks until the link-layer
+    // ACK callback fires (or a short timeout).  Returns true if the frame
+    // was acknowledged by the peer.
     virtual bool sendRaw(const void* data, size_t len) = 0;
 
-    // Broadcast to all (pairing discovery). Returns false if unsupported.
+    // Broadcast to all (pairing discovery).  Broadcasts have no real ACK —
+    // returns true if the send was queued OK.
     virtual bool sendBroadcast(const void* data, size_t len) = 0;
 
     // Peer management — opaque address (MAC for ESP-NOW, ignored for UART).
+    // encryptKey is accepted for source-compat but ignored by the ESP-NOW
+    // backend (link-layer encryption is disabled).
     virtual bool addPeer(const uint8_t* peerAddr, const uint8_t* encryptKey = nullptr) = 0;
     virtual void removePeer(const uint8_t* peerAddr) = 0;
     virtual bool hasPeer() const = 0;
@@ -67,15 +78,11 @@ protected:
     MagiBroadcastSpyCb _spyCb  = nullptr;
 };
 
-// ── MagiComms — concrete reliability + session layer ─────────────────────────
+// ── MagiComms — application-facing wrapper ───────────────────────────────────
 //
-// Wraps a MagiCommsTransport and adds:
-//   - sendReliable() with ACK/retry
-//   - Transparent MSG_CHUNK_ACK interception
-//   - Delegates everything else to the transport
-//
-// One global instance per device.  Singleton back-pointer used for the
-// static receive callback that the transport requires.
+// With link-layer ACK doing the reliability work, this is mostly a thin
+// pass-through to the transport.  Its only job beyond pass-through is to
+// route the receive callback through a singleton back to the app.
 
 class MagiComms {
 public:
@@ -85,20 +92,24 @@ public:
     void begin();
 
     // ── Send ──────────────────────────────────────────────────────────
-    // Fire-and-forget to connected peer.
+    // Blocks until the ESP-NOW link-layer ACK fires.  Returns true if the
+    // peer ACKed the frame.
     bool send(const void* data, size_t len);
 
-    // Reliable: sends, waits for MSG_CHUNK_ACK with matching tag, retries.
-    // Blocks until ACK or maxRetries exhausted. Returns true if ACKed.
+    // Same as send() — kept for source compatibility with the previous
+    // sendReliable()/sendRaw() split.  The tag/timeout/maxRetries params
+    // are ignored; reliability is the link-layer ACK only.  Callers that
+    // need to react to a failed send should check the return value.
     bool sendReliable(const void* data, size_t len,
                       uint8_t tag = 0,
-                      uint32_t timeoutMs = 200,
-                      int maxRetries = 10);
+                      uint32_t timeoutMs = 0,
+                      int maxRetries = 0);
 
     // Broadcast (pairing discovery).
     bool sendBroadcast(const void* data, size_t len);
 
     // ── Peer management (delegates to transport) ──────────────────────
+    // lmk param accepted for source-compat; ignored — no link encryption.
     bool addPeer(const uint8_t* addr, const uint8_t* lmk = nullptr);
     void removePeer(const uint8_t* addr);
     bool hasPeer() const;
@@ -106,24 +117,15 @@ public:
     const uint8_t* lastSenderAddr() const;
 
     // ── Receive ───────────────────────────────────────────────────────
-    // Application callback — receives all messages except MSG_CHUNK_ACK
-    // (which is consumed internally by the reliability layer).
     using AppRecvCb = void (*)(const uint8_t* data, int len);
     void setOnReceive(AppRecvCb cb) { _appRecvCb = cb; }
 
     // Maximum single-message payload
     size_t maxPayload() const { return _transport.maxPayload(); }
 
-    // ── Internal (public for static callback access) ──────────────────
-    void _handleAck(uint8_t tag);
-
 private:
     MagiCommsTransport& _transport;
     AppRecvCb           _appRecvCb = nullptr;
-
-    // ACK tracking for sendReliable()
-    volatile bool    _ackReceived = false;
-    volatile uint8_t _ackTag      = 0;
 
     // Singleton for static callback routing
     static MagiComms* _instance;
@@ -144,6 +146,12 @@ inline void MagiComms::begin() {
 }
 
 inline bool MagiComms::send(const void* data, size_t len) {
+    return _transport.sendRaw(data, len);
+}
+
+inline bool MagiComms::sendReliable(const void* data, size_t len,
+                                     uint8_t /*tag*/, uint32_t /*timeoutMs*/,
+                                     int /*maxRetries*/) {
     return _transport.sendRaw(data, len);
 }
 
@@ -171,42 +179,13 @@ inline const uint8_t* MagiComms::lastSenderAddr() const {
     return _transport.lastSenderAddr();
 }
 
-inline void MagiComms::_handleAck(uint8_t tag) {
-    _ackTag      = tag;
-    _ackReceived = true;
-}
-
 inline void MagiComms::_onTransportRecv(const uint8_t* data, int len) {
     if (!_instance) return;
-    // Intercept MSG_CHUNK_ACK (0x27) — consume it for the reliability layer
-    if (len >= 2 && data[0] == 0x27) {
-        _instance->_handleAck(data[1]);
-        return;
-    }
     if (_instance->_appRecvCb) _instance->_appRecvCb(data, len);
-}
-
-inline bool MagiComms::sendReliable(const void* data, size_t len,
-                                     uint8_t tag, uint32_t timeoutMs,
-                                     int maxRetries) {
-    _ackReceived = false;
-    _transport.sendRaw(data, len);
-    int retries = 0;
-    uint32_t t0 = millis();
-    while (!_ackReceived || _ackTag != tag) {
-        delay(1);
-        if (millis() - t0 > timeoutMs) {
-            if (++retries >= maxRetries) return false;
-            _transport.sendRaw(data, len);
-            t0 = millis();
-        }
-    }
-    return true;
 }
 
 // Static member definition — must appear in exactly one translation unit.
 // For Arduino .ino projects (single TU) the inline here is fine.
-// For .cpp projects, define MAGICOMMS_IMPL in one .cpp before including.
 #ifndef MAGICOMMS_NO_STATIC_DEF
 inline MagiComms* MagiComms::_instance = nullptr;
 #endif

@@ -281,8 +281,10 @@ static void seqPlayRow() {
             if (cs.midiChannel == PIXELPOST_CHANNEL) {
                 // PIXELPOST: a real note means "finger down at this XY with
                 // this slider value, on this effect".  Effect index = note - 1
-                // (so C-0 = 0, C#0 = 1, ...).  SELECT_EFFECT is deduped per
-                // column — only sent when the effect index changes.
+                // (so C-0 = 0, C#0 = 1, ...).  SELECT_EFFECT is always sent
+                // (no per-column dedup) — after a song load the posts must
+                // pick up the new song's effect even if it matches the last
+                // one sent from the previous song.
                 // Skip non-pitched notes (NOTE_ANY etc.); they have no
                 // sensible effect mapping.
                 if (nn.note < 1 || nn.note > NOTE_MAX) continue;
@@ -291,10 +293,8 @@ static void seqPlayRow() {
                 extern void pixelpostSendMove(uint8_t x, uint8_t y, bool pressed);
                 seqPpPressed[col] = true;
                 uint8_t effectIdx = (uint8_t)(nn.note - 1);
-                if (effectIdx != seqPpLastEffect[col]) {
-                    pixelpostSendSelectEffect(effectIdx);
-                    seqPpLastEffect[col] = effectIdx;
-                }
+                pixelpostSendSelectEffect(effectIdx);
+                seqPpLastEffect[col] = effectIdx;
                 uint8_t vel = (nn.velocity & 0x80) ? 100 : nn.velocity;
                 uint8_t slider = (vel <= 127) ? (uint8_t)(vel * 2) : 255;
                 pixelpostSendSlider(slider, /*pressed=*/true);

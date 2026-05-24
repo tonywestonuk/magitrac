@@ -18,23 +18,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
+#include <pixelpost_proto.h>
 #include "mic_spectrum.h"
-
-// Shared 32-byte HMAC key — must match pixel_post's eFuse HMAC_KEY4.
-// Copied verbatim from pixel_post_controller.ino.
-static const uint8_t PIXELPOST_HMAC_KEY[32] = {
-    0x0a, 0x8d, 0x29, 0x33, 0xb0, 0x89, 0x36, 0x30,
-    0xf4, 0xfc, 0xe9, 0x5c, 0x29, 0xed, 0xc0, 0xf9,
-    0xd5, 0xd8, 0x0e, 0x6e, 0xca, 0xe0, 0x10, 0x3d,
-    0xeb, 0x20, 0x6b, 0xb6, 0xa6, 0x08, 0x60, 0x1e
-};
-
-// Pixel_post message types we send.  Values match pixel_post.ino.
-#define PIXELPOST_MSG_TAPPED         201
-#define PIXELPOST_MSG_SELECT_EFFECT  202
-#define PIXELPOST_MSG_MOVE           203
-#define PIXELPOST_MSG_SLIDER         204
-#define PIXELPOST_MSG_MAGITRAC       208
 
 // ── Queue + worker ──────────────────────────────────────────────────────────
 
@@ -131,8 +116,8 @@ static void pixelpostHandleRecv(const uint8_t* frame, size_t frameLen) {
     // last set the effect.  Payload is at offset 36 onward.
     size_t payloadLen = frameLen - 36;
     const uint8_t* payload = frame + 36;
-    if (payloadLen >= 2 && payload[0] == PIXELPOST_MSG_SELECT_EFFECT) {
-        spectrumSetActive(payload[1] == 13);
+    if (payloadLen >= 2 && payload[0] == PP_MSG_SELECT_EFFECT) {
+        spectrumSetActive(pixelPostEffectNeedsMic(payload[1]));
     }
 }
 
@@ -199,29 +184,28 @@ void pixelpostEnqueue(const uint8_t* payload, size_t len) {
 // ── Public message helpers (all go through the queue) ───────────────────────
 
 void pixelpostSendPairingBeacon() {
-    uint8_t msg = PIXELPOST_MSG_MAGITRAC;
+    uint8_t msg = PP_MSG_MAGITRAC;
     pixelpostEnqueue(&msg, 1);
 }
 
 void pixelpostSendSelectEffect(uint8_t idx) {
-    uint8_t msg[2] = { PIXELPOST_MSG_SELECT_EFFECT, idx };
+    uint8_t msg[2] = { PP_MSG_SELECT_EFFECT, idx };
     pixelpostEnqueue(msg, sizeof(msg));
-    // Effect 13 = SoundSpectrum.  Magitrac just told the posts to switch —
-    // gate the mic to match.  Any other effect turns the mic off.
-    spectrumSetActive(idx == 13);
+    // Mic gating follows the selected effect — see pixelPostEffectNeedsMic().
+    spectrumSetActive(pixelPostEffectNeedsMic(idx));
 }
 
 void pixelpostSendTapped() {
-    uint8_t msg = PIXELPOST_MSG_TAPPED;
+    uint8_t msg = PP_MSG_TAPPED;
     pixelpostEnqueue(&msg, 1);
 }
 
 void pixelpostSendSlider(uint8_t value, bool pressed) {
-    uint8_t msg[3] = { PIXELPOST_MSG_SLIDER, value, (uint8_t)(pressed ? 1 : 0) };
+    uint8_t msg[3] = { PP_MSG_SLIDER, value, (uint8_t)(pressed ? 1 : 0) };
     pixelpostEnqueue(msg, sizeof(msg));
 }
 
 void pixelpostSendMove(uint8_t x, uint8_t y, bool pressed) {
-    uint8_t msg[4] = { PIXELPOST_MSG_MOVE, x, y, (uint8_t)(pressed ? 1 : 0) };
+    uint8_t msg[4] = { PP_MSG_MOVE, x, y, (uint8_t)(pressed ? 1 : 0) };
     pixelpostEnqueue(msg, sizeof(msg));
 }

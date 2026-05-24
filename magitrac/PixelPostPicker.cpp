@@ -1,31 +1,14 @@
 #include "PixelPostPicker.h"
+#include <pixelpost_proto.h>
 #include <string.h>
 #include <stdio.h>
 
-// Effect labels — verbatim from pixel_post_controller.ino drawPageStrings.
-// Layout matches the controller: row-major, 2-wide × 3-tall per page, so the
-// table reads left-to-right top-to-bottom for each page.  "--" = empty slot
-// (still tappable; sends the effect_idx anyway — pixel_post will just ignore
-// unknown indices).  Expand as you add effects on the pixel_post side.
-static const char* PIXEL_EFFECTS[PPK_NUM_PAGES][6] = {
-    // page 0
-    { "BLOCK-1", "SINE WAVE",
-      "BLOCK-2", "FIRE",
-      "POW!",    "COLOR WHEEL" },
-    // page 1
-    { "Rainbow", "Sparkle",
-      "Strobe",  "Meteor",
-      "Springs", "Circles 1" },
-    // page 2
-    { "Chaser-1",       "Sound Spectrum",
-      "Blood",          "Firmware Update",
-      "--",             "--" },
-    // page 3..6 — empty for now
-    { "--","--","--","--","--","--" },
-    { "--","--","--","--","--","--" },
-    { "--","--","--","--","--","--" },
-    { "--","--","--","--","--","--" }
-};
+// Effect labels are pulled from the shared pixelpost_proto catalogue per
+// page/slot — single source of truth shared with pixel_post,
+// pixel_post_controller, and magitrac_server.  Layout: row-major,
+// 2-wide × 3-tall per page; effect_idx = page * 6 + slot.  Slots that
+// don't map to a catalogue entry render as "--" (still tappable; the
+// pixel_post just ignores unknown indices).
 
 // Effect grid x/y per button index 0..5 (row-major)
 static int effectButtonX(int idx) { return (idx & 1) ? PPK_BTN_COL2_X : PPK_BTN_COL1_X; }
@@ -90,7 +73,9 @@ void PixelPostPicker::drawEffectButtons() {
         int y = effectButtonY(i);
         _d.fillRect(x, y, PPK_BTN_W, PPK_BTN_H, COL_WHITE);
         _d.drawRect(x, y, PPK_BTN_W, PPK_BTN_H, COL_BLACK);
-        drawWrappedLabel(PIXEL_EFFECTS[_page][i], x + PPK_BTN_W / 2, y + PPK_BTN_H / 2);
+        uint8_t effectIdx = (uint8_t)((int)_page * 6 + i);
+        drawWrappedLabel(pixelPostEffectName(effectIdx),
+                         x + PPK_BTN_W / 2, y + PPK_BTN_H / 2);
     }
 }
 
