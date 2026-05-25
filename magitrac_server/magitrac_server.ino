@@ -576,6 +576,33 @@ void setup() {
         },
         nullptr);
 
+    // ── Playback controls (Phase 1 #3) ─────────────────────────────────────
+    // All client→server fire-and-forget.  Worker task dispatches to
+    // handleCommand which routes to the appropriate sequencer call.
+    // Safe to run on the worker task — none of these touch SD.
+    extern void handleCommand(MagiMsgType type, const uint8_t* data, int len);
+    auto controlCb = [](const uint8_t* msg, size_t len, void* /*ctx*/) {
+        handleCommand((MagiMsgType)msg[0], msg, (int)len);
+    };
+    gMagiLink.registerCallback(MSG_PLAY,       controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_STOP,       controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_PAUSE,      controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_UNPAUSE,    controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SEEK,       controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_GOTO,       controlCb, nullptr);
+
+    // ── MSG_DISCONNECT (Phase 1 #2) ────────────────────────────────────────
+    // Either side may send.  Server-side: tear down the session.  No ACK
+    // needed — fire-and-forget.  TCP socket stays up; re-establishment
+    // requires the link to drop (which sets the session task's wasConnected
+    // back to false).
+    gMagiLink.registerCallback(MSG_DISCONNECT,
+        [](const uint8_t* /*msg*/, size_t /*len*/, void* /*ctx*/) {
+            Serial.println("[LINK] MSG_DISCONNECT from client");
+            pairingOnMagiLinkDisconnected();
+        },
+        nullptr);
+
     // ── MagiLink session task ─────────────────────────────────────────────
     // Polls gMagiLink.isConnected() and drives the SERVER_STANDALONE ↔
     // SERVER_CONNECTED transition.  On rising edge: does the synchronous

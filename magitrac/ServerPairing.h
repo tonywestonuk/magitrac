@@ -199,6 +199,8 @@ public:
     // (worker task, mutex held).  Sends MsgConnectAck and transitions
     // _pairState to SUCCESS.
     void _onMagiLinkConnect();
+    // MagiLink: server sent MSG_DISCONNECT.  Transition out of SUCCESS.
+    void _onMagiLinkDisconnect();
     static void _onSongBlobStreamTrampoline(size_t n, void* ctx) {
         static_cast<ServerPairing*>(ctx)->_onSongBlobStream(n);
     }
