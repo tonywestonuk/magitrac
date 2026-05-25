@@ -155,10 +155,6 @@ static uint8_t srvListPendingPage   = 0;
 static bool    srvBackupFilePending = false;
 static bool     srvTcpTestRunning    = false;   // set by MSG_TCP_TEST_START, cleared by MSG_TCP_TEST_STOP
 static uint8_t  srvTcpTestPattern    = 0;       // incrementing-u8 pattern, persists across blobs
-
-// New struct-driven backup (v2): set by registered MSG_START_BACKUP
-// handler.  Main loop fires sendBackupV2() to stream the whole backup.
-static bool     srvBackupV2Pending   = false;
 static char    srvBackupFileName[SRV_FNAME_MAX] = {};
 static bool    srvBackupListPending = false;
 
@@ -182,17 +178,6 @@ void commandsInit() {
         saveInstrumentsToSD();  // write defaults so future boots load them
         Serial.println("[CMD] instruments: created defaults");
     }
-
-    // New struct-driven backup transport (v2): register a permanent
-    // handler for MSG_START_BACKUP.  Deferred to the main-loop tick so
-    // the reader task isn't blocked by SD enumeration + streaming.
-    extern MagiCommsTcp gTransportTcp;
-    gTransportTcp.registerMessageCallback(
-        MSG_START_BACKUP,
-        [](const uint8_t*, size_t, void*) {
-            srvBackupV2Pending = true;
-        },
-        nullptr);
 }
 
 // ── List .mgt files in /songs ──────────────────────────────────────────────────
@@ -706,166 +691,6 @@ static void sendBackupFileRaw(const char* name) {
                   name, fileSize, sendOk ? "OK" : "FAIL");
 }
 
-// ── New struct-driven backup transport (v2) ─────────────────────────────────
-//
-// Streams the whole backup as one atomic transaction (writeMutex held for
-// the duration via keepMutex=true).  No per-file request/response — server
-// just iterates the songs directory + instruments file and emits:
-//
-//   [MsgBackupHeader] [MsgBackupBody]×N    ← one file
-//   [MsgBackupHeader] [MsgBackupBody]×N    ← next file
-//   ...
-//   [MsgEndOfData]                          ← stream complete
-//
-// REPRO_SKIP_SERVER_SD_READ skips SD entirely — sends 4 fake files of
-// 4096 bytes each so we can isolate the wire path from SD work.
-static void sendBackupV2() {
-    extern MagiCommsTcp gTransportTcp;
-
-#if REPRO_SKIP_SERVER_SD_READ
-    static const uint16_t FAKE_COUNT     = 4;
-    static const uint32_t FAKE_FILE_SIZE = 4096;
-    Serial.printf("[CMD] backupV2 START (REPRO: %u fake files of %u bytes)\n",
-                  FAKE_COUNT, (unsigned)FAKE_FILE_SIZE);
-
-    MsgBackupBody body;
-    body.id     = (uint8_t)MSG_BACKUP_BODY;
-    body.length = sizeof(body);
-    uint8_t patt = 0;
-
-    bool ok = true;
-    for (uint16_t i = 1; i <= FAKE_COUNT && ok; i++) {
-        MsgBackupHeader hdr;
-        hdr.id         = (uint8_t)MSG_BACKUP_HEADER;
-        hdr.length     = sizeof(hdr);
-        memset(hdr.filename, 0, sizeof(hdr.filename));
-        snprintf(hdr.filename, sizeof(hdr.filename), "FAKE%u.mgt", i);
-        hdr.file_size  = FAKE_FILE_SIZE;
-        hdr.file_index = i;
-        hdr.file_total = FAKE_COUNT;
-        ok = gTransportTcp.send(&hdr, sizeof(hdr));
-
-        uint32_t sent = 0;
-        while (ok && sent < FAKE_FILE_SIZE) {
-            uint32_t chunk = FAKE_FILE_SIZE - sent;
-            if (chunk > sizeof(body.data)) chunk = sizeof(body.data);
-            body.data_len = (uint16_t)chunk;
-            for (uint32_t k = 0; k < chunk; ++k) body.data[k] = patt++;
-            ok = gTransportTcp.send(&body, sizeof(body));
-            sent += chunk;
-        }
-    }
-
-    MsgEndOfData eod;
-    eod.id     = (uint8_t)MSG_END_OF_DATA;
-    eod.length = sizeof(eod);
-    // Final send releases the mutex.
-    gTransportTcp.send(&eod, sizeof(eod));
-    gTransportTcp.releaseMutex();
-
-    Serial.printf("[CMD] backupV2 DONE (ok=%d)\n", ok ? 1 : 0);
-#else
-    // Real SD path — enumerate /songs + instruments.mgt, stream each.
-    if (!srvSdOk) {
-        Serial.println("[CMD] backupV2: SD not available");
-        // Still need to send END_OF_DATA so client doesn't hang.
-        MsgEndOfData eod = { (uint8_t)MSG_END_OF_DATA, sizeof(eod) };
-        gTransportTcp.send(&eod, sizeof(eod),
-                           nullptr, nullptr, /*keepMutex=*/false);
-        return;
-    }
-
-    // Build file list under SdLock — keep the lock window short.
-    char     names[SRV_MAX_FILES][SRV_FNAME_MAX];
-    uint32_t sizes[SRV_MAX_FILES];
-    uint16_t fileCount = 0;
-    {
-        SdLock _;
-        File d = SD.open(SRV_SONGS_DIR);
-        if (d && d.isDirectory()) {
-            while (fileCount < SRV_MAX_FILES) {
-                File entry = d.openNextFile();
-                if (!entry) break;
-                if (!entry.isDirectory()) {
-                    const char* nm = entry.name();
-                    if (nm && strstr(nm, ".mgt")) {
-                        strncpy(names[fileCount], nm, SRV_FNAME_MAX - 1);
-                        names[fileCount][SRV_FNAME_MAX - 1] = '\0';
-                        sizes[fileCount] = (uint32_t)entry.size();
-                        fileCount++;
-                    }
-                }
-                entry.close();
-            }
-            d.close();
-        }
-        // Add instruments.mgt as the final file.
-        if (fileCount < SRV_MAX_FILES && SD.exists(SRV_INSTRUMENTS_PATH)) {
-            File ins = SD.open(SRV_INSTRUMENTS_PATH);
-            if (ins) {
-                strncpy(names[fileCount], "instruments.mgt", SRV_FNAME_MAX - 1);
-                names[fileCount][SRV_FNAME_MAX - 1] = '\0';
-                sizes[fileCount] = (uint32_t)ins.size();
-                fileCount++;
-                ins.close();
-            }
-        }
-    }
-
-    Serial.printf("[CMD] backupV2 START (%u files)\n", (unsigned)fileCount);
-
-    MsgBackupBody body;
-    body.id     = (uint8_t)MSG_BACKUP_BODY;
-    body.length = sizeof(body);
-
-    bool ok = true;
-    for (uint16_t i = 0; i < fileCount && ok; i++) {
-        MsgBackupHeader hdr;
-        hdr.id         = (uint8_t)MSG_BACKUP_HEADER;
-        hdr.length     = sizeof(hdr);
-        memset(hdr.filename, 0, sizeof(hdr.filename));
-        strncpy(hdr.filename, names[i], sizeof(hdr.filename) - 1);
-        hdr.file_size  = sizes[i];
-        hdr.file_index = (uint16_t)(i + 1);
-        hdr.file_total = fileCount;
-        ok = gTransportTcp.send(&hdr, sizeof(hdr));
-
-        // Stream the file body in 1024-byte chunks.
-        char path[48];
-        if (strcmp(names[i], "instruments.mgt") == 0) {
-            strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
-        } else {
-            snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, names[i]);
-        }
-        path[sizeof(path) - 1] = '\0';
-
-        File f;
-        { SdLock _; f = SD.open(path); }
-        if (!f) {
-            Serial.printf("[CMD] backupV2: open failed '%s'\n", path);
-            continue;
-        }
-        uint32_t sent = 0;
-        while (ok && sent < sizes[i]) {
-            uint32_t chunk = sizes[i] - sent;
-            if (chunk > sizeof(body.data)) chunk = sizeof(body.data);
-            int got;
-            { SdLock _; got = f.read(body.data, chunk); }
-            if (got <= 0) break;
-            body.data_len = (uint16_t)got;
-            ok = gTransportTcp.send(&body, sizeof(body));
-            sent += got;
-        }
-        { SdLock _; f.close(); }
-    }
-
-    MsgEndOfData eod = { (uint8_t)MSG_END_OF_DATA, sizeof(eod) };
-    gTransportTcp.send(&eod, sizeof(eod));
-    gTransportTcp.releaseMutex();
-
-    Serial.printf("[CMD] backupV2 DONE (ok=%d)\n", ok ? 1 : 0);
-#endif
-}
 
 // ── TCP/IP diagnostic test — sends a 4096-byte incrementing-u8 blob ────────
 //
@@ -1119,13 +944,6 @@ void commandsTick() {
         sendTcpTestBlob();
     }
 
-    // New struct-driven backup (v2): triggered by registered handler
-    // for MSG_START_BACKUP.  Runs as a transaction (mutex held the whole
-    // way) so no other task can interleave a message into the stream.
-    if (srvBackupV2Pending) {
-        srvBackupV2Pending = false;
-        sendBackupV2();
-    }
     if (srvRestoreFinaliseNeeded) {
         srvRestoreFinaliseNeeded = false;
         finaliseRestore();

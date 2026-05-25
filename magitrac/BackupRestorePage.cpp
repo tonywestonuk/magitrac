@@ -1,6 +1,4 @@
 #include "BackupRestorePage.h"
-#include "MagiCommsTcp.h"
-#include "MagiMsg.h"
 #include <SD.h>
 #include <string.h>
 #include <stdio.h>
@@ -107,7 +105,6 @@ void BackupRestorePage::draw() {
         case BRState::MENU:                drawMenu();            break;
         case BRState::BACKUP_WAITING_LIST: drawBackupProgress();  break;
         case BRState::BACKUP_PROGRESS:     drawBackupProgress();  break;
-        case BRState::BACKUP_V2_RUNNING:   drawBackupProgress();  break;
         case BRState::BACKUP_DONE:         drawBackupDone();      break;
         case BRState::FOLDER_LIST:         drawFolderList();      break;
         case BRState::FILE_LIST:           drawFileList();        break;
@@ -307,42 +304,12 @@ void BackupRestorePage::startBackup() {
         draw(); _d.paint();
         return;
     }
-    // New v2 transport.  Client sends one MSG_START_BACKUP and the recv
-    // callback handles the continuous header+body+...+end stream that
-    // follows.  No per-file request/response.
-    _bkFileTotal         = 0;
-    _bkFileCurrent       = 0;
-    _bkCancelled         = false;
-    _bkV2BytesRecvd      = 0;
-    _bkV2CurrentFileSize = 0;
-    _bkV2Done            = false;
-    _state               = BRState::BACKUP_V2_RUNNING;
-
-    // Create the destination folder up front (timestamp from RTC if present).
-    if (_rtc) {
-        I2C_BM8563_TimeTypeDef t; I2C_BM8563_DateTypeDef d;
-        _rtc->getTime(&t); _rtc->getDate(&d);
-        int yr = d.year; if (yr > 2000) yr -= 2000;
-        snprintf(_bkFolder, sizeof(_bkFolder),
-                 "%s/bk_%02d%02d%02d_%02d%02d%02d",
-                 BR_BACKUPS_DIR, yr, d.month, d.date,
-                 t.hours, t.minutes, t.seconds);
-    } else {
-        snprintf(_bkFolder, sizeof(_bkFolder),
-                 "%s/bk_%lu", BR_BACKUPS_DIR, millis());
-    }
-#if !REPRO_SKIP_SD_WRITE
-    if (!SD.exists(BR_BACKUPS_DIR)) SD.mkdir(BR_BACKUPS_DIR);
-    SD.mkdir(_bkFolder);
-#endif
-
-    // Spawn the synchronous backup task.  Procedural send/recv/release
-    // lives in _runBackupTask().  Main loop continues, UI stays responsive;
-    // backupTick() polls _bkV2Done to know when to flip to BACKUP_DONE.
-    xTaskCreate(&BackupRestorePage::_backupTaskTrampoline,
-                "bkV2", 4096, this, 5, nullptr);
-    Serial.println("[BK] backup task spawned");
-
+    _bkFileTotal   = 0;
+    _bkFileCurrent = 0;
+    _bkCancelled   = false;
+    _state = BRState::BACKUP_WAITING_LIST;
+    gServerPairing.resetBackup();
+    gServerPairing.requestBackupFileList(0);
 #if REPRO_SKIP_EPD_PAINT
     Serial.println("[BK][REPRO] skip-paint startBackup");
 #else
@@ -350,103 +317,7 @@ void BackupRestorePage::startBackup() {
 #endif
 }
 
-// ── New v2 transport — synchronous task ────────────────────────────────────
-//
-// Spawned per-backup.  Owns the transaction mutex from the first send()
-// to the closing releaseMutex().  Sets _bkV2Done before exiting; the main
-// loop sees the flag in backupTick() and transitions UI to BACKUP_DONE.
-
-void BackupRestorePage::_backupTaskTrampoline(void* arg) {
-    static_cast<BackupRestorePage*>(arg)->_runBackupTask();
-    vTaskDelete(nullptr);
-}
-
-void BackupRestorePage::_runBackupTask() {
-    extern MagiCommsTcp gTransport;
-
-    // Kick off the backup.
-    MsgStartBackup req = { (uint8_t)MSG_START_BACKUP, sizeof(req) };
-    bool ok = gTransport.send(&req, sizeof(req));
-    Serial.printf("[BK] START_BACKUP send=%s\n", ok ? "OK" : "FAIL");
-    if (!ok) { gTransport.releaseMutex(); _bkV2Done = true; return; }
-
-    // Read the stream: HEADER → N×BODY → HEADER → N×BODY → … → END_OF_DATA.
-    while (true) {
-        const uint8_t* m = gTransport.recv(15000);     // 15 s per-message timeout
-        if (!m) {
-            Serial.println("[BK] recv timeout/disconnect — abandoning");
-            break;
-        }
-
-        uint8_t id = m[0];
-        // IMPORTANT: even if the user has cancelled, we MUST drain every
-        // message the server sends until END_OF_DATA — otherwise the
-        // remaining body bytes stay in the lwIP/recv-queue and the NEXT
-        // transaction reads them as a new message, desyncing the wire.
-        // Cancel just means "skip the SD/state work", not "stop reading".
-        if (id == MSG_BACKUP_HEADER) {
-            const MsgBackupHeader* h = (const MsgBackupHeader*)m;
-            if (!_bkCancelled) {
-                _bkFileCurrent       = h->file_index;
-                _bkFileTotal         = h->file_total;
-                _bkV2CurrentFileSize = h->file_size;
-                _bkV2BytesRecvd      = 0;
-                char nameStr[25] = {};
-                strncpy(nameStr, h->filename, 24);
-                Serial.printf("[BK] V2 header file=%u/%u name='%s' size=%u\n",
-                              (unsigned)h->file_index, (unsigned)h->file_total,
-                              nameStr, (unsigned)h->file_size);
-            }
-        }
-        else if (id == MSG_BACKUP_BODY) {
-            const MsgBackupBody* b = (const MsgBackupBody*)m;
-            uint16_t n = b->data_len;
-            if (n > sizeof(b->data)) n = sizeof(b->data);
-            if (!_bkCancelled) {
-                _bkV2BytesRecvd += n;
-#if REPRO_SKIP_SD_WRITE
-                // discard
-#else
-                // TODO: SD write of (b->data, n) to current file
-#endif
-                if (_bkV2BytesRecvd >= _bkV2CurrentFileSize) {
-                    Serial.printf("[BK] V2 file %u/%u complete (%u bytes)\n",
-                                  (unsigned)_bkFileCurrent, (unsigned)_bkFileTotal,
-                                  (unsigned)_bkV2BytesRecvd);
-                }
-            }
-            // else: bytes are read off the queue (above) and silently dropped
-        }
-        else if (id == MSG_END_OF_DATA) {
-            Serial.printf("[BK] V2 END_OF_DATA — backup %s\n",
-                          _bkCancelled ? "cancelled (drained)" : "complete");
-            break;
-        }
-        else {
-            Serial.printf("[BK] unexpected id=0x%02X during backup — ignoring\n", id);
-        }
-    }
-
-    gTransport.releaseMutex();
-    _bkV2Done = true;
-}
-
 void BackupRestorePage::backupTick() {
-    // New v2 path — recv callback owns the heavy lifting on the reader
-    // task; main loop just polls the done-flag and transitions the UI.
-    if (_state == BRState::BACKUP_V2_RUNNING) {
-        if (_bkV2Done) {
-            _state = BRState::BACKUP_DONE;
-            draw(); _d.paint();
-        } else {
-            // Repaint progress periodically as headers/bodies arrive.
-            // For now, no-op — the existing per-burst draw on EPD is
-            // skipped during the v2 run to avoid the EPD-during-stream
-            // patterns we've been investigating.
-        }
-        return;
-    }
-
     BackupState bs = gServerPairing.backupState();
 
     if (_state == BRState::BACKUP_WAITING_LIST) {

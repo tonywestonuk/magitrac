@@ -32,7 +32,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
-#include <freertos/queue.h>
 #include <lwip/sockets.h>
 #include <string.h>
 
@@ -59,33 +58,14 @@ static const uint32_t POLL_IDLE_MS     = 5;
 static const uint32_t READ_PAYLOAD_TIMEOUT_MS = 5000;
 
 // ── Hidden state ────────────────────────────────────────────────────────────
-// Item type for the FreeRTOS queue between the reader task and recv() callers.
-struct MagiCommsTcpQueueItem {
-    size_t   len;
-    uint8_t  data[1029];   // MAX message size — biggest current struct is MsgBackupBody
-};
-
 struct MagiCommsTcp::Impl {
-    WiFiServer*       server        = nullptr;
+    WiFiServer*       server     = nullptr;
     WiFiClient        peer;
-    // Transaction semaphore.  Binary (not mutex) so the reader task can
-    // give on behalf of whichever task took it, if we ever need that.
-    // Today only the taker releases (via releaseMutex()), so a mutex
-    // would also work — using binary keeps the door open.
-    SemaphoreHandle_t writeMutex    = nullptr;
-    SemaphoreHandle_t dispatchMutex = nullptr;   // guards _registered table
-    TaskHandle_t      readerTask    = nullptr;
-    // Current owner of writeMutex (the transaction holder).  Set on first
-    // take, cleared on releaseMutex().  Lets repeated send()/recv() from
-    // the same task skip the take/release dance.
-    volatile TaskHandle_t txHolder  = nullptr;
-    volatile bool     running       = false;
-    bool              started       = false;
-    uint8_t*          rxBuf         = nullptr;   // heap-allocated, MAX_FRAME bytes
-    // Queue from reader task → recv() callers.  Stores messages whose
-    // id has no registered handler.  Bounded depth — overflow drops the
-    // newest with a serial warning.
-    QueueHandle_t     recvQueue     = nullptr;
+    SemaphoreHandle_t writeMutex = nullptr;
+    TaskHandle_t      readerTask = nullptr;
+    volatile bool     running    = false;
+    bool              started    = false;
+    uint8_t*          rxBuf      = nullptr;   // heap-allocated, MAX_FRAME bytes
 };
 
 // ── Construction / destruction ──────────────────────────────────────────────
@@ -161,19 +141,7 @@ bool MagiCommsTcp::begin() {
         return false;
     }
     if (_impl->started) return true;        // idempotent
-    if (!_impl->writeMutex) {
-        _impl->writeMutex = xSemaphoreCreateBinary();
-        xSemaphoreGive(_impl->writeMutex);   // start "available"
-    }
-    if (!_impl->dispatchMutex) _impl->dispatchMutex = xSemaphoreCreateMutex();
-    if (!_impl->recvQueue) {
-        // Depth 16 → ~16 KB internal RAM.  Items dropped on overflow.
-        _impl->recvQueue = xQueueCreate(16, sizeof(MagiCommsTcpQueueItem));
-        if (!_impl->recvQueue) {
-            Serial.printf("%s recvQueue alloc FAILED\n", _logPfx);
-            return false;
-        }
-    }
+    if (!_impl->writeMutex) _impl->writeMutex = xSemaphoreCreateMutex();
     if (!_impl->rxBuf) {
         // Internal SRAM only — PSRAM is too slow for the reader to keep
         // up with TCP backpressure.  At MAX_FRAME=8192 this barely shows
@@ -368,12 +336,7 @@ void MagiCommsTcp::_readerLoop() {
             total += n;
         }
         if (total == (int)flen) {
-            // New two-tier dispatch first (registered handlers, then
-            // send-callback queue).  Falls through to the legacy
-            // setOnReceive path only if neither handled the message.
-            if (!_dispatchNew(buf, flen)) {
-                invokeRecvCb(buf, flen);
-            }
+            invokeRecvCb(buf, flen);
         } else {
             Serial.printf("%s payload read timeout — dropping connection\n",
                           _logPfx);
@@ -523,156 +486,6 @@ size_t MagiCommsTcp::streamReadRecv(uint8_t* buf, size_t want) {
         _hasPeer = false;
     }
     return total;
-}
-
-// ── New struct-driven send/recv API ─────────────────────────────────────────
-
-bool MagiCommsTcp::send(const void* msg, size_t len) {
-    if (!_hasPeer || len == 0 || len > maxPayload()) return false;
-    if (!_impl || !_impl->writeMutex) return false;
-
-    // Take the transaction mutex if this task doesn't already hold it.
-    TaskHandle_t me = xTaskGetCurrentTaskHandle();
-    if (_impl->txHolder != me) {
-        xSemaphoreTake(_impl->writeMutex, portMAX_DELAY);
-        _impl->txHolder = me;
-    }
-
-    bool ok = false;
-    if (_impl->peer.connected()) {
-        // 2-byte length prefix + payload, composed into one write where it
-        // fits the stack buffer; two writes otherwise.
-        uint8_t buf[256];
-        if (2 + len > sizeof(buf)) {
-            uint8_t hdr[2] = { (uint8_t)(len & 0xFF),
-                               (uint8_t)((len >> 8) & 0xFF) };
-            size_t w1 = _impl->peer.write(hdr, 2);
-            size_t w2 = (w1 == 2) ? _impl->peer.write((const uint8_t*)msg, len) : 0;
-            ok = (w1 == 2 && w2 == len);
-        } else {
-            buf[0] = (uint8_t)(len & 0xFF);
-            buf[1] = (uint8_t)((len >> 8) & 0xFF);
-            memcpy(buf + 2, msg, len);
-            size_t w = _impl->peer.write(buf, 2 + len);
-            ok = (w == 2 + len);
-        }
-    }
-    if (!ok) _hasPeer = false;
-    // Mutex stays held — caller must releaseMutex() when done.
-    return ok;
-}
-
-const uint8_t* MagiCommsTcp::recv(uint32_t timeout_ms) {
-    if (!_impl || !_impl->writeMutex || !_impl->recvQueue) return nullptr;
-
-    TaskHandle_t me = xTaskGetCurrentTaskHandle();
-    if (_impl->txHolder != me) {
-        xSemaphoreTake(_impl->writeMutex, portMAX_DELAY);
-        _impl->txHolder = me;
-    }
-
-    MagiCommsTcpQueueItem item;
-    TickType_t ticks = (timeout_ms == 0xFFFFFFFFu)
-                        ? portMAX_DELAY
-                        : pdMS_TO_TICKS(timeout_ms);
-    if (xQueueReceive(_impl->recvQueue, &item, ticks) != pdTRUE) {
-        return nullptr;   // timeout — mutex stays held
-    }
-
-    size_t n = item.len;
-    if (n > RECV_BUF_BYTES) n = RECV_BUF_BYTES;   // shouldn't happen — guard anyway
-    memcpy(_recvBuf, item.data, n);
-    _recvBufLen = n;
-    return _recvBuf;
-}
-
-void MagiCommsTcp::releaseMutex() {
-    if (!_impl || !_impl->writeMutex) return;
-    TaskHandle_t me = xTaskGetCurrentTaskHandle();
-    if (_impl->txHolder == me) {
-        _impl->txHolder = nullptr;
-        xSemaphoreGive(_impl->writeMutex);
-    }
-}
-
-bool MagiCommsTcp::registerMessageCallback(uint8_t msgType,
-                                            MessageCb cb, void* ctx) {
-    if (!_impl) return false;
-    if (_impl->dispatchMutex) xSemaphoreTake(_impl->dispatchMutex, portMAX_DELAY);
-
-    for (int i = 0; i < _registeredCount; i++) {
-        if (_registered[i].msgType == msgType) {
-            _registered[i] = { msgType, cb, ctx };
-            if (_impl->dispatchMutex) xSemaphoreGive(_impl->dispatchMutex);
-            return true;
-        }
-    }
-    if (_registeredCount >= MAX_REGISTERED) {
-        if (_impl->dispatchMutex) xSemaphoreGive(_impl->dispatchMutex);
-        Serial.printf("%s registerMessageCallback: table full (%d)\n",
-                      _logPfx, MAX_REGISTERED);
-        return false;
-    }
-    _registered[_registeredCount++] = { msgType, cb, ctx };
-    if (_impl->dispatchMutex) xSemaphoreGive(_impl->dispatchMutex);
-    return true;
-}
-
-void MagiCommsTcp::unregisterMessageCallback(uint8_t msgType) {
-    if (!_impl || !_impl->dispatchMutex) return;
-    xSemaphoreTake(_impl->dispatchMutex, portMAX_DELAY);
-    for (int i = 0; i < _registeredCount; i++) {
-        if (_registered[i].msgType == msgType) {
-            _registered[i] = _registered[--_registeredCount];
-            break;
-        }
-    }
-    xSemaphoreGive(_impl->dispatchMutex);
-}
-
-bool MagiCommsTcp::_dispatchNew(const uint8_t* msg, size_t len) {
-    if (len < 1 || !_impl) return false;
-    uint8_t id = msg[0];
-
-    // 1) Registered handlers win.  Run unlocked.
-    MessageCb regCb  = nullptr;
-    void*     regCtx = nullptr;
-    if (_impl->dispatchMutex) {
-        xSemaphoreTake(_impl->dispatchMutex, portMAX_DELAY);
-        for (int i = 0; i < _registeredCount; i++) {
-            if (_registered[i].msgType == id) {
-                regCb  = _registered[i].cb;
-                regCtx = _registered[i].ctx;
-                break;
-            }
-        }
-        xSemaphoreGive(_impl->dispatchMutex);
-    }
-    if (regCb) {
-        regCb(msg, len, regCtx);
-        return true;
-    }
-
-    // 2) No registered handler.  Only queue for recv() if a transaction is
-    //    actually active (someone is about to / already drain via recv()).
-    //    Otherwise fall through to the legacy setOnReceive path — that's
-    //    how pairing, song save/load, MIDI etc. still receive messages
-    //    until they migrate to the new API.
-    if (_impl->txHolder == nullptr) {
-        return false;   // fall through to legacy invokeRecvCb
-    }
-
-    if (_impl->recvQueue && len <= sizeof(((MagiCommsTcpQueueItem*)0)->data)) {
-        MagiCommsTcpQueueItem item;
-        item.len = len;
-        memcpy(item.data, msg, len);
-        if (xQueueSend(_impl->recvQueue, &item, 0) != pdTRUE) {
-            Serial.printf("%s recv queue full — dropping id=0x%02X\n",
-                          _logPfx, id);
-        }
-        return true;
-    }
-    return false;
 }
 
 // ── Peer management ─────────────────────────────────────────────────────────
