@@ -576,6 +576,50 @@ void setup() {
         },
         nullptr);
 
+    // ── MagiLink session task ─────────────────────────────────────────────
+    // Polls gMagiLink.isConnected() and drives the SERVER_STANDALONE ↔
+    // SERVER_CONNECTED transition.  On rising edge: does the synchronous
+    // MSG_CONNECT/ACK handshake then calls pairingOnMagiLinkConnected().
+    // On falling edge: calls pairingOnMagiLinkDisconnected().
+    extern void pairingOnMagiLinkConnected();
+    extern void pairingOnMagiLinkDisconnected();
+    xTaskCreate(
+        [](void* /*pv*/) {
+            bool wasConnected = false;
+            for (;;) {
+                bool nowConnected = gMagiLink.isConnected();
+                if (nowConnected && !wasConnected) {
+                    // Rising edge — do the handshake.
+                    MsgConnect req;
+                    req.id     = MSG_CONNECT;
+                    req.length = sizeof(req);
+                    gMagiLink.acquireMutex();
+                    bool sentOk = gMagiLink.send(&req, sizeof(req));
+                    Serial.printf("[LINK-SES] sent MSG_CONNECT (%s)\n",
+                                  sentOk ? "OK" : "FAIL");
+                    const uint8_t* resp = sentOk ? gMagiLink.read() : nullptr;
+                    if (resp && resp[0] == MSG_CONNECT_ACK) {
+                        Serial.println("[LINK-SES] got MSG_CONNECT_ACK");
+                        pairingOnMagiLinkConnected();
+                        wasConnected = true;
+                    } else {
+                        Serial.println("[LINK-SES] handshake failed");
+                    }
+                    gMagiLink.releaseMutex();
+                } else if (!nowConnected && wasConnected) {
+                    // Falling edge — tear the session down.
+                    pairingOnMagiLinkDisconnected();
+                    wasConnected = false;
+                }
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+        },
+        "link_ses",
+        4096,
+        nullptr,
+        3,        // low-ish priority — not on the critical path
+        nullptr);
+
     // Streaming-receive handlers for the big client→server uploads
     // (song save, restore file).  Handler bodies live in
     // commands_server.ino; declared extern here.

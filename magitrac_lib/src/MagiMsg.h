@@ -132,18 +132,18 @@ struct MsgBeacon {
     char        name[16]; // e.g. "MagiTrac"
 };
 
-// Client → server unicast: connect request with authentication
-// HMAC = HMAC-SHA256(sharedSecret, "CONNECT" || senderMac)[0..7]
+// MagiLink session handshake.  Server (STA) sends MsgConnect once TCP
+// is up; client (AP) replies with MsgConnectAck.  No payload — identity
+// is established by TCP itself, auth by the WPA2-PSK on the AP.  Both
+// structs follow the new {id, length} framing.
 struct MsgConnect {
-    MagiMsgType type;         // MSG_CONNECT
-    uint8_t     senderMac[6]; // client's own MAC
-    uint8_t     hmac8[8];     // first 8 bytes of HMAC-SHA256 for authentication
+    uint8_t  id;          // MSG_CONNECT
+    uint16_t length;      // sizeof(MsgConnect) — always 3
 };
 
-// Server → client: session established, includes per-session nonce
 struct MsgConnectAck {
-    MagiMsgType type;     // MSG_CONNECT_ACK
-    uint8_t     nonce[8]; // server-issued session nonce (anti-replay)
+    uint8_t  id;          // MSG_CONNECT_ACK
+    uint16_t length;      // sizeof(MsgConnectAck) — always 3
 };
 
 // ── Pairing ceremony messages ─────────────────────────────────────────────────
