@@ -122,6 +122,14 @@ void ServerPairing::begin() {
             static_cast<ServerPairing*>(ctx)->_onMagiLinkConnect();
         }, this);
 
+    // MagiLink: MSG_DISCONNECT from the server — explicit teardown.
+    // Currently never invoked (no UI calls disconnect()), but registered
+    // for symmetry so the protocol works if either side ever issues it.
+    gMagiLink.registerCallback(MSG_DISCONNECT,
+        [](const uint8_t* /*msg*/, size_t /*len*/, void* ctx) {
+            static_cast<ServerPairing*>(ctx)->_onMagiLinkDisconnect();
+        }, this);
+
     _ready = true;
 
     if (_hasPairing) {
@@ -219,40 +227,58 @@ void ServerPairing::clearPairing() {
 void ServerPairing::disconnect() {
     if (_pairState != PairClientState::SUCCESS) return;
     MsgDisconnect msg;
-    msg.type = MSG_DISCONNECT;
-    gComms.send(&msg, sizeof(msg));
-    gComms.removePeer(_serverMac);
+    msg.id     = MSG_DISCONNECT;
+    msg.length = sizeof(msg);
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
     _serverName[0] = '\0';
     _setBrowseState(BrowseState::IDLE);
-    if (_hasPairing)
-        _tryAutoConnect();
-    else
-        _setPairState(PairClientState::IDLE);
+    if (_hasPairing) _tryAutoConnect();
+    else             _setPairState(PairClientState::IDLE);
 }
 
 // ── sendControl / seek / midi ─────────────────────────────────────────────────
+//
+// sendControl is for the empty-payload controls PLAY/STOP/PAUSE/UNPAUSE — all
+// share the 3-byte {id, length} wire layout, so a single MsgPlay-shaped
+// buffer carries any of them.  CANCEL_QUEUE and friends still go through
+// the legacy path (Phase 3 of the migration).
 bool ServerPairing::sendControl(MagiMsgType type) {
     if (_pairState != PairClientState::SUCCESS) return false;
-    uint8_t msg = (uint8_t)type;
-    return gComms.send(&msg, 1);
+    MsgPlay msg;
+    msg.id     = (uint8_t)type;
+    msg.length = sizeof(msg);
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendSeek(uint8_t pattern, uint8_t row) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgSeek msg;
-    msg.type    = MSG_SEEK;
+    msg.id      = MSG_SEEK;
+    msg.length  = sizeof(msg);
     msg.pattern = pattern;
     msg.row     = row;
-    return gComms.send(&msg, sizeof(msg));
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendGoto(uint8_t pattern, uint8_t row) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgGoto msg;
-    msg.type    = MSG_GOTO;
+    msg.id      = MSG_GOTO;
+    msg.length  = sizeof(msg);
     msg.pattern = pattern;
     msg.row     = row;
-    return gComms.send(&msg, sizeof(msg));
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendQueueBlock(uint8_t pattern) {
@@ -480,10 +506,9 @@ void ServerPairing::tick() {
     switch (_pairState) {
 
         case PairClientState::AUTO_CONNECTING:
-            if (now - _pairStateMs >= AUTO_CONNECT_RETRY_MS) {
-                Serial.println("[SP] auto-connect retry");
-                _tryAutoConnect();
-            }
+            // Server is the one that initiates the MagiLink handshake.
+            // Nothing to retry from here — we just wait for the
+            // registered MSG_CONNECT callback to fire.
             break;
 
         case PairClientState::REQUESTING:
@@ -964,6 +989,15 @@ void ServerPairing::_onMagiLinkConnect() {
     Serial.printf("[SP] MagiLink: got MSG_CONNECT, ack send=%s\n",
                   ok ? "OK" : "FAIL");
     _setPairState(PairClientState::SUCCESS);
+}
+
+void ServerPairing::_onMagiLinkDisconnect() {
+    Serial.println("[SP] MagiLink: MSG_DISCONNECT from server");
+    _serverName[0] = '\0';
+    _serverPlaying = false;
+    _setBrowseState(BrowseState::IDLE);
+    if (_hasPairing) _tryAutoConnect();
+    else             _setPairState(PairClientState::IDLE);
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

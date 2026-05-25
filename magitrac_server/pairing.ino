@@ -136,11 +136,13 @@ void enterPairingMode() {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+__attribute__((unused))
 static void endSession(bool sendDisconnect) {
     if (serverMode == SERVER_CONNECTED) {
         if (sendDisconnect) {
             MsgDisconnect msg;
-            msg.type = MSG_DISCONNECT;
+            msg.id     = MSG_DISCONNECT;
+            msg.length = sizeof(msg);
             gComms.send(&msg, sizeof(msg));
         }
         gComms.removePeer(clientMac);

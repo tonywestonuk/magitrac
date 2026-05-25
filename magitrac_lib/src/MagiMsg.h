@@ -189,7 +189,31 @@ struct MsgPairOffer {
 
 // Either side → other: session ended
 struct MsgDisconnect {
-    MagiMsgType type;     // MSG_DISCONNECT
+    uint8_t  id;          // MSG_DISCONNECT
+    uint16_t length;      // sizeof(MsgDisconnect) — always 3
+};
+
+// ── Fire-and-forget playback controls (MagiLink) ──────────────────────────
+// All client → server.  No payload — id alone is the instruction.  Server
+// registers one MagiLink callback per id.
+struct MsgPlay {
+    uint8_t  id;          // MSG_PLAY
+    uint16_t length;      // sizeof(MsgPlay) — always 3
+};
+
+struct MsgStop {
+    uint8_t  id;          // MSG_STOP
+    uint16_t length;
+};
+
+struct MsgPause {
+    uint8_t  id;          // MSG_PAUSE
+    uint16_t length;
+};
+
+struct MsgUnpause {
+    uint8_t  id;          // MSG_UNPAUSE
+    uint16_t length;
 };
 
 // Client → server: switch WiFi channel.
@@ -302,17 +326,19 @@ struct MsgSeqPos {
 
 // Client → Server: scrub to position and play
 struct MsgSeek {
-    MagiMsgType type;    // MSG_SEEK
-    uint8_t     pattern;
-    uint8_t     row;
+    uint8_t  id;          // MSG_SEEK
+    uint16_t length;      // sizeof(MsgSeek) — always 5
+    uint8_t  pattern;
+    uint8_t  row;
 };
 
 // Client → Server: position only (no audible play).  When running, tick
 // fires on the next iteration and the existing WAIT/play logic kicks in.
 struct MsgGoto {
-    MagiMsgType type;    // MSG_GOTO
-    uint8_t     pattern;
-    uint8_t     row;
+    uint8_t  id;          // MSG_GOTO
+    uint16_t length;      // sizeof(MsgGoto) — always 5
+    uint8_t  pattern;
+    uint8_t  row;
 };
 
 // Client → Server: queue a block to play after current block ends
