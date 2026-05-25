@@ -119,6 +119,13 @@ enum MagiMsgType : uint8_t {
     MSG_SONG_PUSH_HEADER   = 0x84,
     MSG_SONG_PUSH_BODY     = 0x85,
 
+    // Song save (client → server).  Same streaming pattern but reversed:
+    // client streams its in-memory Song to the server.  Header carries
+    // destination filename (empty = "push, don't write to SD") and the
+    // SongFileHeader; bodies carry the raw Song bytes.
+    MSG_SAVE_SONG_HEADER   = 0x86,
+    MSG_SAVE_SONG_BODY     = 0x87,
+
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
 
@@ -552,5 +559,29 @@ struct MsgNoSong {
     uint8_t  id     = MSG_NO_SONG;
     uint16_t length = sizeof(MsgNoSong);
 };
+
+// ── Song save (client → server) ────────────────────────────────────────────
+// Client takes the MagiLink mutex, sends HEADER once, then loops sending
+// BODY chunks of raw Song bytes (data_len ≤ 1024) until song_bytes have
+// been sent.  Receiver assembles in srvActiveBuf + sizeof(SongFileHeader)
+// and stamps SongFileHeader at offset 0 from the header itself.  Empty
+// name means "push to active without writing to SD".
+
+struct MsgSongSaveHeader {
+    uint8_t  id     = MSG_SAVE_SONG_HEADER;
+    uint16_t length = sizeof(MsgSongSaveHeader);
+    char     name[SRV_NAME_MAX];     // 24 — destination filename (no .mgt), "" = push only
+    uint32_t song_bytes;             // bytes of Song that follow across BODY messages
+    SongFileHeader song_file_header; // 8 — magic/version, copied into srvActiveBuf[0..8]
+};
+// 1 + 2 + 24 + 4 + 8 = 39 bytes
+
+struct MsgSongSaveBody {
+    uint8_t  id     = MSG_SAVE_SONG_BODY;
+    uint16_t length = sizeof(MsgSongSaveBody);
+    uint16_t data_len;
+    uint8_t  data[1024];
+};
+// 1029 bytes (same shape as MsgBackupBody / MsgSongPushBody)
 
 #pragma pack(pop)

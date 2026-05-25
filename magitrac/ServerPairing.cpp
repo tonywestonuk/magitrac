@@ -385,27 +385,40 @@ bool ServerPairing::sendNoteSetReliable(const Song& song, uint8_t pattern, uint8
 
 bool ServerPairing::sendSongToServer(const char* name, const Song* song) {
     if (_pairState != PairClientState::SUCCESS) return false;
+    if (!gMagiLink.isConnected()) return false;
 
-    // Wire payload: type(1) + name(SRV_NAME_MAX) + SongFileHeader + Song.
-    // Streamed straight from our in-memory buffers — no chunk-buffer copy,
-    // no per-chunk loop, just three streamMore calls.
-    SongFileHeader hdr;
-    hdr.magic   = SONG_FILE_MAGIC;
-    hdr.version = SONG_FILE_VERSION;
-    memset(hdr._pad, 0, sizeof(hdr._pad));
+    // Build the save header.  Empty name means "push to server's active
+    // buffer without writing to SD" — used after in-memory edits to keep
+    // the server's playback copy in sync.
+    MsgSongSaveHeader hdr;
+    memset(hdr.name, 0, sizeof(hdr.name));
+    if (name) strncpy(hdr.name, name, sizeof(hdr.name) - 1);
+    hdr.song_bytes               = sizeof(Song);
+    hdr.song_file_header.magic   = SONG_FILE_MAGIC;
+    hdr.song_file_header.version = SONG_FILE_VERSION;
+    memset(hdr.song_file_header._pad, 0, sizeof(hdr.song_file_header._pad));
 
-    char namePadded[SRV_NAME_MAX] = {};
-    strncpy(namePadded, name, SRV_NAME_MAX - 1);
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&hdr, sizeof(hdr));
 
-    size_t totalLen = 1 + SRV_NAME_MAX + sizeof(SongFileHeader) + sizeof(Song);
-    if (!gTransport.streamBegin(totalLen)) return false;
-    uint8_t type = (uint8_t)MSG_SONG_SAVE_BLOB;
-    bool ok = true;
-    ok &= gTransport.streamMore(&type, 1);
-    ok &= gTransport.streamMore(namePadded, SRV_NAME_MAX);
-    ok &= gTransport.streamMore(&hdr, sizeof(hdr));
-    ok &= gTransport.streamMore(song, sizeof(Song));
-    gTransport.streamEnd();
+    // Stream Song bytes in 1024-byte chunks.  Body is 1029 bytes — fits
+    // in the main-loop task's 8 KB stack with headroom; declaring it
+    // here scopes it to the function and avoids polluting RAM.
+    MsgSongSaveBody body;
+    const uint8_t* p = (const uint8_t*)song;
+    uint32_t remaining = sizeof(Song);
+    while (ok && remaining > 0) {
+        uint16_t chunk = remaining > 1024 ? 1024 : (uint16_t)remaining;
+        body.data_len = chunk;
+        memcpy(body.data, p, chunk);
+        ok = gMagiLink.send(&body, sizeof(body));
+        p         += chunk;
+        remaining -= chunk;
+    }
+
+    gMagiLink.releaseMutex();
+    Serial.printf("[SP] song save: name='%s' %u bytes (%s)\n",
+                  hdr.name, (unsigned)sizeof(Song), ok ? "OK" : "FAIL");
     return ok;
 }
 

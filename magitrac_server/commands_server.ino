@@ -689,6 +689,90 @@ static void sendBackupFileRaw(const char* name) {
 // M5Stack ESP32 classic — its DRAM is tight).
 static MsgBackupBody sStreamBody;
 
+// ── MagiLink song save (client → server) state ─────────────────────────────
+// Populated by the MSG_SAVE_SONG_HEADER and _BODY callbacks (worker task).
+// On stream completion, the BODY callback sets sMagiSavePending; the main
+// loop's commandsTick consumes it and writes to SD if a name was given.
+// SD writes can't run on the worker task (SamplePlayer contention rule)
+// so deferring to main loop is mandatory.
+static char     sMagiSaveName[SRV_FNAME_MAX] = {};
+static uint32_t sMagiSaveExpectedBytes       = 0;  // Song bytes expected
+static uint32_t sMagiSaveReceivedBytes       = 0;  // Song bytes received so far
+static bool     sMagiSavePending             = false;
+
+void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (len < sizeof(MsgSongSaveHeader)) return;
+    const MsgSongSaveHeader* h = (const MsgSongSaveHeader*)msg;
+    if (h->song_bytes > sizeof(Song)) {
+        Serial.printf("[CMD] save header rejected: %u bytes > max %u\n",
+                      (unsigned)h->song_bytes, (unsigned)sizeof(Song));
+        sMagiSaveExpectedBytes = 0;
+        return;
+    }
+    // Stop the sequencer up-front: the receive writes incrementally into
+    // srvActiveBuf over many ms.  If the sequencer keeps reading it could
+    // follow a half-overwritten NoteNode pointer into garbage.
+    sequencerStop();
+    // Stamp SongFileHeader at the front of srvActiveBuf.
+    memcpy(srvActiveBuf, &h->song_file_header, sizeof(SongFileHeader));
+    strncpy(sMagiSaveName, h->name, sizeof(sMagiSaveName) - 1);
+    sMagiSaveName[sizeof(sMagiSaveName) - 1] = '\0';
+    sMagiSaveExpectedBytes = h->song_bytes;
+    sMagiSaveReceivedBytes = 0;
+    Serial.printf("[CMD] save start: name='%s' bytes=%u\n",
+                  sMagiSaveName, (unsigned)sMagiSaveExpectedBytes);
+}
+
+void onMagiLinkSaveBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (sMagiSaveExpectedBytes == 0) return;          // stray body
+    if (len < sizeof(MsgSongSaveBody)) return;
+    const MsgSongSaveBody* b = (const MsgSongSaveBody*)msg;
+    if (b->data_len > 1024) return;
+    if (sMagiSaveReceivedBytes + b->data_len > sMagiSaveExpectedBytes) {
+        Serial.println("[CMD] save body overshoot — dropping");
+        sMagiSaveExpectedBytes = 0;
+        return;
+    }
+    memcpy(srvActiveBuf + sizeof(SongFileHeader) + sMagiSaveReceivedBytes,
+           b->data, b->data_len);
+    sMagiSaveReceivedBytes += b->data_len;
+    if (sMagiSaveReceivedBytes == sMagiSaveExpectedBytes) {
+        sMagiSaveExpectedBytes = 0;
+        sMagiSavePending       = true;
+    }
+}
+
+// Called from commandsTick when sMagiSavePending fires.  Writes the
+// in-memory song to SD if a name was provided; either way, marks
+// srvHasActive and resets the sequencer.
+static void finaliseMagiLinkSongSave() {
+    srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
+    srvHasActive    = true;
+    Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
+
+    if (sMagiSaveName[0] != '\0') {
+        char path[48];
+        snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, sMagiSaveName);
+        SdLock _;
+        SD.remove(path);
+        File f = SD.open(path, FILE_WRITE);
+        if (!f) {
+            Serial.printf("[CMD] save: open failed '%s'\n", path);
+            return;
+        }
+        bool ok = songWriteCompact(f, song);
+        uint32_t sz = (uint32_t)f.size();
+        f.close();
+        Serial.printf("[CMD] save: wrote '%s' %u bytes %s\n",
+                      path, sz, ok ? "OK" : "FAIL");
+        snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", sMagiSaveName);
+    } else {
+        Serial.println("[CMD] save: in-memory push (no SD write)");
+    }
+    sequencerStop();
+    sequencerReset();
+}
+
 // ── MagiLink backup — streams every /songs/*.mgt + instruments.mgt ─────────
 //
 // Called from the MagiLink MSG_START_BACKUP handler (worker task context,
@@ -1033,6 +1117,10 @@ void commandsTick() {
         srvFinaliseNeeded = false;
         finaliseSongSave();  // loads into srvActiveBuf, writes compact to SD
         if (srvHasActive) { sequencerStop(); sequencerReset(); }
+    }
+    if (sMagiSavePending) {
+        sMagiSavePending = false;
+        finaliseMagiLinkSongSave();
     }
     if (srvInstLoadPending) {
         srvInstLoadPending = false;
