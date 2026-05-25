@@ -68,6 +68,10 @@ private:
     // task — must be volatile for visibility across cores/tasks.
     volatile bool _bkCancelled;
 
+    // Number of files fully written to SD this backup run.  Used by
+    // drawBackupDone to show "N of M saved" (especially after a cancel).
+    int _bkFilesSaved = 0;
+
 
     // TCP/IP test request flag (set when user taps the TCP TEST menu button)
     bool     _tcpTestRequested = false;

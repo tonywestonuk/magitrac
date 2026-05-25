@@ -67,6 +67,12 @@ static const int BR_PB_Y     = 300;
 static const int BR_PB_W     = 700;
 static const int BR_PB_H     = 40;
 
+// Cancel button — shown only during BACKUP_PROGRESS.
+static const int BR_CANCEL_W = 200;
+static const int BR_CANCEL_H = 60;
+static const int BR_CANCEL_X = (960 - BR_CANCEL_W) / 2;
+static const int BR_CANCEL_Y = 400;
+
 // ── Constructor ───────────────────────────────────────────────────────────────
 
 BackupRestorePage::BackupRestorePage(EPD_PainterAdafruit& display,
@@ -177,6 +183,12 @@ void BackupRestorePage::drawBackupProgress() {
         // Progress bar
         drawProgressBar(BR_PB_X, BR_PB_Y, BR_PB_W, BR_PB_H,
                         _bkFileCurrent, _bkFileTotal);
+
+        // Cancel button — visible during BACKUP_PROGRESS only.  Greyed
+        // out once the user has tapped it (we still drain the wire).
+        uiButton(_d, BR_CANCEL_X, BR_CANCEL_Y, BR_CANCEL_W, BR_CANCEL_H,
+                 _bkCancelled ? "CANCELLING..." : "CANCEL",
+                 COL_WHITE, COL_BLACK, 3);
     }
 }
 
@@ -186,10 +198,15 @@ void BackupRestorePage::drawBackupDone() {
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
     _d.setCursor(300, 180);
-    _d.print("Backup complete!");
+    _d.print(_bkCancelled ? "Backup cancelled" : "Backup complete!");
 
     char buf[64];
-    snprintf(buf, sizeof(buf), "%d files saved", _bkFileTotal);
+    if (_bkCancelled) {
+        snprintf(buf, sizeof(buf), "%d of %d files saved",
+                 _bkFilesSaved, _bkFileTotal);
+    } else {
+        snprintf(buf, sizeof(buf), "%d files saved", _bkFilesSaved);
+    }
     _d.setCursor(330, 240);
     _d.print(buf);
 
@@ -334,6 +351,7 @@ void BackupRestorePage::startBackup() {
     _bkFileTotal   = 0;
     _bkFileCurrent = 0;
     _bkCancelled   = false;
+    _bkFilesSaved  = 0;
 
     // Show "backup in progress" — paintLater so the EPD work happens on
     // its own task and we proceed to the transaction immediately.
@@ -357,8 +375,35 @@ void BackupRestorePage::startBackup() {
     uint32_t curFileSize     = 0;
     bool     done            = false;
     bool     readOk          = true;
+    bool     touchWasDown    = _touch.isTouched;
+    bool     cancelRepainted = false;
 
     while (!done) {
+        // Poll touch for the Cancel button.  Edge-detect (down on this
+        // tick + up previously) so a held finger only fires once.  Even
+        // if cancelled, we keep looping until END_OF_DATA — otherwise
+        // remaining body bytes desync the wire.
+        if (!_bkCancelled && _touch.read()) {
+            bool down = _touch.isTouched;
+            if (down && !touchWasDown) {
+                int sx, sy;
+                rawToScreen(_touch.x, _touch.y, sx, sy);
+                if (sx >= BR_CANCEL_X && sx < BR_CANCEL_X + BR_CANCEL_W &&
+                    sy >= BR_CANCEL_Y && sy < BR_CANCEL_Y + BR_CANCEL_H) {
+                    _bkCancelled = true;
+                    Serial.println("[BK] CANCEL tapped — draining remaining stream");
+                }
+            }
+            touchWasDown = down;
+        }
+
+        // Repaint once on the cancel transition so the button label
+        // changes to "CANCELLING..." — confirmation to the user.
+        if (_bkCancelled && !cancelRepainted) {
+            cancelRepainted = true;
+            draw(); _d.paintLater();
+        }
+
         const uint8_t* m = gMagiLink.read();
         if (!m) {
             Serial.println("[BK] read returned nullptr (disconnect)");
@@ -367,9 +412,12 @@ void BackupRestorePage::startBackup() {
         }
 
         uint8_t id = m[0];
+
+        // IMPORTANT: when _bkCancelled is set we still drain every
+        // message until END_OF_DATA so the wire doesn't desync.  We just
+        // skip the SD writes / UI updates.
         if (id == MSG_BACKUP_HEADER) {
             const MsgBackupHeader* h = (const MsgBackupHeader*)m;
-            if (curFile) curFile.close();
 
             // drawBackupProgress + the existing UI expect _bkFileCurrent
             // as a 0-based index; h->file_index is 1-based.  Translate.
@@ -381,43 +429,54 @@ void BackupRestorePage::startBackup() {
             char nameStr[25] = {};
             strncpy(nameStr, h->filename, 24);
 
-            // Populate _bkFileNames so drawBackupProgress can display the
-            // currently-streaming file's name.
-            if (_bkFileCurrent >= 0 && _bkFileCurrent < BR_MAX_FILES) {
-                memset(_bkFileNames[_bkFileCurrent], 0, SRV_FNAME_MAX);
-                strncpy(_bkFileNames[_bkFileCurrent], nameStr,
-                        SRV_FNAME_MAX - 1);
-            }
-            Serial.printf("[BK] header file=%u/%u name='%s' size=%u\n",
+            Serial.printf("[BK] header file=%u/%u name='%s' size=%u%s\n",
                           (unsigned)h->file_index, (unsigned)h->file_total,
-                          nameStr, (unsigned)h->file_size);
+                          nameStr, (unsigned)h->file_size,
+                          _bkCancelled ? "  (skipped, cancelled)" : "");
 
-            char path[80];
-            snprintf(path, sizeof(path), "%s/%s", _bkFolder, nameStr);
-            if (SD.exists(path)) SD.remove(path);
-            curFile = SD.open(path, FILE_WRITE);
-            if (!curFile) {
-                Serial.printf("[BK] SD open failed '%s'\n", path);
+            if (!_bkCancelled) {
+                if (curFile) curFile.close();
+
+                // Populate _bkFileNames so drawBackupProgress can display
+                // the currently-streaming file's name.
+                if (_bkFileCurrent >= 0 && _bkFileCurrent < BR_MAX_FILES) {
+                    memset(_bkFileNames[_bkFileCurrent], 0, SRV_FNAME_MAX);
+                    strncpy(_bkFileNames[_bkFileCurrent], nameStr,
+                            SRV_FNAME_MAX - 1);
+                }
+
+                char path[80];
+                snprintf(path, sizeof(path), "%s/%s", _bkFolder, nameStr);
+                if (SD.exists(path)) SD.remove(path);
+                curFile = SD.open(path, FILE_WRITE);
+                if (!curFile) {
+                    Serial.printf("[BK] SD open failed '%s'\n", path);
+                }
+
+                // Per-file UI update — paintLater so the EPD repaint
+                // runs on its own task and doesn't block the body stream.
+                draw(); _d.paintLater();
             }
-
-            // Per-file UI update — paintLater so the EPD repaint runs on
-            // its own task and doesn't block the body stream.
-            draw(); _d.paintLater();
         }
         else if (id == MSG_BACKUP_BODY) {
             const MsgBackupBody* b = (const MsgBackupBody*)m;
             uint16_t n = b->data_len;
             if (n > sizeof(b->data)) n = sizeof(b->data);
-            if (curFile) curFile.write(b->data, n);
-            curBytesWritten += n;
-            if (curBytesWritten >= curFileSize) {
-                Serial.printf("[BK] file %u/%u complete (%u bytes)\n",
-                              (unsigned)_bkFileCurrent, (unsigned)_bkFileTotal,
-                              (unsigned)curBytesWritten);
+            if (!_bkCancelled) {
+                if (curFile) curFile.write(b->data, n);
+                curBytesWritten += n;
+                if (curBytesWritten >= curFileSize) {
+                    _bkFilesSaved++;
+                    Serial.printf("[BK] file %u/%u complete (%u bytes) saved=%d\n",
+                                  (unsigned)_bkFileCurrent, (unsigned)_bkFileTotal,
+                                  (unsigned)curBytesWritten, _bkFilesSaved);
+                }
             }
+            // else: bytes already off the wire (gMagiLink.read), dropped here
         }
         else if (id == MSG_END_OF_DATA) {
-            Serial.println("[BK] END_OF_DATA — backup complete");
+            Serial.printf("[BK] END_OF_DATA — backup %s\n",
+                          _bkCancelled ? "cancelled (drained)" : "complete");
             done = true;
         }
         else {
