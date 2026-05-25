@@ -395,8 +395,10 @@ void loadSong(int idx) {
         // OFF — deactivate song and notify connected client
         srvHasActive = false;
         if (pairingIsConnected()) {
-            uint8_t msg = (uint8_t)MSG_NO_SONG;
-            gComms.send(&msg, 1);
+            MsgNoSong msg;
+            gMagiLink.acquireMutex();
+            gMagiLink.send(&msg, sizeof(msg));
+            gMagiLink.releaseMutex();
         }
         return;
     }
@@ -618,8 +620,6 @@ void setup() {
                 if (nowConnected && !wasConnected) {
                     // Rising edge — do the handshake.
                     MsgConnect req;
-                    req.id     = MSG_CONNECT;
-                    req.length = sizeof(req);
                     gMagiLink.acquireMutex();
                     bool sentOk = gMagiLink.send(&req, sizeof(req));
                     Serial.printf("[LINK-SES] sent MSG_CONNECT (%s)\n",

@@ -112,6 +112,13 @@ enum MagiMsgType : uint8_t {
     MSG_BACKUP_BODY        = 0x82,  // server → client: 1024-byte data slot + data_len
     MSG_END_OF_DATA        = 0x83,  // server → client: marks end of a multi-message stream (generic)
 
+    // Song push / load (server → client, MagiLink).  Server streams the
+    // active song's bytes (SongFileHeader + Song) as HEADER + N×BODY.
+    // No end marker — header carries total_size; receiver knows when
+    // bytes_received == total_size that the stream is complete.
+    MSG_SONG_PUSH_HEADER   = 0x84,
+    MSG_SONG_PUSH_BODY     = 0x85,
+
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
 
@@ -136,14 +143,20 @@ struct MsgBeacon {
 // is up; client (AP) replies with MsgConnectAck.  No payload — identity
 // is established by TCP itself, auth by the WPA2-PSK on the AP.  Both
 // structs follow the new {id, length} framing.
+//
+// All MagiLink structs from here on use NSDMI for id and length so the
+// caller never needs to fill them in:
+//   MsgFoo msg;                            // id + length already set
+//   msg.payload_field = ...;               // set whatever varies
+//   gMagiLink.send(&msg, sizeof(msg));
 struct MsgConnect {
-    uint8_t  id;          // MSG_CONNECT
-    uint16_t length;      // sizeof(MsgConnect) — always 3
+    uint8_t  id     = MSG_CONNECT;
+    uint16_t length = sizeof(MsgConnect);
 };
 
 struct MsgConnectAck {
-    uint8_t  id;          // MSG_CONNECT_ACK
-    uint16_t length;      // sizeof(MsgConnectAck) — always 3
+    uint8_t  id     = MSG_CONNECT_ACK;
+    uint16_t length = sizeof(MsgConnectAck);
 };
 
 // ── Pairing ceremony messages ─────────────────────────────────────────────────
@@ -189,31 +202,31 @@ struct MsgPairOffer {
 
 // Either side → other: session ended
 struct MsgDisconnect {
-    uint8_t  id;          // MSG_DISCONNECT
-    uint16_t length;      // sizeof(MsgDisconnect) — always 3
+    uint8_t  id     = MSG_DISCONNECT;
+    uint16_t length = sizeof(MsgDisconnect);
 };
 
 // ── Fire-and-forget playback controls (MagiLink) ──────────────────────────
 // All client → server.  No payload — id alone is the instruction.  Server
 // registers one MagiLink callback per id.
 struct MsgPlay {
-    uint8_t  id;          // MSG_PLAY
-    uint16_t length;      // sizeof(MsgPlay) — always 3
+    uint8_t  id     = MSG_PLAY;
+    uint16_t length = sizeof(MsgPlay);
 };
 
 struct MsgStop {
-    uint8_t  id;          // MSG_STOP
-    uint16_t length;
+    uint8_t  id     = MSG_STOP;
+    uint16_t length = sizeof(MsgStop);
 };
 
 struct MsgPause {
-    uint8_t  id;          // MSG_PAUSE
-    uint16_t length;
+    uint8_t  id     = MSG_PAUSE;
+    uint16_t length = sizeof(MsgPause);
 };
 
 struct MsgUnpause {
-    uint8_t  id;          // MSG_UNPAUSE
-    uint16_t length;
+    uint8_t  id     = MSG_UNPAUSE;
+    uint16_t length = sizeof(MsgUnpause);
 };
 
 // Client → server: switch WiFi channel.
@@ -326,8 +339,8 @@ struct MsgSeqPos {
 
 // Client → Server: scrub to position and play
 struct MsgSeek {
-    uint8_t  id;          // MSG_SEEK
-    uint16_t length;      // sizeof(MsgSeek) — always 5
+    uint8_t  id      = MSG_SEEK;
+    uint16_t length  = sizeof(MsgSeek);
     uint8_t  pattern;
     uint8_t  row;
 };
@@ -335,8 +348,8 @@ struct MsgSeek {
 // Client → Server: position only (no audible play).  When running, tick
 // fires on the next iteration and the existing WAIT/play logic kicks in.
 struct MsgGoto {
-    uint8_t  id;          // MSG_GOTO
-    uint16_t length;      // sizeof(MsgGoto) — always 5
+    uint8_t  id      = MSG_GOTO;
+    uint16_t length  = sizeof(MsgGoto);
     uint8_t  pattern;
     uint8_t  row;
 };
@@ -481,31 +494,59 @@ struct MsgSampleListResp {
 // many bytes follow, even for types it doesn't recognise.
 
 struct MsgStartBackup {
-    uint8_t  id;          // MSG_START_BACKUP
-    uint16_t length;      // sizeof(MsgStartBackup) — always 3
+    uint8_t  id     = MSG_START_BACKUP;
+    uint16_t length = sizeof(MsgStartBackup);
 };
 
 struct MsgBackupHeader {
-    uint8_t  id;          // MSG_BACKUP_HEADER
-    uint16_t length;      // sizeof(MsgBackupHeader)
+    uint8_t  id     = MSG_BACKUP_HEADER;
+    uint16_t length = sizeof(MsgBackupHeader);
     char     filename[24];
-    uint32_t file_size;   // total bytes in this file
-    uint16_t file_index;  // 1-based: this is the Nth file
-    uint16_t file_total;  // total files in this backup (for progress UI)
+    uint32_t file_size;
+    uint16_t file_index;  // 1-based
+    uint16_t file_total;
 };
-// 1 + 2 + 24 + 4 + 2 + 2 = 35 bytes
+// 35 bytes
 
 struct MsgBackupBody {
-    uint8_t  id;          // MSG_BACKUP_BODY
-    uint16_t length;      // sizeof(MsgBackupBody) — always 1029
+    uint8_t  id     = MSG_BACKUP_BODY;
+    uint16_t length = sizeof(MsgBackupBody);
     uint16_t data_len;    // 0..1024 — meaningful bytes in `data`
-    uint8_t  data[1024];  // always sent in full, trailing bytes undefined
+    uint8_t  data[1024];  // trailing bytes after data_len are undefined
 };
-// 1 + 2 + 2 + 1024 = 1029 bytes
+// 1029 bytes
 
 struct MsgEndOfData {
-    uint8_t  id;          // MSG_END_OF_DATA
-    uint16_t length;      // sizeof(MsgEndOfData) — always 3
+    uint8_t  id     = MSG_END_OF_DATA;
+    uint16_t length = sizeof(MsgEndOfData);
+};
+
+// ── Song push / load (server → client) ────────────────────────────────────
+// Server takes the MagiLink mutex, sends HEADER once, then loops sending
+// BODY chunks (data_len ≤ 1024) until the total declared in HEADER has
+// been sent, then releases.  Receiver tracks bytes received and fires
+// the "song ready" transition when bytes_received == total_size.
+
+struct MsgSongPushHeader {
+    uint8_t  id     = MSG_SONG_PUSH_HEADER;
+    uint16_t length = sizeof(MsgSongPushHeader);
+    uint32_t total_size;  // total bytes that will follow across BODY messages
+};
+// 7 bytes
+
+struct MsgSongPushBody {
+    uint8_t  id     = MSG_SONG_PUSH_BODY;
+    uint16_t length = sizeof(MsgSongPushBody);
+    uint16_t data_len;    // 0..1024 — meaningful bytes in `data`
+    uint8_t  data[1024];
+};
+// 1029 bytes (same shape as MsgBackupBody)
+
+// Server → client: "no song loaded".  Sent in lieu of a SONG_PUSH stream
+// when the server has nothing active on connect.
+struct MsgNoSong {
+    uint8_t  id     = MSG_NO_SONG;
+    uint16_t length = sizeof(MsgNoSong);
 };
 
 #pragma pack(pop)

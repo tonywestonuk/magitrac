@@ -705,7 +705,7 @@ static void sendBackupFileRaw(const char* name) {
 void sendBackupToClient() {
     if (!srvSdOk) {
         Serial.println("[BK-SRV] SD not available — sending bare END_OF_DATA");
-        MsgEndOfData eod = { (uint8_t)MSG_END_OF_DATA, sizeof(eod) };
+        MsgEndOfData eod;
         gMagiLink.send(&eod, sizeof(eod));
         return;
     }
@@ -753,16 +753,12 @@ void sendBackupToClient() {
 
     // Step 2: send each file as header + N×body.
     // body is static — 1029 bytes is too much for the worker task stack,
-    // and re-entrancy is not a concern.
+    // and re-entrancy is not a concern.  NSDMI sets id+length at startup.
     static MsgBackupBody body;
-    body.id     = (uint8_t)MSG_BACKUP_BODY;
-    body.length = sizeof(body);
 
     bool ok = true;
     for (uint16_t i = 0; i < count && ok; i++) {
         MsgBackupHeader hdr;
-        hdr.id         = (uint8_t)MSG_BACKUP_HEADER;
-        hdr.length     = sizeof(hdr);
         memset(hdr.filename, 0, sizeof(hdr.filename));
         strncpy(hdr.filename, names[i], sizeof(hdr.filename) - 1);
         hdr.file_size  = sizes[i];
@@ -811,7 +807,7 @@ void sendBackupToClient() {
     }
 
     // Step 3: end-of-data marker.
-    MsgEndOfData eod = { (uint8_t)MSG_END_OF_DATA, sizeof(eod) };
+    MsgEndOfData eod;
     gMagiLink.send(&eod, sizeof(eod));
     Serial.printf("[BK-SRV] backup done (ok=%d)\n", ok ? 1 : 0);
 }
@@ -960,24 +956,37 @@ static void finaliseRestore() {
 }
 
 // ── Send active song buffer to the connected client ───────────────────────────
-// Called from commandsTick() when sSongPushPending is set.
-// Sends from srvActiveBuf directly — no SD read needed.
+// Called from commandsTick() when sSongPushPending is set.  Streams from
+// srvActiveBuf over MagiLink as HEADER + N×BODY (no SD read needed).
+// Body is `static` because 1029 bytes is too big for any caller's stack.
 static void sendActiveSongToClient() {
     if (!srvHasActive || srvActiveBufLen == 0) return;
-    extern MagiCommsTcp gTransportTcp;
-    uint32_t totalBytes = srvActiveBufLen;
-    size_t   totalLen   = 1 + totalBytes;
-    if (!gTransportTcp.streamBegin(totalLen)) {
-        Serial.printf("[CMD] push song: streamBegin failed (len=%u)\n", (unsigned)totalLen);
+    if (!gMagiLink.isConnected()) {
+        Serial.println("[CMD] song push: link not connected");
         return;
     }
-    uint8_t type = (uint8_t)MSG_SONG_BLOB;
-    bool ok = true;
-    ok &= gTransportTcp.streamMore(&type, 1);
-    ok &= gTransportTcp.streamMore(srvActiveBuf, totalBytes);
-    gTransportTcp.streamEnd();
-    Serial.printf("[CMD] push song to client: %u bytes streamed=%s\n",
-                  totalBytes, ok ? "OK" : "FAIL");
+
+    gMagiLink.acquireMutex();
+
+    MsgSongPushHeader hdr;
+    hdr.total_size = srvActiveBufLen;
+    bool ok = gMagiLink.send(&hdr, sizeof(hdr));
+
+    static MsgSongPushBody body;
+
+    uint32_t sent = 0;
+    while (ok && sent < srvActiveBufLen) {
+        uint32_t remain = srvActiveBufLen - sent;
+        uint16_t chunk  = remain > 1024 ? 1024 : (uint16_t)remain;
+        body.data_len = chunk;
+        memcpy(body.data, srvActiveBuf + sent, chunk);
+        ok = gMagiLink.send(&body, sizeof(body));
+        sent += chunk;
+    }
+
+    gMagiLink.releaseMutex();
+    Serial.printf("[CMD] song push: %u bytes (%s)\n",
+                  (unsigned)srvActiveBufLen, ok ? "OK" : "FAIL");
 }
 
 // ── Tick — call from main loop() to run deferred operations ──────────────────
@@ -990,8 +999,10 @@ void commandsTick() {
             sendActiveSongToClient();
         } else if (pairingIsConnected()) {
             // No song loaded — tell client to show "NO SONG" overlay
-            uint8_t msg = (uint8_t)MSG_NO_SONG;
-            gComms.send(&msg, 1);
+            MsgNoSong msg;
+            gMagiLink.acquireMutex();
+            gMagiLink.send(&msg, sizeof(msg));
+            gMagiLink.releaseMutex();
         }
     }
 

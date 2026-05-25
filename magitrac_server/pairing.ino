@@ -141,8 +141,6 @@ static void endSession(bool sendDisconnect) {
     if (serverMode == SERVER_CONNECTED) {
         if (sendDisconnect) {
             MsgDisconnect msg;
-            msg.id     = MSG_DISCONNECT;
-            msg.length = sizeof(msg);
             gComms.send(&msg, sizeof(msg));
         }
         gComms.removePeer(clientMac);
@@ -221,8 +219,6 @@ void pairingHandleMessage(const uint8_t* data, int len) {
                 gComms.addPeer(clientMac);
 
                 MsgConnectAck ack;
-                ack.id     = MSG_CONNECT_ACK;
-                ack.length = sizeof(ack);
                 gComms.send(&ack, sizeof(ack));
 
                 serverMode       = SERVER_CONNECTED;
