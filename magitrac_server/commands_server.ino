@@ -692,6 +692,130 @@ static void sendBackupFileRaw(const char* name) {
 }
 
 
+// ── MagiLink backup — streams every /songs/*.mgt + instruments.mgt ─────────
+//
+// Called from the MagiLink MSG_START_BACKUP handler (worker task context,
+// transaction mutex already held).  Sends:
+//   MsgBackupHeader, MsgBackupBody×N    ← for each file
+//   MsgEndOfData                         ← run complete
+//
+// SD reads gated by SdLock so SamplePlayer / other tasks can interleave
+// safely.  Sends are fire-and-forget — TCP backpressure paces via
+// blocking peer.write in MagiLink::send.
+void sendBackupToClient() {
+    if (!srvSdOk) {
+        Serial.println("[BK-SRV] SD not available — sending bare END_OF_DATA");
+        MsgEndOfData eod = { (uint8_t)MSG_END_OF_DATA, sizeof(eod) };
+        gMagiLink.send(&eod, sizeof(eod));
+        return;
+    }
+
+    // Step 1: enumerate files (one SdLock window, kept tight).
+    // names/sizes/body are static — they're large (~2 KB combined) and
+    // sendBackupToClient is only ever called from one task at a time,
+    // so static keeps the worker task's stack usage low.
+    static char     names[SRV_MAX_FILES][SRV_FNAME_MAX];
+    static uint32_t sizes[SRV_MAX_FILES];
+    uint16_t count = 0;
+    {
+        SdLock _;
+        File d = SD.open(SRV_SONGS_DIR);
+        if (d && d.isDirectory()) {
+            while (count < SRV_MAX_FILES) {
+                File entry = d.openNextFile();
+                if (!entry) break;
+                if (!entry.isDirectory()) {
+                    const char* nm = entry.name();
+                    if (nm && strstr(nm, ".mgt")) {
+                        strncpy(names[count], nm, SRV_FNAME_MAX - 1);
+                        names[count][SRV_FNAME_MAX - 1] = '\0';
+                        sizes[count] = (uint32_t)entry.size();
+                        count++;
+                    }
+                }
+                entry.close();
+            }
+            d.close();
+        }
+        // Add instruments.mgt at the end.
+        if (count < SRV_MAX_FILES && SD.exists(SRV_INSTRUMENTS_PATH)) {
+            File ins = SD.open(SRV_INSTRUMENTS_PATH);
+            if (ins) {
+                strncpy(names[count], "instruments.mgt", SRV_FNAME_MAX - 1);
+                names[count][SRV_FNAME_MAX - 1] = '\0';
+                sizes[count] = (uint32_t)ins.size();
+                count++;
+                ins.close();
+            }
+        }
+    }
+    Serial.printf("[BK-SRV] sending %u files\n", (unsigned)count);
+
+    // Step 2: send each file as header + N×body.
+    // body is static — 1029 bytes is too much for the worker task stack,
+    // and re-entrancy is not a concern.
+    static MsgBackupBody body;
+    body.id     = (uint8_t)MSG_BACKUP_BODY;
+    body.length = sizeof(body);
+
+    bool ok = true;
+    for (uint16_t i = 0; i < count && ok; i++) {
+        MsgBackupHeader hdr;
+        hdr.id         = (uint8_t)MSG_BACKUP_HEADER;
+        hdr.length     = sizeof(hdr);
+        memset(hdr.filename, 0, sizeof(hdr.filename));
+        strncpy(hdr.filename, names[i], sizeof(hdr.filename) - 1);
+        hdr.file_size  = sizes[i];
+        hdr.file_index = (uint16_t)(i + 1);
+        hdr.file_total = count;
+        ok = gMagiLink.send(&hdr, sizeof(hdr));
+        if (!ok) {
+            Serial.printf("[BK-SRV] header send failed at file %u\n", (unsigned)i);
+            break;
+        }
+
+        // Open the file.
+        char path[64];
+        if (strcmp(names[i], "instruments.mgt") == 0) {
+            strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
+        } else {
+            snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, names[i]);
+        }
+        path[sizeof(path) - 1] = '\0';
+
+        File f;
+        { SdLock _; f = SD.open(path); }
+        if (!f) {
+            Serial.printf("[BK-SRV] open failed '%s'\n", path);
+            continue;
+        }
+
+        // Stream body chunks.
+        uint32_t sent = 0;
+        while (ok && sent < sizes[i]) {
+            uint32_t want = sizes[i] - sent;
+            if (want > sizeof(body.data)) want = sizeof(body.data);
+            int got;
+            { SdLock _; got = f.read(body.data, want); }
+            if (got <= 0) break;
+            body.data_len = (uint16_t)got;
+            ok = gMagiLink.send(&body, sizeof(body));
+            if (!ok) {
+                Serial.printf("[BK-SRV] body send failed at file %u sent=%u\n",
+                              (unsigned)i, (unsigned)sent);
+                break;
+            }
+            sent += got;
+        }
+        { SdLock _; f.close(); }
+    }
+
+    // Step 3: end-of-data marker.
+    MsgEndOfData eod = { (uint8_t)MSG_END_OF_DATA, sizeof(eod) };
+    gMagiLink.send(&eod, sizeof(eod));
+    Serial.printf("[BK-SRV] backup done (ok=%d)\n", ok ? 1 : 0);
+}
+
 // ── TCP/IP diagnostic test — sends a 4096-byte incrementing-u8 blob ────────
 //
 // Wire payload (totalPayloadLen = 1 + 4 + 4096 = 4101):
