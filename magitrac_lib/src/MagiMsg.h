@@ -283,9 +283,11 @@ struct MsgSongLoadReq {
 // Client → Server: request a specific song by name (no extension).
 // Server appends ".mgt" to build the SD path.  Used by the setlist feature
 // where the client stores a bare song name rather than a positional ref.
+// Migrated to MagiLink — {id, length, name}.
 struct MsgSongLoadNameReq {
-    MagiMsgType type;
-    char        name[SL_NAME_LEN];   // null-terminated, no extension
+    uint8_t  id     = MSG_SONG_LOAD_NAME;
+    uint16_t length = sizeof(MsgSongLoadNameReq);
+    char     name[SL_NAME_LEN];   // null-terminated, no extension
 };
 
 // Server → Client: one chunk of song file data (download)
@@ -390,23 +392,25 @@ struct MsgInstrumentsPatch {
     uint8_t     data[SONG_PATCH_MAX];
 };
 
-// Client → Server: set or clear a single note
+// Client → Server: set or clear a single note (migrated to MagiLink).
 struct MsgNoteSet {
-    MagiMsgType type;       // MSG_NOTE_SET
-    uint8_t     pattern;    // pattern index
-    uint8_t     row;
-    uint8_t     col;
-    Note        note;       // all-zero = clear the cell
+    uint8_t  id      = MSG_NOTE_SET;
+    uint16_t length  = sizeof(MsgNoteSet);
+    uint8_t  pattern;
+    uint8_t  row;
+    uint8_t  col;
+    Note     note;       // all-zero = clear the cell
 };
 
 // Client → Server: audition the note at (pattern, row, col) for ~500ms.
 // Server reads the cell from the active song so transpose/velocity/program
 // stay in sync without duplicating logic on the client.
 struct MsgNoteAudition {
-    MagiMsgType type;       // MSG_NOTE_AUDITION
-    uint8_t     pattern;
-    uint8_t     row;
-    uint8_t     col;
+    uint8_t  id      = MSG_NOTE_AUDITION;
+    uint16_t length  = sizeof(MsgNoteAudition);
+    uint8_t  pattern;
+    uint8_t  row;
+    uint8_t  col;
 };
 
 // ── Backup / Restore ──────────────────────────────────────────────────────────

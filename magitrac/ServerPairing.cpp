@@ -344,36 +344,34 @@ bool ServerPairing::sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, 
     if (_pairState != PairClientState::SUCCESS) return false;
     if (pattern >= MAX_PATTERNS) return false;
     MsgNoteSet msg;
-    msg.type    = MagiMsgType::MSG_NOTE_SET;
     msg.pattern = pattern;
     msg.row     = row;
     msg.col     = col;
     NoteGrid grid(song.notePool, &song.patterns[pattern].noteHead);
     msg.note = grid.get(row, col);
-    return gComms.send(&msg, sizeof(msg));
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgNoteAudition msg;
-    msg.type    = MSG_NOTE_AUDITION;
     msg.pattern = pattern;
     msg.row     = row;
     msg.col     = col;
-    return gComms.send(&msg, sizeof(msg));
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendNoteSetReliable(const Song& song, uint8_t pattern, uint8_t row, uint8_t col) {
-    if (_pairState != PairClientState::SUCCESS) return false;
-    if (pattern >= MAX_PATTERNS) return false;
-    MsgNoteSet msg;
-    msg.type    = MagiMsgType::MSG_NOTE_SET;
-    msg.pattern = pattern;
-    msg.row     = row;
-    msg.col     = col;
-    NoteGrid grid(song.notePool, &song.patterns[pattern].noteHead);
-    msg.note = grid.get(row, col);
-    return gComms.sendReliable(&msg, sizeof(msg), row);
+    // TCP delivery is already reliable, so this is identical to sendNoteSet now.
+    // The legacy "sendReliable" had a row-keyed retransmit ring on top of
+    // ESP-NOW; with MagiLink it's a no-op distinction.
+    return sendNoteSet(song, pattern, row, col);
 }
 
 bool ServerPairing::sendSongToServer(const char* name, const Song* song) {
@@ -605,10 +603,11 @@ void ServerPairing::requestSongLoadByName(const char* name) {
     _chunksGot    = 0;
     _chunksTotal  = 0;
     MsgSongLoadNameReq req;
-    req.type = MSG_SONG_LOAD_NAME;
     memset(req.name, 0, sizeof(req.name));
     if (name) strncpy(req.name, name, sizeof(req.name) - 1);
-    gComms.send(&req, sizeof(req));
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&req, sizeof(req));
+    gMagiLink.releaseMutex();
     _setBrowseState(BrowseState::WAITING_SONG);
 }
 

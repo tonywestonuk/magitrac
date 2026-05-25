@@ -336,23 +336,11 @@ static void sendSongDataFromPath(const char* path, const char* displayName) {
     srvActiveName[sizeof(srvActiveName) - 1] = '\0';
     srvHasActive = true;
 
-    // Stream the whole song (SongFileHeader + Song struct) as one frame.
-    // Client receives via its MSG_SONG_BLOB stream-recv handler and writes
-    // straight into its in-memory song; no chunked accumulator state needed.
-    extern MagiCommsTcp gTransportTcp;
-    uint32_t totalBytes = srvActiveBufLen;
-    size_t   totalLen   = 1 + totalBytes;  // type byte + payload
-    if (!gTransportTcp.streamBegin(totalLen)) {
-        Serial.printf("[CMD] sendSongData: streamBegin failed (len=%u)\n", (unsigned)totalLen);
-        return;
-    }
-    uint8_t type = (uint8_t)MSG_SONG_BLOB;
-    bool ok = true;
-    ok &= gTransportTcp.streamMore(&type, 1);
-    ok &= gTransportTcp.streamMore(srvActiveBuf, totalBytes);
-    gTransportTcp.streamEnd();
-    Serial.printf("[CMD] sendSongData '%s' %u bytes streamed=%s\n",
-                  path, totalBytes, ok ? "OK" : "FAIL");
+    // Push the loaded song to the client via the MagiLink HEADER+BODY stream.
+    // Same path as the unsolicited push after handshake.
+    Serial.printf("[CMD] sendSongData '%s' %u bytes — pushing\n",
+                  path, (unsigned)srvActiveBufLen);
+    sendActiveSongToClient();
 }
 
 static void sendSongData(uint8_t page, uint8_t index) {
