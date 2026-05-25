@@ -596,6 +596,15 @@ void setup() {
     gMagiLink.registerCallback(MSG_NOTE_AUDITION,   controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_LOAD_NAME,  controlCb, nullptr);
 
+    // ── Song save (Phase 2 #6) — client streams Song bytes to us ───────────
+    // Handlers live in commands_server.ino; they accumulate into srvActiveBuf
+    // and set sMagiSavePending so commandsTick can do the SD write off the
+    // worker task (SD-on-worker would race with SamplePlayer).
+    extern void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* ctx);
+    extern void onMagiLinkSaveBody  (const uint8_t* msg, size_t len, void* ctx);
+    gMagiLink.registerCallback(MSG_SAVE_SONG_HEADER, onMagiLinkSaveHeader, nullptr);
+    gMagiLink.registerCallback(MSG_SAVE_SONG_BODY,   onMagiLinkSaveBody,   nullptr);
+
     // ── MSG_DISCONNECT (Phase 1 #2) ────────────────────────────────────────
     // Either side may send.  Server-side: tear down the session.  No ACK
     // needed — fire-and-forget.  TCP socket stays up; re-establishment
