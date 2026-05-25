@@ -195,6 +195,10 @@ public:
     void _onPairReceive(const uint8_t* data, int len);
     void _onSongBlobStream(size_t remainingLen);
     void _onInstrumentsBlobStream(size_t remainingLen);
+    // MagiLink session handshake — called from the registered callback
+    // (worker task, mutex held).  Sends MsgConnectAck and transitions
+    // _pairState to SUCCESS.
+    void _onMagiLinkConnect();
     static void _onSongBlobStreamTrampoline(size_t n, void* ctx) {
         static_cast<ServerPairing*>(ctx)->_onSongBlobStream(n);
     }

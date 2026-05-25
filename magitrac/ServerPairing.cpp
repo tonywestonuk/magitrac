@@ -4,6 +4,7 @@
 #include "MagiCommsEspNow.h"
 #include "MagiCommsTcp.h"
 #include "MagiUdpLink.h"
+#include "MagiLink.h"
 #include "MagiMsg.h"          // magiWifiChannelFromIdx()
 #include "SettingsPage.h"     // extern gWifiChannelIdx
 #include <WiFi.h>
@@ -112,6 +113,15 @@ void ServerPairing::begin() {
     gTransport.registerStreamRecv((uint8_t)MSG_INSTRUMENTS_BLOB,
                                   &ServerPairing::_onInstrumentsBlobStreamTrampoline, this);
 
+    // MagiLink: register MSG_CONNECT handler.  Server (STA) initiates the
+    // session handshake the moment its TCP connect succeeds; we reply
+    // with ACK and transition to SUCCESS.  The session ends when
+    // gMagiLink.isConnected() flips false — handled in tick().
+    gMagiLink.registerCallback(MSG_CONNECT,
+        [](const uint8_t* /*msg*/, size_t /*len*/, void* ctx) {
+            static_cast<ServerPairing*>(ctx)->_onMagiLinkConnect();
+        }, this);
+
     _ready = true;
 
     if (_hasPairing) {
@@ -126,29 +136,14 @@ void ServerPairing::begin() {
     }
 }
 
-// ── Auto-connect (over TCP — sends MSG_CONNECT once the socket is up) ───────
+// ── Auto-connect ─────────────────────────────────────────────────────────────
 //
-// On the magitrac client the AP is up the moment begin() returns, but the
-// TCP socket only flips hasPeer=true after the server boots, joins the AP,
-// and opens its socket.  If we're called before that, just sit in
-// AUTO_CONNECTING and let tick() retry every AUTO_CONNECT_RETRY_MS.
+// Post-MagiLink: the server (STA) is the one that initiates the session
+// handshake — it sends MSG_CONNECT the moment its TCP connect succeeds,
+// and our registered callback (set up in begin()) replies with ACK and
+// transitions to SUCCESS.  So _tryAutoConnect just parks us in the
+// AUTO_CONNECTING state and waits for that to happen.
 void ServerPairing::_tryAutoConnect() {
-    if (!gComms.hasPeer()) {
-        _setPairState(PairClientState::AUTO_CONNECTING);
-        return;
-    }
-
-    uint8_t myMac[6];
-    gComms.localAddr(myMac);
-
-    MsgConnect msg;
-    msg.type = MSG_CONNECT;
-    memcpy(msg.senderMac, myMac, 6);
-    memset(msg.hmac8, 0, sizeof(msg.hmac8));   // reserved — formerly HMAC
-
-    bool ok = gComms.send(&msg, sizeof(msg));
-    Serial.printf("[SP] auto-connect send=%s\n", ok ? "OK" : "FAIL");
-
     _setPairState(PairClientState::AUTO_CONNECTING);
 }
 
@@ -532,21 +527,16 @@ void ServerPairing::tick() {
             break;
 
         case PairClientState::SUCCESS:
-            // TCP keepalive drives liveness now — when the underlying
-            // socket goes away, gComms.hasPeer() flips false and we
-            // restart the auto-connect loop.
-            if (!gComms.hasPeer()) {
-                Serial.println("[SP] TCP peer gone — retrying");
-                gComms.removePeer(_serverMac);
+            // MagiLink's TCP keepalive drives liveness — when the socket
+            // dies, isConnected() flips false and we go back to waiting
+            // for the server to re-initiate the handshake.
+            if (!gMagiLink.isConnected()) {
+                Serial.println("[SP] MagiLink disconnected — back to AUTO_CONNECTING");
                 _serverName[0] = '\0';
                 _serverPlaying = false;
                 _setBrowseState(BrowseState::IDLE);
-                if (_hasPairing) {
-                    memcpy(_serverMac, _storedServerMac, 6);
-                    _tryAutoConnect();
-                } else {
-                    _setPairState(PairClientState::IDLE);
-                }
+                if (_hasPairing) _tryAutoConnect();
+                else             _setPairState(PairClientState::IDLE);
             }
             break;
 
@@ -958,6 +948,22 @@ void ServerPairing::_onPairReceive(const uint8_t* data, int len) {
         default:
             break;
     }
+}
+
+// ── MagiLink session handshake ──────────────────────────────────────────────
+//
+// Called from the worker task with the transaction mutex held — handler is
+// re-entrant-safe to call gMagiLink.send() (same task → mutex re-take is a
+// no-op).  Server has already established TCP and just sent MsgConnect;
+// we reply with MsgConnectAck and flip state to SUCCESS.
+void ServerPairing::_onMagiLinkConnect() {
+    MsgConnectAck ack;
+    ack.id     = MSG_CONNECT_ACK;
+    ack.length = sizeof(ack);
+    bool ok = gMagiLink.send(&ack, sizeof(ack));
+    Serial.printf("[SP] MagiLink: got MSG_CONNECT, ack send=%s\n",
+                  ok ? "OK" : "FAIL");
+    _setPairState(PairClientState::SUCCESS);
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

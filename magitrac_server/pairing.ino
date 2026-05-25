@@ -173,6 +173,29 @@ void pairingSendToClient(const void* data, size_t len) {
     gComms.send(data, len);
 }
 
+// ── MagiLink session hooks ──────────────────────────────────────────────────
+// Called from the MagiLink session task in magitrac_server.ino after the
+// MSG_CONNECT / MSG_CONNECT_ACK handshake completes (or fails).  These
+// own the SERVER_STANDALONE ↔ SERVER_CONNECTED transition for the new
+// transport.  Legacy gComms path is parallel and currently disabled —
+// when it's deleted, the MSG_CONNECT branch in pairingHandleMessage
+// goes too.
+void pairingOnMagiLinkConnected() {
+    if (serverMode == SERVER_CONNECTED) return;
+    serverMode       = SERVER_CONNECTED;
+    sSongPushPending = true;
+    sCancelArmed     = false;
+    needsFullRedraw  = true;
+    Serial.println("[PAIR] MagiLink session established");
+}
+
+void pairingOnMagiLinkDisconnected() {
+    if (serverMode != SERVER_CONNECTED) return;
+    serverMode      = SERVER_STANDALONE;
+    needsFullRedraw = true;
+    Serial.println("[PAIR] MagiLink session ended");
+}
+
 // ── Handle incoming messages ─────────────────────────────────────────────────
 void pairingHandleMessage(const uint8_t* data, int len) {
     if (len < 1) return;
@@ -196,8 +219,8 @@ void pairingHandleMessage(const uint8_t* data, int len) {
                 gComms.addPeer(clientMac);
 
                 MsgConnectAck ack;
-                ack.type = MSG_CONNECT_ACK;
-                memset(ack.nonce, 0, sizeof(ack.nonce));   // reserved
+                ack.id     = MSG_CONNECT_ACK;
+                ack.length = sizeof(ack);
                 gComms.send(&ack, sizeof(ack));
 
                 serverMode       = SERVER_CONNECTED;
@@ -338,13 +361,9 @@ void pairingLoop() {
         }
 
         case SERVER_CONNECTED:
-            // Liveness via TCP keepalive on the data socket — when it
-            // goes away, gComms.hasPeer() flips false and we end the
-            // session so the magitrac client can re-establish.
-            if (!gComms.hasPeer()) {
-                Serial.println("[PAIR] TCP peer gone — ending session");
-                endSession(false);
-            }
+            // Liveness now driven by the MagiLink session task in
+            // magitrac_server.ino — it watches gMagiLink.isConnected()
+            // and calls pairingOnMagiLinkDisconnected() on falling edge.
             break;
     }
 }
