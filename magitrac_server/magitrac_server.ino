@@ -813,38 +813,38 @@ void loop() {
         uint32_t now = millis();
 
         // ── BTN_B: short press = navigate up, long press = toggle test mode ─
+        //
+        // Release check before long-press check: if the main loop was blocked
+        // for ≥ LONG_PRESS_MS (e.g. a synchronous song push over WiFi), the
+        // button may have been pressed AND released within that gap.  Without
+        // re-sampling isDown(), the long-press timer would fire after the
+        // fact even though the user only tapped briefly.
         static bool sBtnBTestActive = false;
         if (BtnB.wasPressed()) {
             BtnB._held      = true;
             BtnB._longFired = false;
         }
         if (BtnB._held) {
-            if (!BtnB._longFired && (now - BtnB._pressedMs >= LONG_PRESS_MS)) {
+            if (!BtnB.isDown()) {
+                BtnB._held = false;
+                if (!BtnB._longFired) {
+                    if (sampleBrowserOpen) sampleMoveCursor(-1);
+                    else                  moveCursor(-1);
+                }
+            } else if (!BtnB._longFired && (now - BtnB._pressedMs >= LONG_PRESS_MS)) {
                 BtnB._longFired = true;
                 sBtnBTestActive = !sBtnBTestActive;
                 sequencerSetTestMode(sBtnBTestActive ? 500 : 0);
             }
-            if (!BtnB.isDown()) {
-                BtnB._held = false;
-                if (!BtnB._longFired) {
-                    // Short press released — navigate up
-                    if (sampleBrowserOpen) sampleMoveCursor(-1);
-                    else                  moveCursor(-1);
-                }
-            }
         }
 
         // ── BTN_A: short press = activate, long press = switch screen ────────
+        // Same release-before-long-press ordering as BtnB; see comment there.
         if (BtnA.wasPressed()) {
             BtnA._held      = true;
             BtnA._longFired = false;
         }
         if (BtnA._held) {
-            if (!BtnA._longFired && (now - BtnA._pressedMs >= LONG_PRESS_MS)) {
-                BtnA._longFired = true;
-                if (sampleBrowserOpen) switchToSongs();
-                else                   switchToSamples();
-            }
             if (!BtnA.isDown()) {
                 BtnA._held = false;
                 if (!BtnA._longFired) {
@@ -879,6 +879,10 @@ void loop() {
                         else                      sequencerStart();
                     }
                 }
+            } else if (!BtnA._longFired && (now - BtnA._pressedMs >= LONG_PRESS_MS)) {
+                BtnA._longFired = true;
+                if (sampleBrowserOpen) switchToSongs();
+                else                   switchToSamples();
             }
         }
 
@@ -893,11 +897,6 @@ void loop() {
             BtnC._longFired = false;
         }
         if (BtnC._held) {
-            if (!BtnC._longFired && (now - BtnC._pressedMs >= 2000)) {
-                BtnC._longFired = true;
-                if (pairingIsPaired()) pairingClearAndRestart();
-                else                   enterPairingMode();
-            }
             if (!BtnC.isDown()) {
                 BtnC._held = false;
                 if (!BtnC._longFired) {
@@ -905,6 +904,10 @@ void loop() {
                     if (sampleBrowserOpen) sampleMoveCursor(+1);
                     else                  moveCursor(+1);
                 }
+            } else if (!BtnC._longFired && (now - BtnC._pressedMs >= 2000)) {
+                BtnC._longFired = true;
+                if (pairingIsPaired()) pairingClearAndRestart();
+                else                   enterPairingMode();
             }
         }
 
