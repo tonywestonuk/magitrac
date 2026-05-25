@@ -810,7 +810,10 @@ void loop() {
 
     // Allow navigation in STANDALONE and CONNECTED; only block during active pairing ceremony
     if (!pairingIsActive() || pairingIsConnected()) {
-        uint32_t now = millis();
+        // No cached `now` — each long-press check calls millis() fresh.
+        // A stale cached value was the source of a uint32_t underflow when
+        // millis() ticked between sampling and the elif: see the long-press
+        // checks below for the explanation.
 
         // ── BTN_B: short press = navigate up, long press = toggle test mode ─
         //
@@ -831,7 +834,7 @@ void loop() {
                     if (sampleBrowserOpen) sampleMoveCursor(-1);
                     else                  moveCursor(-1);
                 }
-            } else if (!BtnB._longFired && (now - BtnB._pressedMs >= LONG_PRESS_MS)) {
+            } else if (!BtnB._longFired && (millis() - BtnB._pressedMs >= LONG_PRESS_MS)) {
                 BtnB._longFired = true;
                 sBtnBTestActive = !sBtnBTestActive;
                 sequencerSetTestMode(sBtnBTestActive ? 500 : 0);
@@ -879,7 +882,7 @@ void loop() {
                         else                      sequencerStart();
                     }
                 }
-            } else if (!BtnA._longFired && (now - BtnA._pressedMs >= LONG_PRESS_MS)) {
+            } else if (!BtnA._longFired && (millis() - BtnA._pressedMs >= LONG_PRESS_MS)) {
                 BtnA._longFired = true;
                 if (sampleBrowserOpen) switchToSongs();
                 else                   switchToSamples();
@@ -904,7 +907,7 @@ void loop() {
                     if (sampleBrowserOpen) sampleMoveCursor(+1);
                     else                  moveCursor(+1);
                 }
-            } else if (!BtnC._longFired && (now - BtnC._pressedMs >= 2000)) {
+            } else if (!BtnC._longFired && (millis() - BtnC._pressedMs >= 2000)) {
                 BtnC._longFired = true;
                 if (pairingIsPaired()) pairingClearAndRestart();
                 else                   enterPairingMode();
