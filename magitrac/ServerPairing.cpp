@@ -2,18 +2,40 @@
 #include "NoteGrid.h"
 #include "PairNVS.h"
 #include "MagiCommsEspNow.h"
+#include "MagiCommsTcp.h"
+#include "MagiUdpLink.h"
+#include "MagiMsg.h"          // magiWifiChannelFromIdx()
+#include "SettingsPage.h"     // extern gWifiChannelIdx
+#include <WiFi.h>
+#include <esp_random.h>
+#include <esp_mac.h>
 #include <string.h>
 
 #define CLI_NVS_NS "magitrac_cli"
 
 // ── Global instances ─────────────────────────────────────────────────────────
-static MagiCommsEspNow gTransport;
+// Three links running simultaneously on the magitrac client:
+//   • gTransport (TCP)     — main reliable data path; AP role at 192.168.0.1.
+//   • gPairTransport (ESP-NOW) — pairing ceremony only; coexist mode.
+//   • gUdpLink (UDP)       — best-effort datagrams for loss-tolerant updates
+//                            (row position, preview playhead, MIDI note-in).
+//                            Listener bound to MAGI_PORT alongside the TCP
+//                            listener (TCP/UDP port namespaces are disjoint).
+// Only the TCP transport is wrapped in MagiComms — pairing code and UDP
+// callers go through their own direct APIs.
+MagiCommsTcp            gTransport;          // exposed for streamBegin/streamMore from save/restore paths
+static MagiCommsEspNow  gPairTransport;
+static MagiUdpLink      gUdpLink;
 MagiComms gComms(gTransport);
 ServerPairing gServerPairing;
 
-// ── Receive callback — bridges MagiComms → ServerPairing ─────────────────────
+// ── Receive callbacks — data vs pairing, kept fully separate ────────────────
 static void onCommsRecv(const uint8_t* data, int len) {
     gServerPairing._onReceive(data, len);
+}
+
+static void onPairRecv(const uint8_t* data, int len) {
+    gServerPairing._onPairReceive(data, len);
 }
 
 // ── begin() ───────────────────────────────────────────────────────────────────
@@ -22,25 +44,100 @@ void ServerPairing::begin() {
     if (!_instBuf) _instBuf = new uint8_t[MAX_INSTRUMENTS * sizeof(Instrument)]();
     if (_ready) return;
 
+    // DEBUG: dump raw NVS state at boot — temporary, for NVS-corruption hunt.
+    pairNvsDump(CLI_NVS_NS);
+
+    // Load existing pairing (server MAC + secret).
+    _hasPairing = pairNvsLoad(CLI_NVS_NS, _storedServerMac, _storedSecret);
+
+    // Load or generate the AP info.  PSK is generated once on first boot
+    // and persisted forever — it's our identity as an AP, not part of any
+    // particular pairing.  Survives clearPairing().
+    //
+    // Also regenerate if a previous build saved a degenerate SSID (all-zero
+    // MAC bytes, e.g. "magitrac-000000") — that came from calling
+    // WiFi.macAddress() before WiFi was initialised; we now use
+    // esp_read_mac() which works pre-init.
+    bool loaded = pairNvsLoadApInfo(CLI_NVS_NS, _apSsid, _apPsk, &_nextHostOctet);
+    bool bogus  = loaded && (strstr(_apSsid, "000000") != nullptr);
+    if (!loaded || bogus) {
+        uint8_t myMac[6] = {};
+        esp_read_mac(myMac, ESP_MAC_WIFI_STA);   // factory MAC from eFuse — no WiFi needed
+        snprintf(_apSsid, sizeof(_apSsid), "magitrac-%02X%02X%02X",
+                 myMac[3], myMac[4], myMac[5]);
+        for (int i = 0; i < 16; i++) {
+            uint8_t v = esp_random() & 0xF;
+            _apPsk[i] = "0123456789abcdef"[v];
+        }
+        _apPsk[16] = 0;
+        _nextHostOctet = 3;
+        pairNvsSaveApInfo(CLI_NVS_NS, _apSsid, _apPsk, _nextHostOctet);
+        Serial.printf("[SP] %s AP: SSID=%s PSK=%s\n",
+                      bogus ? "regenerated" : "generated",
+                      _apSsid, _apPsk);
+    } else {
+        Serial.printf("[SP] AP ready: SSID=%s next-IP=.%u\n",
+                      _apSsid, _nextHostOctet);
+    }
+
+    // TCP transport — main data path.  AP role on 192.168.0.1, always on
+    // the user-configured channel (one of 1/6/11).  The server, when in
+    // pair mode, scans those three channels broadcasting MSG_PAIR_PROBE
+    // — so wherever our AP lives, the server will find it.  Once paired,
+    // the server STA-joins by SSID and tracks channel changes automatically.
+    const uint8_t channel = magiWifiChannelFromIdx(gWifiChannelIdx);
+    Serial.printf("[SP] AP channel: %u\n", channel);
+    gTransport.configureAp(_apSsid, _apPsk, MAGI_PORT, channel);
     gComms.setOnReceive(onCommsRecv);
     gComms.begin();
+
+    // ESP-NOW transport — pairing ceremony only.  Coexist mode keeps it
+    // from clobbering the TCP transport's WiFi setup.
+    gPairTransport.setCoexistMode(true);
+    gPairTransport.setOnReceive(onPairRecv);
+    gPairTransport.begin();
+
+    // UDP listener — shares MAGI_PORT with the TCP listener.  Loss-tolerant
+    // position/preview updates come in here.  Dispatches via the same
+    // _onReceive handler as TCP — the existing MAC check trivially passes
+    // because `lastSenderAddr()` returns the static `_storedServerMac`.
+    gUdpLink.setOnReceive(onCommsRecv);
+    gUdpLink.beginListener(MAGI_PORT);
+
+    // Streaming receive — song-load and instruments-load blobs come in as
+    // single ~35 KB frames; we read them straight into the in-memory
+    // buffers without a giant rxBuf in the TCP transport.
+    gTransport.registerStreamRecv((uint8_t)MSG_SONG_BLOB,
+                                  &ServerPairing::_onSongBlobStreamTrampoline, this);
+    gTransport.registerStreamRecv((uint8_t)MSG_INSTRUMENTS_BLOB,
+                                  &ServerPairing::_onInstrumentsBlobStreamTrampoline, this);
+
     _ready = true;
 
-    // Load stored pairing and attempt auto-connect immediately
-    _hasPairing = pairNvsLoad(CLI_NVS_NS, _storedServerMac, _storedSecret);
     if (_hasPairing) {
         Serial.printf("[SP] stored server: %02X:%02X:%02X:%02X:%02X:%02X\n",
             _storedServerMac[0], _storedServerMac[1], _storedServerMac[2],
             _storedServerMac[3], _storedServerMac[4], _storedServerMac[5]);
         memcpy(_serverMac, _storedServerMac, 6);
+        gComms.addPeer(_storedServerMac);   // register MAC for TCP-side lastSenderAddr
         _tryAutoConnect();
     } else {
         Serial.println("[SP] no stored pairing");
     }
 }
 
-// ── Auto-connect (pure ESP-NOW unicast — no HMAC) ─────────────────────────────
+// ── Auto-connect (over TCP — sends MSG_CONNECT once the socket is up) ───────
+//
+// On the magitrac client the AP is up the moment begin() returns, but the
+// TCP socket only flips hasPeer=true after the server boots, joins the AP,
+// and opens its socket.  If we're called before that, just sit in
+// AUTO_CONNECTING and let tick() retry every AUTO_CONNECT_RETRY_MS.
 void ServerPairing::_tryAutoConnect() {
+    if (!gComms.hasPeer()) {
+        _setPairState(PairClientState::AUTO_CONNECTING);
+        return;
+    }
+
     uint8_t myMac[6];
     gComms.localAddr(myMac);
 
@@ -49,35 +146,65 @@ void ServerPairing::_tryAutoConnect() {
     memcpy(msg.senderMac, myMac, 6);
     memset(msg.hmac8, 0, sizeof(msg.hmac8));   // reserved — formerly HMAC
 
-    gComms.addPeer(_storedServerMac);
-
     bool ok = gComms.send(&msg, sizeof(msg));
     Serial.printf("[SP] auto-connect send=%s\n", ok ? "OK" : "FAIL");
 
     _setPairState(PairClientState::AUTO_CONNECTING);
 }
 
-// ── Pairing ceremony ──────────────────────────────────────────────────────────
+// ── Pairing ceremony (over ESP-NOW; AP stays on user channel) ───────────────
+//
+// Flow (new, post-2026-05-24 redesign):
+//   1. User enters pair mode here → state = PAIRING_REQUEST (listening).
+//   2. Server (in its own pair mode) scans channels 1/6/11 broadcasting
+//      MSG_PAIR_PROBE.  When the server's current scan channel matches
+//      our AP channel, we receive the probe — see _onPairReceive.
+//   3. We generate a 4-digit PIN, register the server as ESP-NOW peer,
+//      unicast MSG_PAIR_CHALLENGE back with the PIN, show PIN on screen,
+//      → PAIRING_CONFIRM.
+//   4. User taps Confirm → confirmPairCode() unicasts MSG_PAIR_OFFER with
+//      AP creds + assigned static IP, persists the server MAC, → AUTO_CONNECTING.
+//   5. Server saves creds and reboots into TCP-STA mode.  TCP-side
+//      MSG_CONNECT closes the loop and we go to SUCCESS.
 void ServerPairing::startPairCeremony() {
-    MsgPairRequest req;
-    req.type = MSG_PAIR_REQUEST;
-    memcpy(req.magic, MAGI_PAIR_MAGIC, sizeof(req.magic));
-    gComms.localAddr(req.senderMac);
-    gComms.sendBroadcast(&req, sizeof(req));
-    Serial.println("[SP] sent MSG_PAIR_REQUEST");
+    Serial.println("[SP] entering pair mode — listening for PROBE");
+    _challengePending = false;
     _setPairState(PairClientState::PAIRING_REQUEST);
 }
 
 void ServerPairing::confirmPairCode() {
     if (_pairState != PairClientState::PAIRING_CONFIRM) return;
-    MsgPairAccept accept;
-    accept.type = MSG_PAIR_ACCEPT;
-    gComms.send(&accept, sizeof(accept));
-    Serial.println("[SP] sent MSG_PAIR_ACCEPT");
-    _setPairState(PairClientState::PAIRING_WAITING);
+
+    MsgPairOffer offer;
+    memset(&offer, 0, sizeof(offer));
+    offer.type = MSG_PAIR_OFFER;
+    strncpy(offer.apSsid, _apSsid, sizeof(offer.apSsid) - 1);
+    strncpy(offer.apPsk,  _apPsk,  sizeof(offer.apPsk)  - 1);
+    offer.assignedIp[0] = 192; offer.assignedIp[1] = 168;
+    offer.assignedIp[2] = 0;   offer.assignedIp[3] = 2;
+    offer.gatewayIp[0]  = 192; offer.gatewayIp[1]  = 168;
+    offer.gatewayIp[2]  = 0;   offer.gatewayIp[3]  = 1;
+    bool ok = gPairTransport.sendRaw(&offer, sizeof(offer));
+    Serial.printf("[SP] sent MSG_PAIR_OFFER unicast (%s)\n", ok ? "OK" : "FAIL");
+
+    // Persist server MAC — needed for TCP-side `lastSenderAddr` matching
+    // after the server reboots into STA mode and connects.  Secret is
+    // unused (no per-frame signing) but kept in the NVS schema.
+    uint8_t zeroSecret[16] = {};
+    pairNvsSave(CLI_NVS_NS, _serverMac, zeroSecret);
+    memcpy(_storedServerMac, _serverMac, 6);
+    _hasPairing = true;
+
+    // Hand off to the auto-connect path.  Server will be unreachable for
+    // a few seconds (reboot + WiFi join), then it sends MSG_CONNECT over
+    // TCP and we transition to SUCCESS.
+    gPairTransport.removePeer(_serverMac);    // ESP-NOW peer no longer needed
+    gComms.addPeer(_storedServerMac);         // register MAC label on TCP transport
+    _tryAutoConnect();
 }
 
 void ServerPairing::cancelPairing() {
+    _challengePending = false;
     if (_hasPairing) {
         memcpy(_serverMac, _storedServerMac, 6);
         _tryAutoConnect();
@@ -228,35 +355,28 @@ bool ServerPairing::sendNoteSetReliable(const Song& song, uint8_t pattern, uint8
 
 bool ServerPairing::sendSongToServer(const char* name, const Song* song) {
     if (_pairState != PairClientState::SUCCESS) return false;
-    static uint8_t buf[SONG_TRANSFER_MAX];
-    SongFileHeader* hdr = (SongFileHeader*)buf;
-    hdr->magic   = SONG_FILE_MAGIC;
-    hdr->version = SONG_FILE_VERSION;
-    memset(hdr->_pad, 0, sizeof(hdr->_pad));
-    memcpy(buf + sizeof(SongFileHeader), song, sizeof(Song));
-    uint32_t totalSize   = sizeof(SongFileHeader) + sizeof(Song);
-    uint8_t  totalChunks = (uint8_t)((totalSize + SONG_CHUNK_SIZE - 1) / SONG_CHUNK_SIZE);
 
-    MsgSongSaveStart start;
-    start.type = MSG_SONG_SAVE;
-    strncpy(start.name, name, sizeof(start.name) - 1);
-    start.name[sizeof(start.name) - 1] = '\0';
-    start.totalChunks = totalChunks;
-    gComms.send(&start, sizeof(start));
-    delay(10);
+    // Wire payload: type(1) + name(SRV_NAME_MAX) + SongFileHeader + Song.
+    // Streamed straight from our in-memory buffers — no chunk-buffer copy,
+    // no per-chunk loop, just three streamMore calls.
+    SongFileHeader hdr;
+    hdr.magic   = SONG_FILE_MAGIC;
+    hdr.version = SONG_FILE_VERSION;
+    memset(hdr._pad, 0, sizeof(hdr._pad));
 
-    MsgSongSaveData chunk;
-    chunk.type        = MSG_SONG_SAVE_DATA;
-    chunk.totalChunks = totalChunks;
-    for (uint8_t i = 0; i < totalChunks; i++) {
-        uint32_t offset    = (uint32_t)i * SONG_CHUNK_SIZE;
-        uint32_t remaining = totalSize - offset;
-        chunk.chunk   = i;
-        chunk.dataLen = (uint8_t)(remaining < SONG_CHUNK_SIZE ? remaining : SONG_CHUNK_SIZE);
-        memcpy(chunk.payload, buf + offset, chunk.dataLen);
-        gComms.sendReliable(&chunk, 4 + chunk.dataLen, i);
-    }
-    return true;
+    char namePadded[SRV_NAME_MAX] = {};
+    strncpy(namePadded, name, SRV_NAME_MAX - 1);
+
+    size_t totalLen = 1 + SRV_NAME_MAX + sizeof(SongFileHeader) + sizeof(Song);
+    if (!gTransport.streamBegin(totalLen)) return false;
+    uint8_t type = (uint8_t)MSG_SONG_SAVE_BLOB;
+    bool ok = true;
+    ok &= gTransport.streamMore(&type, 1);
+    ok &= gTransport.streamMore(namePadded, SRV_NAME_MAX);
+    ok &= gTransport.streamMore(&hdr, sizeof(hdr));
+    ok &= gTransport.streamMore(song, sizeof(Song));
+    gTransport.streamEnd();
+    return ok;
 }
 
 void ServerPairing::requestInstruments() {
@@ -297,12 +417,12 @@ void ServerPairing::resetInstruments() {
 
 // ── Backup / Restore ─────────────────────────────────────────────────────────
 
-void ServerPairing::requestBackupFileList(uint8_t page) {
+void ServerPairing::requestBackupFileList(uint8_t /*unused*/) {
     if (_pairState != PairClientState::SUCCESS) return;
     MsgBackupListReq msg;
     msg.type = MSG_BACKUP_LIST_REQ;
-    msg.page = page;
-    gComms.send(&msg, sizeof(msg));
+    bool ok = gComms.send(&msg, sizeof(msg));
+    Serial.printf("[SP] requestBackupFileList send=%s\n", ok ? "OK" : "FAIL");
     _backupState = BackupState::WAITING_FILE_LIST;
 }
 
@@ -322,35 +442,28 @@ void ServerPairing::requestBackupFile(const char* name) {
 void ServerPairing::resetBackup() {
     _backupState = BackupState::IDLE;
     _bkFileCount = 0;
-    _bkTotalFiles = 0;
 }
 
 bool ServerPairing::sendRestoreFile(const char* name, bool isInstruments,
                                      const uint8_t* data, uint32_t dataLen) {
     if (_pairState != PairClientState::SUCCESS) return false;
-    uint8_t totalChunks = (uint8_t)((dataLen + SONG_CHUNK_SIZE - 1) / SONG_CHUNK_SIZE);
 
-    MsgRestoreFileStart start;
-    start.type = MSG_RESTORE_FILE_START;
-    strncpy(start.name, name, sizeof(start.name) - 1);
-    start.name[sizeof(start.name) - 1] = '\0';
-    start.totalChunks  = totalChunks;
-    start.isInstruments = isInstruments ? 1 : 0;
-    gComms.send(&start, sizeof(start));
-    delay(10);
+    // Wire payload: type(1) + name(SRV_FNAME_MAX) + isInstruments(1) + size(u32) + bytes.
+    char namePadded[SRV_FNAME_MAX] = {};
+    strncpy(namePadded, name, SRV_FNAME_MAX - 1);
+    uint8_t isInstrByte = isInstruments ? 1 : 0;
 
-    MsgRestoreFileData chunk;
-    chunk.type        = MSG_RESTORE_FILE_DATA;
-    chunk.totalChunks = totalChunks;
-    for (uint8_t i = 0; i < totalChunks; i++) {
-        uint32_t offset    = (uint32_t)i * SONG_CHUNK_SIZE;
-        uint32_t remaining = dataLen - offset;
-        chunk.chunk   = i;
-        chunk.dataLen = (uint8_t)(remaining < SONG_CHUNK_SIZE ? remaining : SONG_CHUNK_SIZE);
-        memcpy(chunk.payload, data + offset, chunk.dataLen);
-        gComms.sendReliable(&chunk, 4 + chunk.dataLen, i);
-    }
-    return true;
+    size_t totalLen = 1 + SRV_FNAME_MAX + 1 + 4 + dataLen;
+    if (!gTransport.streamBegin(totalLen)) return false;
+    uint8_t type = (uint8_t)MSG_RESTORE_FILE_BLOB;
+    bool ok = true;
+    ok &= gTransport.streamMore(&type, 1);
+    ok &= gTransport.streamMore(namePadded, SRV_FNAME_MAX);
+    ok &= gTransport.streamMore(&isInstrByte, 1);
+    ok &= gTransport.streamMore(&dataLen, 4);
+    if (dataLen > 0) ok &= gTransport.streamMore(data, dataLen);
+    gTransport.streamEnd();
+    return ok;
 }
 
 bool ServerPairing::deleteSongOnServer(const char* name) {
@@ -364,6 +477,10 @@ bool ServerPairing::deleteSongOnServer(const char* name) {
 
 // ── tick() ────────────────────────────────────────────────────────────────────
 void ServerPairing::tick() {
+    // Drain any pending UDP datagrams (row/preview/note-in updates).  No-op
+    // when nothing's been received.
+    gUdpLink.poll();
+
     uint32_t now = millis();
     switch (_pairState) {
 
@@ -385,22 +502,41 @@ void ServerPairing::tick() {
             break;
 
         case PairClientState::PAIRING_REQUEST:
-            if (now - _pairStateMs >= PAIR_REQUEST_TIMEOUT_MS) {
-                Serial.println("[SP] pair request timeout");
+            if (_challengePending) {
+                _challengePending = false;
+                gPairTransport.addPeer(_serverMac);
+                MsgPairChallenge ch;
+                ch.type = MSG_PAIR_CHALLENGE;
+                memcpy(ch.pin, _pairCode, 4);
+                bool ok = gPairTransport.sendRaw(&ch, sizeof(ch));
+                Serial.printf("[SP] got PROBE → PIN %c%c%c%c, CHALLENGE send=%s\n",
+                    _pairCode[0], _pairCode[1], _pairCode[2], _pairCode[3],
+                    ok ? "OK" : "FAIL");
+                _setPairState(PairClientState::PAIRING_CONFIRM);
+                // We just transitioned — skip the timeout check this tick
+                // (else if).  Otherwise `now` (sampled before _setPairState)
+                // is older than the freshly-stamped _pairStateMs and the
+                // uint32_t subtraction underflows, firing the timeout
+                // immediately.
+            } else if (now - _pairStateMs >= PAIR_REQUEST_TIMEOUT_MS) {
+                Serial.println("[SP] pair window timeout");
                 _setPairState(PairClientState::IDLE);
             }
             break;
 
-        case PairClientState::PAIRING_WAITING:
-            if (now - _pairStateMs >= CONNECT_TIMEOUT_MS) {
-                Serial.println("[SP] pair complete timeout");
+        case PairClientState::PAIRING_CONFIRM:
+            if (now - _pairStateMs >= PAIR_REQUEST_TIMEOUT_MS) {
+                Serial.println("[SP] pair window timeout");
                 _setPairState(PairClientState::IDLE);
             }
             break;
 
         case PairClientState::SUCCESS:
-            if (now - _lastPingMs >= PING_TIMEOUT_MS) {
-                Serial.println("[SP] ping timeout — server gone, retrying");
+            // TCP keepalive drives liveness now — when the underlying
+            // socket goes away, gComms.hasPeer() flips false and we
+            // restart the auto-connect loop.
+            if (!gComms.hasPeer()) {
+                Serial.println("[SP] TCP peer gone — retrying");
                 gComms.removePeer(_serverMac);
                 _serverName[0] = '\0';
                 _serverPlaying = false;
@@ -525,47 +661,6 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
             }
             break;
 
-        case MSG_PAIR_CONFIRM:
-            if (_pairState != PairClientState::PAIRING_REQUEST) return;
-            if (len < (int)sizeof(MsgPairConfirm)) return;
-            {
-                const MsgPairConfirm* c = (const MsgPairConfirm*)data;
-                memcpy(_pairCode, c->code, 4);
-                // Store server MAC from sender so we can send back to it
-                memcpy(_serverMac, senderMac, 6);
-                gComms.addPeer(_serverMac);
-                Serial.printf("[SP] pair code: %c%c%c%c\n",
-                    _pairCode[0], _pairCode[1], _pairCode[2], _pairCode[3]);
-                _setPairState(PairClientState::PAIRING_CONFIRM);
-            }
-            break;
-
-        case MSG_PAIR_COMPLETE:
-            if (_pairState != PairClientState::PAIRING_WAITING) return;
-            if (len < (int)sizeof(MsgPairComplete)) return;
-            {
-                const MsgPairComplete* c = (const MsgPairComplete*)data;
-                pairNvsSave(CLI_NVS_NS, c->serverMac, c->secret);
-                memcpy(_storedServerMac, c->serverMac, 6);
-                memcpy(_storedSecret,    c->secret,    16);
-                _hasPairing = true;
-                Serial.println("[SP] pairing complete — secret saved");
-                gComms.removePeer(_serverMac);
-                memcpy(_serverMac, c->serverMac, 6);
-                _tryAutoConnect();
-            }
-            break;
-
-        case MSG_PING:
-            if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
-            _lastPingMs = millis();
-            {
-                uint8_t pong = (uint8_t)MSG_PONG;
-                gComms.send(&pong, 1);
-            }
-            break;
-
         case MSG_DISCONNECT:
             if (_pairState != PairClientState::SUCCESS) return;
             if (memcmp(senderMac, _serverMac, 6) != 0) return;
@@ -598,34 +693,8 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
             }
             break;
 
-        case MSG_SONG_DATA:
-            if (_backupState != BackupState::IDLE) return;
-            if (_browseState == BrowseState::IDLE && _pairState == PairClientState::SUCCESS) {
-                if (len >= 4 && ((const MsgSongData*)data)->chunk == 0)
-                    _setBrowseState(BrowseState::WAITING_SONG);
-                else
-                    return;
-            }
-            if (_browseState != BrowseState::WAITING_SONG) return;
-            if (len < 4) return;
-            {
-                const MsgSongData* d = (const MsgSongData*)data;
-                if (d->chunk == 0) {
-                    _songBufLen  = 0;
-                    _chunksGot   = 0;
-                    _chunksTotal = d->totalChunks;
-                }
-                uint32_t offset = (uint32_t)d->chunk * SONG_CHUNK_SIZE;
-                if (offset + d->dataLen <= SONG_TRANSFER_MAX) {
-                    memcpy(_songBuf + offset, d->payload, d->dataLen);
-                    _chunksGot++;
-                    if (offset + d->dataLen > _songBufLen)
-                        _songBufLen = offset + d->dataLen;
-                }
-                if (_chunksGot >= _chunksTotal && _chunksTotal > 0)
-                    _setBrowseState(BrowseState::SONG_READY);
-            }
-            break;
+        // MSG_SONG_DATA (chunked song download) retired — replaced by the
+        // streaming MSG_SONG_BLOB path which lands in _onSongBlobStream.
 
         case MSG_SAMPLE_LIST_RESP:
             if (_pairState != PairClientState::SUCCESS) return;
@@ -661,29 +730,8 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
             }
             break;
 
-        case MSG_INSTRUMENTS_DATA:
-            if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
-            if (len < 4) return;
-            {
-                const MsgInstrumentsData* d = (const MsgInstrumentsData*)data;
-                if (d->chunk == 0) {
-                    _instBufLen      = 0;
-                    _instChunksGot   = 0;
-                    _instChunksTotal = d->totalChunks;
-                }
-                uint32_t instMax = MAX_INSTRUMENTS * sizeof(Instrument);
-                uint32_t offset  = (uint32_t)d->chunk * SONG_CHUNK_SIZE;
-                if (offset + d->dataLen <= instMax) {
-                    memcpy(_instBuf + offset, d->payload, d->dataLen);
-                    _instChunksGot++;
-                    if (offset + d->dataLen > _instBufLen)
-                        _instBufLen = offset + d->dataLen;
-                }
-                if (_instChunksGot >= _instChunksTotal && _instChunksTotal > 0)
-                    _instReady = true;
-            }
-            break;
+        // MSG_INSTRUMENTS_DATA (chunked) retired — replaced by streaming
+        // MSG_INSTRUMENTS_BLOB which lands in _onInstrumentsBlobStream.
 
         case MSG_SEQ_POS:
             if (_pairState != PairClientState::SUCCESS) return;
@@ -738,52 +786,129 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
             }
             break;
 
-        case MSG_BACKUP_LIST_RESP:
+        case MSG_BACKUP_LIST_BLOB:
+            // Wire: type(1) + numFiles(1) + BkFileEntry × numFiles.
+            // The whole list arrives in one frame — UI just iterates
+            // backupFileCount() entries and goes.
             if (_backupState != BackupState::WAITING_FILE_LIST) return;
-            if (len < 5) return;
+            if (len < 2) return;
             {
-                const MsgBackupListResp* r = (const MsgBackupListResp*)data;
-                _bkPage       = r->page;
-                _bkTotalPages = r->totalPages;
-                _bkTotalFiles = r->totalFiles;
-                _bkFileCount  = r->count;
-                for (int i = 0; i < r->count && i < BK_PER_PKT; i++)
-                    _bkEntries[i] = r->entries[i];
+                int numFiles = data[1];
+                int hdrLen   = 2;
+                int expected = hdrLen + numFiles * (int)sizeof(BkFileEntry);
+                if (len != expected) return;
+                int cap = (int)(sizeof(_bkEntries) / sizeof(_bkEntries[0]));
+                if (numFiles > cap) numFiles = cap;
+                memcpy(_bkEntries, data + hdrLen,
+                       numFiles * sizeof(BkFileEntry));
+                _bkFileCount = numFiles;
                 _backupState = BackupState::FILE_LIST_READY;
             }
             break;
 
-        case MSG_BACKUP_FILE_START:
+        case MSG_BACKUP_FILE_BLOB:
+            // Layout: type(1) + name(SRV_FNAME_MAX=24) + size(u32 LE) + bytes.
+            // The whole file arrives as a single framed message — TCP did
+            // the segmentation/reassembly transparently.
+            Serial.printf("[SP] BACKUP_FILE_BLOB arrived len=%d bkState=%d\n",
+                          len, (int)_backupState);
             if (_backupState != BackupState::WAITING_FILE) return;
-            if (len < (int)sizeof(MsgBackupFileStart)) return;
+            if (len < 1 + (int)SRV_FNAME_MAX + 4) return;
             {
-                const MsgBackupFileStart* s = (const MsgBackupFileStart*)data;
-                _songBufLen  = 0;
-                _chunksGot   = 0;
-                _chunksTotal = s->totalChunks;
+                uint32_t fileSize;
+                memcpy(&fileSize, data + 1 + SRV_FNAME_MAX, 4);
+                int hdrLen = 1 + SRV_FNAME_MAX + 4;
+                Serial.printf("[SP] BLOB fileSize=%u expectLen=%d\n",
+                              (unsigned)fileSize, hdrLen + (int)fileSize);
+                if (len != hdrLen + (int)fileSize) return;
+                if (fileSize > SONG_TRANSFER_MAX) return;
+                memcpy(_songBuf, data + hdrLen, fileSize);
+                _songBufLen  = fileSize;
+                _backupState = BackupState::FILE_RECEIVED;
             }
             break;
 
-        case MSG_BACKUP_FILE_DATA:
-            if (_backupState != BackupState::WAITING_FILE) return;
-            if (len < 4) return;
-            {
-                const MsgBackupFileData* d = (const MsgBackupFileData*)data;
-                uint32_t offset = (uint32_t)d->chunk * SONG_CHUNK_SIZE;
-                if (offset + d->dataLen <= SONG_TRANSFER_MAX) {
-                    memcpy(_songBuf + offset, d->payload, d->dataLen);
-                    _chunksGot++;
-                    if (offset + d->dataLen > _songBufLen)
-                        _songBufLen = offset + d->dataLen;
-                }
-                if (_chunksGot >= _chunksTotal && _chunksTotal > 0)
-                    _backupState = BackupState::FILE_RECEIVED;
-            }
+        case MSG_TCP_TEST_BLOB:
+            // Pure streaming test — just count the blob and its bytes.
+            // No verification, no buffering, no per-blob handshake.
+            _tcpTestBlobCount++;
+            _tcpTestByteCount += (uint64_t)len;
             break;
 
         default:
             break;
     }
+}
+
+bool ServerPairing::startTcpTest() {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    uint8_t msg = (uint8_t)MSG_TCP_TEST_START;
+    return gComms.send(&msg, 1);
+}
+
+bool ServerPairing::stopTcpTest() {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    uint8_t msg = (uint8_t)MSG_TCP_TEST_STOP;
+    return gComms.send(&msg, 1);
+}
+
+// ── Streaming receive: song load (server → client) ──────────────────────────
+//
+// Frame payload is SongFileHeader + Song (~35 KB) — too big for the 8 KB
+// reader buffer.  Pump it straight into _songBuf, advance the browse state
+// machine on completion.  Runs on the TCP reader task.
+void ServerPairing::_onSongBlobStream(size_t remainingLen) {
+    // Drain anything we can't store cleanly so the next frame stays
+    // aligned to the wire.
+    if (remainingLen > SONG_TRANSFER_MAX) {
+        uint8_t junk[256];
+        while (remainingLen > 0) {
+            size_t n = remainingLen > sizeof(junk) ? sizeof(junk) : remainingLen;
+            size_t got = gTransport.streamReadRecv(junk, n);
+            if (got == 0) break;
+            remainingLen -= got;
+        }
+        Serial.println("[SP] SONG_BLOB too big — dropped");
+        return;
+    }
+
+    size_t got = gTransport.streamReadRecv(_songBuf, remainingLen);
+    if (got != remainingLen) {
+        Serial.printf("[SP] SONG_BLOB short read: got=%u want=%u\n",
+                      (unsigned)got, (unsigned)remainingLen);
+        return;
+    }
+    _songBufLen  = got;
+    _chunksGot   = 0;
+    _chunksTotal = 0;
+    _setBrowseState(BrowseState::SONG_READY);
+}
+
+// ── Streaming receive: instruments load (server → client) ───────────────────
+void ServerPairing::_onInstrumentsBlobStream(size_t remainingLen) {
+    if (!_instBuf) return;
+    uint32_t cap = MAX_INSTRUMENTS * (uint32_t)sizeof(Instrument);
+    if (remainingLen > cap) {
+        uint8_t junk[256];
+        while (remainingLen > 0) {
+            size_t n = remainingLen > sizeof(junk) ? sizeof(junk) : remainingLen;
+            size_t got = gTransport.streamReadRecv(junk, n);
+            if (got == 0) break;
+            remainingLen -= got;
+        }
+        Serial.println("[SP] INSTRUMENTS_BLOB too big — dropped");
+        return;
+    }
+    size_t got = gTransport.streamReadRecv(_instBuf, remainingLen);
+    if (got != remainingLen) {
+        Serial.printf("[SP] INSTRUMENTS_BLOB short read: got=%u want=%u\n",
+                      (unsigned)got, (unsigned)remainingLen);
+        return;
+    }
+    _instBufLen      = got;
+    _instChunksGot   = 0;
+    _instChunksTotal = 0;
+    _instReady       = true;
 }
 
 bool ServerPairing::remoteSeqPos(uint8_t* pattern, uint8_t* row) {
@@ -802,12 +927,43 @@ bool ServerPairing::pollMidiNoteIn(uint8_t* midiNote, uint8_t* velocity) {
     return true;
 }
 
+// ── Pair-ceremony receive callback (off the ESP-NOW transport) ──────────────
+void ServerPairing::_onPairReceive(const uint8_t* data, int len) {
+    if (len < 1) return;
+    MagiMsgType type = (MagiMsgType)data[0];
+    const uint8_t* senderMac = gPairTransport.lastSenderAddr();
+
+    switch (type) {
+
+        case MSG_PAIR_PROBE:
+            if (_pairState != PairClientState::PAIRING_REQUEST) return;
+            if (len < (int)sizeof(MsgPairProbe)) return;
+            if (_challengePending) return;   // already queued from an earlier probe
+            {
+                // Generate 4-digit PIN; record the server MAC.  The
+                // CHALLENGE itself is sent from tick() — we're on the
+                // WiFi task here and esp_now_send's send-cb runs on the
+                // same task, so blocking on the ACK semaphore inline
+                // would time out every time.
+                uint32_t r = esp_random();
+                _pairCode[0] = '0' + (r % 10); r /= 10;
+                _pairCode[1] = '0' + (r % 10); r /= 10;
+                _pairCode[2] = '0' + (r % 10); r /= 10;
+                _pairCode[3] = '0' + (r % 10);
+                memcpy(_serverMac, senderMac, 6);
+                _challengePending = true;
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
 // ── Internal helpers ──────────────────────────────────────────────────────────
 void ServerPairing::_setPairState(PairClientState s) {
     _pairState   = s;
     _pairStateMs = millis();
-    if (s == PairClientState::SUCCESS)
-        _lastPingMs = millis();
 }
 
 void ServerPairing::_setBrowseState(BrowseState s) {

@@ -1,4 +1,5 @@
 #include "SampleManifest.h"
+#include "sd_mutex.h"
 #include <Arduino.h>
 #include <SD.h>
 #include <string.h>
@@ -55,6 +56,7 @@ static uint8_t nextFreeId() {
 // ── Manifest I/O ───────────────────────────────────────────────────────────
 
 static void loadManifest() {
+    SdLock _;
     s_count = 0;
     File f = SD.open(SM_PATH, FILE_READ);
     if (!f) return;
@@ -81,6 +83,7 @@ static void loadManifest() {
 }
 
 static bool writeManifest() {
+    SdLock _;
     SD.remove(SM_PATH);
     File f = SD.open(SM_PATH, FILE_WRITE);
     if (!f) return false;
@@ -96,6 +99,7 @@ static bool writeManifest() {
 // Walks /samples/ for .wav files and appends any not already in the manifest.
 // Returns true if new entries were added.
 static bool scanAndAppend() {
+    SdLock _;
     File dir = SD.open(SM_DIR);
     if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return false; }
 
@@ -144,10 +148,13 @@ static void sortById() {
 
 bool sampleManifestSync() {
     s_count = 0;
-    File dir = SD.open(SM_DIR);
-    bool dirOk = dir && dir.isDirectory();
-    if (dir) dir.close();
-    if (!dirOk) return false;
+    {
+        SdLock _;
+        File dir = SD.open(SM_DIR);
+        bool dirOk = dir && dir.isDirectory();
+        if (dir) dir.close();
+        if (!dirOk) return false;
+    }
 
     loadManifest();
     bool changed = scanAndAppend();

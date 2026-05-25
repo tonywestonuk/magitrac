@@ -8,9 +8,8 @@
 enum class PairClientState : uint8_t {
     IDLE,
     AUTO_CONNECTING,   // has stored pairing; silently retrying connection
-    PAIRING_REQUEST,   // broadcast MSG_PAIR_REQUEST; waiting for MSG_PAIR_CONFIRM
-    PAIRING_CONFIRM,   // received code; waiting for user confirmation
-    PAIRING_WAITING,   // sent MSG_PAIR_ACCEPT; waiting for MSG_PAIR_COMPLETE
+    PAIRING_REQUEST,   // in pair mode; listening for MSG_PAIR_PROBE
+    PAIRING_CONFIRM,   // got probe + generated PIN; waiting for user to tap Confirm
     REQUESTING,        // sent MSG_CONNECT; waiting for MSG_CONNECT_ACK
     SUCCESS,           // connected — session active
     TIMEOUT,
@@ -20,16 +19,16 @@ enum class BrowseState : uint8_t {
     IDLE,
     WAITING_LIST,   // waiting for MSG_SONG_LIST_RESP
     LIST_READY,     // list available, user can select
-    WAITING_SONG,   // waiting for MSG_SONG_DATA chunks
+    WAITING_SONG,   // waiting for MSG_SONG_BLOB stream
     SONG_READY,     // song fully received and validated
     ERROR,
 };
 
 enum class BackupState : uint8_t {
     IDLE,
-    WAITING_FILE_LIST,  // waiting for MSG_BACKUP_LIST_RESP
+    WAITING_FILE_LIST,  // waiting for MSG_BACKUP_LIST_BLOB
     FILE_LIST_READY,    // list received
-    WAITING_FILE,       // waiting for MSG_BACKUP_FILE_START + DATA chunks
+    WAITING_FILE,       // waiting for MSG_BACKUP_FILE_BLOB
     FILE_RECEIVED,      // all chunks received for current file
     ERROR,
 };
@@ -60,8 +59,8 @@ public:
     void begin();   // init transport, load NVS pairing, auto-connect if paired
 
     // ── Pairing ceremony ──────────────────────────────────────────────────────
-    void startPairCeremony();           // broadcast MSG_PAIR_REQUEST
-    void confirmPairCode();             // user confirmed code → send MSG_PAIR_ACCEPT
+    void startPairCeremony();           // enter listen mode for MSG_PAIR_PROBE
+    void confirmPairCode();             // user tapped Confirm → send MSG_PAIR_OFFER
     void cancelPairing();               // abort ceremony or auto-connect
     bool hasPairing()    const { return _hasPairing; }
     void clearPairing();                // forget stored pairing (NVS clear)
@@ -124,15 +123,25 @@ public:
 
     BackupState backupState()       const { return _backupState; }
     int         backupFileCount()   const { return _bkFileCount; }
-    uint8_t     backupTotalFiles()  const { return _bkTotalFiles; }
-    uint8_t     backupPage()        const { return _bkPage; }
-    uint8_t     backupTotalPages()  const { return _bkTotalPages; }
+    uint8_t     backupTotalFiles()  const { return (uint8_t)_bkFileCount; }
     const char* backupFileName(int i) const { return _bkEntries[i].name; }
     uint32_t    backupFileSize(int i) const {
         return ((uint32_t)_bkEntries[i].sizeHi << 16) | _bkEntries[i].sizeLo;
     }
     const uint8_t* receivedFileData() const { return _songBuf; }
     uint32_t       receivedFileLen()  const { return _songBufLen; }
+
+    // ── TCP/IP diagnostic test ───────────────────────────────────────────────
+    // startTcpTest() tells the server to start emitting MSG_TCP_TEST_BLOB
+    // continuously (one per server main-loop tick, paced by TCP backpressure).
+    // stopTcpTest() tells it to stop.  Each arriving blob increments
+    // _tcpTestBlobCount and adds to _tcpTestByteCount — the page just
+    // reads those counters; no per-blob handshake.
+    bool startTcpTest();
+    bool stopTcpTest();
+    uint32_t tcpTestBlobCount() const { return _tcpTestBlobCount; }
+    uint64_t tcpTestByteCount() const { return _tcpTestByteCount; }
+    void     tcpTestResetCounters() { _tcpTestBlobCount = 0; _tcpTestByteCount = 0; }
 
     // ── MIDI passthrough ──────────────────────────────────────────────────────
     bool sendMidi(const uint8_t* bytes, uint8_t len);
@@ -173,8 +182,25 @@ public:
     const char* listName(int i)    const { return _listNames[i]; }
     bool        copySong(Song* out) const;
 
-    // ── Internal (called by receive callback) ─────────────────────────────────
+    // ── Internal (called by receive callbacks) ────────────────────────────────
+    // _onReceive  — data path, comes off MagiCommsTcp via gComms.
+    // _onPairReceive — pairing ceremony, comes off MagiCommsEspNow directly
+    //                  (bypassing MagiComms so the two recv streams stay
+    //                  segregated).
+    // _onSongBlobStream / _onInstrumentsBlobStream — streaming-receive
+    //                  handlers invoked by MagiCommsTcp's reader task when
+    //                  a MSG_*_BLOB arrives.  They pump bytes straight into
+    //                  the in-memory buffers via streamReadRecv().
     void _onReceive(const uint8_t* data, int len);
+    void _onPairReceive(const uint8_t* data, int len);
+    void _onSongBlobStream(size_t remainingLen);
+    void _onInstrumentsBlobStream(size_t remainingLen);
+    static void _onSongBlobStreamTrampoline(size_t n, void* ctx) {
+        static_cast<ServerPairing*>(ctx)->_onSongBlobStream(n);
+    }
+    static void _onInstrumentsBlobStreamTrampoline(size_t n, void* ctx) {
+        static_cast<ServerPairing*>(ctx)->_onInstrumentsBlobStream(n);
+    }
 
 private:
     void _setPairState(PairClientState s);
@@ -194,8 +220,25 @@ private:
     uint8_t _storedServerMac[6]  = {};
     uint8_t _storedSecret[16]    = {};
 
+    // Client-owned AP info — generated once on first boot, persisted forever.
+    // Handed to the server inside MsgPairOffer so it can STA-join the AP.
+    // _nextHostOctet is the next static IP to allocate (starts at 3 — .1 is
+    // the AP itself, .2 is reserved for magitrac_server).
+    char    _apSsid[33]    = {};
+    char    _apPsk[64]     = {};
+    uint8_t _nextHostOctet = 3;
+
+    // TCP/IP diagnostic test — receiver just counts, no buffering needed
+    uint32_t _tcpTestBlobCount = 0;
+    uint64_t _tcpTestByteCount = 0;
+
     // Pairing ceremony
     uint8_t _pairCode[4] = {};
+    // Set by the PROBE handler; consumed by tick().  Sending the CHALLENGE
+    // from inside the ESP-NOW recv callback would block waiting for the
+    // send-cb on the same WiFi task, so the ACK always times out.  Defer
+    // to the main loop instead.
+    bool    _challengePending = false;
 
     // Browse
     BrowseState _browseState      = BrowseState::IDLE;
@@ -226,13 +269,12 @@ private:
     uint8_t  _chunksGot    = 0;
     uint8_t  _chunksTotal  = 0;
 
-    // Backup state
+    // Backup state — single-blob list (no paging) holds every entry the
+    // server reported.  Sized to match the server's SRV_MAX_FILES upper
+    // bound plus one for the instruments file.
     BackupState _backupState    = BackupState::IDLE;
-    BkFileEntry _bkEntries[BK_PER_PKT];
+    BkFileEntry _bkEntries[SRV_MAX_FILES + 1];
     int         _bkFileCount    = 0;
-    uint8_t     _bkPage         = 0;
-    uint8_t     _bkTotalPages   = 1;
-    uint8_t     _bkTotalFiles   = 0;
 
     // Instruments receive buffer
     uint8_t* _instBuf         = nullptr;
@@ -249,13 +291,9 @@ private:
     uint8_t          _samplePage      = 0;
     uint8_t          _sampleTotalPages = 0;
 
-    // Keepalive
-    uint32_t _lastPingMs = 0;
-
     static const uint32_t CONNECT_TIMEOUT_MS    = 10000;
-    static const uint32_t PING_TIMEOUT_MS        = 15000;
     static const uint32_t AUTO_CONNECT_RETRY_MS  = 5000;
-    static const uint32_t PAIR_REQUEST_TIMEOUT_MS = 15000;
+    static const uint32_t PAIR_REQUEST_TIMEOUT_MS = 60000;   // match the server's 60 s window
 };
 
 extern ServerPairing gServerPairing;

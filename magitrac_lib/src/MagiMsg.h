@@ -14,14 +14,18 @@ enum MagiMsgType : uint8_t {
     MSG_CONNECT      = 0x02,  // client → server unicast: "connect to me" (includes HMAC)
     MSG_CONNECT_ACK  = 0x03,  // server → client: "connected" (includes session nonce)
     MSG_DISCONNECT   = 0x04,  // either → other:  "ending session"
-    MSG_PING         = 0x05,  // server → client: keepalive ping
-    MSG_PONG         = 0x06,  // client → server: keepalive pong
+    MSG_PING         = 0x05,  // retired — liveness now via TCP keepalive (id reserved)
+    MSG_PONG         = 0x06,  // retired — liveness now via TCP keepalive (id reserved)
 
-    // Pairing ceremony (one-time setup)
-    MSG_PAIR_REQUEST  = 0x07,  // client → broadcast: start one-time pairing
-    MSG_PAIR_CONFIRM  = 0x08,  // server → client:    4-digit confirmation code
-    MSG_PAIR_ACCEPT   = 0x09,  // client → server:    user confirmed code match
-    MSG_PAIR_COMPLETE = 0x0A,  // server → client:    shared secret + server MAC
+    // Pairing ceremony (one-time setup).  Server scans channels 1/6/11
+    // broadcasting MSG_PAIR_PROBE; magitrac client (when in pair mode)
+    // replies with MSG_PAIR_CHALLENGE carrying a 4-digit PIN it generated.
+    // The PIN is shown on both screens; user taps Confirm on magitrac;
+    // magitrac then unicasts MSG_PAIR_OFFER with the AP creds + static IP.
+    // Server saves and reboots into TCP-STA mode.
+    MSG_PAIR_PROBE     = 0x07,  // server → broadcast: "magitrac, are you there?"
+    MSG_PAIR_CHALLENGE = 0x08,  // client → server:    PIN to display + confirm
+    MSG_PAIR_OFFER     = 0x0B,  // client → server:    AP creds + assigned IP (TCP transport handoff)
 
     // Playback control
     MSG_PLAY             = 0x10,
@@ -36,14 +40,16 @@ enum MagiMsgType : uint8_t {
     MSG_SONG_LIST_REQ  = 0x20,
     MSG_SONG_LIST_RESP = 0x21,
     MSG_SONG_LOAD_REQ  = 0x22,
-    MSG_SONG_DATA      = 0x23,  // server → client: one download chunk
+    MSG_SONG_DATA      = 0x23,  // (retired — superseded by MSG_SONG_BLOB)
 
     // Song transfer — client → server (save)
-    MSG_SONG_SAVE      = 0x24,  // client → server: save-start (name + total chunks)
-    MSG_SONG_SAVE_DATA = 0x25,  // client → server: one upload chunk
+    MSG_SONG_SAVE      = 0x24,  // (retired — superseded by MSG_SONG_SAVE_BLOB)
+    MSG_SONG_SAVE_DATA = 0x25,  // (retired — superseded by MSG_SONG_SAVE_BLOB)
     MSG_SONG_DELETE    = 0x26,  // client → server: delete file by name
     MSG_CHUNK_ACK      = 0x27,  // reserved — formerly per-chunk app ACK; link-layer ACK is the only reliability now
     MSG_SONG_LOAD_NAME = 0x28,  // client → server: request song by bare name (no .mgt)
+    MSG_SONG_BLOB      = 0x29,  // server → client: whole song in one streamed message
+    MSG_SONG_SAVE_BLOB = 0x2A,  // client → server: whole song save in one streamed message
 
     // MIDI passthrough — client → server
     MSG_MIDI_DATA      = 0x30,  // client → server: raw MIDI bytes to forward to MIDI out
@@ -66,8 +72,9 @@ enum MagiMsgType : uint8_t {
 
     // Instruments — bidirectional
     MSG_INSTRUMENTS_REQ   = 0x40,  // client → server: request full instruments array
-    MSG_INSTRUMENTS_DATA  = 0x41,  // server → client: one chunk of instruments data
+    MSG_INSTRUMENTS_DATA  = 0x41,  // (retired — superseded by MSG_INSTRUMENTS_BLOB)
     MSG_INSTRUMENTS_PATCH = 0x42,  // client → server: patch bytes in instruments array
+    MSG_INSTRUMENTS_BLOB  = 0x43,  // server → client: whole instruments array in one streamed message
 
     // Note edit
     MSG_NOTE_SET = 0x50,  // client → server: set or clear one note by (pattern, row, col)
@@ -76,13 +83,34 @@ enum MagiMsgType : uint8_t {
     MSG_NOTE_AUDITION = 0x3A,  // client → server: play (pattern, row, col) briefly
 
     // Backup/Restore — bidirectional
-    MSG_BACKUP_LIST_REQ    = 0x70,  // client → server: request file list with sizes
-    MSG_BACKUP_LIST_RESP   = 0x71,  // server → client: one page of file entries
+    MSG_BACKUP_LIST_REQ    = 0x70,  // client → server: request full file list (no paging)
+    MSG_BACKUP_LIST_RESP   = 0x71,  // (retired — superseded by MSG_BACKUP_LIST_BLOB)
     MSG_BACKUP_FILE_REQ    = 0x72,  // client → server: request raw file by name
-    MSG_BACKUP_FILE_START  = 0x73,  // server → client: file header before chunks
-    MSG_BACKUP_FILE_DATA   = 0x74,  // server → client: one chunk of raw file bytes
-    MSG_RESTORE_FILE_START = 0x75,  // client → server: begin restore upload
-    MSG_RESTORE_FILE_DATA  = 0x76,  // client → server: one chunk of restore data
+    MSG_BACKUP_FILE_START  = 0x73,  // (retired — superseded by MSG_BACKUP_FILE_BLOB)
+    MSG_BACKUP_FILE_DATA   = 0x74,  // (retired — superseded by MSG_BACKUP_FILE_BLOB)
+    MSG_RESTORE_FILE_START = 0x75,  // (retired — superseded by MSG_RESTORE_FILE_BLOB)
+    MSG_RESTORE_FILE_DATA  = 0x76,  // (retired — superseded by MSG_RESTORE_FILE_BLOB)
+    MSG_BACKUP_FILE_BLOB   = 0x77,  // server → client: whole file in one streamed message
+    MSG_BACKUP_LIST_BLOB   = 0x78,  // server → client: all file entries in one streamed message
+    MSG_RESTORE_FILE_BLOB  = 0x79,  // client → server: whole restore file in one streamed message
+
+    // TCP/IP diagnostic test — minimal continuous streamer.  After START,
+    // server emits MSG_TCP_TEST_BLOB on every main-loop tick (paced only
+    // by TCP backpressure) until STOP.  Client just counts bytes.  No
+    // SD, no request/response per frame — pure WiFi+TCP throughput test.
+    MSG_TCP_TEST_START     = 0x7A,  // client → server: start streaming blobs
+    MSG_TCP_TEST_BLOB      = 0x7B,  // server → client: 4096-byte payload
+    MSG_TCP_TEST_STOP      = 0x7C,  // client → server: stop streaming
+
+    // New struct-driven backup transport (v2).  Client sends START_BACKUP
+    // once; server streams a continuous sequence of (HEADER + N×BODY) per
+    // file, finishing with END_OF_DATA.  Every message is a fixed-size
+    // struct in MagiMsg.h — receiver dispatches by id alone, no per-file
+    // request/response handshake.
+    MSG_START_BACKUP       = 0x80,  // client → server: start the backup
+    MSG_BACKUP_HEADER      = 0x81,  // server → client: filename + size + index/total
+    MSG_BACKUP_BODY        = 0x82,  // server → client: 1024-byte data slot + data_len
+    MSG_END_OF_DATA        = 0x83,  // server → client: marks end of a multi-message stream (generic)
 
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
@@ -120,35 +148,43 @@ struct MsgConnectAck {
 
 // ── Pairing ceremony messages ─────────────────────────────────────────────────
 
-// 8-byte magic prefix that pair-ceremony frames carry to distinguish a real
-// magitrac MsgPairRequest from a stray 7+8-byte ESP-NOW broadcast that
-// happens to start with the right type byte.  Not security — just a sanity
-// guard against random traffic on shared channels.
+// 8-byte magic prefix on the PROBE broadcast to distinguish a real
+// magitrac pairing frame from a stray ESP-NOW broadcast that happens to
+// start with the right type byte.  Not security — just a sanity guard
+// against random traffic on shared channels.
 #define MAGI_PAIR_MAGIC  "MAGITRAC"   // 8 chars, no terminator
 
-// Client → broadcast: initiate one-time pairing
-struct MsgPairRequest {
-    MagiMsgType type;         // MSG_PAIR_REQUEST
+// Server → broadcast (on channels 1, 6, 11 in turn): "magitrac, are you
+// there?"  Magitrac client replies (if in pair mode) with MSG_PAIR_CHALLENGE.
+struct MsgPairProbe {
+    MagiMsgType type;         // MSG_PAIR_PROBE
     char        magic[8];     // must equal MAGI_PAIR_MAGIC
-    uint8_t     senderMac[6]; // client's own MAC (broadcast has no sender info)
+    uint8_t     senderMac[6]; // server's own MAC (informational; wire src has it too)
 };
 
-// Server → client: 4-digit confirmation code to display
-struct MsgPairConfirm {
-    MagiMsgType type;    // MSG_PAIR_CONFIRM
-    uint8_t     code[4]; // 4 ASCII digit bytes, e.g. {'4','7','1','9'}
+// Client → server unicast: PIN to display on both screens.  Magitrac
+// generates the PIN locally, sends it here, and shows it to the user.
+// Server displays the received PIN.  User taps Confirm on magitrac.
+struct MsgPairChallenge {
+    MagiMsgType type;    // MSG_PAIR_CHALLENGE
+    uint8_t     pin[4];  // 4 ASCII digit bytes, e.g. {'4','7','1','9'}
 };
 
-// Client → server: user confirmed codes match (no payload beyond type)
-struct MsgPairAccept {
-    MagiMsgType type;    // MSG_PAIR_ACCEPT
-};
-
-// Server → client: pairing complete — shared secret and server MAC
-struct MsgPairComplete {
-    MagiMsgType type;         // MSG_PAIR_COMPLETE
-    uint8_t     secret[16];   // randomly generated 16-byte shared secret
-    uint8_t     serverMac[6]; // server's own MAC address
+// Client → server unicast: AP credentials and assigned IP — sent only
+// after the user confirms on the magitrac side.  Server saves to NVS and
+// reboots into TCP-STA mode to join the AP.
+//
+// SSID/PSK lengths are tight to fit the format we generate
+// ("magitrac-XXXXXX" + 16 hex chars).  Bump if longer creds are ever
+// needed.
+#define MAGI_OFFER_SSID_LEN 20
+#define MAGI_OFFER_PSK_LEN  20
+struct MsgPairOffer {
+    MagiMsgType type;                             // MSG_PAIR_OFFER
+    char        apSsid[MAGI_OFFER_SSID_LEN];      // null-terminated, ≤ 19 chars
+    char        apPsk [MAGI_OFFER_PSK_LEN];       // null-terminated, ≤ 19 chars
+    uint8_t     assignedIp[4];                    // {192,168,0,2}
+    uint8_t     gatewayIp [4];                    // {192,168,0,1}
 };
 
 // Either side → other: session ended
@@ -336,8 +372,6 @@ struct MsgNoteAudition {
 
 // ── Backup / Restore ──────────────────────────────────────────────────────────
 
-#define BK_PER_PKT  5   // backup list entries per response packet
-
 struct BkFileEntry {
     char     name[SRV_FNAME_MAX];  // 24 bytes — filename with extension
     uint16_t sizeHi;               // file size >> 16
@@ -346,38 +380,24 @@ struct BkFileEntry {
 
 struct MsgBackupListReq {
     MagiMsgType type;      // MSG_BACKUP_LIST_REQ
-    uint8_t     page;      // 0-based page
 };
 
-struct MsgBackupListResp {
-    MagiMsgType type;          // MSG_BACKUP_LIST_RESP
-    uint8_t     page;
-    uint8_t     totalPages;
-    uint8_t     count;         // entries this packet (0..BK_PER_PKT)
-    uint8_t     totalFiles;    // total across all pages
-    BkFileEntry entries[BK_PER_PKT];
-};
-// 5 + 5*28 = 145 bytes — fits ESP-NOW 250-byte limit
+// MSG_BACKUP_LIST_BLOB wire layout (streamed via MagiCommsTcp):
+//   type(1) + numFiles(1) + BkFileEntry × numFiles
+// No struct definition because the body is variable-length.  At
+// SRV_MAX_FILES+1 = 33 entries the blob is 1+1+33*28 = 926 bytes — well
+// under the reader buffer.  Old MsgBackupListResp + paging retired.
 
 struct MsgBackupFileReq {
     MagiMsgType type;              // MSG_BACKUP_FILE_REQ
     char        name[SRV_FNAME_MAX]; // filename to fetch
 };
 
-struct MsgBackupFileStart {
-    MagiMsgType type;              // MSG_BACKUP_FILE_START
-    char        name[SRV_FNAME_MAX];
-    uint16_t    totalSize;         // total file bytes
-    uint8_t     totalChunks;
-};
-
-struct MsgBackupFileData {
-    MagiMsgType type;        // MSG_BACKUP_FILE_DATA
-    uint8_t     chunk;
-    uint8_t     totalChunks;
-    uint8_t     dataLen;
-    uint8_t     payload[SONG_CHUNK_SIZE];
-};
+// MsgBackupFileStart / MsgBackupFileData (ESP-NOW-era chunked transfer)
+// retired — replaced by a single streamed MSG_BACKUP_FILE_BLOB whose wire
+// layout is: type(1) + name(SRV_FNAME_MAX) + size(u32 LE) + bytes.  No
+// struct definition because the body is variable-length raw bytes; the
+// sender uses MagiCommsTcp::streamMore() to shovel SD→socket directly.
 
 struct MsgRestoreFileStart {
     MagiMsgType type;              // MSG_RESTORE_FILE_START
@@ -429,5 +449,37 @@ struct MsgSampleListResp {
     MsgSampleListEntry entries[SAMPLES_PER_PKT];
 };
 // 5 + 8 * 25 = 205 bytes — fits ESP-NOW 250-byte limit
+
+// ── New struct-driven backup messages (v2 transport) ──────────────────────────
+// Every message starts with {id, length} so the receiver always knows how
+// many bytes follow, even for types it doesn't recognise.
+
+struct MsgStartBackup {
+    uint8_t  id;          // MSG_START_BACKUP
+    uint16_t length;      // sizeof(MsgStartBackup) — always 3
+};
+
+struct MsgBackupHeader {
+    uint8_t  id;          // MSG_BACKUP_HEADER
+    uint16_t length;      // sizeof(MsgBackupHeader)
+    char     filename[24];
+    uint32_t file_size;   // total bytes in this file
+    uint16_t file_index;  // 1-based: this is the Nth file
+    uint16_t file_total;  // total files in this backup (for progress UI)
+};
+// 1 + 2 + 24 + 4 + 2 + 2 = 35 bytes
+
+struct MsgBackupBody {
+    uint8_t  id;          // MSG_BACKUP_BODY
+    uint16_t length;      // sizeof(MsgBackupBody) — always 1029
+    uint16_t data_len;    // 0..1024 — meaningful bytes in `data`
+    uint8_t  data[1024];  // always sent in full, trailing bytes undefined
+};
+// 1 + 2 + 2 + 1024 = 1029 bytes
+
+struct MsgEndOfData {
+    uint8_t  id;          // MSG_END_OF_DATA
+    uint16_t length;      // sizeof(MsgEndOfData) — always 3
+};
 
 #pragma pack(pop)
