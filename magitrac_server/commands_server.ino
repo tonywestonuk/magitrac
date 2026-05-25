@@ -225,7 +225,6 @@ static void sendSongList(uint8_t page) {
     if (inPage < 0)          inPage = 0;
 
     MsgSongListResp resp;
-    resp.type       = MSG_SONG_LIST_RESP;
     resp.page       = page;
     resp.totalPages = (uint8_t)totalPages;
     resp.count      = (uint8_t)inPage;
@@ -239,7 +238,9 @@ static void sendSongList(uint8_t page) {
         if (len > 4 && resp.names[i][len - 4] == '.') resp.names[i][len - 4] = '\0';
     }
 
-    gComms.send(&resp, sizeof(resp));
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&resp, sizeof(resp));
+    gMagiLink.releaseMutex();
 }
 
 // ── Send sample list page to client ────────────────────────────────────────────
