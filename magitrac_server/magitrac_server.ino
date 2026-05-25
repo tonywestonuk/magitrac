@@ -586,12 +586,15 @@ void setup() {
     auto controlCb = [](const uint8_t* msg, size_t len, void* /*ctx*/) {
         handleCommand((MagiMsgType)msg[0], msg, (int)len);
     };
-    gMagiLink.registerCallback(MSG_PLAY,       controlCb, nullptr);
-    gMagiLink.registerCallback(MSG_STOP,       controlCb, nullptr);
-    gMagiLink.registerCallback(MSG_PAUSE,      controlCb, nullptr);
-    gMagiLink.registerCallback(MSG_UNPAUSE,    controlCb, nullptr);
-    gMagiLink.registerCallback(MSG_SEEK,       controlCb, nullptr);
-    gMagiLink.registerCallback(MSG_GOTO,       controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_PLAY,            controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_STOP,            controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_PAUSE,           controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_UNPAUSE,         controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SEEK,            controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_GOTO,            controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_NOTE_SET,        controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_NOTE_AUDITION,   controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SONG_LOAD_NAME,  controlCb, nullptr);
 
     // ── MSG_DISCONNECT (Phase 1 #2) ────────────────────────────────────────
     // Either side may send.  Server-side: tear down the session.  No ACK
