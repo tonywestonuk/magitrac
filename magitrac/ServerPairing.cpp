@@ -139,6 +139,15 @@ void ServerPairing::begin() {
     gMagiLink.registerCallback(MSG_SONG_PUSH_BODY,   songCb, this);
     gMagiLink.registerCallback(MSG_NO_SONG,          songCb, this);
 
+    // MagiLink: server → client play/stop notification.  Same id as the
+    // outbound request controls — receivers know by direction.  Updates
+    // _serverPlaying so the UI play/stop button reflects sequencer state.
+    auto playStopCb = [](const uint8_t* msg, size_t /*len*/, void* ctx) {
+        static_cast<ServerPairing*>(ctx)->_onMagiLinkServerState(msg[0] == MSG_PLAY);
+    };
+    gMagiLink.registerCallback(MSG_PLAY, playStopCb, this);
+    gMagiLink.registerCallback(MSG_STOP, playStopCb, this);
+
     _ready = true;
 
     if (_hasPairing) {
@@ -1055,6 +1064,11 @@ void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
             Serial.println("[SP] NO_SONG from server");
             break;
     }
+}
+
+void ServerPairing::_onMagiLinkServerState(bool playing) {
+    _serverPlaying = playing;
+    Serial.printf("[SP] server sequencer %s\n", playing ? "PLAY" : "STOP");
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

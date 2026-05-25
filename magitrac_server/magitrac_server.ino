@@ -757,11 +757,20 @@ void loop() {
         gUdpLink.send(&msg, sizeof(msg));
     }
 
-    // Forward play/stop notifications queued by the MIDI task
+    // Forward play/stop notifications queued by the MIDI task.  MagiLink
+    // direction: server → client.  Same id as the inbound client→server
+    // "please play/stop" — receiver knows by context (client has its own
+    // request callbacks for these).  MsgPlay's 3-byte layout is shared
+    // for both, override `id` per send.
     if (sStateNotify.dirty) {
         sStateNotify.dirty = false;
-        uint8_t msg = sStateNotify.playing ? (uint8_t)MSG_PLAY : (uint8_t)MSG_STOP;
-        pairingSendToClient(&msg, 1);
+        if (pairingIsConnected()) {
+            MsgPlay msg;
+            msg.id = sStateNotify.playing ? MSG_PLAY : MSG_STOP;
+            gMagiLink.acquireMutex();
+            gMagiLink.send(&msg, sizeof(msg));
+            gMagiLink.releaseMutex();
+        }
         // Redraw selected row so selector bar colour reflects play/stop state
         if (!sampleBrowserOpen && cursor >= scrollOffset &&
             cursor < scrollOffset + UI_VISIBLE_ROWS) {
