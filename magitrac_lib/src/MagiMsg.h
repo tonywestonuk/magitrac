@@ -267,24 +267,27 @@ struct MsgSetSongData {
 
 // Client → Server: request page of song list
 struct MsgSongListReq {
-    MagiMsgType type;   // MSG_SONG_LIST_REQ
-    uint8_t     page;   // 0-based page
+    uint8_t  id     = MSG_SONG_LIST_REQ;
+    uint16_t length = sizeof(MsgSongListReq);
+    uint8_t  page;   // 0-based page
 };
 
 // Server → Client: one page of the song list
 struct MsgSongListResp {
-    MagiMsgType type;
-    uint8_t     page;
-    uint8_t     totalPages;
-    uint8_t     count;                      // entries in this packet (0..SL_PER_PKT)
-    char        names[SL_PER_PKT][SL_NAME_LEN]; // 7 × 16 = 112 bytes
+    uint8_t  id     = MSG_SONG_LIST_RESP;
+    uint16_t length = sizeof(MsgSongListResp);
+    uint8_t  page;
+    uint8_t  totalPages;
+    uint8_t  count;                            // entries in this packet (0..SL_PER_PKT)
+    char     names[SL_PER_PKT][SL_NAME_LEN];   // 7 × 16 = 112 bytes
 };
 
 // Client → Server: request a specific song by page + index-within-page
 struct MsgSongLoadReq {
-    MagiMsgType type;
-    uint8_t     page;
-    uint8_t     index;
+    uint8_t  id     = MSG_SONG_LOAD_REQ;
+    uint16_t length = sizeof(MsgSongLoadReq);
+    uint8_t  page;
+    uint8_t  index;
 };
 
 // Client → Server: request a specific song by name (no extension).
@@ -328,8 +331,9 @@ struct MsgSongSaveData {
 
 // Client → Server: delete a file by name
 struct MsgSongDelete {
-    MagiMsgType type;              // MSG_SONG_DELETE
-    char        name[SRV_NAME_MAX]; // filename to delete (no extension)
+    uint8_t  id     = MSG_SONG_DELETE;
+    uint16_t length = sizeof(MsgSongDelete);
+    char     name[SRV_NAME_MAX];   // filename to delete (no extension)
 };
 
 // Client → Server: raw MIDI bytes to forward directly to MIDI out

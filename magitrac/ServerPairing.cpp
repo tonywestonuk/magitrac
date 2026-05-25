@@ -138,6 +138,7 @@ void ServerPairing::begin() {
     gMagiLink.registerCallback(MSG_SONG_PUSH_HEADER, songCb, this);
     gMagiLink.registerCallback(MSG_SONG_PUSH_BODY,   songCb, this);
     gMagiLink.registerCallback(MSG_NO_SONG,          songCb, this);
+    gMagiLink.registerCallback(MSG_SONG_LIST_RESP,   songCb, this);
 
     // MagiLink: server → client play/stop notification.  Same id as the
     // outbound request controls — receivers know by direction.  Updates
@@ -512,10 +513,12 @@ bool ServerPairing::sendRestoreFile(const char* name, bool isInstruments,
 bool ServerPairing::deleteSongOnServer(const char* name) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgSongDelete msg;
-    msg.type = MSG_SONG_DELETE;
-    strncpy(msg.name, name, sizeof(msg.name) - 1);
-    msg.name[sizeof(msg.name) - 1] = '\0';
-    return gComms.send(&msg, sizeof(msg));
+    memset(msg.name, 0, sizeof(msg.name));
+    if (name) strncpy(msg.name, name, sizeof(msg.name) - 1);
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 // ── tick() ────────────────────────────────────────────────────────────────────
@@ -598,9 +601,10 @@ void ServerPairing::requestSongList(uint8_t page) {
     _listCount = 0;
     _listPage  = page;
     MsgSongListReq req;
-    req.type = MSG_SONG_LIST_REQ;
     req.page = page;
-    gComms.send(&req, sizeof(req));
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&req, sizeof(req));
+    gMagiLink.releaseMutex();
     _setBrowseState(BrowseState::WAITING_LIST);
 }
 
@@ -612,10 +616,11 @@ void ServerPairing::requestSongLoad(uint8_t page, uint8_t index) {
     _chunksGot    = 0;
     _chunksTotal  = 0;
     MsgSongLoadReq req;
-    req.type  = MSG_SONG_LOAD_REQ;
     req.page  = page;
     req.index = index;
-    gComms.send(&req, sizeof(req));
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&req, sizeof(req));
+    gMagiLink.releaseMutex();
     _setBrowseState(BrowseState::WAITING_SONG);
 }
 
@@ -1076,6 +1081,24 @@ void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
             _noSongPending = true;
             Serial.println("[SP] NO_SONG from server");
             break;
+
+        case MSG_SONG_LIST_RESP: {
+            if (_browseState != BrowseState::WAITING_LIST) return;
+            if (len < sizeof(MsgSongListResp)) return;
+            const MsgSongListResp* r = (const MsgSongListResp*)msg;
+            _listPage       = r->page;
+            _listTotalPages = r->totalPages > 0 ? r->totalPages : 1;
+            _listCount      = r->count <= SL_PER_PKT ? r->count : SL_PER_PKT;
+            memset(_listNames, 0, sizeof(_listNames));
+            for (int i = 0; i < _listCount; i++) {
+                strncpy(_listNames[i], r->names[i], SL_NAME_LEN - 1);
+                _listNames[i][SL_NAME_LEN - 1] = '\0';
+            }
+            _setBrowseState(BrowseState::LIST_READY);
+            Serial.printf("[SP] song list page %u: %d entries\n",
+                          (unsigned)_listPage, _listCount);
+            break;
+        }
     }
 }
 
