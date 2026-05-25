@@ -204,6 +204,9 @@ public:
     // MagiLink dispatcher for song-related messages: PUSH_HEADER, PUSH_BODY,
     // NO_SONG.  Switches on msg[0] and updates browse state / _songBuf.
     void _onMagiLinkSongMessage(const uint8_t* msg, size_t len);
+    // MagiLink server-state notification: MSG_PLAY / MSG_STOP from server
+    // tell us whether its sequencer is running.  Updates _serverPlaying.
+    void _onMagiLinkServerState(bool playing);
     static void _onSongBlobStreamTrampoline(size_t n, void* ctx) {
         static_cast<ServerPairing*>(ctx)->_onSongBlobStream(n);
     }
