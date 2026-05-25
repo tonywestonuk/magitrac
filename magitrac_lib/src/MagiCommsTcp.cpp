@@ -38,6 +38,14 @@
 // ── Tuning ──────────────────────────────────────────────────────────────────
 static const uint32_t READER_STACK     = 4096;
 static const UBaseType_t READER_PRIO   = 5;
+
+// Set to 1 to disable the legacy TCP server + reader task while keeping
+// the WiFi setup (softAP / STA association).  The new MagiLink runs on a
+// separate port and provides the only live socket.  Pairing, song
+// save/load, MIDI, etc. that route through gComms.send / streamBegin
+// will still try to use this transport but find no peer — they're
+// expected to be broken until they migrate to the new transport.
+#define DISABLE_LEGACY_TCP 1
 // TCP keepalive — replaces the old ESP-NOW ping/pong heartbeat that
 // kept getting starved by sustained TCP traffic sharing the radio.
 // Probes only fire when the link is idle, so backup-time data flow
@@ -189,10 +197,15 @@ bool MagiCommsTcp::begin() {
         Serial.printf("%s AP IP: %s\n", _logPfx,
                       WiFi.softAPIP().toString().c_str());
 
+#if !DISABLE_LEGACY_TCP
         _impl->server = new WiFiServer(_port);
         _impl->server->begin();
         Serial.printf("%s AP up: SSID=%s port=%u\n",
                       _logPfx, _ssid, (unsigned)_port);
+#else
+        Serial.printf("%s LEGACY TCP SERVER DISABLED — MagiLink owns the socket\n",
+                      _logPfx);
+#endif
     } else {
         // Same persistence reasoning as the AP branch — disable WiFi's
         // auto-save of SSID/PSK to NVS so a brown-out can't corrupt the
@@ -210,9 +223,14 @@ bool MagiCommsTcp::begin() {
 
     _impl->running = true;
     _impl->started = true;
+#if !DISABLE_LEGACY_TCP
     xTaskCreate(&MagiCommsTcp::_readerTrampoline,
                 _role == Role::Ap ? "mctcp_ap" : "mctcp_sta",
                 READER_STACK, this, READER_PRIO, &_impl->readerTask);
+#else
+    Serial.printf("%s LEGACY READER TASK NOT STARTED — MagiLink in use\n",
+                  _logPfx);
+#endif
     return true;
 }
 

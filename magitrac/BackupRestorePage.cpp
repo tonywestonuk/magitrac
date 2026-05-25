@@ -1,4 +1,6 @@
 #include "BackupRestorePage.h"
+#include "MagiLink.h"
+#include "MagiMsg.h"
 #include <SD.h>
 #include <string.h>
 #include <stdio.h>
@@ -298,23 +300,141 @@ void BackupRestorePage::drawError() {
 // ── Backup logic ─────────────────────────────────────────────────────────────
 
 void BackupRestorePage::startBackup() {
-    if (!gServerPairing.isPaired()) {
-        strncpy(_errMsg, "Not connected to server", sizeof(_errMsg));
+    // Real backup over MagiLink.  Synchronous — UI freezes for the
+    // duration (~10-20 s for a typical 28-file backup).  Pattern:
+    //   acquire mutex
+    //   send MSG_START_BACKUP
+    //   loop read(): header → bodies (write each to SD) → ... → end
+    //   release mutex
+
+    if (!gMagiLink.isConnected()) {
+        strncpy(_errMsg, "Not connected (link)", sizeof(_errMsg));
         _state = BRState::ERROR_SCREEN;
-        draw(); _d.paint();
+        draw(); _d.paintLater();
         return;
     }
+
+    // Create the destination folder with a timestamp.
+    if (_rtc) {
+        I2C_BM8563_TimeTypeDef t; I2C_BM8563_DateTypeDef d;
+        _rtc->getTime(&t); _rtc->getDate(&d);
+        int yr = d.year; if (yr > 2000) yr -= 2000;
+        snprintf(_bkFolder, sizeof(_bkFolder),
+                 "%s/bk_%02d%02d%02d_%02d%02d%02d",
+                 BR_BACKUPS_DIR, yr, d.month, d.date,
+                 t.hours, t.minutes, t.seconds);
+    } else {
+        snprintf(_bkFolder, sizeof(_bkFolder),
+                 "%s/bk_%lu", BR_BACKUPS_DIR, millis());
+    }
+    if (!SD.exists(BR_BACKUPS_DIR)) SD.mkdir(BR_BACKUPS_DIR);
+    SD.mkdir(_bkFolder);
+    Serial.printf("[BK] folder=%s\n", _bkFolder);
+
     _bkFileTotal   = 0;
     _bkFileCurrent = 0;
     _bkCancelled   = false;
-    _state = BRState::BACKUP_WAITING_LIST;
-    gServerPairing.resetBackup();
-    gServerPairing.requestBackupFileList(0);
-#if REPRO_SKIP_EPD_PAINT
-    Serial.println("[BK][REPRO] skip-paint startBackup");
-#else
-    draw(); _d.paint();
-#endif
+
+    // Show "backup in progress" — paintLater so the EPD work happens on
+    // its own task and we proceed to the transaction immediately.
+    _state = BRState::BACKUP_PROGRESS;
+    draw(); _d.paintLater();
+
+    gMagiLink.acquireMutex();
+    MsgStartBackup req = { (uint8_t)MSG_START_BACKUP, sizeof(req) };
+    if (!gMagiLink.send(&req, sizeof(req))) {
+        Serial.println("[BK] send MSG_START_BACKUP failed");
+        gMagiLink.releaseMutex();
+        strncpy(_errMsg, "Backup send failed", sizeof(_errMsg));
+        _state = BRState::ERROR_SCREEN;
+        draw(); _d.paintLater();
+        return;
+    }
+
+    // Receive loop: header → bodies → header → bodies → ... → end_of_data.
+    File     curFile;
+    uint32_t curBytesWritten = 0;
+    uint32_t curFileSize     = 0;
+    bool     done            = false;
+    bool     readOk          = true;
+
+    while (!done) {
+        const uint8_t* m = gMagiLink.read();
+        if (!m) {
+            Serial.println("[BK] read returned nullptr (disconnect)");
+            readOk = false;
+            break;
+        }
+
+        uint8_t id = m[0];
+        if (id == MSG_BACKUP_HEADER) {
+            const MsgBackupHeader* h = (const MsgBackupHeader*)m;
+            if (curFile) curFile.close();
+
+            // drawBackupProgress + the existing UI expect _bkFileCurrent
+            // as a 0-based index; h->file_index is 1-based.  Translate.
+            _bkFileCurrent  = (int)h->file_index - 1;
+            _bkFileTotal    = h->file_total;
+            curBytesWritten = 0;
+            curFileSize     = h->file_size;
+
+            char nameStr[25] = {};
+            strncpy(nameStr, h->filename, 24);
+
+            // Populate _bkFileNames so drawBackupProgress can display the
+            // currently-streaming file's name.
+            if (_bkFileCurrent >= 0 && _bkFileCurrent < BR_MAX_FILES) {
+                memset(_bkFileNames[_bkFileCurrent], 0, SRV_FNAME_MAX);
+                strncpy(_bkFileNames[_bkFileCurrent], nameStr,
+                        SRV_FNAME_MAX - 1);
+            }
+            Serial.printf("[BK] header file=%u/%u name='%s' size=%u\n",
+                          (unsigned)h->file_index, (unsigned)h->file_total,
+                          nameStr, (unsigned)h->file_size);
+
+            char path[80];
+            snprintf(path, sizeof(path), "%s/%s", _bkFolder, nameStr);
+            if (SD.exists(path)) SD.remove(path);
+            curFile = SD.open(path, FILE_WRITE);
+            if (!curFile) {
+                Serial.printf("[BK] SD open failed '%s'\n", path);
+            }
+
+            // Per-file UI update — paintLater so the EPD repaint runs on
+            // its own task and doesn't block the body stream.
+            draw(); _d.paintLater();
+        }
+        else if (id == MSG_BACKUP_BODY) {
+            const MsgBackupBody* b = (const MsgBackupBody*)m;
+            uint16_t n = b->data_len;
+            if (n > sizeof(b->data)) n = sizeof(b->data);
+            if (curFile) curFile.write(b->data, n);
+            curBytesWritten += n;
+            if (curBytesWritten >= curFileSize) {
+                Serial.printf("[BK] file %u/%u complete (%u bytes)\n",
+                              (unsigned)_bkFileCurrent, (unsigned)_bkFileTotal,
+                              (unsigned)curBytesWritten);
+            }
+        }
+        else if (id == MSG_END_OF_DATA) {
+            Serial.println("[BK] END_OF_DATA — backup complete");
+            done = true;
+        }
+        else {
+            Serial.printf("[BK] unexpected id=0x%02X — ignoring\n", id);
+        }
+    }
+
+    if (curFile) curFile.close();
+    gMagiLink.releaseMutex();
+
+    if (readOk) {
+        _state = BRState::BACKUP_DONE;
+    } else {
+        strncpy(_errMsg, "Connection lost mid-backup", sizeof(_errMsg));
+        _state = BRState::ERROR_SCREEN;
+    }
+    draw(); _d.paintLater();
 }
 
 void BackupRestorePage::backupTick() {

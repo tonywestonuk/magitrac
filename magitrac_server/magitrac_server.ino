@@ -557,6 +557,25 @@ void setup() {
     });
     gComms.begin();
 
+    // ── New comms link (alongside legacy MagiCommsTcp, separate port) ──────
+    // Connects to the magitrac AP at 192.168.0.1:4343.  The MagiLink task
+    // waits internally for WiFi STA association before attempting connect,
+    // so it's safe to start before the WiFi is fully up.
+    gMagiLink.beginSta(4343, IPAddress(192, 168, 0, 1));
+
+    // ── Backup handler ─────────────────────────────────────────────────────
+    // Client sends MSG_START_BACKUP → server streams every /songs/*.mgt
+    // plus instruments.mgt as (header + N bodies), terminated by
+    // MsgEndOfData.  Runs on the MagiLink worker task with the transaction
+    // mutex already held; sendBackupToClient lives in commands_server.ino.
+    extern void sendBackupToClient();
+    gMagiLink.registerCallback(MSG_START_BACKUP,
+        [](const uint8_t* /*msg*/, size_t /*len*/, void* /*ctx*/) {
+            Serial.println("[BK-SRV] MSG_START_BACKUP received");
+            sendBackupToClient();
+        },
+        nullptr);
+
     // Streaming-receive handlers for the big client→server uploads
     // (song save, restore file).  Handler bodies live in
     // commands_server.ino; declared extern here.

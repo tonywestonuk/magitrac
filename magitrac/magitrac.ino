@@ -273,6 +273,11 @@ void setup() {
     loadWifiChannel();
     gServerPairing.begin();
 
+    // ── New comms link (alongside legacy MagiCommsTcp, separate port) ───────
+    // Coexists on port 4343 while the old transport keeps running on 4242.
+    // Will take over 4242 once everything is migrated.
+    gMagiLink.beginAp(4343);
+
     // Backlight — only available on LilyGo T5 boards (BOARD_BL_EN conflicts
     // with display pins on M5PaperS3)
     if (display.getPreset() != &EPD_M5PAPER_S3_PRESET) {
@@ -370,17 +375,16 @@ void loop() {
         PairClientState ps = gServerPairing.pairState();
         BrowseState     bs = gServerPairing.browseState();
 
-        if (ps == PairClientState::AUTO_CONNECTING ||
-            ps == PairClientState::REQUESTING      ||
-            ps == PairClientState::PAIRING_REQUEST ||
-            ps == PairClientState::PAIRING_CONFIRM) {
-            strncpy(sStatusBuf, "Connecting...", 31);
-        } else if (ps == PairClientState::SUCCESS && bs == BrowseState::WAITING_SONG) {
-            strncpy(sStatusBuf, "Downloading...", 31);
-        } else if (ps == PairClientState::SUCCESS) {
+        // Status now driven by the new MagiLink — the legacy pairState is
+        // still updating in the background (old transport runs on 4242),
+        // but the visible word reflects the new link's socket state on
+        // port 4343.  Will collapse back to one signal after the
+        // migration finishes.
+        (void)ps; (void)bs;
+        if (gMagiLink.isConnected()) {
             strncpy(sStatusBuf, "Connected", 31);
         } else {
-            strncpy(sStatusBuf, "Standalone", 31);
+            strncpy(sStatusBuf, "Connecting...", 31);
         }
         sStatusBuf[31] = '\0';
 

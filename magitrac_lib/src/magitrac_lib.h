@@ -13,4 +13,5 @@
 #include "MagiCommsEspNow.h"
 #include "MagiCommsTcp.h"
 #include "MagiUdpLink.h"
+#include "MagiLink.h"
 #include "PairNVS.h"
