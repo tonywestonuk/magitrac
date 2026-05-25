@@ -53,9 +53,18 @@ static void onEspNowRecv(const esp_now_recv_info* info, const uint8_t* data, int
     // dispatcher's filtering.
     MagiCommsEspNow::_inst->invokeSpyCb(data, len);
 
-    // Main dispatch: drop broadcasts (they're not magitrac-protocol unicasts
-    // and don't carry valid MagiMsgType byte at offset 0).
-    if (isBcast) return;
+    // Main dispatch:
+    //   Unicasts → always.
+    //   Broadcasts → only if a magitrac MSG_PAIR_PROBE — the magitrac
+    //     server broadcasts these while scanning channels 1/6/11 in pair
+    //     mode.  The MAGI_PAIR_MAGIC prefix at offset 1 disambiguates the
+    //     frame from random channel chatter.  CHALLENGE and OFFER are
+    //     unicast, so they don't appear in this branch.
+    if (isBcast) {
+        if (data[0] != MSG_PAIR_PROBE) return;
+        if (len < 1 + (int)sizeof(MAGI_PAIR_MAGIC) - 1) return;
+        if (memcmp(data + 1, MAGI_PAIR_MAGIC, sizeof(MAGI_PAIR_MAGIC) - 1) != 0) return;
+    }
 
     memcpy(MagiCommsEspNow::_inst->_lastSender, info->src_addr, 6);
     MagiCommsEspNow::_inst->invokeRecvCb(data, len);
@@ -63,22 +72,48 @@ static void onEspNowRecv(const esp_now_recv_info* info, const uint8_t* data, int
 
 bool MagiCommsEspNow::begin() {
     _inst = this;
-    WiFi.mode(WIFI_STA);
-    WiFi.setChannel(1);
-    while (!WiFi.STA.started()) delay(10);
-    Serial.println("[MC] STA started");
 
-    // LR-only — matches pixel_post / pixel_post_controller.  Mixed-protocol
-    // mode silently drops inbound LR-rate frames on this chip, so LR-only is
-    // the only configuration that lets magitrac receive pixel_post broadcasts.
-    // Magitrac↔magitrac traffic is also forced to LR rate this way (~500 Kbps
-    // throughput — fine for our message sizes).
-    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_LR);
+    // In coexist mode another transport (MagiCommsTcp AP role) has already
+    // taken WiFi up in AP_STA mode; touching WiFi.mode / channel / protocol
+    // here would clobber that setup and tear down the TCP listener.
+    if (!_coexist) {
+        WiFi.mode(WIFI_STA);
+        WiFi.setChannel(1);
+        while (!WiFi.STA.started()) delay(10);
+        Serial.println("[MC] STA started");
+
+        // WIFI_PROTOCOL_LR DELIBERATELY NOT SET.  In the TCP-transport
+        // era this MagiCommsEspNow is only used during the pairing
+        // ceremony (server boots ESP-NOW only when there are no TCP
+        // creds; client uses coexist mode which already skipped LR).
+        // LR-only mode silently dropped larger pairing frames (e.g. the
+        // 106-byte MSG_PAIR_OFFER) because the client AP transmits them
+        // at standard 802.11n rates the LR receiver can't decode — small
+        // frames sneak through at base rate but anything past ~30 bytes
+        // can fail.  Trade-off: pixelpost MSG_TICK_SYNC broadcast sync
+        // may not be received by the server.  Acceptable — the server is
+        // a pixelpost *sender*, not a pure receiver, and pixelpost is
+        // planned to move to TCP anyway.
+    } else {
+        Serial.println("[MC] coexist mode — WiFi already up, skipping setup");
+    }
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("[MC] ESP-NOW init FAILED");
         return false;
     }
+
+    // Force ESP-NOW frames to 1 Mbps DSSS — the slowest, most-reliable rate.
+    // Without this, the WiFi driver does rate adaptation per-frame and tends
+    // to bump larger unicasts (e.g. 106-byte MSG_PAIR_OFFER) up to rates an
+    // unassociated peer can't reliably decode.  Small frames sneak through
+    // at base rate; larger ones get silently dropped.  Forcing 1M is bullet-
+    // proof for our pairing-traffic sizes.  Setting on both AP and STA so
+    // the same code works for the coexist (client AP-STA) and pure-STA
+    // (server) configs.
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L);
+    esp_wifi_config_espnow_rate(WIFI_IF_AP,  WIFI_PHY_RATE_1M_L);
+    Serial.println("[MC] ESP-NOW rate forced to 1 Mbps DSSS");
 
     if (!s_sendMutex) s_sendMutex = xSemaphoreCreateMutex();
     if (!s_sendDone)  s_sendDone  = xSemaphoreCreateBinary();
@@ -112,12 +147,16 @@ bool MagiCommsEspNow::sendBroadcast(const void* data, size_t len) {
     static const uint8_t BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
     if (!s_sendMutex || !s_sendDone) return false;
 
-    // Ensure broadcast peer exists
+    // Ensure broadcast peer exists.  In coexist mode (AP is up alongside
+    // ESP-NOW), bind the peer to the AP interface — STA is up but not
+    // associated, and esp_now_send returns ESP_ERR_ESPNOW_IF if the
+    // peer's ifidx doesn't match an interface able to transmit.
     if (!esp_now_is_peer_exist(BROADCAST)) {
         esp_now_peer_info_t bp = {};
         memcpy(bp.peer_addr, BROADCAST, 6);
-        bp.channel = 0;   // follow current WiFi channel
+        bp.channel = 0;
         bp.encrypt = false;
+        bp.ifidx   = _coexist ? WIFI_IF_AP : WIFI_IF_STA;
         esp_now_add_peer(&bp);
     }
 
@@ -125,8 +164,6 @@ bool MagiCommsEspNow::sendBroadcast(const void* data, size_t len) {
     xSemaphoreTake(s_sendDone, 0);
 
     esp_err_t err = esp_now_send(BROADCAST, (const uint8_t*)data, len);
-    // Drain the cb so the next send sees a clean slate.  Broadcast status
-    // is always SUCCESS — there's no real ACK — so we don't act on it.
     if (err == ESP_OK) xSemaphoreTake(s_sendDone, pdMS_TO_TICKS(SEND_TIMEOUT_MS));
 
     xSemaphoreGive(s_sendMutex);
@@ -137,9 +174,11 @@ bool MagiCommsEspNow::addPeer(const uint8_t* mac6, const uint8_t* /*encryptKey*/
     if (esp_now_is_peer_exist(mac6)) esp_now_del_peer(mac6);
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, mac6, 6);
-    peer.channel = 0;   // follow current WiFi channel
-    peer.encrypt = false;   // pure ESP-NOW — no link-layer encryption
-    bool ok = esp_now_add_peer(&peer) == ESP_OK;
+    peer.channel = 0;
+    peer.encrypt = false;
+    peer.ifidx   = _coexist ? WIFI_IF_AP : WIFI_IF_STA;
+    esp_err_t err = esp_now_add_peer(&peer);
+    bool ok = (err == ESP_OK);
     if (ok) {
         memcpy(_peerMac, mac6, 6);
         _hasPeer = true;

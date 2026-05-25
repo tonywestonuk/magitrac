@@ -28,6 +28,7 @@
 #include "ColumnEditor.h"
 #include "SettingsPage.h"
 #include "BackupRestorePage.h"
+#include "TcpTestPage.h"
 #include "PerformancePage.h"
 #include "SetlistPage.h"
 #include "Battery.h"
@@ -82,6 +83,7 @@ SetlistPage        setlistPage(display, touch, song);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
 BackupRestorePage* backupRestorePage = nullptr;
+TcpTestPage*       tcpTestPage       = nullptr;
 
 bool gSdAvailable = false;
 int  gSdCs        = -1;   // chip-select pin used for SD; set in setup()
@@ -135,7 +137,7 @@ static void drawPairingScreen() {
     uiButton(display, 0, 0, 960, 80, "PAIRING SETUP", COL_BLACK, COL_WHITE, 4);
 
     if (state == PairClientState::PAIRING_REQUEST) {
-        uiButton(display, 100, 200, 760, 100, "Waiting for server...", COL_WHITE, COL_BLACK, 3);
+        uiButton(display, 100, 200, 760, 100, "Put server in pair mode...", COL_WHITE, COL_BLACK, 3);
 
     } else if (state == PairClientState::PAIRING_CONFIRM) {
         uiButton(display, 100, 140, 760, 80,  "Check code matches on server:", COL_WHITE, COL_BLACK, 3);
@@ -147,9 +149,6 @@ static void drawPairingScreen() {
         uiButton(display, 280, 240, 400, 120, codeStr, COL_LTGREY, COL_BLACK, 6);
         // Confirm button
         uiButton(display, 280, 390, 400, 100, "CONFIRM", COL_BLACK, COL_WHITE, 4);
-
-    } else if (state == PairClientState::PAIRING_WAITING) {
-        uiButton(display, 100, 200, 760, 100, "Completing pairing...", COL_WHITE, COL_BLACK, 3);
 
     } else {
         // SUCCESS or IDLE — close the UI from loop()
@@ -170,6 +169,14 @@ static bool pollPairingUi() {
         state == PairClientState::AUTO_CONNECTING ||
         state == PairClientState::IDLE) {
         return true;
+    }
+
+    // Redraw on state change BEFORE the touch early-return — otherwise
+    // PIN never repaints on REQUEST→CONFIRM unless the user happens to
+    // be touching the screen at that exact moment.
+    if (state != gLastPairState) {
+        gLastPairState = state;
+        drawPairingScreen();
     }
 
     if (!touch.read()) return false;
@@ -195,14 +202,6 @@ static bool pollPairingUi() {
         }
     }
     if (down && !gPairingUiWasDown) gPairingUiWasDown = true;
-
-    // Redraw if state changed (e.g. code arrived while waiting)
-    PairClientState cur = gServerPairing.pairState();
-    if (cur != gLastPairState) {
-        gLastPairState = cur;
-        drawPairingScreen();
-    }
-
     return false;
 }
 
@@ -222,6 +221,7 @@ static bool     columnEditorOpen    = false;
 static bool     noteEditorPageOpen  = false;
 static bool     settingsPageOpen    = false;
 static bool     backupRestorePageOpen = false;
+static bool     tcpTestPageOpen       = false;
 static bool     performancePageOpen   = false;
 static bool     setlistPageOpen       = false;
 
@@ -241,6 +241,16 @@ static bool     gLastBattChg   = false;
 
 void setup() {
     Serial.begin(115200);
+    delay(200);
+
+    // Pre-init the WiFi driver BEFORE display.begin() takes LCD_CAM.
+    // This claims WiFi's internal resources (netifs, driver structs)
+    // so that the heavier softAP() call later — after display init —
+    // doesn't hit the ieee80211_hostap_attach panic that was diagnosed
+    // when softAP ran on a fully-initialised LCD_CAM with no WiFi prep.
+    // persistent(false) suppresses WiFi's own NVS writes of SSID/PSK.
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_AP_STA);
 
     Serial.printf("[MEM] Before display.begin() — internal: %u  PSRAM: %u\n",
         heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -252,8 +262,16 @@ void setup() {
         Serial.println("Display init failed — halting");
         while (1) {}
     }
-    display.setQuality(EPD_Painter::Quality::QUALITY_HIGH);
+    display.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
     display.clear();
+
+    // Display is up.  Now bring up the AP and pairing transport.
+    // loadWifiChannel() must run before gServerPairing.begin() so the
+    // SoftAP comes up on the user-persisted channel — not channel 1.
+    // If we reach here, display.begin() did NOT take the shutdown path
+    // (which is [[noreturn]]), so we're committed to a full boot.
+    loadWifiChannel();
+    gServerPairing.begin();
 
     // Backlight — only available on LilyGo T5 boards (BOARD_BL_EN conflicts
     // with display pins on M5PaperS3)
@@ -281,6 +299,7 @@ void setup() {
     }
 
     backupRestorePage = new BackupRestorePage(display, touch, rtc);
+    tcpTestPage       = new TcpTestPage(display, touch);
 
 #if defined(EPD_PAINTER_PRESET_M5PAPER_S3)
     bool m5paper = true;
@@ -297,12 +316,15 @@ void setup() {
     gSdAvailable = SD.begin(gSdCs);
     Serial.printf("[SD] %s\n", gSdAvailable ? "OK" : "not found / no card?");
 
-    gServerPairing.begin();
+    // gServerPairing.begin() was moved up — must run before display.begin()
+    // (EPD_Painter Core-0 + GDMA + LCD_CAM grab breaks WiFi softAP attach
+    // under m5stack:esp32 if it runs first).  See the note next to its
+    // current call site at the top of setup().
     loadMidiLimits();
-    loadWifiChannel();
-    WiFi.setChannel(magiWifiChannelFromIdx(gWifiChannelIdx));
-    Serial.printf("[WIFI] boot channel: %u\n",
-                  (unsigned)magiWifiChannelFromIdx(gWifiChannelIdx));
+    // loadWifiChannel() moved up — now runs before gServerPairing.begin()
+    // so the SoftAP starts on the right channel.  Don't call WiFi.setChannel()
+    // here: with the AP already up, changing channel from STA would either
+    // be ignored or tear down the AP.
 
     // Battery — LilyGo T5 S3 has BQ25896 PMIC on I2C with ADC fallback;
     // M5PaperS3 has neither, so leave battery backend as NONE.
@@ -351,8 +373,7 @@ void loop() {
         if (ps == PairClientState::AUTO_CONNECTING ||
             ps == PairClientState::REQUESTING      ||
             ps == PairClientState::PAIRING_REQUEST ||
-            ps == PairClientState::PAIRING_CONFIRM ||
-            ps == PairClientState::PAIRING_WAITING) {
+            ps == PairClientState::PAIRING_CONFIRM) {
             strncpy(sStatusBuf, "Connecting...", 31);
         } else if (ps == PairClientState::SUCCESS && bs == BrowseState::WAITING_SONG) {
             strncpy(sStatusBuf, "Downloading...", 31);
@@ -535,6 +556,27 @@ void loop() {
     if (backupRestorePageOpen && backupRestorePage) {
         if (backupRestorePage->poll()) {
             backupRestorePageOpen = false;
+            // If the close was triggered by the TCP/IP TEST button, open
+            // the test page instead of restoring the tracker UI.
+            if (backupRestorePage->consumeTcpTestRequest() && tcpTestPage) {
+                tcpTestPageOpen = true;
+                tcpTestPage->open();
+                display.clear();
+                tcpTestPage->draw();
+                display.paint();
+            } else {
+                display.clear();
+                ui.drawAll();
+                display.paintLater();
+            }
+        }
+        return;
+    }
+
+    // ── TCP/IP test page ────────────────────────────────────────────────────
+    if (tcpTestPageOpen && tcpTestPage) {
+        if (tcpTestPage->poll()) {
+            tcpTestPageOpen = false;
             display.clear();
             ui.drawAll();
             display.paintLater();

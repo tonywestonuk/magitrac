@@ -2,6 +2,7 @@
 // Depends on: MagiComms (gComms), MagiMsg.h
 
 #include <SD.h>
+#include "sd_mutex.h"
 #include <WiFi.h>
 #include <Preferences.h>
 #include "TrackerData.h"
@@ -9,6 +10,14 @@
 #include "SongMigration.h"
 #include "midi_player.h"
 #include "SampleManifest.h"
+
+// ── REPRO: set to 1 to stub the SD reads in sendBackupFileRaw — pretend
+// every backup file is 4096 fake bytes (memset 0xAB) instead of reading
+// real data from the SD card.  Pairs with the magitrac-side
+// REPRO_SKIP_SD_WRITE so both sides are SD-free during backup.  Lets us
+// test whether the wedge involves SD/SDIO contention or current draw on
+// either device.  Revert to 0 when done.
+#define REPRO_SKIP_SERVER_SD_READ 1
 
 // ── WiFi channel persistence ──────────────────────────────────────────────────
 // Shared namespace name with the client side ("magitrac_wifi") so the channel
@@ -79,6 +88,7 @@ static void initDefaultInstruments() {
 }
 
 static bool loadInstrumentsFromSD() {
+    SdLock _;
     File f = SD.open(SRV_INSTRUMENTS_PATH);
     if (!f) return false;
     InstrFileHeader hdr;
@@ -95,6 +105,7 @@ static bool loadInstrumentsFromSD() {
 }
 
 static void saveInstrumentsToSD() {
+    SdLock _;
     if (SD.exists(SRV_INSTRUMENTS_PATH)) SD.remove(SRV_INSTRUMENTS_PATH);
     File f = SD.open(SRV_INSTRUMENTS_PATH, FILE_WRITE);
     if (!f) { Serial.println("[CMD] saveInstruments: open failed"); return; }
@@ -142,7 +153,14 @@ static uint8_t srvListPendingPage   = 0;
 
 // ── Deferred backup file send ──────────────────────────────────────────────────
 static bool    srvBackupFilePending = false;
+static bool     srvTcpTestRunning    = false;   // set by MSG_TCP_TEST_START, cleared by MSG_TCP_TEST_STOP
+static uint8_t  srvTcpTestPattern    = 0;       // incrementing-u8 pattern, persists across blobs
+
+// New struct-driven backup (v2): set by registered MSG_START_BACKUP
+// handler.  Main loop fires sendBackupV2() to stream the whole backup.
+static bool     srvBackupV2Pending   = false;
 static char    srvBackupFileName[SRV_FNAME_MAX] = {};
+static bool    srvBackupListPending = false;
 
 // ── Restore upload state ──────────────────────────────────────────────────────
 static bool    srvRestoreActive          = false;
@@ -164,11 +182,23 @@ void commandsInit() {
         saveInstrumentsToSD();  // write defaults so future boots load them
         Serial.println("[CMD] instruments: created defaults");
     }
+
+    // New struct-driven backup transport (v2): register a permanent
+    // handler for MSG_START_BACKUP.  Deferred to the main-loop tick so
+    // the reader task isn't blocked by SD enumeration + streaming.
+    extern MagiCommsTcp gTransportTcp;
+    gTransportTcp.registerMessageCallback(
+        MSG_START_BACKUP,
+        [](const uint8_t*, size_t, void*) {
+            srvBackupV2Pending = true;
+        },
+        nullptr);
 }
 
 // ── List .mgt files in /songs ──────────────────────────────────────────────────
 int srvListSongs(char names[][SRV_FNAME_MAX], int maxFiles) {
     if (!srvSdOk) return 0;
+    SdLock _;
     File d = SD.open(SRV_SONGS_DIR);
     if (!d || !d.isDirectory()) return 0;
     int count = 0;
@@ -268,41 +298,43 @@ static void sendSampleList(uint8_t page) {
 // This handles legacy v7..v16 files transparently — the client always
 // receives a current-version payload regardless of the on-disk format.
 static void sendSongDataFromPath(const char* path, const char* displayName) {
-    File f = SD.open(path);
-    if (!f) {
-        Serial.printf("[CMD] sendSongData: open failed '%s'\n", path);
-        return;
-    }
-
     srvHasActive    = false;
     srvActiveBufLen = 0;
     bool loaded = false;
-
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
-    SongFileHeader hdr;
-    if (f.read((uint8_t*)&hdr, sizeof(hdr)) == (int)sizeof(hdr)
-        && hdr.magic == SONG_FILE_MAGIC) {
 
-        if (hdr.version == SONG_FILE_VERSION) {
-            loaded = songReadCompact(f, song);
-        } else if (hdr.version == 16) {
-            loaded = songMigrateV16FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v16->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 15) {
-            loaded = songMigrateV15FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v15->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 14) {
-            loaded = songMigrateV14FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v14->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 13) {
-            loaded = songMigrateV13FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v13->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 11) {
-            loaded = songMigrateV11FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v11->v%d '%s'\n", SONG_FILE_VERSION, path);
+    {
+        SdLock _;
+        File f = SD.open(path);
+        if (!f) {
+            Serial.printf("[CMD] sendSongData: open failed '%s'\n", path);
+            return;
         }
+        SongFileHeader hdr;
+        if (f.read((uint8_t*)&hdr, sizeof(hdr)) == (int)sizeof(hdr)
+            && hdr.magic == SONG_FILE_MAGIC) {
+
+            if (hdr.version == SONG_FILE_VERSION) {
+                loaded = songReadCompact(f, song);
+            } else if (hdr.version == 16) {
+                loaded = songMigrateV16FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v16->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 15) {
+                loaded = songMigrateV15FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v15->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 14) {
+                loaded = songMigrateV14FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v14->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 13) {
+                loaded = songMigrateV13FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v13->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 11) {
+                loaded = songMigrateV11FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v11->v%d '%s'\n", SONG_FILE_VERSION, path);
+            }
+        }
+        f.close();
     }
-    f.close();
 
     if (!loaded) {
         Serial.printf("[CMD] sendSongData: load failed '%s'\n", path);
@@ -319,24 +351,23 @@ static void sendSongDataFromPath(const char* path, const char* displayName) {
     srvActiveName[sizeof(srvActiveName) - 1] = '\0';
     srvHasActive = true;
 
-    uint32_t totalBytes  = srvActiveBufLen;
-    uint8_t  totalChunks = (uint8_t)((totalBytes + SONG_CHUNK_SIZE - 1) / SONG_CHUNK_SIZE);
-    Serial.printf("[CMD] sending '%s' %u bytes %u chunks\n", path, totalBytes, totalChunks);
-
-    MsgSongData msg;
-    msg.type        = MSG_SONG_DATA;
-    msg.totalChunks = totalChunks;
-
-    for (uint8_t chunk = 0; chunk < totalChunks; chunk++) {
-        uint32_t offset    = (uint32_t)chunk * SONG_CHUNK_SIZE;
-        uint32_t remaining = totalBytes - offset;
-        int n = (int)(remaining < (uint32_t)SONG_CHUNK_SIZE ? remaining : (uint32_t)SONG_CHUNK_SIZE);
-        memcpy(msg.payload, srvActiveBuf + offset, n);
-        msg.chunk   = chunk;
-        msg.dataLen = (uint8_t)n;
-        gComms.sendReliable(&msg, 4 + n, chunk);
+    // Stream the whole song (SongFileHeader + Song struct) as one frame.
+    // Client receives via its MSG_SONG_BLOB stream-recv handler and writes
+    // straight into its in-memory song; no chunked accumulator state needed.
+    extern MagiCommsTcp gTransportTcp;
+    uint32_t totalBytes = srvActiveBufLen;
+    size_t   totalLen   = 1 + totalBytes;  // type byte + payload
+    if (!gTransportTcp.streamBegin(totalLen)) {
+        Serial.printf("[CMD] sendSongData: streamBegin failed (len=%u)\n", (unsigned)totalLen);
+        return;
     }
-    Serial.println("[CMD] sendSongData done");
+    uint8_t type = (uint8_t)MSG_SONG_BLOB;
+    bool ok = true;
+    ok &= gTransportTcp.streamMore(&type, 1);
+    ok &= gTransportTcp.streamMore(srvActiveBuf, totalBytes);
+    gTransportTcp.streamEnd();
+    Serial.printf("[CMD] sendSongData '%s' %u bytes streamed=%s\n",
+                  path, totalBytes, ok ? "OK" : "FAIL");
 }
 
 static void sendSongData(uint8_t page, uint8_t index) {
@@ -390,41 +421,43 @@ bool srvLoadSongLocal(int listIdx) {
     char path[48];
     snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, raw[listIdx]);
 
-    File f = SD.open(path);
-    if (!f) {
-        Serial.printf("[CMD] srvLoadSongLocal: open failed '%s'\n", path);
-        return false;
-    }
-
     srvHasActive    = false;
     srvActiveBufLen = 0;
     bool loaded = false;
-
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
-    SongFileHeader hdr;
-    if (f.read((uint8_t*)&hdr, sizeof(hdr)) == (int)sizeof(hdr)
-        && hdr.magic == SONG_FILE_MAGIC) {
 
-        if (hdr.version == SONG_FILE_VERSION) {
-            loaded = songReadCompact(f, song);
-        } else if (hdr.version == 16) {
-            loaded = songMigrateV16FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v16->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 15) {
-            loaded = songMigrateV15FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v15->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 14) {
-            loaded = songMigrateV14FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v14->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 13) {
-            loaded = songMigrateV13FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v13->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 11) {
-            loaded = songMigrateV11FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v11->v%d '%s'\n", SONG_FILE_VERSION, path);
+    {
+        SdLock _;
+        File f = SD.open(path);
+        if (!f) {
+            Serial.printf("[CMD] srvLoadSongLocal: open failed '%s'\n", path);
+            return false;
         }
+        SongFileHeader hdr;
+        if (f.read((uint8_t*)&hdr, sizeof(hdr)) == (int)sizeof(hdr)
+            && hdr.magic == SONG_FILE_MAGIC) {
+
+            if (hdr.version == SONG_FILE_VERSION) {
+                loaded = songReadCompact(f, song);
+            } else if (hdr.version == 16) {
+                loaded = songMigrateV16FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v16->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 15) {
+                loaded = songMigrateV15FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v15->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 14) {
+                loaded = songMigrateV14FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v14->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 13) {
+                loaded = songMigrateV13FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v13->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 11) {
+                loaded = songMigrateV11FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v11->v%d '%s'\n", SONG_FILE_VERSION, path);
+            }
+        }
+        f.close();
     }
-    f.close();
 
     if (loaded) {
         SongFileHeader* h2 = (SongFileHeader*)srvActiveBuf;
@@ -447,6 +480,7 @@ static void flushActiveSong() {
     if (!srvHasActive || srvActiveName[0] == '\0') return;
     char path[48];
     snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, srvActiveName);
+    SdLock _;
     SD.remove(path);
     File f = SD.open(path, FILE_WRITE);
     if (!f) { Serial.printf("[CMD] flush: open failed '%s'\n", path); return; }
@@ -459,6 +493,7 @@ static void flushActiveSong() {
 
 // ── Write uploaded song chunks to SD ──────────────────────────────────────────
 static void finaliseSongSave() {
+    SdLock _;
     if (srvSaveFile) srvSaveFile.close();
     if (!srvSaveActive) return;
 
@@ -511,87 +546,100 @@ static void finaliseSongSave() {
     srvSaveActive = false;
 }
 
-// ── Send full instruments array in chunks ─────────────────────────────────────
+// ── Send full instruments array as one streamed blob ─────────────────────────
 static void sendInstrumentsData() {
+    extern MagiCommsTcp gTransportTcp;
     const uint8_t* raw   = (const uint8_t*)srvInstruments;
     uint32_t       total = (uint32_t)sizeof(srvInstruments);
-    uint8_t totalChunks  = (uint8_t)((total + SONG_CHUNK_SIZE - 1) / SONG_CHUNK_SIZE);
-
-    MsgInstrumentsData chunk;
-    chunk.type        = MSG_INSTRUMENTS_DATA;
-    chunk.totalChunks = totalChunks;
-
-    for (uint8_t i = 0; i < totalChunks; i++) {
-        uint32_t offset    = (uint32_t)i * SONG_CHUNK_SIZE;
-        uint32_t remaining = total - offset;
-        chunk.chunk   = i;
-        chunk.dataLen = (uint8_t)(remaining < SONG_CHUNK_SIZE ? remaining : SONG_CHUNK_SIZE);
-        memcpy(chunk.payload, raw + offset, chunk.dataLen);
-        gComms.sendReliable(&chunk, 4 + chunk.dataLen, i);
+    size_t         totalLen = 1 + total;
+    if (!gTransportTcp.streamBegin(totalLen)) {
+        Serial.printf("[CMD] sendInstruments: streamBegin failed (len=%u)\n",
+                      (unsigned)totalLen);
+        return;
     }
-    Serial.printf("[CMD] sendInstruments: %u chunks done\n", totalChunks);
+    uint8_t type = (uint8_t)MSG_INSTRUMENTS_BLOB;
+    bool ok = true;
+    ok &= gTransportTcp.streamMore(&type, 1);
+    ok &= gTransportTcp.streamMore(raw, total);
+    gTransportTcp.streamEnd();
+    Serial.printf("[CMD] sendInstruments: %u bytes streamed=%s\n",
+                  total, ok ? "OK" : "FAIL");
 }
 
-// ── Backup: send file list ────────────────────────────────────────────────────
-static void sendBackupFileList(uint8_t page) {
+// ── Backup: stream the full file list as a single framed blob ───────────────
+//
+// Wire payload: type(1) + numFiles(1) + BkFileEntry × numFiles.
+// All entries arrive in one round-trip — no paging.  Server enumerates
+// songs + instruments, stat()s each for its size, packs the entries into
+// the BkFileEntry layout, and ships them.  At SRV_MAX_FILES+1 = 33
+// entries the blob is 1+1+33*28 = 926 bytes — well under MAX_FRAME.
+static void sendBackupFileList(uint8_t /*unused*/) {
     if (!srvSdOk) return;
+    extern MagiCommsTcp gTransportTcp;
 
-    // Build full file list: songs + instruments
-    char names[SRV_MAX_FILES + 1][SRV_FNAME_MAX];
-    uint32_t sizes[SRV_MAX_FILES + 1];
+    BkFileEntry entries[SRV_MAX_FILES + 1];
     int total = 0;
 
-    // Song files
+    // Enumerate songs + instruments under a single SD lock — srvListSongs
+    // takes its own lock internally so we release ours around it.
     char songNames[SRV_MAX_FILES][SRV_FNAME_MAX];
     int songCount = srvListSongs(songNames, SRV_MAX_FILES);
-    for (int i = 0; i < songCount && total < SRV_MAX_FILES; i++) {
-        strncpy(names[total], songNames[i], SRV_FNAME_MAX - 1);
-        names[total][SRV_FNAME_MAX - 1] = '\0';
-        char path[48];
-        snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, songNames[i]);
-        File f = SD.open(path);
-        sizes[total] = f ? (uint32_t)f.size() : 0;
-        if (f) f.close();
-        total++;
+    {
+        SdLock _;
+        for (int i = 0; i < songCount && total < SRV_MAX_FILES; i++) {
+            memset(&entries[total], 0, sizeof(entries[total]));
+            strncpy(entries[total].name, songNames[i], SRV_FNAME_MAX - 1);
+            char path[48];
+            snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, songNames[i]);
+            File f = SD.open(path);
+            uint32_t sz = f ? (uint32_t)f.size() : 0;
+            if (f) f.close();
+            entries[total].sizeHi = (uint16_t)(sz >> 16);
+            entries[total].sizeLo = (uint16_t)(sz & 0xFFFF);
+            total++;
+        }
+        if (SD.exists(SRV_INSTRUMENTS_PATH) && total < (int)(sizeof(entries)/sizeof(entries[0]))) {
+            memset(&entries[total], 0, sizeof(entries[total]));
+            strncpy(entries[total].name, "instruments.mgt", SRV_FNAME_MAX - 1);
+            File f = SD.open(SRV_INSTRUMENTS_PATH);
+            uint32_t sz = f ? (uint32_t)f.size() : 0;
+            if (f) f.close();
+            entries[total].sizeHi = (uint16_t)(sz >> 16);
+            entries[total].sizeLo = (uint16_t)(sz & 0xFFFF);
+            total++;
+        }
     }
 
-    // Instruments file
-    if (SD.exists(SRV_INSTRUMENTS_PATH) && total < SRV_MAX_FILES + 1) {
-        strncpy(names[total], "instruments.mgt", SRV_FNAME_MAX - 1);
-        names[total][SRV_FNAME_MAX - 1] = '\0';
-        File f = SD.open(SRV_INSTRUMENTS_PATH);
-        sizes[total] = f ? (uint32_t)f.size() : 0;
-        if (f) f.close();
-        total++;
+    size_t totalLen = 1 + 1 + (size_t)total * sizeof(BkFileEntry);
+    if (!gTransportTcp.streamBegin(totalLen)) {
+        Serial.printf("[CMD] backupList: streamBegin failed (len=%u)\n", (unsigned)totalLen);
+        return;
     }
-
-    int totalPages = total > 0 ? (total + BK_PER_PKT - 1) / BK_PER_PKT : 1;
-    if (page >= totalPages) page = totalPages - 1;
-    int start   = page * BK_PER_PKT;
-    int inPage  = total - start;
-    if (inPage > BK_PER_PKT) inPage = BK_PER_PKT;
-    if (inPage < 0) inPage = 0;
-
-    MsgBackupListResp resp;
-    resp.type       = MSG_BACKUP_LIST_RESP;
-    resp.page       = page;
-    resp.totalPages = (uint8_t)totalPages;
-    resp.count      = (uint8_t)inPage;
-    resp.totalFiles = (uint8_t)total;
-    memset(resp.entries, 0, sizeof(resp.entries));
-    for (int i = 0; i < inPage; i++) {
-        strncpy(resp.entries[i].name, names[start + i], SRV_FNAME_MAX - 1);
-        resp.entries[i].name[SRV_FNAME_MAX - 1] = '\0';
-        resp.entries[i].sizeHi = (uint16_t)(sizes[start + i] >> 16);
-        resp.entries[i].sizeLo = (uint16_t)(sizes[start + i] & 0xFFFF);
+    bool sendOk = true;
+    uint8_t type    = (uint8_t)MSG_BACKUP_LIST_BLOB;
+    uint8_t numByte = (uint8_t)total;
+    sendOk &= gTransportTcp.streamMore(&type,    1);
+    sendOk &= gTransportTcp.streamMore(&numByte, 1);
+    if (total > 0) {
+        sendOk &= gTransportTcp.streamMore(entries, (size_t)total * sizeof(BkFileEntry));
     }
-    gComms.send(&resp, sizeof(resp));
-    Serial.printf("[CMD] backupList page=%d count=%d total=%d\n", page, inPage, total);
+    gTransportTcp.streamEnd();
+    Serial.printf("[CMD] backupList total=%d streamed=%s\n", total, sendOk ? "OK" : "FAIL");
 }
 
-// ── Backup: send raw file in chunks (deferred — called from commandsTick) ────
+// ── Backup: stream raw file as a single framed message ──────────────────────
+//
+// Wire payload (totalPayloadLen = 1 + 24 + 4 + fileSize):
+//   [type=MSG_BACKUP_FILE_BLOB][name 24B null-padded][fileSize u32 LE][bytes]
+//
+// SD is read in 1 KB pieces and shovelled straight into the TCP socket via
+// the streaming API — peer.write() blocks when the kernel send buffer fills,
+// so TCP flow control paces the SD reads naturally.  Peak RAM: one 1 KB
+// read buffer on the stack.
 static void sendBackupFileRaw(const char* name) {
     if (!srvSdOk) return;
+    extern MagiCommsTcp gTransportTcp;
+
     char path[48];
     if (strcmp(name, "instruments.mgt") == 0) {
         strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
@@ -600,37 +648,265 @@ static void sendBackupFileRaw(const char* name) {
     }
     path[sizeof(path) - 1] = '\0';
 
-    File f = SD.open(path);
-    if (!f) {
-        Serial.printf("[CMD] backupFile: open failed '%s'\n", path);
+#if REPRO_SKIP_SERVER_SD_READ
+    uint32_t fileSize = 4096;   // fake — actual SD never touched
+    Serial.printf("[CMD][REPRO] skip-SD-read '%s' (fake %u bytes)\n",
+                  name, (unsigned)fileSize);
+#else
+    File f;
+    uint32_t fileSize = 0;
+    {
+        SdLock _;
+        f = SD.open(path);
+        if (!f) {
+            Serial.printf("[CMD] backupFile: open failed '%s'\n", path);
+            return;
+        }
+        fileSize = (uint32_t)f.size();
+    }
+#endif
+    size_t totalLen = 1 + SRV_FNAME_MAX + 4 + fileSize;
+
+    if (!gTransportTcp.streamBegin(totalLen)) {
+        Serial.printf("[CMD] backupFile: streamBegin failed (len=%u)\n", (unsigned)totalLen);
+#if !REPRO_SKIP_SERVER_SD_READ
+        { SdLock _; f.close(); }
+#endif
         return;
     }
-    uint32_t fileSize = (uint32_t)f.size();
-    uint8_t totalChunks = (uint8_t)((fileSize + SONG_CHUNK_SIZE - 1) / SONG_CHUNK_SIZE);
+    bool    sendOk = true;
+    uint8_t type = (uint8_t)MSG_BACKUP_FILE_BLOB;
+    char    namePadded[SRV_FNAME_MAX] = {};
+    strncpy(namePadded, name, SRV_FNAME_MAX - 1);
+    sendOk &= gTransportTcp.streamMore(&type, 1);
+    sendOk &= gTransportTcp.streamMore(namePadded, SRV_FNAME_MAX);
+    sendOk &= gTransportTcp.streamMore(&fileSize, 4);
 
-    // Send start header
-    MsgBackupFileStart startMsg;
-    startMsg.type        = MSG_BACKUP_FILE_START;
-    strncpy(startMsg.name, name, SRV_FNAME_MAX - 1);
-    startMsg.name[SRV_FNAME_MAX - 1] = '\0';
-    startMsg.totalSize   = (uint16_t)fileSize;
-    startMsg.totalChunks = totalChunks;
-    gComms.send(&startMsg, sizeof(startMsg));
-    delay(10);
-
-    // Stream data chunks directly from file (no RAM buffer needed)
-    MsgBackupFileData chunk;
-    chunk.type        = MSG_BACKUP_FILE_DATA;
-    chunk.totalChunks = totalChunks;
-    for (uint8_t i = 0; i < totalChunks; i++) {
-        uint32_t remaining = fileSize - (uint32_t)i * SONG_CHUNK_SIZE;
-        chunk.chunk   = i;
-        chunk.dataLen = (uint8_t)(remaining < SONG_CHUNK_SIZE ? remaining : SONG_CHUNK_SIZE);
-        f.read(chunk.payload, chunk.dataLen);
-        gComms.sendReliable(&chunk, 4 + chunk.dataLen, i);
+    uint8_t  buf[1024];
+    uint32_t sent = 0;
+    while (sent < fileSize && sendOk) {
+        size_t want = sizeof(buf);
+        if (fileSize - sent < want) want = fileSize - sent;
+        int got;
+#if REPRO_SKIP_SERVER_SD_READ
+        memset(buf, 0xAB, want);
+        got = (int)want;
+#else
+        { SdLock _; got = f.read(buf, want); }
+#endif
+        if (got <= 0) break;
+        sendOk = gTransportTcp.streamMore(buf, (size_t)got);
+        sent += got;
     }
-    f.close();
-    Serial.printf("[CMD] backupFile '%s' %u bytes %u chunks done\n", name, fileSize, totalChunks);
+    gTransportTcp.streamEnd();
+#if !REPRO_SKIP_SERVER_SD_READ
+    { SdLock _; f.close(); }
+#endif
+    Serial.printf("[CMD] backupFile '%s' %u bytes streamed=%s\n",
+                  name, fileSize, sendOk ? "OK" : "FAIL");
+}
+
+// ── New struct-driven backup transport (v2) ─────────────────────────────────
+//
+// Streams the whole backup as one atomic transaction (writeMutex held for
+// the duration via keepMutex=true).  No per-file request/response — server
+// just iterates the songs directory + instruments file and emits:
+//
+//   [MsgBackupHeader] [MsgBackupBody]×N    ← one file
+//   [MsgBackupHeader] [MsgBackupBody]×N    ← next file
+//   ...
+//   [MsgEndOfData]                          ← stream complete
+//
+// REPRO_SKIP_SERVER_SD_READ skips SD entirely — sends 4 fake files of
+// 4096 bytes each so we can isolate the wire path from SD work.
+static void sendBackupV2() {
+    extern MagiCommsTcp gTransportTcp;
+
+#if REPRO_SKIP_SERVER_SD_READ
+    static const uint16_t FAKE_COUNT     = 4;
+    static const uint32_t FAKE_FILE_SIZE = 4096;
+    Serial.printf("[CMD] backupV2 START (REPRO: %u fake files of %u bytes)\n",
+                  FAKE_COUNT, (unsigned)FAKE_FILE_SIZE);
+
+    MsgBackupBody body;
+    body.id     = (uint8_t)MSG_BACKUP_BODY;
+    body.length = sizeof(body);
+    uint8_t patt = 0;
+
+    bool ok = true;
+    for (uint16_t i = 1; i <= FAKE_COUNT && ok; i++) {
+        MsgBackupHeader hdr;
+        hdr.id         = (uint8_t)MSG_BACKUP_HEADER;
+        hdr.length     = sizeof(hdr);
+        memset(hdr.filename, 0, sizeof(hdr.filename));
+        snprintf(hdr.filename, sizeof(hdr.filename), "FAKE%u.mgt", i);
+        hdr.file_size  = FAKE_FILE_SIZE;
+        hdr.file_index = i;
+        hdr.file_total = FAKE_COUNT;
+        ok = gTransportTcp.send(&hdr, sizeof(hdr));
+
+        uint32_t sent = 0;
+        while (ok && sent < FAKE_FILE_SIZE) {
+            uint32_t chunk = FAKE_FILE_SIZE - sent;
+            if (chunk > sizeof(body.data)) chunk = sizeof(body.data);
+            body.data_len = (uint16_t)chunk;
+            for (uint32_t k = 0; k < chunk; ++k) body.data[k] = patt++;
+            ok = gTransportTcp.send(&body, sizeof(body));
+            sent += chunk;
+        }
+    }
+
+    MsgEndOfData eod;
+    eod.id     = (uint8_t)MSG_END_OF_DATA;
+    eod.length = sizeof(eod);
+    // Final send releases the mutex.
+    gTransportTcp.send(&eod, sizeof(eod));
+    gTransportTcp.releaseMutex();
+
+    Serial.printf("[CMD] backupV2 DONE (ok=%d)\n", ok ? 1 : 0);
+#else
+    // Real SD path — enumerate /songs + instruments.mgt, stream each.
+    if (!srvSdOk) {
+        Serial.println("[CMD] backupV2: SD not available");
+        // Still need to send END_OF_DATA so client doesn't hang.
+        MsgEndOfData eod = { (uint8_t)MSG_END_OF_DATA, sizeof(eod) };
+        gTransportTcp.send(&eod, sizeof(eod),
+                           nullptr, nullptr, /*keepMutex=*/false);
+        return;
+    }
+
+    // Build file list under SdLock — keep the lock window short.
+    char     names[SRV_MAX_FILES][SRV_FNAME_MAX];
+    uint32_t sizes[SRV_MAX_FILES];
+    uint16_t fileCount = 0;
+    {
+        SdLock _;
+        File d = SD.open(SRV_SONGS_DIR);
+        if (d && d.isDirectory()) {
+            while (fileCount < SRV_MAX_FILES) {
+                File entry = d.openNextFile();
+                if (!entry) break;
+                if (!entry.isDirectory()) {
+                    const char* nm = entry.name();
+                    if (nm && strstr(nm, ".mgt")) {
+                        strncpy(names[fileCount], nm, SRV_FNAME_MAX - 1);
+                        names[fileCount][SRV_FNAME_MAX - 1] = '\0';
+                        sizes[fileCount] = (uint32_t)entry.size();
+                        fileCount++;
+                    }
+                }
+                entry.close();
+            }
+            d.close();
+        }
+        // Add instruments.mgt as the final file.
+        if (fileCount < SRV_MAX_FILES && SD.exists(SRV_INSTRUMENTS_PATH)) {
+            File ins = SD.open(SRV_INSTRUMENTS_PATH);
+            if (ins) {
+                strncpy(names[fileCount], "instruments.mgt", SRV_FNAME_MAX - 1);
+                names[fileCount][SRV_FNAME_MAX - 1] = '\0';
+                sizes[fileCount] = (uint32_t)ins.size();
+                fileCount++;
+                ins.close();
+            }
+        }
+    }
+
+    Serial.printf("[CMD] backupV2 START (%u files)\n", (unsigned)fileCount);
+
+    MsgBackupBody body;
+    body.id     = (uint8_t)MSG_BACKUP_BODY;
+    body.length = sizeof(body);
+
+    bool ok = true;
+    for (uint16_t i = 0; i < fileCount && ok; i++) {
+        MsgBackupHeader hdr;
+        hdr.id         = (uint8_t)MSG_BACKUP_HEADER;
+        hdr.length     = sizeof(hdr);
+        memset(hdr.filename, 0, sizeof(hdr.filename));
+        strncpy(hdr.filename, names[i], sizeof(hdr.filename) - 1);
+        hdr.file_size  = sizes[i];
+        hdr.file_index = (uint16_t)(i + 1);
+        hdr.file_total = fileCount;
+        ok = gTransportTcp.send(&hdr, sizeof(hdr));
+
+        // Stream the file body in 1024-byte chunks.
+        char path[48];
+        if (strcmp(names[i], "instruments.mgt") == 0) {
+            strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
+        } else {
+            snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, names[i]);
+        }
+        path[sizeof(path) - 1] = '\0';
+
+        File f;
+        { SdLock _; f = SD.open(path); }
+        if (!f) {
+            Serial.printf("[CMD] backupV2: open failed '%s'\n", path);
+            continue;
+        }
+        uint32_t sent = 0;
+        while (ok && sent < sizes[i]) {
+            uint32_t chunk = sizes[i] - sent;
+            if (chunk > sizeof(body.data)) chunk = sizeof(body.data);
+            int got;
+            { SdLock _; got = f.read(body.data, chunk); }
+            if (got <= 0) break;
+            body.data_len = (uint16_t)got;
+            ok = gTransportTcp.send(&body, sizeof(body));
+            sent += got;
+        }
+        { SdLock _; f.close(); }
+    }
+
+    MsgEndOfData eod = { (uint8_t)MSG_END_OF_DATA, sizeof(eod) };
+    gTransportTcp.send(&eod, sizeof(eod));
+    gTransportTcp.releaseMutex();
+
+    Serial.printf("[CMD] backupV2 DONE (ok=%d)\n", ok ? 1 : 0);
+#endif
+}
+
+// ── TCP/IP diagnostic test — sends a 4096-byte incrementing-u8 blob ────────
+//
+// Wire payload (totalPayloadLen = 1 + 4 + 4096 = 4101):
+//   [type=MSG_TCP_TEST_BLOB][size u32 LE = 4096][4096 incrementing u8 bytes]
+//
+// No SD, no I/O — same streamBegin/streamMore/streamEnd path the real backup
+// uses, but isolated from any subsystem outside WiFi+TCP.  Lets us tell
+// whether the wedge sits in the network stack under the actual magitrac
+// runtime environment (EPD task, MIDI, etc.) vs in something specific to
+// the backup data path (which we've already stubbed and which still wedges).
+static void sendTcpTestBlob() {
+    extern MagiCommsTcp gTransportTcp;
+
+    static const uint32_t PAYLOAD = 4096;
+    size_t totalLen = 1 + 4 + PAYLOAD;
+
+    if (!gTransportTcp.streamBegin(totalLen)) {
+        Serial.printf("[CMD] tcpTest: streamBegin failed (len=%u)\n",
+                      (unsigned)totalLen);
+        return;
+    }
+
+    bool sendOk = true;
+    uint8_t  type = (uint8_t)MSG_TCP_TEST_BLOB;
+    uint32_t size = PAYLOAD;
+    sendOk &= gTransportTcp.streamMore(&type, 1);
+    sendOk &= gTransportTcp.streamMore(&size, 4);
+
+    uint8_t buf[1024];
+    uint32_t sent = 0;
+    while (sent < PAYLOAD && sendOk) {
+        size_t want = sizeof(buf);
+        if (PAYLOAD - sent < want) want = PAYLOAD - sent;
+        for (size_t i = 0; i < want; ++i) buf[i] = srvTcpTestPattern++;
+        sendOk = gTransportTcp.streamMore(buf, want);
+        sent  += want;
+    }
+    gTransportTcp.streamEnd();
+    Serial.printf("[CMD] tcpTest %u bytes streamed=%s\n",
+                  (unsigned)PAYLOAD, sendOk ? "OK" : "FAIL");
 }
 
 // ── Reload the active song from SD into srvActiveBuf and push to client ──────
@@ -640,38 +916,40 @@ static void reloadActiveSongFromSD() {
     char path[48];
     snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, srvActiveName);
 
-    File f = SD.open(path);
-    if (!f) {
-        Serial.printf("[CMD] reload: open failed '%s'\n", path);
-        return;
-    }
-
     srvHasActive    = false;
     srvActiveBufLen = 0;
     bool loaded = false;
-
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
-    SongFileHeader hdr;
-    if (f.read((uint8_t*)&hdr, sizeof(hdr)) == (int)sizeof(hdr)
-        && hdr.magic == SONG_FILE_MAGIC) {
 
-        if (hdr.version == SONG_FILE_VERSION) {
-            loaded = songReadCompact(f, song);
-        } else if (hdr.version == 16) {
-            loaded = songMigrateV16FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v16->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 15) {
-            loaded = songMigrateV15FromFile(f, song);
-            if (loaded) Serial.printf("[CMD] migrated v15->v%d '%s'\n", SONG_FILE_VERSION, path);
-        } else if (hdr.version == 14) {
-            loaded = songMigrateV14FromFile(f, song);
-        } else if (hdr.version == 13) {
-            loaded = songMigrateV13FromFile(f, song);
-        } else if (hdr.version == 11) {
-            loaded = songMigrateV11FromFile(f, song);
+    {
+        SdLock _;
+        File f = SD.open(path);
+        if (!f) {
+            Serial.printf("[CMD] reload: open failed '%s'\n", path);
+            return;
         }
+        SongFileHeader hdr;
+        if (f.read((uint8_t*)&hdr, sizeof(hdr)) == (int)sizeof(hdr)
+            && hdr.magic == SONG_FILE_MAGIC) {
+
+            if (hdr.version == SONG_FILE_VERSION) {
+                loaded = songReadCompact(f, song);
+            } else if (hdr.version == 16) {
+                loaded = songMigrateV16FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v16->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 15) {
+                loaded = songMigrateV15FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v15->v%d '%s'\n", SONG_FILE_VERSION, path);
+            } else if (hdr.version == 14) {
+                loaded = songMigrateV14FromFile(f, song);
+            } else if (hdr.version == 13) {
+                loaded = songMigrateV13FromFile(f, song);
+            } else if (hdr.version == 11) {
+                loaded = songMigrateV11FromFile(f, song);
+            }
+        }
+        f.close();
     }
-    f.close();
 
     if (!loaded) {
         Serial.printf("[CMD] reload: load failed '%s'\n", path);
@@ -694,8 +972,11 @@ static void reloadActiveSongFromSD() {
 
 // ── Restore: finalise uploaded file (deferred — called from commandsTick) ────
 static void finaliseRestore() {
-    if (srvRestoreFile) srvRestoreFile.close();
-    if (!srvRestoreActive || srvRestoreName[0] == '\0') return;
+    if (!srvRestoreActive || srvRestoreName[0] == '\0') {
+        SdLock _;
+        if (srvRestoreFile) srvRestoreFile.close();
+        return;
+    }
     char path[48];
     if (srvRestoreIsInstruments) {
         strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
@@ -704,9 +985,13 @@ static void finaliseRestore() {
     }
     path[sizeof(path) - 1] = '\0';
 
-    // Rename temp file to final destination
-    if (SD.exists(path)) SD.remove(path);
-    SD.rename(SRV_RESTORE_TMP, path);
+    {
+        SdLock _;
+        if (srvRestoreFile) srvRestoreFile.close();
+        // Rename temp file to final destination
+        if (SD.exists(path)) SD.remove(path);
+        SD.rename(SRV_RESTORE_TMP, path);
+    }
     Serial.printf("[CMD] restored '%s'\n", path);
 
     // If instruments, reload into memory
@@ -730,24 +1015,20 @@ static void finaliseRestore() {
 // Sends from srvActiveBuf directly — no SD read needed.
 static void sendActiveSongToClient() {
     if (!srvHasActive || srvActiveBufLen == 0) return;
-    uint32_t totalBytes  = srvActiveBufLen;
-    uint8_t  totalChunks = (uint8_t)((totalBytes + SONG_CHUNK_SIZE - 1) / SONG_CHUNK_SIZE);
-    Serial.printf("[CMD] push song to client: %u bytes %u chunks\n", totalBytes, totalChunks);
-
-    MsgSongData msg;
-    msg.type        = MSG_SONG_DATA;
-    msg.totalChunks = totalChunks;
-
-    for (uint8_t chunk = 0; chunk < totalChunks; chunk++) {
-        uint32_t offset    = (uint32_t)chunk * SONG_CHUNK_SIZE;
-        uint32_t remaining = totalBytes - offset;
-        int n = (int)(remaining < (uint32_t)SONG_CHUNK_SIZE ? remaining : (uint32_t)SONG_CHUNK_SIZE);
-        memcpy(msg.payload, srvActiveBuf + offset, n);
-        msg.chunk   = chunk;
-        msg.dataLen = (uint8_t)n;
-        gComms.sendReliable(&msg, 4 + n, chunk);
+    extern MagiCommsTcp gTransportTcp;
+    uint32_t totalBytes = srvActiveBufLen;
+    size_t   totalLen   = 1 + totalBytes;
+    if (!gTransportTcp.streamBegin(totalLen)) {
+        Serial.printf("[CMD] push song: streamBegin failed (len=%u)\n", (unsigned)totalLen);
+        return;
     }
-    Serial.println("[CMD] push song done");
+    uint8_t type = (uint8_t)MSG_SONG_BLOB;
+    bool ok = true;
+    ok &= gTransportTcp.streamMore(&type, 1);
+    ok &= gTransportTcp.streamMore(srvActiveBuf, totalBytes);
+    gTransportTcp.streamEnd();
+    Serial.printf("[CMD] push song to client: %u bytes streamed=%s\n",
+                  totalBytes, ok ? "OK" : "FAIL");
 }
 
 // ── Tick — call from main loop() to run deferred operations ──────────────────
@@ -806,14 +1087,17 @@ void commandsTick() {
         srvDeletePending = false;
         char path[48];
         snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, srvDeleteName);
-        if (SD.exists(path)) {
-            SD.remove(path);
-            Serial.printf("[CMD] deleted '%s'\n", path);
-        } else {
-            snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, srvDeleteName);
+        {
+            SdLock _;
             if (SD.exists(path)) {
                 SD.remove(path);
                 Serial.printf("[CMD] deleted '%s'\n", path);
+            } else {
+                snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, srvDeleteName);
+                if (SD.exists(path)) {
+                    SD.remove(path);
+                    Serial.printf("[CMD] deleted '%s'\n", path);
+                }
             }
         }
         char expectedActive[SRV_FNAME_MAX];
@@ -824,6 +1108,23 @@ void commandsTick() {
     if (srvBackupFilePending) {
         srvBackupFilePending = false;
         sendBackupFileRaw(srvBackupFileName);
+    }
+    if (srvBackupListPending) {
+        srvBackupListPending = false;
+        sendBackupFileList(0);
+    }
+    // Pure-streaming test — emit one blob per tick while running.
+    // TCP backpressure naturally paces via blocking peer.write.
+    if (srvTcpTestRunning) {
+        sendTcpTestBlob();
+    }
+
+    // New struct-driven backup (v2): triggered by registered handler
+    // for MSG_START_BACKUP.  Runs as a transaction (mutex held the whole
+    // way) so no other task can interleave a message into the stream.
+    if (srvBackupV2Pending) {
+        srvBackupV2Pending = false;
+        sendBackupV2();
     }
     if (srvRestoreFinaliseNeeded) {
         srvRestoreFinaliseNeeded = false;
@@ -898,39 +1199,9 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             }
             break;
 
-        case MSG_SONG_SAVE:
-            if (len < (int)sizeof(MsgSongSaveStart)) return;
-            {
-                const MsgSongSaveStart* s = (const MsgSongSaveStart*)data;
-                strncpy(srvSaveName, s->name, sizeof(srvSaveName) - 1);
-                srvSaveName[sizeof(srvSaveName) - 1] = '\0';
-                srvSaveTotal  = s->totalChunks;
-                srvSaveGot    = 0;
-                srvSaveActive = true;
-                // Open temp file and keep it open for all chunks
-                if (srvSaveFile) srvSaveFile.close();
-                SD.remove(SRV_UPLOAD_TMP);
-                srvSaveFile = SD.open(SRV_UPLOAD_TMP, FILE_WRITE);
-                Serial.printf("[CMD] save start '%s' %u chunks, file=%d\n",
-                              srvSaveName, srvSaveTotal, (bool)srvSaveFile);
-            }
-            break;
-
-        case MSG_SONG_SAVE_DATA:
-            if (!srvSaveActive) return;
-            if (len < 4) return;
-            {
-                const MsgSongSaveData* d = (const MsgSongSaveData*)data;
-                if (srvSaveFile) {
-                    srvSaveFile.write(d->payload, d->dataLen);
-                    srvSaveGot++;
-                }
-                if (srvSaveGot >= srvSaveTotal && srvSaveTotal > 0) {
-                    srvSaveFile.close();
-                    srvFinaliseNeeded = true;
-                }
-            }
-            break;
+        // MSG_SONG_SAVE / MSG_SONG_SAVE_DATA (chunked upload) retired —
+        // replaced by streaming MSG_SONG_SAVE_BLOB handled in
+        // onSongSaveBlobStream() below.
 
         case MSG_SONG_DELETE:
             if (len < (int)sizeof(MsgSongDelete)) return;
@@ -1040,7 +1311,10 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
 
         case MSG_BACKUP_LIST_REQ:
             if (len < (int)sizeof(MsgBackupListReq)) return;
-            sendBackupFileList(((const MsgBackupListReq*)data)->page);
+            // Defer SD enumeration to the main loop — SD/SPI isn't
+            // thread-safe and inline access from the TCP reader task
+            // races with SamplePlayer SD reads on the MIDI task.
+            srvBackupListPending = true;
             break;
 
         case MSG_BACKUP_FILE_REQ:
@@ -1051,47 +1325,159 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             srvBackupFilePending = true;
             break;
 
-        case MSG_RESTORE_FILE_START:
-            if (len < (int)sizeof(MsgRestoreFileStart)) return;
-            {
-                // If previous restore hasn't been finalised yet, do it now
-                if (srvRestoreFinaliseNeeded) {
-                    srvRestoreFinaliseNeeded = false;
-                    finaliseRestore();
-                }
-                const MsgRestoreFileStart* r = (const MsgRestoreFileStart*)data;
-                strncpy(srvRestoreName, r->name, SRV_FNAME_MAX - 1);
-                srvRestoreName[SRV_FNAME_MAX - 1] = '\0';
-                srvRestoreIsInstruments = (r->isInstruments != 0);
-                srvRestoreTotal  = r->totalChunks;
-                srvRestoreGot    = 0;
-                srvRestoreActive = true;
-                // Open temp file and keep open for all chunks
-                if (srvRestoreFile) srvRestoreFile.close();
-                SD.remove(SRV_RESTORE_TMP);
-                srvRestoreFile = SD.open(SRV_RESTORE_TMP, FILE_WRITE);
-                Serial.printf("[CMD] restore start '%s' %u chunks instr=%d\n",
-                              srvRestoreName, srvRestoreTotal, srvRestoreIsInstruments);
-            }
+        case MSG_TCP_TEST_START:
+            srvTcpTestRunning = true;
             break;
 
-        case MSG_RESTORE_FILE_DATA:
-            if (!srvRestoreActive) return;
-            if (len < 4) return;
-            {
-                const MsgRestoreFileData* d = (const MsgRestoreFileData*)data;
-                if (srvRestoreFile) {
-                    srvRestoreFile.write(d->payload, d->dataLen);
-                    srvRestoreGot++;
-                }
-                if (srvRestoreGot >= srvRestoreTotal && srvRestoreTotal > 0) {
-                    srvRestoreFile.close();
-                    srvRestoreFinaliseNeeded = true;
-                }
-            }
+        case MSG_TCP_TEST_STOP:
+            srvTcpTestRunning = false;
             break;
+
+        // MSG_RESTORE_FILE_START / MSG_RESTORE_FILE_DATA (chunked upload)
+        // retired — replaced by streaming MSG_RESTORE_FILE_BLOB handled in
+        // onRestoreFileBlobStream() below.
 
         default:
             break;
     }
+}
+
+// ── Streaming receive: song save (client → server) ──────────────────────────
+//
+// Wire payload (remaining after the type byte was consumed by the reader):
+//   name(SRV_NAME_MAX) + SongFileHeader + Song
+//
+// We pull each section straight off the socket and write to a temp file
+// on SD as bytes arrive — no full-buffer copy of the 35 KB Song.  Marks
+// srvFinaliseNeeded so commandsTick's main-loop finalizer renames the
+// temp file and reloads the active song.
+void onSongSaveBlobStream(size_t remainingLen, void* /*ctx*/) {
+    extern MagiCommsTcp gTransportTcp;
+
+    if (remainingLen < SRV_NAME_MAX + sizeof(SongFileHeader) + sizeof(Song)) {
+        // Bad frame — drain so framing stays aligned
+        uint8_t junk[256];
+        while (remainingLen > 0) {
+            size_t n = remainingLen > sizeof(junk) ? sizeof(junk) : remainingLen;
+            size_t got = gTransportTcp.streamReadRecv(junk, n);
+            if (got == 0) break;
+            remainingLen -= got;
+        }
+        Serial.println("[CMD] SONG_SAVE_BLOB: undersized, dropped");
+        return;
+    }
+
+    char nameBuf[SRV_NAME_MAX] = {};
+    gTransportTcp.streamReadRecv((uint8_t*)nameBuf, SRV_NAME_MAX);
+    SongFileHeader hdr;
+    gTransportTcp.streamReadRecv((uint8_t*)&hdr, sizeof(hdr));
+
+    size_t expectedSong = remainingLen - SRV_NAME_MAX - sizeof(SongFileHeader);
+
+    SdLock _;
+    SD.remove(SRV_UPLOAD_TMP);
+    File f = SD.open(SRV_UPLOAD_TMP, FILE_WRITE);
+    if (!f) {
+        Serial.println("[CMD] SONG_SAVE_BLOB: tmp open failed");
+        // Drain remaining
+        uint8_t junk[512];
+        while (expectedSong > 0) {
+            size_t n = expectedSong > sizeof(junk) ? sizeof(junk) : expectedSong;
+            size_t got = gTransportTcp.streamReadRecv(junk, n);
+            if (got == 0) break;
+            expectedSong -= got;
+        }
+        return;
+    }
+    // Write header
+    f.write((const uint8_t*)&hdr, sizeof(hdr));
+    // Stream the Song bytes from socket → SD
+    uint8_t buf[1024];
+    size_t  remain = expectedSong;
+    while (remain > 0) {
+        size_t want = remain > sizeof(buf) ? sizeof(buf) : remain;
+        size_t got  = gTransportTcp.streamReadRecv(buf, want);
+        if (got == 0) break;
+        f.write(buf, got);
+        remain -= got;
+    }
+    f.close();
+
+    strncpy(srvSaveName, nameBuf, sizeof(srvSaveName) - 1);
+    srvSaveName[sizeof(srvSaveName) - 1] = '\0';
+    srvSaveActive     = true;
+    srvFinaliseNeeded = true;
+    Serial.printf("[CMD] SONG_SAVE_BLOB '%s' %u bytes received\n",
+                  srvSaveName, (unsigned)expectedSong);
+}
+
+// ── Streaming receive: restore upload (client → server) ─────────────────────
+//
+// Wire payload (after type byte):
+//   name(SRV_FNAME_MAX) + isInstruments(1) + size(u32 LE) + bytes
+void onRestoreFileBlobStream(size_t remainingLen, void* /*ctx*/) {
+    extern MagiCommsTcp gTransportTcp;
+
+    const size_t HDR = SRV_FNAME_MAX + 1 + 4;
+    if (remainingLen < HDR) {
+        uint8_t junk[256];
+        while (remainingLen > 0) {
+            size_t n = remainingLen > sizeof(junk) ? sizeof(junk) : remainingLen;
+            size_t got = gTransportTcp.streamReadRecv(junk, n);
+            if (got == 0) break;
+            remainingLen -= got;
+        }
+        Serial.println("[CMD] RESTORE_FILE_BLOB: undersized, dropped");
+        return;
+    }
+    char nameBuf[SRV_FNAME_MAX] = {};
+    gTransportTcp.streamReadRecv((uint8_t*)nameBuf, SRV_FNAME_MAX);
+    uint8_t isInstr;
+    gTransportTcp.streamReadRecv(&isInstr, 1);
+    uint32_t fileSize;
+    gTransportTcp.streamReadRecv((uint8_t*)&fileSize, 4);
+
+    size_t remain = remainingLen - HDR;
+    if (remain != fileSize) {
+        Serial.printf("[CMD] RESTORE_FILE_BLOB: size mismatch frame=%u hdr=%u\n",
+                      (unsigned)remain, (unsigned)fileSize);
+    }
+
+    // If a prior restore is still waiting to finalize, finish it first
+    if (srvRestoreFinaliseNeeded) {
+        srvRestoreFinaliseNeeded = false;
+        finaliseRestore();
+    }
+
+    SdLock _;
+    SD.remove(SRV_RESTORE_TMP);
+    File f = SD.open(SRV_RESTORE_TMP, FILE_WRITE);
+    if (!f) {
+        Serial.println("[CMD] RESTORE_FILE_BLOB: tmp open failed");
+        uint8_t junk[512];
+        while (remain > 0) {
+            size_t n = remain > sizeof(junk) ? sizeof(junk) : remain;
+            size_t got = gTransportTcp.streamReadRecv(junk, n);
+            if (got == 0) break;
+            remain -= got;
+        }
+        return;
+    }
+    uint8_t buf[1024];
+    while (remain > 0) {
+        size_t want = remain > sizeof(buf) ? sizeof(buf) : remain;
+        size_t got  = gTransportTcp.streamReadRecv(buf, want);
+        if (got == 0) break;
+        f.write(buf, got);
+        remain -= got;
+    }
+    f.close();
+
+    strncpy(srvRestoreName, nameBuf, SRV_FNAME_MAX - 1);
+    srvRestoreName[SRV_FNAME_MAX - 1] = '\0';
+    srvRestoreIsInstruments  = (isInstr != 0);
+    srvRestoreActive         = true;
+    srvRestoreFinaliseNeeded = true;
+    Serial.printf("[CMD] RESTORE_FILE_BLOB '%s' %u bytes instr=%d received\n",
+                  srvRestoreName, (unsigned)fileSize, srvRestoreIsInstruments);
 }

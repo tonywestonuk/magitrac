@@ -1,7 +1,24 @@
 #include "BackupRestorePage.h"
+#include "MagiCommsTcp.h"
+#include "MagiMsg.h"
 #include <SD.h>
 #include <string.h>
 #include <stdio.h>
+
+// ── REPRO: set to 1 to discard incoming backup-file bytes instead of writing
+// them to SD.  Lets us test whether the magitrac wedge is caused by SD-write
+// contention with the WiFi/TCP task during sustained inbound streaming.
+// All other code paths (WiFi rx, _songBuf fill, BackupState progression,
+// EPD repaint, request next file, 80 ms pacing) are unchanged.
+// Revert to 0 when done.
+#define REPRO_SKIP_SD_WRITE 1
+
+// ── REPRO: set to 1 to suppress the per-file EPD progress repaint during
+// backup.  Testing the hypothesis that TPS65185 rail-cycle EMI / current
+// spikes during the panel paint are corrupting nearby WiFi packets and
+// causing TCP teardowns mid-backup.  The final BACKUP_DONE paint is
+// unaffected.  Revert to 0 when done.
+#define REPRO_SKIP_EPD_PAINT 1
 
 extern ServerPairing gServerPairing;
 
@@ -62,7 +79,6 @@ BackupRestorePage::BackupRestorePage(EPD_PainterAdafruit& display,
     , _wasDown(false)
     , _bkFileTotal(0)
     , _bkFileCurrent(0)
-    , _bkListPage(0)
     , _bkCancelled(false)
     , _rsFolderCount(0)
     , _rsFolderPage(0)
@@ -91,6 +107,7 @@ void BackupRestorePage::draw() {
         case BRState::MENU:                drawMenu();            break;
         case BRState::BACKUP_WAITING_LIST: drawBackupProgress();  break;
         case BRState::BACKUP_PROGRESS:     drawBackupProgress();  break;
+        case BRState::BACKUP_V2_RUNNING:   drawBackupProgress();  break;
         case BRState::BACKUP_DONE:         drawBackupDone();      break;
         case BRState::FOLDER_LIST:         drawFolderList();      break;
         case BRState::FILE_LIST:           drawFileList();        break;
@@ -112,10 +129,18 @@ void BackupRestorePage::drawHeader(const char* title) {
     uiButton(_d, BR_HOME_X, 0, BR_HOME_W, BR_HDR_H, "HOME", COL_BLACK, COL_WHITE, 3);
 }
 
+// TCP/IP test button — below the BACKUP/RESTORE pair.
+static const int BR_TCP_BTN_W = 300;
+static const int BR_TCP_BTN_H = 80;
+static const int BR_TCP_BTN_X = (960 - BR_TCP_BTN_W) / 2;       // = 330
+static const int BR_TCP_BTN_Y = BR_BTN_Y + BR_BTN_H + 40;       // = 340
+
 void BackupRestorePage::drawMenu() {
     drawHeader("BACKUP / RESTORE");
     uiButton(_d, BR_BTN1_X, BR_BTN_Y, BR_BTN_W, BR_BTN_H, "BACKUP",  COL_WHITE, COL_BLACK, 3);
     uiButton(_d, BR_BTN2_X, BR_BTN_Y, BR_BTN_W, BR_BTN_H, "RESTORE", COL_WHITE, COL_BLACK, 3);
+    uiButton(_d, BR_TCP_BTN_X, BR_TCP_BTN_Y, BR_TCP_BTN_W, BR_TCP_BTN_H,
+             "TCP/IP TEST", COL_WHITE, COL_BLACK, 2);
 }
 
 void BackupRestorePage::drawProgressBar(int x, int y, int w, int h,
@@ -282,22 +307,151 @@ void BackupRestorePage::startBackup() {
         draw(); _d.paint();
         return;
     }
-    _bkFileTotal   = 0;
-    _bkFileCurrent = 0;
-    _bkListPage    = 0;
-    _bkCancelled   = false;
-    _state = BRState::BACKUP_WAITING_LIST;
-    gServerPairing.resetBackup();
-    gServerPairing.requestBackupFileList(0);
+    // New v2 transport.  Client sends one MSG_START_BACKUP and the recv
+    // callback handles the continuous header+body+...+end stream that
+    // follows.  No per-file request/response.
+    _bkFileTotal         = 0;
+    _bkFileCurrent       = 0;
+    _bkCancelled         = false;
+    _bkV2BytesRecvd      = 0;
+    _bkV2CurrentFileSize = 0;
+    _bkV2Done            = false;
+    _state               = BRState::BACKUP_V2_RUNNING;
+
+    // Create the destination folder up front (timestamp from RTC if present).
+    if (_rtc) {
+        I2C_BM8563_TimeTypeDef t; I2C_BM8563_DateTypeDef d;
+        _rtc->getTime(&t); _rtc->getDate(&d);
+        int yr = d.year; if (yr > 2000) yr -= 2000;
+        snprintf(_bkFolder, sizeof(_bkFolder),
+                 "%s/bk_%02d%02d%02d_%02d%02d%02d",
+                 BR_BACKUPS_DIR, yr, d.month, d.date,
+                 t.hours, t.minutes, t.seconds);
+    } else {
+        snprintf(_bkFolder, sizeof(_bkFolder),
+                 "%s/bk_%lu", BR_BACKUPS_DIR, millis());
+    }
+#if !REPRO_SKIP_SD_WRITE
+    if (!SD.exists(BR_BACKUPS_DIR)) SD.mkdir(BR_BACKUPS_DIR);
+    SD.mkdir(_bkFolder);
+#endif
+
+    // Spawn the synchronous backup task.  Procedural send/recv/release
+    // lives in _runBackupTask().  Main loop continues, UI stays responsive;
+    // backupTick() polls _bkV2Done to know when to flip to BACKUP_DONE.
+    xTaskCreate(&BackupRestorePage::_backupTaskTrampoline,
+                "bkV2", 4096, this, 5, nullptr);
+    Serial.println("[BK] backup task spawned");
+
+#if REPRO_SKIP_EPD_PAINT
+    Serial.println("[BK][REPRO] skip-paint startBackup");
+#else
     draw(); _d.paint();
+#endif
+}
+
+// ── New v2 transport — synchronous task ────────────────────────────────────
+//
+// Spawned per-backup.  Owns the transaction mutex from the first send()
+// to the closing releaseMutex().  Sets _bkV2Done before exiting; the main
+// loop sees the flag in backupTick() and transitions UI to BACKUP_DONE.
+
+void BackupRestorePage::_backupTaskTrampoline(void* arg) {
+    static_cast<BackupRestorePage*>(arg)->_runBackupTask();
+    vTaskDelete(nullptr);
+}
+
+void BackupRestorePage::_runBackupTask() {
+    extern MagiCommsTcp gTransport;
+
+    // Kick off the backup.
+    MsgStartBackup req = { (uint8_t)MSG_START_BACKUP, sizeof(req) };
+    bool ok = gTransport.send(&req, sizeof(req));
+    Serial.printf("[BK] START_BACKUP send=%s\n", ok ? "OK" : "FAIL");
+    if (!ok) { gTransport.releaseMutex(); _bkV2Done = true; return; }
+
+    // Read the stream: HEADER → N×BODY → HEADER → N×BODY → … → END_OF_DATA.
+    while (true) {
+        const uint8_t* m = gTransport.recv(15000);     // 15 s per-message timeout
+        if (!m) {
+            Serial.println("[BK] recv timeout/disconnect — abandoning");
+            break;
+        }
+
+        uint8_t id = m[0];
+        // IMPORTANT: even if the user has cancelled, we MUST drain every
+        // message the server sends until END_OF_DATA — otherwise the
+        // remaining body bytes stay in the lwIP/recv-queue and the NEXT
+        // transaction reads them as a new message, desyncing the wire.
+        // Cancel just means "skip the SD/state work", not "stop reading".
+        if (id == MSG_BACKUP_HEADER) {
+            const MsgBackupHeader* h = (const MsgBackupHeader*)m;
+            if (!_bkCancelled) {
+                _bkFileCurrent       = h->file_index;
+                _bkFileTotal         = h->file_total;
+                _bkV2CurrentFileSize = h->file_size;
+                _bkV2BytesRecvd      = 0;
+                char nameStr[25] = {};
+                strncpy(nameStr, h->filename, 24);
+                Serial.printf("[BK] V2 header file=%u/%u name='%s' size=%u\n",
+                              (unsigned)h->file_index, (unsigned)h->file_total,
+                              nameStr, (unsigned)h->file_size);
+            }
+        }
+        else if (id == MSG_BACKUP_BODY) {
+            const MsgBackupBody* b = (const MsgBackupBody*)m;
+            uint16_t n = b->data_len;
+            if (n > sizeof(b->data)) n = sizeof(b->data);
+            if (!_bkCancelled) {
+                _bkV2BytesRecvd += n;
+#if REPRO_SKIP_SD_WRITE
+                // discard
+#else
+                // TODO: SD write of (b->data, n) to current file
+#endif
+                if (_bkV2BytesRecvd >= _bkV2CurrentFileSize) {
+                    Serial.printf("[BK] V2 file %u/%u complete (%u bytes)\n",
+                                  (unsigned)_bkFileCurrent, (unsigned)_bkFileTotal,
+                                  (unsigned)_bkV2BytesRecvd);
+                }
+            }
+            // else: bytes are read off the queue (above) and silently dropped
+        }
+        else if (id == MSG_END_OF_DATA) {
+            Serial.printf("[BK] V2 END_OF_DATA — backup %s\n",
+                          _bkCancelled ? "cancelled (drained)" : "complete");
+            break;
+        }
+        else {
+            Serial.printf("[BK] unexpected id=0x%02X during backup — ignoring\n", id);
+        }
+    }
+
+    gTransport.releaseMutex();
+    _bkV2Done = true;
 }
 
 void BackupRestorePage::backupTick() {
+    // New v2 path — recv callback owns the heavy lifting on the reader
+    // task; main loop just polls the done-flag and transitions the UI.
+    if (_state == BRState::BACKUP_V2_RUNNING) {
+        if (_bkV2Done) {
+            _state = BRState::BACKUP_DONE;
+            draw(); _d.paint();
+        } else {
+            // Repaint progress periodically as headers/bodies arrive.
+            // For now, no-op — the existing per-burst draw on EPD is
+            // skipped during the v2 run to avoid the EPD-during-stream
+            // patterns we've been investigating.
+        }
+        return;
+    }
+
     BackupState bs = gServerPairing.backupState();
 
     if (_state == BRState::BACKUP_WAITING_LIST) {
         if (bs == BackupState::FILE_LIST_READY) {
-            // Collect files from this page
+            // Single-blob list — all entries arrived in one frame.
             int count = gServerPairing.backupFileCount();
             for (int i = 0; i < count && _bkFileTotal < BR_MAX_FILES; i++) {
                 strncpy(_bkFileNames[_bkFileTotal],
@@ -305,13 +459,6 @@ void BackupRestorePage::backupTick() {
                         SRV_FNAME_MAX - 1);
                 _bkFileNames[_bkFileTotal][SRV_FNAME_MAX - 1] = '\0';
                 _bkFileTotal++;
-            }
-            // More pages?
-            _bkListPage++;
-            if (_bkListPage < gServerPairing.backupTotalPages()) {
-                gServerPairing.resetBackup();
-                gServerPairing.requestBackupFileList((uint8_t)_bkListPage);
-                return;
             }
 
             if (_bkFileTotal == 0) {
@@ -346,7 +493,11 @@ void BackupRestorePage::backupTick() {
             gServerPairing.resetBackup();
             gServerPairing.requestBackupFile(_bkFileNames[0]);
 
+#if REPRO_SKIP_EPD_PAINT
+            Serial.println("[BK][REPRO] skip-paint after file-list received");
+#else
             draw(); _d.paint();
+#endif
         }
         return;
     }
@@ -357,15 +508,26 @@ void BackupRestorePage::backupTick() {
             char path[80];
             snprintf(path, sizeof(path), "%s/%s",
                      _bkFolder, _bkFileNames[_bkFileCurrent]);
+#if REPRO_SKIP_SD_WRITE
+            Serial.printf("[BK][REPRO] skip-SD '%s' %u bytes  heap=%u  psram=%u\n",
+                          path,
+                          gServerPairing.receivedFileLen(),
+                          (unsigned)ESP.getFreeHeap(),
+                          (unsigned)ESP.getFreePsram());
+#else
             if (SD.exists(path)) SD.remove(path);
             File f = SD.open(path, FILE_WRITE);
             if (f) {
                 f.write(gServerPairing.receivedFileData(),
                         gServerPairing.receivedFileLen());
                 f.close();
-                Serial.printf("[BK] saved '%s' %u bytes\n",
-                              path, gServerPairing.receivedFileLen());
+                Serial.printf("[BK] saved '%s' %u bytes  heap=%u  psram=%u\n",
+                              path,
+                              gServerPairing.receivedFileLen(),
+                              (unsigned)ESP.getFreeHeap(),
+                              (unsigned)ESP.getFreePsram());
             }
+#endif
 
             _bkFileCurrent++;
             if (_bkFileCurrent >= _bkFileTotal || _bkCancelled) {
@@ -375,14 +537,25 @@ void BackupRestorePage::backupTick() {
                 return;
             }
 
+            // Brief pacing — spreads the WiFi-TX + EPD-repaint + SD-write peak
+            // current draw across files so we don't brown-out the LilyGo.
+            delay(80);
+
             // Request next file
             gServerPairing.resetBackup();
             gServerPairing.requestBackupFile(_bkFileNames[_bkFileCurrent]);
 
+#if REPRO_SKIP_EPD_PAINT
+            // Per-file progress paint suppressed for EMI/wedge investigation.
+            // BACKUP_DONE paint above still runs.
+            Serial.printf("[BK][REPRO] skip-paint after file %u/%u\n",
+                          _bkFileCurrent, _bkFileTotal);
+#else
             // Update progress display (partial)
             _d.fillRect(0, BR_HDR_H, 960, 540 - BR_HDR_H, COL_WHITE);
             drawBackupProgress();
             _d.paint();
+#endif
         }
     }
 }
@@ -563,6 +736,13 @@ bool BackupRestorePage::poll() {
                     _state = BRState::FOLDER_LIST;
                     draw(); _d.paint();
                     return false;
+                }
+                // TCP/IP TEST button — flag for main loop and close page.
+                if (sx >= BR_TCP_BTN_X && sx < BR_TCP_BTN_X + BR_TCP_BTN_W &&
+                    sy >= BR_TCP_BTN_Y && sy < BR_TCP_BTN_Y + BR_TCP_BTN_H) {
+                    _tcpTestRequested = true;
+                    _wasDown = down;
+                    return true;
                 }
                 break;
 

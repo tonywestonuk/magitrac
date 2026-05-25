@@ -11,11 +11,24 @@
 #include "SamplePlayer.h"
 #include "SampleManifest.h"
 #include "mic_spectrum.h"
+#include "sd_mutex.h"
 #include "hal/uart_ll.h"
+#include "esp_wifi.h"
 
 // ── Communications ───────────────────────────────────────────────────────────
-static MagiCommsEspNow gTransport;
-MagiComms gComms(gTransport);
+// Both transports are constructed up front; setup() picks the active one
+// at boot based on whether the server has TCP creds stored in NVS.
+//
+//   • No creds  → ESP-NOW transport, ready to run the pairing ceremony.
+//   • Has creds → TCP transport, STA-join the magitrac client's SoftAP.
+//
+// After a successful pairing the server calls ESP.restart() to come back
+// up in the other mode.  This keeps each boot single-transport — no
+// runtime switching, no AP-STA juggling on this end.
+static MagiCommsEspNow gTransportEspNow;
+MagiCommsTcp           gTransportTcp;          // exposed for streamed sends in commands_server.ino
+static MagiUdpLink     gUdpLink;
+MagiComms gComms(gTransportEspNow);
 
 bool needsFullRedraw = false;   // set by pairing.ino to trigger song list redraw
 extern bool srvHasActive;       // defined in commands_server.ino
@@ -98,8 +111,16 @@ struct Button {
     bool wasPressed() {
         if (!_isrFlag) return false;
         _isrFlag = false;
+        // GPIO 36/39 errata: WiFi TX activity generates spurious
+        // falling-edge glitches that trip the ISR.  Re-sample after a
+        // short delay — a real press stays LOW (finger is still down),
+        // an errata glitch has returned HIGH within microseconds.  With
+        // TCP traffic constantly flowing the radio is rarely idle, so
+        // without this every keepalive ping would phantom-press buttons.
+        delayMicroseconds(200);
+        if (digitalRead(pin) != LOW) return false;
         uint32_t now = millis();
-        if (now - _lastAccept < 30) return false;  // bounce filter
+        if (now - _lastAccept < 30) return false;
         _lastAccept = now;
         _pressedMs  = now;
         return true;
@@ -195,6 +216,7 @@ static bool nextWavFile(File& dir, char* buf, int bufLen) {
 
 // Count .wav files in samples dir and update numSamples
 static void loadSampleList() {
+    SdLock _;
     numSamples = 0;
     File dir = SD.open(SRV_SAMPLES_DIR);
     if (!dir || !dir.isDirectory()) { dir.close(); return; }
@@ -231,6 +253,7 @@ static void drawSampleFooter() {
 
 // Open dir, skip to sampleScrollOff, then stream filenames directly to screen
 static void drawSampleList() {
+    SdLock _;
     File dir = SD.open(SRV_SAMPLES_DIR);
     bool dirOk = dir && dir.isDirectory();
 
@@ -480,6 +503,7 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     debugLogInit();
+    sdMutexInit();   // BEFORE any SD-touching task spawns (sample player, MIDI, TCP reader)
     Serial.println("[SETUP] start");
 
     midi.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
@@ -503,10 +527,45 @@ void setup() {
     Serial.println("[SETUP] comms init");
     // Forward declarations (defined in pairing.ino)
     extern void pairingHandleMessage(const uint8_t* data, int len);
+
+    // Boot-time transport pick.  If TCP creds are stored, we go straight
+    // into STA mode and connect to the magitrac client's AP.  Otherwise
+    // we stay on ESP-NOW for the pairing ceremony — and ESP.restart()
+    // after a successful MSG_PAIR_OFFER brings us back here in TCP mode.
+    {
+        char    tssid[33], tpsk[64];
+        uint8_t tmyip[4], tgwip[4];
+        if (pairNvsLoadCreds("magitrac_srv", tssid, tpsk, tmyip, tgwip)) {
+            Serial.printf("[SETUP] TCP creds present — STA→%s ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
+                tssid,
+                tmyip[0], tmyip[1], tmyip[2], tmyip[3],
+                tgwip[0], tgwip[1], tgwip[2], tgwip[3]);
+            gTransportTcp.configureSta(tssid, tpsk, tmyip, tgwip, MAGI_PORT);
+            gComms.setTransport(gTransportTcp);
+            // Best-effort UDP companion for loss-tolerant updates
+            // (row position, preview playhead, MIDI note-in).  Send-only
+            // from the server side — magitrac's gateway is the destination.
+            gUdpLink.beginSender(tgwip, MAGI_PORT);
+        } else {
+            Serial.println("[SETUP] no TCP creds — booting on ESP-NOW for pairing");
+            gComms.setTransport(gTransportEspNow);
+        }
+    }
+
     gComms.setOnReceive([](const uint8_t* data, int len) {
         pairingHandleMessage(data, len);
     });
     gComms.begin();
+
+    // Streaming-receive handlers for the big client→server uploads
+    // (song save, restore file).  Handler bodies live in
+    // commands_server.ino; declared extern here.
+    extern void onSongSaveBlobStream(size_t remainingLen, void* ctx);
+    extern void onRestoreFileBlobStream(size_t remainingLen, void* ctx);
+    gTransportTcp.registerStreamRecv((uint8_t)MSG_SONG_SAVE_BLOB,
+                                     onSongSaveBlobStream, nullptr);
+    gTransportTcp.registerStreamRecv((uint8_t)MSG_RESTORE_FILE_BLOB,
+                                     onRestoreFileBlobStream, nullptr);
     {
         uint8_t mac[6];
         WiFi.macAddress(mac);
@@ -514,7 +573,25 @@ void setup() {
                       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
     extern void wifiChannelInit();   // defined in commands_server.ino
-    wifiChannelInit();               // load + apply persisted WiFi channel
+    // Only honour the persisted channel when we're already in TCP-STA mode
+    // (paired) — in ESP-NOW pairing mode the channel must stay at 1 so the
+    // ceremony works (client AP also drops to channel 1 in pair mode).
+    // Once paired, the channel is determined by AP scan anyway, so this is
+    // largely cosmetic at that point.
+    {
+        char ssid[33], psk[64];
+        uint8_t ip[4], gw[4];
+        if (pairNvsLoadCreds("magitrac_srv", ssid, psk, ip, gw)) {
+            wifiChannelInit();
+        } else {
+            Serial.println("[SETUP] not paired — leaving channel at 1 for ESP-NOW pairing");
+        }
+        // Diagnostic — log the actual channel the WiFi driver thinks it's on.
+        uint8_t prim = 0;
+        wifi_second_chan_t sec;
+        esp_wifi_get_channel(&prim, &sec);
+        Serial.printf("[SETUP-DBG] WiFi channel after setup = %u\n", (unsigned)prim);
+    }
     extern void pixelpostInit();     // defined in pixelpost_send.ino
     pixelpostInit();                 // queue + worker for outgoing pixel_post traffic
     pairingInit();   // load stored pairing from NVS
@@ -575,14 +652,16 @@ void loop() {
     commandsTick();
     // sequencerPollMidiIn() and sequencerTick() now run in midiTaskFn()
 
-    // Forward row-position notifications queued by the MIDI task
-    if (sPosNotify.dirty) {
+    // Forward row-position notifications queued by the MIDI task.  UDP
+    // best-effort — these fire 5+ Hz and a stale one is just superseded
+    // by the next.  Avoids head-of-line blocking that TCP would impose.
+    if (sPosNotify.dirty && pairingIsConnected()) {
         sPosNotify.dirty = false;
         MsgSeqPos msg;
         msg.type    = MSG_SEQ_POS;
         msg.pattern = sPosNotify.pattern;
         msg.row     = sPosNotify.row;
-        pairingSendToClient(&msg, sizeof(msg));
+        gUdpLink.send(&msg, sizeof(msg));
     }
 
     // Forward play/stop notifications queued by the MIDI task
@@ -597,23 +676,25 @@ void loop() {
         }
     }
 
-    // Forward MIDI note-on (received while stopped) to client for step-entry
-    if (sMidiNoteInNotify.dirty) {
+    // Forward MIDI note-on (received while stopped) to client for step-entry.
+    // UDP best-effort — loss of one step-entry note is recoverable by replay.
+    if (sMidiNoteInNotify.dirty && pairingIsConnected()) {
         sMidiNoteInNotify.dirty = false;
         MsgMidiNoteIn msg;
         msg.type     = MSG_MIDI_NOTE_IN;
         msg.midiNote = sMidiNoteInNotify.midiNote;
         msg.velocity = sMidiNoteInNotify.velocity;
-        pairingSendToClient(&msg, sizeof(msg));
+        gUdpLink.send(&msg, sizeof(msg));
     }
 
-    // Forward column-preview row position to the client
-    if (sPreviewRowNotify.dirty) {
+    // Forward column-preview row position to the client.  UDP best-effort
+    // — coalescing is fine, missed rows just mean the highlight lags briefly.
+    if (sPreviewRowNotify.dirty && pairingIsConnected()) {
         sPreviewRowNotify.dirty = false;
         MsgPreviewRow msg;
         msg.type = MSG_PREVIEW_ROW;
         msg.row  = sPreviewRowNotify.row;
-        pairingSendToClient(&msg, sizeof(msg));
+        gUdpLink.send(&msg, sizeof(msg));
     }
 
     if (needsFullRedraw) {
@@ -677,11 +758,14 @@ void loop() {
                     // Short press released — activate current item
                     if (sampleBrowserOpen && numSamples > 0) {
                         char fname[32] = {};
-                        File dir = SD.open(SRV_SAMPLES_DIR);
-                        if (dir && dir.isDirectory()) {
-                            for (int i = 0; i <= sampleCursor; i++)
-                                if (!nextWavFile(dir, fname, sizeof(fname))) { fname[0] = '\0'; break; }
-                            dir.close();
+                        {
+                            SdLock _;
+                            File dir = SD.open(SRV_SAMPLES_DIR);
+                            if (dir && dir.isDirectory()) {
+                                for (int i = 0; i <= sampleCursor; i++)
+                                    if (!nextWavFile(dir, fname, sizeof(fname))) { fname[0] = '\0'; break; }
+                                dir.close();
+                            }
                         }
                         if (fname[0]) {
                             // BTN-A toggles: stop if currently playing, else start.
@@ -705,7 +789,12 @@ void loop() {
             }
         }
 
-        // ── BTN_C: short press = navigate down, long press = pairing mode ────
+        // ── BTN_C: short press = navigate down, long press = pair / re-pair ──
+        // When paired (TCP-STA mode), long-press clears creds + reboots so
+        // the next boot comes up in ESP-NOW pair-ready mode.  Otherwise it
+        // enters the pair-scan ceremony directly.
+        extern bool pairingIsPaired();
+        extern void pairingClearAndRestart();
         if (BtnC.wasPressed()) {
             BtnC._held      = true;
             BtnC._longFired = false;
@@ -713,7 +802,8 @@ void loop() {
         if (BtnC._held) {
             if (!BtnC._longFired && (now - BtnC._pressedMs >= 2000)) {
                 BtnC._longFired = true;
-                enterPairingMode();
+                if (pairingIsPaired()) pairingClearAndRestart();
+                else                   enterPairingMode();
             }
             if (!BtnC.isDown()) {
                 BtnC._held = false;

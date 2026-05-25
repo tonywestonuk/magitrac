@@ -1,4 +1,5 @@
 #include "SamplePlayer.h"
+#include "sd_mutex.h"
 #include <Arduino.h>
 #include <SD.h>
 #include <string.h>
@@ -87,10 +88,11 @@ static void wavTaskFn(void*) {
         s_stop    = false;
         s_playing = true;
 
-        File f = SD.open(activePath);
+        File f;
+        { SdLock _; f = SD.open(activePath); }
         if (f) {
             uint8_t hdr[44];
-            f.read(hdr, 44);
+            { SdLock _; f.read(hdr, 44); }
             uint32_t sampleRate = (uint32_t)hdr[24]
                                 | ((uint32_t)hdr[25] << 8)
                                 | ((uint32_t)hdr[26] << 16)
@@ -100,7 +102,8 @@ static void wavTaskFn(void*) {
             // Pre-read and fade-in the first audio chunk.
             int16_t* current = s_bufA;
             int16_t* next    = s_bufB;
-            int curBytes = f.readBytes(reinterpret_cast<char*>(current), sizeof(s_bufA));
+            int curBytes;
+            { SdLock _; curBytes = f.readBytes(reinterpret_cast<char*>(current), sizeof(s_bufA)); }
             s_fadeInRemaining = FADE_IN_SAMPLES;
             applyFadeIn(current, curBytes / 2);
 
@@ -122,7 +125,7 @@ static void wavTaskFn(void*) {
             if (r != ESP_OK) {
                 Serial.printf("[SP] DAC init err=%d\n", (int)r);
                 if (dac) dac_continuous_del_channels(dac);
-                f.close();
+                { SdLock _; f.close(); }
                 s_playing = false;
                 continue;
             }
@@ -135,12 +138,14 @@ static void wavTaskFn(void*) {
             int16ToUint8(current, s_dbuf, samplesIn);
             dac_continuous_write(dac, s_dbuf, samplesIn, &bw, 1000);
 
-            int curBytes2 = f.readBytes(reinterpret_cast<char*>(next), sizeof(s_bufB));
+            int curBytes2;
+            { SdLock _; curBytes2 = f.readBytes(reinterpret_cast<char*>(next), sizeof(s_bufB)); }
             int16_t* cur2 = next;
             int16_t* nxt2 = current;
 
             while (curBytes2 > 0 && !s_stop) {
-                int nextBytes = f.readBytes(reinterpret_cast<char*>(nxt2), sizeof(s_bufA));
+                int nextBytes;
+                { SdLock _; nextBytes = f.readBytes(reinterpret_cast<char*>(nxt2), sizeof(s_bufA)); }
                 if (nextBytes > 0 && !s_stop) {
                     applyFadeIn(cur2, curBytes2 / 2);
                 }
@@ -153,7 +158,7 @@ static void wavTaskFn(void*) {
                 int16_t* tmp = cur2; cur2 = nxt2; nxt2 = tmp;
                 curBytes2 = nextBytes;
             }
-            f.close();
+            { SdLock _; f.close(); }
 
             dac_continuous_disable(dac);
             dac_continuous_del_channels(dac);

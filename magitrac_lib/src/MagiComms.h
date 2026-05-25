@@ -91,6 +91,11 @@ public:
     // Initialize transport
     void begin();
 
+    // Switch the underlying transport (call before begin()).  Lets the
+    // magitrac_server pick MagiCommsEspNow vs MagiCommsTcp at boot time
+    // based on whether stored TCP creds exist in NVS.
+    void setTransport(MagiCommsTransport& t) { _transport = &t; }
+
     // ── Send ──────────────────────────────────────────────────────────
     // Blocks until the ESP-NOW link-layer ACK fires.  Returns true if the
     // peer ACKed the frame.
@@ -121,10 +126,10 @@ public:
     void setOnReceive(AppRecvCb cb) { _appRecvCb = cb; }
 
     // Maximum single-message payload
-    size_t maxPayload() const { return _transport.maxPayload(); }
+    size_t maxPayload() const { return _transport->maxPayload(); }
 
 private:
-    MagiCommsTransport& _transport;
+    MagiCommsTransport* _transport;
     AppRecvCb           _appRecvCb = nullptr;
 
     // Singleton for static callback routing
@@ -135,48 +140,48 @@ private:
 // ── Inline implementations ───────────────────────────────────────────────────
 
 inline MagiComms::MagiComms(MagiCommsTransport& transport)
-    : _transport(transport)
+    : _transport(&transport)
 {
     _instance = this;
 }
 
 inline void MagiComms::begin() {
-    _transport.setOnReceive(_onTransportRecv);
-    _transport.begin();
+    _transport->setOnReceive(_onTransportRecv);
+    _transport->begin();
 }
 
 inline bool MagiComms::send(const void* data, size_t len) {
-    return _transport.sendRaw(data, len);
+    return _transport->sendRaw(data, len);
 }
 
 inline bool MagiComms::sendReliable(const void* data, size_t len,
                                      uint8_t /*tag*/, uint32_t /*timeoutMs*/,
                                      int /*maxRetries*/) {
-    return _transport.sendRaw(data, len);
+    return _transport->sendRaw(data, len);
 }
 
 inline bool MagiComms::sendBroadcast(const void* data, size_t len) {
-    return _transport.sendBroadcast(data, len);
+    return _transport->sendBroadcast(data, len);
 }
 
 inline bool MagiComms::addPeer(const uint8_t* addr, const uint8_t* lmk) {
-    return _transport.addPeer(addr, lmk);
+    return _transport->addPeer(addr, lmk);
 }
 
 inline void MagiComms::removePeer(const uint8_t* addr) {
-    _transport.removePeer(addr);
+    _transport->removePeer(addr);
 }
 
 inline bool MagiComms::hasPeer() const {
-    return _transport.hasPeer();
+    return _transport->hasPeer();
 }
 
 inline void MagiComms::localAddr(uint8_t* out6) const {
-    _transport.localAddr(out6);
+    _transport->localAddr(out6);
 }
 
 inline const uint8_t* MagiComms::lastSenderAddr() const {
-    return _transport.lastSenderAddr();
+    return _transport->lastSenderAddr();
 }
 
 inline void MagiComms::_onTransportRecv(const uint8_t* data, int len) {
