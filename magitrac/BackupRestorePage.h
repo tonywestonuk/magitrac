@@ -24,9 +24,8 @@
 
 enum class BRState : uint8_t {
     MENU,
-    BACKUP_WAITING_LIST,    // (legacy v1 path — unused after v2 migration)
-    BACKUP_PROGRESS,        // (legacy v1 path — unused after v2 migration)
-    BACKUP_V2_RUNNING,      // new transport — server streaming header+body+...+end
+    BACKUP_WAITING_LIST,
+    BACKUP_PROGRESS,
     BACKUP_DONE,
     FOLDER_LIST,
     FILE_LIST,
@@ -69,16 +68,6 @@ private:
     // task — must be volatile for visibility across cores/tasks.
     volatile bool _bkCancelled;
 
-    // New struct-driven backup (v2) — runs on a spawned FreeRTOS task so
-    // the synchronous send/recv/releaseMutex pattern doesn't block the
-    // main UI loop.  _bkV2Done is set by the task on completion;
-    // backupTick() polls it and transitions the UI to BACKUP_DONE.
-    uint32_t _bkV2BytesRecvd      = 0;
-    uint32_t _bkV2CurrentFileSize = 0;
-    volatile bool _bkV2Done       = false;
-
-    static void _backupTaskTrampoline(void* arg);
-    void        _runBackupTask();
 
     // TCP/IP test request flag (set when user taps the TCP TEST menu button)
     bool     _tcpTestRequested = false;

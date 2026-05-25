@@ -114,61 +114,6 @@ public:
     // handler.
     size_t streamReadRecv(uint8_t* buf, size_t want);
 
-    // ── New struct-driven send/recv API ──────────────────────────────────────
-    //
-    // Procedural transaction model — applications send and recv whole
-    // MagiMsg structs.  Every struct's first byte is the message id and
-    // bytes 1-2 are the length (so the receiver can sanity-check before
-    // casting).
-    //
-    // Mutex model:
-    //   - send() and recv() both take a shared transaction mutex if this
-    //     task doesn't already hold it.  The mutex stays held until
-    //     releaseMutex() is called.
-    //   - Within a transaction, other tasks that try to send/recv block
-    //     until release.
-    //   - Forgetting to release blocks everyone else — keep transactions
-    //     tight.  Typical pattern:
-    //
-    //         send(&req,  sizeof(req));            // takes mutex
-    //         auto* hdr = (MsgFooHeader*)recv();   // mutex still held
-    //         while (auto* b = recv(), b && b[0] == MSG_FOO_BODY) {
-    //             process(b);
-    //         }
-    //         releaseMutex();
-    //
-    // Async/unsolicited messages (MIDI in, status updates) never go
-    // through recv() — register a handler with registerMessageCallback
-    // and the reader task fires it directly.
-
-    using MessageCb = void (*)(const uint8_t* msg, size_t len, void* ctx);
-
-    // Send one message.  Takes the transaction mutex if this task doesn't
-    // already hold it.  Returns false if the connection is down or the
-    // write fails (mutex stays held — call releaseMutex() to clean up).
-    bool send(const void* msg, size_t len);
-
-    // Block until the next message arrives that has NO registered handler.
-    // Returns a pointer to an internal buffer (caller may cast to a
-    // message struct).  Returns nullptr on timeout or disconnect.  Buffer
-    // is valid until the next send()/recv()/releaseMutex().
-    //
-    // Takes the transaction mutex if this task doesn't already hold it.
-    const uint8_t* recv(uint32_t timeout_ms = 0xFFFFFFFFu);
-
-    // Release the transaction mutex (if this task holds it).  Safe to
-    // call even if no transaction is active.
-    void releaseMutex();
-
-    // Register a permanent handler for messages of one type.  Replaces
-    // any existing registration for the same type.  Returns false if the
-    // table is full.  Handler runs on the reader task — keep it fast and
-    // non-blocking.  Messages with a registered handler never reach recv().
-    bool registerMessageCallback(uint8_t msgType, MessageCb cb, void* ctx = nullptr);
-
-    // Unregister a previously-set handler.  Safe to call if none registered.
-    void unregisterMessageCallback(uint8_t msgType);
-
 private:
     enum class Role : uint8_t { Unconfigured, Ap, Sta };
     Role     _role = Role::Unconfigured;
@@ -187,22 +132,6 @@ private:
     int              _streamHandlerCount = 0;
     StreamHandler*   _findStreamHandler(uint8_t type);
 
-    // ── New struct-driven dispatch state ─────────────────────────────────────
-    struct RegisteredHandler { uint8_t msgType; MessageCb cb; void* ctx; };
-    static const int MAX_REGISTERED = 32;
-    RegisteredHandler _registered[MAX_REGISTERED];
-    int               _registeredCount = 0;
-
-    // Buffer that recv() returns a pointer into.  Single-slot — safe
-    // because only the current mutex-holder can call recv(), and they
-    // get a fresh fill on each call.
-    static const size_t RECV_BUF_BYTES = 1029;   // sizeof MsgBackupBody
-    uint8_t  _recvBuf[RECV_BUF_BYTES] = {};
-    size_t   _recvBufLen              = 0;
-
-    // Try the new dispatch (registered handler → recv queue).  Returns
-    // true if handled; false to fall through to legacy setOnReceive.
-    bool _dispatchNew(const uint8_t* msg, size_t len);
 
     // Shared config
     char     _ssid[33] = {};
