@@ -201,6 +201,9 @@ public:
     void _onMagiLinkConnect();
     // MagiLink: server sent MSG_DISCONNECT.  Transition out of SUCCESS.
     void _onMagiLinkDisconnect();
+    // MagiLink dispatcher for song-related messages: PUSH_HEADER, PUSH_BODY,
+    // NO_SONG.  Switches on msg[0] and updates browse state / _songBuf.
+    void _onMagiLinkSongMessage(const uint8_t* msg, size_t len);
     static void _onSongBlobStreamTrampoline(size_t n, void* ctx) {
         static_cast<ServerPairing*>(ctx)->_onSongBlobStream(n);
     }
@@ -274,6 +277,10 @@ private:
     uint32_t _songBufLen   = 0;
     uint8_t  _chunksGot    = 0;
     uint8_t  _chunksTotal  = 0;
+    // Set by MSG_SONG_PUSH_HEADER, cleared when the body bytes drain.
+    // 0 means "not currently receiving a push" — stray body messages are
+    // dropped if this is 0.
+    uint32_t _songRecvExpected = 0;
 
     // Backup state — single-blob list (no paging) holds every entry the
     // server reported.  Sized to match the server's SRV_MAX_FILES upper

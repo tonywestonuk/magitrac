@@ -130,6 +130,15 @@ void ServerPairing::begin() {
             static_cast<ServerPairing*>(ctx)->_onMagiLinkDisconnect();
         }, this);
 
+    // MagiLink: song push (HEADER + N×BODY) and NO_SONG.  All funnel
+    // into the same dispatcher which switches on the id byte.
+    auto songCb = [](const uint8_t* msg, size_t len, void* ctx) {
+        static_cast<ServerPairing*>(ctx)->_onMagiLinkSongMessage(msg, len);
+    };
+    gMagiLink.registerCallback(MSG_SONG_PUSH_HEADER, songCb, this);
+    gMagiLink.registerCallback(MSG_SONG_PUSH_BODY,   songCb, this);
+    gMagiLink.registerCallback(MSG_NO_SONG,          songCb, this);
+
     _ready = true;
 
     if (_hasPairing) {
@@ -227,8 +236,6 @@ void ServerPairing::clearPairing() {
 void ServerPairing::disconnect() {
     if (_pairState != PairClientState::SUCCESS) return;
     MsgDisconnect msg;
-    msg.id     = MSG_DISCONNECT;
-    msg.length = sizeof(msg);
     gMagiLink.acquireMutex();
     gMagiLink.send(&msg, sizeof(msg));
     gMagiLink.releaseMutex();
@@ -246,9 +253,8 @@ void ServerPairing::disconnect() {
 // the legacy path (Phase 3 of the migration).
 bool ServerPairing::sendControl(MagiMsgType type) {
     if (_pairState != PairClientState::SUCCESS) return false;
-    MsgPlay msg;
-    msg.id     = (uint8_t)type;
-    msg.length = sizeof(msg);
+    MsgPlay msg;          // any 3-byte control type shares this layout
+    msg.id = (uint8_t)type;   // override NSDMI default — could be any of PLAY/STOP/PAUSE/UNPAUSE
     gMagiLink.acquireMutex();
     bool ok = gMagiLink.send(&msg, sizeof(msg));
     gMagiLink.releaseMutex();
@@ -258,8 +264,6 @@ bool ServerPairing::sendControl(MagiMsgType type) {
 bool ServerPairing::sendSeek(uint8_t pattern, uint8_t row) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgSeek msg;
-    msg.id      = MSG_SEEK;
-    msg.length  = sizeof(msg);
     msg.pattern = pattern;
     msg.row     = row;
     gMagiLink.acquireMutex();
@@ -271,8 +275,6 @@ bool ServerPairing::sendSeek(uint8_t pattern, uint8_t row) {
 bool ServerPairing::sendGoto(uint8_t pattern, uint8_t row) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgGoto msg;
-    msg.id      = MSG_GOTO;
-    msg.length  = sizeof(msg);
     msg.pattern = pattern;
     msg.row     = row;
     gMagiLink.acquireMutex();
@@ -983,8 +985,6 @@ void ServerPairing::_onPairReceive(const uint8_t* data, int len) {
 // we reply with MsgConnectAck and flip state to SUCCESS.
 void ServerPairing::_onMagiLinkConnect() {
     MsgConnectAck ack;
-    ack.id     = MSG_CONNECT_ACK;
-    ack.length = sizeof(ack);
     bool ok = gMagiLink.send(&ack, sizeof(ack));
     Serial.printf("[SP] MagiLink: got MSG_CONNECT, ack send=%s\n",
                   ok ? "OK" : "FAIL");
@@ -998,6 +998,64 @@ void ServerPairing::_onMagiLinkDisconnect() {
     _setBrowseState(BrowseState::IDLE);
     if (_hasPairing) _tryAutoConnect();
     else             _setPairState(PairClientState::IDLE);
+}
+
+// ── MagiLink song messages — push header / push body / no song ──────────────
+//
+// Runs on the worker task with the mutex held.  The push protocol is:
+//   server: HEADER(total_size) → N×BODY(data_len,data) until total_size bytes sent
+//   client: HEADER → reset counters + record expected size + WAITING_SONG
+//           BODY  → append data into _songBuf; when bytes == expected → SONG_READY
+//
+// No end marker — the header's total_size is authoritative.  Stray bodies
+// (received with _songRecvExpected == 0) are dropped; oversize headers are
+// rejected.
+void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
+    switch (msg[0]) {
+        case MSG_SONG_PUSH_HEADER: {
+            if (len < sizeof(MsgSongPushHeader)) return;
+            const MsgSongPushHeader* h = (const MsgSongPushHeader*)msg;
+            if (h->total_size > SONG_TRANSFER_MAX) {
+                Serial.printf("[SP] song push too big: %u (max %u)\n",
+                              (unsigned)h->total_size,
+                              (unsigned)SONG_TRANSFER_MAX);
+                _songRecvExpected = 0;
+                return;
+            }
+            _songBufLen       = 0;
+            _songRecvExpected = h->total_size;
+            _setBrowseState(BrowseState::WAITING_SONG);
+            Serial.printf("[SP] song push start: %u bytes\n",
+                          (unsigned)_songRecvExpected);
+            break;
+        }
+
+        case MSG_SONG_PUSH_BODY: {
+            if (_songRecvExpected == 0) return;       // stray body
+            if (len < sizeof(MsgSongPushBody))  return;
+            const MsgSongPushBody* b = (const MsgSongPushBody*)msg;
+            if (b->data_len > 1024) return;
+            if (_songBufLen + b->data_len > _songRecvExpected) {
+                Serial.println("[SP] song push: overshoot — dropping");
+                _songRecvExpected = 0;
+                return;
+            }
+            memcpy(_songBuf + _songBufLen, b->data, b->data_len);
+            _songBufLen += b->data_len;
+            if (_songBufLen == _songRecvExpected) {
+                Serial.printf("[SP] song push done: %u bytes\n",
+                              (unsigned)_songBufLen);
+                _setBrowseState(BrowseState::SONG_READY);
+                _songRecvExpected = 0;
+            }
+            break;
+        }
+
+        case MSG_NO_SONG:
+            _noSongPending = true;
+            Serial.println("[SP] NO_SONG from server");
+            break;
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

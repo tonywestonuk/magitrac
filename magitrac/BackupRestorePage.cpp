@@ -359,7 +359,7 @@ void BackupRestorePage::startBackup() {
     draw(); _d.paintLater();
 
     gMagiLink.acquireMutex();
-    MsgStartBackup req = { (uint8_t)MSG_START_BACKUP, sizeof(req) };
+    MsgStartBackup req;
     if (!gMagiLink.send(&req, sizeof(req))) {
         Serial.println("[BK] send MSG_START_BACKUP failed");
         gMagiLink.releaseMutex();
