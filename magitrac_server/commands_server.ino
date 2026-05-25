@@ -680,6 +680,15 @@ static void sendBackupFileRaw(const char* name) {
 }
 
 
+// Shared 1029-byte streaming body buffer for backup and song push.
+// MsgBackupBody and MsgSongPushBody have identical wire shape — only the
+// id byte differs — so we keep one buffer and rewrite the id per-use.
+// Worker stack is 8 KB so this struct is too big for it; the mutex
+// serializes use sites so a single shared static is safe.  Saves ~1 KB
+// of DRAM vs. a separate static body per function (matters on the
+// M5Stack ESP32 classic — its DRAM is tight).
+static MsgBackupBody sStreamBody;
+
 // ── MagiLink backup — streams every /songs/*.mgt + instruments.mgt ─────────
 //
 // Called from the MagiLink MSG_START_BACKUP handler (worker task context,
@@ -740,9 +749,9 @@ void sendBackupToClient() {
     Serial.printf("[BK-SRV] sending %u files\n", (unsigned)count);
 
     // Step 2: send each file as header + N×body.
-    // body is static — 1029 bytes is too much for the worker task stack,
-    // and re-entrancy is not a concern.  NSDMI sets id+length at startup.
-    static MsgBackupBody body;
+    // Use the shared sStreamBody buffer.  Set id explicitly since song
+    // push may have left it as MSG_SONG_PUSH_BODY.
+    sStreamBody.id = MSG_BACKUP_BODY;
 
     bool ok = true;
     for (uint16_t i = 0; i < count && ok; i++) {
@@ -778,12 +787,12 @@ void sendBackupToClient() {
         uint32_t sent = 0;
         while (ok && sent < sizes[i]) {
             uint32_t want = sizes[i] - sent;
-            if (want > sizeof(body.data)) want = sizeof(body.data);
+            if (want > sizeof(sStreamBody.data)) want = sizeof(sStreamBody.data);
             int got;
-            { SdLock _; got = f.read(body.data, want); }
+            { SdLock _; got = f.read(sStreamBody.data, want); }
             if (got <= 0) break;
-            body.data_len = (uint16_t)got;
-            ok = gMagiLink.send(&body, sizeof(body));
+            sStreamBody.data_len = (uint16_t)got;
+            ok = gMagiLink.send(&sStreamBody, sizeof(sStreamBody));
             if (!ok) {
                 Serial.printf("[BK-SRV] body send failed at file %u sent=%u\n",
                               (unsigned)i, (unsigned)sent);
@@ -960,15 +969,17 @@ static void sendActiveSongToClient() {
     hdr.total_size = srvActiveBufLen;
     bool ok = gMagiLink.send(&hdr, sizeof(hdr));
 
-    static MsgSongPushBody body;
+    // Reuse the shared streaming body buffer; flip its id since backup may
+    // have left it as MSG_BACKUP_BODY.
+    sStreamBody.id = MSG_SONG_PUSH_BODY;
 
     uint32_t sent = 0;
     while (ok && sent < srvActiveBufLen) {
         uint32_t remain = srvActiveBufLen - sent;
         uint16_t chunk  = remain > 1024 ? 1024 : (uint16_t)remain;
-        body.data_len = chunk;
-        memcpy(body.data, srvActiveBuf + sent, chunk);
-        ok = gMagiLink.send(&body, sizeof(body));
+        sStreamBody.data_len = chunk;
+        memcpy(sStreamBody.data, srvActiveBuf + sent, chunk);
+        ok = gMagiLink.send(&sStreamBody, sizeof(sStreamBody));
         sent += chunk;
     }
 
