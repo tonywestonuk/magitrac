@@ -89,7 +89,7 @@ static void drawClientServerScreen(const char* line1, const char* line2,
     }
 
     uint8_t mac[6];
-    gComms.localAddr(mac);
+    gTransportEspNow.localAddr(mac);
     lcd.setTextSize(1);
     lcd.setCursor(8, 130);
     lcd.printf("Server: %02X:%02X:%02X:%02X:%02X:%02X",
@@ -102,19 +102,17 @@ static void drawClientServerScreen(const char* line1, const char* line2,
     lcd.print(footer);
 }
 
-// ── Init (call from setup() after gComms.begin()) ────────────────────────────
+// ── Init (call from setup() after the active transport is up) ────────────────
 void pairingInit() {
     sHasPairing = pairNvsLoad(SRV_NVS_NS, sStoredClientMac, sStoredSecret);
     if (sHasPairing) {
         Serial.printf("[PAIR] stored client: %02X:%02X:%02X:%02X:%02X:%02X\n",
             sStoredClientMac[0], sStoredClientMac[1], sStoredClientMac[2],
             sStoredClientMac[3], sStoredClientMac[4], sStoredClientMac[5]);
-        // Register the paired-client MAC on the active transport so
-        // `lastSenderAddr` resolves to a meaningful value when frames
-        // arrive — the MSG_CONNECT handler's MAC check depends on this.
-        // In TCP-STA mode this is the only place the label gets set;
-        // ESP-NOW peer registration also happens at pair time.
-        gComms.addPeer(sStoredClientMac);
+        // Register the paired-client MAC on the ESP-NOW transport so the
+        // pairing handler's MAC check resolves correctly when a PAIR_OFFER
+        // arrives during a re-pair attempt.
+        gTransportEspNow.addPeer(sStoredClientMac);
     } else {
         Serial.println("[PAIR] no stored pairing — use BtnC long-press to pair");
     }
@@ -131,7 +129,7 @@ void enterPairingMode() {
     sCancelArmed = false;
     drawClientServerScreen("PAIR MODE", "Scanning...", "C: Cancel");
     uint8_t mac[6];
-    gComms.localAddr(mac);
+    gTransportEspNow.localAddr(mac);
     Serial.printf("[PAIR] pair window open (60 s); my MAC=%02X:%02X:%02X:%02X:%02X:%02X\n",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
@@ -182,7 +180,7 @@ void pairingOnMagiLinkDisconnected() {
 void pairingHandleMessage(const uint8_t* data, int len) {
     if (len < 1) return;
     MagiMsgType type = (MagiMsgType)data[0];
-    const uint8_t* senderMac = gComms.lastSenderAddr();
+    const uint8_t* senderMac = gTransportEspNow.lastSenderAddr();
 
     switch (type) {
 
@@ -276,8 +274,8 @@ void pairingLoop() {
                 MsgPairProbe probe;
                 probe.type = MSG_PAIR_PROBE;
                 memcpy(probe.magic, MAGI_PAIR_MAGIC, sizeof(probe.magic));
-                gComms.localAddr(probe.senderMac);
-                gComms.sendBroadcast(&probe, sizeof(probe));
+                gTransportEspNow.localAddr(probe.senderMac);
+                gTransportEspNow.sendBroadcast(&probe, sizeof(probe));
             }
             break;
         }
