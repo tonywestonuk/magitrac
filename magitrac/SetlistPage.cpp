@@ -16,8 +16,11 @@ SetlistPage::SetlistPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& 
     , _state(State::LIST)
     , _wasDown(false)
     , _slot(1)
-    , _page(0)
+    , _scrollOffset(0)
     , _selectedIdx(-1)
+    , _dragStartY(0)
+    , _dragStartScrollOffset(0)
+    , _dragMoved(false)
     , _draftIsNew(false)
     , _kbdTarget(nullptr)
     , _fileCount(0)
@@ -28,19 +31,31 @@ SetlistPage::SetlistPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& 
 {
     memset(&_list, 0, sizeof(_list));
     memset(&_draft, 0, sizeof(_draft));
-    _kbdSnap[0]            = '\0';
-    _loadedFilename[0]     = '\0';
-    _loadedDisplayName[0]  = '\0';
+    _kbdSnap[0]              = '\0';
+    _loadedFilename[0]       = '\0';
+    _loadedDisplayName[0]    = '\0';
+    _currentLoadedFile[0]    = '\0';
 }
 
 void SetlistPage::open() {
-    _state   = State::LIST;
-    _wasDown = _touch.isTouched;
-    _page    = 0;
+    _state         = State::LIST;
+    _wasDown       = _touch.isTouched;
+    _scrollOffset  = 0;
+    _dragMoved     = false;
     if (!loadSetlist(_slot, &_list)) {
         initSetlist(&_list, _slot);
     }
     _loadedFilename[0] = '\0';
+    // If the previously-loaded entry is in this slot, scroll it into view
+    // so the highlight is visible without a manual scroll.
+    if (_currentLoadedFile[0]) {
+        for (int i = 0; i < (int)_list.count; i++) {
+            if (strcmp(_list.songs[i].file, _currentLoadedFile) == 0) {
+                ensureRowVisible(i);
+                break;
+            }
+        }
+    }
 }
 
 void SetlistPage::draw() {
@@ -213,6 +228,8 @@ SetlistResult SetlistPage::pollInfo() {
                 _loadedFilename[sizeof(_loadedFilename) - 1] = '\0';
                 strncpy(_loadedDisplayName, e.name, sizeof(_loadedDisplayName) - 1);
                 _loadedDisplayName[sizeof(_loadedDisplayName) - 1] = '\0';
+                strncpy(_currentLoadedFile, e.file, sizeof(_currentLoadedFile) - 1);
+                _currentLoadedFile[sizeof(_currentLoadedFile) - 1] = '\0';
                 return SetlistResult::SONG_LOADED;
             }
             Serial.printf("[SetlistPage] load failed: %s\n", path);
@@ -277,13 +294,22 @@ void SetlistPage::drawListRows() {
 
 void SetlistPage::drawListRow(int rowOnPage) {
     int y    = SL_LIST_Y + rowOnPage * SL_ROW_H;
-    int abs  = _page * SL_ROWS_PER_PAGE + rowOnPage;
+    int abs  = _scrollOffset + rowOnPage;
     bool has = (abs >= 0 && abs < (int)_list.count);
 
     _d.fillRect(0, y, 960, SL_ROW_H, COL_WHITE);
     _d.drawFastHLine(20, y + SL_ROW_H - 1, 920, COL_LTGREY);
 
     if (!has) return;
+
+    // "Currently loaded" marker: solid black bar on the left edge.  Sits
+    // outside the number column (which starts at SL_NUM_X=10) so the
+    // number/name layout is unaffected.
+    bool isCurrent = _currentLoadedFile[0] &&
+                     strcmp(_list.songs[abs].file, _currentLoadedFile) == 0;
+    if (isCurrent) {
+        _d.fillRect(0, y + 2, 6, SL_ROW_H - 4, COL_BLACK);
+    }
 
     char numStr[6];
     snprintf(numStr, sizeof(numStr), "%d.", abs + 1);
@@ -319,17 +345,17 @@ void SetlistPage::drawListBottomBar() {
     _d.fillRect(0, SL_BAR_Y, 960, SL_BAR_H, COL_WHITE);
     _d.drawFastHLine(0, SL_BAR_Y, 960, COL_BLACK);
 
-    int total   = numPages();
-    bool hasPrev = (_page > 0);
-    bool hasNext = (_page + 1 < total);
-
-    uiButton(_d, SL_PREV_X, SL_BAR_Y + 5, SL_PREV_W, SL_BAR_H - 10,
-             "< PREV", COL_LTGREY, hasPrev ? COL_BLACK : COL_DKGREY, 3);
-    uiButton(_d, SL_NEXT_X, SL_BAR_Y + 5, SL_NEXT_W, SL_BAR_H - 10,
-             "NEXT >", COL_LTGREY, hasNext ? COL_BLACK : COL_DKGREY, 3);
-
-    char status[24];
-    snprintf(status, sizeof(status), "Page %d / %d", _page + 1, total);
+    char status[40];
+    int total = (int)_list.count;
+    if (total == 0) {
+        snprintf(status, sizeof(status), "(empty)");
+    } else {
+        int firstVis = _scrollOffset + 1;
+        int lastVis  = _scrollOffset + SL_ROWS_PER_PAGE;
+        if (lastVis > total) lastVis = total;
+        snprintf(status, sizeof(status), "%d-%d of %d  (drag to scroll)",
+                 firstVis, lastVis, total);
+    }
     int tw = (int)strlen(status) * 18;
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
@@ -337,9 +363,21 @@ void SetlistPage::drawListBottomBar() {
     _d.print(status);
 }
 
-int SetlistPage::numPages() const {
-    int n = ((int)_list.count + SL_ROWS_PER_PAGE - 1) / SL_ROWS_PER_PAGE;
-    return (n < 1) ? 1 : n;
+int SetlistPage::maxScrollOffset() const {
+    int max = (int)_list.count - SL_ROWS_PER_PAGE;
+    return max > 0 ? max : 0;
+}
+
+void SetlistPage::ensureRowVisible(int idx) {
+    if (idx < 0) return;
+    if (idx < _scrollOffset) {
+        _scrollOffset = idx;
+    } else if (idx >= _scrollOffset + SL_ROWS_PER_PAGE) {
+        _scrollOffset = idx - SL_ROWS_PER_PAGE + 1;
+    }
+    int max = maxScrollOffset();
+    if (_scrollOffset > max) _scrollOffset = max;
+    if (_scrollOffset < 0)   _scrollOffset = 0;
 }
 
 SetlistResult SetlistPage::pollList() {
@@ -348,10 +386,54 @@ SetlistResult SetlistPage::pollList() {
     bool down = _touch.isTouched;
     int sx, sy;
     rawToScreen(_touch.x, _touch.y, sx, sy);
-    bool falling = (!down && _wasDown);
-    _wasDown = down;
-    if (!falling) return SetlistResult::NONE;
 
+    // Rising edge — start a potential drag.  We don't know yet whether
+    // it'll resolve as a tap or a scroll, so just capture the start state.
+    if (down && !_wasDown) {
+        _wasDown               = true;
+        _dragStartY            = sy;
+        _dragStartScrollOffset = _scrollOffset;
+        _dragMoved             = false;
+        return SetlistResult::NONE;
+    }
+
+    // Finger held — pan the list once movement crosses the threshold.
+    // Buttons (BACK, ADD, tabs, per-row arrows) still work because the
+    // drag-mode flip suppresses the falling-edge tap.
+    if (down && _wasDown) {
+        int dy = sy - _dragStartY;
+        if (!_dragMoved && (dy >= SL_DRAG_THRESH_PX || dy <= -SL_DRAG_THRESH_PX)) {
+            _dragMoved = true;
+        }
+        if (_dragMoved) {
+            // Dragging finger DOWN reveals earlier rows → smaller offset.
+            int rowDelta = -dy / SL_ROW_H;
+            int newOff   = _dragStartScrollOffset + rowDelta;
+            int maxOff   = maxScrollOffset();
+            if (newOff < 0)      newOff = 0;
+            if (newOff > maxOff) newOff = maxOff;
+            if (newOff != _scrollOffset) {
+                _scrollOffset = newOff;
+                drawListRows();
+                drawListBottomBar();
+                _d.paintLater();
+            }
+        }
+        return SetlistResult::NONE;
+    }
+
+    // Falling edge.
+    if (!down && _wasDown) {
+        _wasDown = false;
+        if (_dragMoved) {
+            _dragMoved = false;
+            return SetlistResult::NONE;   // pan ended — no tap fires
+        }
+    } else {
+        return SetlistResult::NONE;       // ignore stray "still up" events
+    }
+
+    // ── Tap handling ──
     if (hitBack(sx, sy)) {
         save();
         return SetlistResult::BACK;
@@ -363,21 +445,6 @@ SetlistResult SetlistPage::pollList() {
         _d.fillScreen(COL_WHITE);
         drawList();
         _d.paint();
-        return SetlistResult::NONE;
-    }
-
-    if (hitPrevPage(sx, sy) && _page > 0) {
-        _page--;
-        drawListRows();
-        drawListBottomBar();
-        _d.paintLater();
-        return SetlistResult::NONE;
-    }
-    if (hitNextPage(sx, sy) && _page + 1 < numPages()) {
-        _page++;
-        drawListRows();
-        drawListBottomBar();
-        _d.paintLater();
         return SetlistResult::NONE;
     }
 
@@ -399,10 +466,7 @@ SetlistResult SetlistPage::pollList() {
     if (upIdx >= 0) {
         moveSongUp(upIdx);
         save();
-        if (upIdx - 1 >= 0) {
-            int newPage = (upIdx - 1) / SL_ROWS_PER_PAGE;
-            if (newPage != _page) _page = newPage;
-        }
+        ensureRowVisible(upIdx - 1);
         drawListRows();
         drawListBottomBar();
         _d.paintLater();
@@ -413,8 +477,7 @@ SetlistResult SetlistPage::pollList() {
     if (dnIdx >= 0) {
         moveSongDown(dnIdx);
         save();
-        int newPage = (dnIdx + 1) / SL_ROWS_PER_PAGE;
-        if (newPage != _page) _page = newPage;
+        ensureRowVisible(dnIdx + 1);
         drawListRows();
         drawListBottomBar();
         _d.paintLater();
@@ -446,7 +509,7 @@ int SetlistPage::hitRowName(int sx, int sy) const {
     if (sx < SL_NAME_X || sx >= SL_NAME_X + SL_NAME_W) return -1;
     if (sy < SL_LIST_Y || sy >= SL_LIST_Y + SL_ROWS_PER_PAGE * SL_ROW_H) return -1;
     int rowOnPage = (sy - SL_LIST_Y) / SL_ROW_H;
-    int abs = _page * SL_ROWS_PER_PAGE + rowOnPage;
+    int abs = _scrollOffset + rowOnPage;
     if (abs < 0 || abs >= (int)_list.count) return -1;
     return abs;
 }
@@ -455,7 +518,7 @@ int SetlistPage::hitRowUp(int sx, int sy) const {
     if (sx < SL_UP_X || sx >= SL_UP_X + SL_UP_W) return -1;
     if (sy < SL_LIST_Y || sy >= SL_LIST_Y + SL_ROWS_PER_PAGE * SL_ROW_H) return -1;
     int rowOnPage = (sy - SL_LIST_Y) / SL_ROW_H;
-    int abs = _page * SL_ROWS_PER_PAGE + rowOnPage;
+    int abs = _scrollOffset + rowOnPage;
     if (abs <= 0 || abs >= (int)_list.count) return -1;
     return abs;
 }
@@ -464,7 +527,7 @@ int SetlistPage::hitRowDown(int sx, int sy) const {
     if (sx < SL_DOWN_X || sx >= SL_DOWN_X + SL_DOWN_W) return -1;
     if (sy < SL_LIST_Y || sy >= SL_LIST_Y + SL_ROWS_PER_PAGE * SL_ROW_H) return -1;
     int rowOnPage = (sy - SL_LIST_Y) / SL_ROW_H;
-    int abs = _page * SL_ROWS_PER_PAGE + rowOnPage;
+    int abs = _scrollOffset + rowOnPage;
     if (abs < 0 || abs + 1 >= (int)_list.count) return -1;
     return abs;
 }
@@ -479,22 +542,23 @@ bool SetlistPage::hitAdd(int sx, int sy) const {
         && sy >= SL_BTN_Y && sy < SL_BTN_Y + SL_BTN_H;
 }
 
-bool SetlistPage::hitPrevPage(int sx, int sy) const {
-    return sx >= SL_PREV_X && sx < SL_PREV_X + SL_PREV_W
-        && sy >= SL_BAR_Y + 5 && sy < SL_BAR_Y + SL_BAR_H - 5;
-}
-
-bool SetlistPage::hitNextPage(int sx, int sy) const {
-    return sx >= SL_NEXT_X && sx < SL_NEXT_X + SL_NEXT_W
-        && sy >= SL_BAR_Y + 5 && sy < SL_BAR_Y + SL_BAR_H - 5;
-}
-
 void SetlistPage::switchToSlot(uint8_t newSlot) {
     save();
-    _slot = newSlot;
-    _page = 0;
+    _slot         = newSlot;
+    _scrollOffset = 0;
+    _dragMoved    = false;
     if (!loadSetlist(_slot, &_list)) {
         initSetlist(&_list, _slot);
+    }
+    // If the currently-loaded entry lives in this slot too, scroll it
+    // into view so the marker is visible.
+    if (_currentLoadedFile[0]) {
+        for (int i = 0; i < (int)_list.count; i++) {
+            if (strcmp(_list.songs[i].file, _currentLoadedFile) == 0) {
+                ensureRowVisible(i);
+                break;
+            }
+        }
     }
 }
 
@@ -519,8 +583,9 @@ void SetlistPage::deleteSong(int idx) {
     }
     _list.count--;
     memset(&_list.songs[_list.count], 0, sizeof(SetlistEntry));
-    if (_page >= numPages()) _page = numPages() - 1;
-    if (_page < 0) _page = 0;
+    int max = maxScrollOffset();
+    if (_scrollOffset > max) _scrollOffset = max;
+    if (_scrollOffset < 0)   _scrollOffset = 0;
 }
 
 bool SetlistPage::fileExistsOnSd(const char* file) const {
@@ -1218,6 +1283,8 @@ SetlistResult SetlistPage::pollWaitingSong() {
                 _loadedFilename[sizeof(_loadedFilename) - 1] = '\0';
                 strncpy(_loadedDisplayName, e.name, sizeof(_loadedDisplayName) - 1);
                 _loadedDisplayName[sizeof(_loadedDisplayName) - 1] = '\0';
+                strncpy(_currentLoadedFile, e.file, sizeof(_currentLoadedFile) - 1);
+                _currentLoadedFile[sizeof(_currentLoadedFile) - 1] = '\0';
             }
             gServerPairing.resetBrowse();
             return SetlistResult::SONG_LOADED;
