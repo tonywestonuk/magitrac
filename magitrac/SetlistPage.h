@@ -78,10 +78,16 @@ static const int SL_ARROW_H      = 40;
 
 static const int SL_BAR_Y        = 490;
 static const int SL_BAR_H        = 50;
+// Prev/next page buttons — only used by the PICK_FILE (SD song picker)
+// view; the main setlist LIST view scrolls by touch-drag instead.
 static const int SL_PREV_X       = 0;
 static const int SL_PREV_W       = 130;
 static const int SL_NEXT_X       = 830;
 static const int SL_NEXT_W       = 130;
+
+// Drag-scroll: any vertical movement past this threshold during a touch
+// suppresses the falling-edge tap and instead pans the list.
+static const int SL_DRAG_THRESH_PX = 12;
 
 // INFO popup
 static const int SL_INFO_X       = 80;
@@ -168,8 +174,22 @@ private:
 
     uint8_t  _slot;          // 1..SETLIST_COUNT (currently visible)
     Setlist  _list;          // currently loaded setlist
-    int      _page;          // 0-based page of the song list view
+    int      _scrollOffset;  // top visible row in the song list (0-based)
     int      _selectedIdx;   // song selected in INFO / being EDITed
+
+    // Drag-scroll state — populated on touch-down inside the list view,
+    // cleared on touch-up.  `_dragMoved` flips to true once vertical
+    // movement exceeds SL_DRAG_THRESH_PX, which suppresses the
+    // would-be tap so panning doesn't accidentally open a row.
+    int      _dragStartY;
+    int      _dragStartScrollOffset;
+    bool     _dragMoved;
+
+    // Bare filename (no .mgt) of the most recently loaded setlist entry —
+    // used to draw a "currently playing" marker.  Survives close/reopen
+    // since this object is long-lived.  Stale if the user loads via
+    // SongPage in the interim; tracking that path is out of scope.
+    char     _currentLoadedFile[SETLIST_FILE_LEN];
 
     // EDIT draft (so CANCEL is non-destructive).
     SetlistEntry _draft;
@@ -204,15 +224,14 @@ private:
     void drawListBottomBar();
     SetlistResult pollList();   // can emit BACK
 
-    int  numPages() const;
+    int  maxScrollOffset() const;
+    void ensureRowVisible(int idx);
     int  hitTab(int sx, int sy) const;          // -1 or 1..SETLIST_COUNT
     int  hitRowName(int sx, int sy) const;      // -1 or absolute song idx
     int  hitRowUp(int sx, int sy) const;        // -1 or absolute song idx
     int  hitRowDown(int sx, int sy) const;      // -1 or absolute song idx
     bool hitBack(int sx, int sy) const;
     bool hitAdd(int sx, int sy) const;
-    bool hitPrevPage(int sx, int sy) const;
-    bool hitNextPage(int sx, int sy) const;
 
     void switchToSlot(uint8_t newSlot);
     void moveSongUp(int idx);
