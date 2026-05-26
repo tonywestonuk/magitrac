@@ -7,6 +7,11 @@
 #define SRV_FNAME_MAX  24
 #define SRV_MAX_FILES  32
 
+// Magitrac default port — used for the MagiLink TCP listener and the
+// MagiUdpLink datagram listener (TCP/UDP namespaces are disjoint so they
+// coexist).
+#define MAGI_PORT 4242
+
 // ── Message types ─────────────────────────────────────────────────────────────
 enum MagiMsgType : uint8_t {
     // MagiLink session
