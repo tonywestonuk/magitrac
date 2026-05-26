@@ -1,17 +1,13 @@
-// MagiLink.h — clean-slate persistent TCP link.
+// MagiLink.h — persistent TCP link, the magitrac reliable data path.
 //
 // One side opens a socket server (AP role), the other side opens a
 // TCP client connection to it (STA role).  Each side spawns one
 // FreeRTOS task that owns the connection: accept (or connect), wait
 // until the peer drops, loop back.
 //
-// This deliberately lives ALONGSIDE the existing MagiCommsTcp / gComms
-// stack during the comms rewrite — uses a different port so they don't
-// fight.  Once the new design is proven, the old transport gets
-// retired and MagiLink takes over port 4242.
-//
-// Status is observable via isConnected() — that's the only public
-// surface for now.  Send/recv/dispatch/etc. will come in later steps.
+// Listens on MAGI_PORT.  Per-message dispatch is via registered
+// callbacks (registerCallback); transactional flows acquire the
+// mutex, send/read, then release.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
