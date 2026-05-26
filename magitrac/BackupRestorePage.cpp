@@ -5,21 +5,6 @@
 #include <string.h>
 #include <stdio.h>
 
-// ── REPRO: set to 1 to discard incoming backup-file bytes instead of writing
-// them to SD.  Lets us test whether the magitrac wedge is caused by SD-write
-// contention with the WiFi/TCP task during sustained inbound streaming.
-// All other code paths (WiFi rx, _songBuf fill, BackupState progression,
-// EPD repaint, request next file, 80 ms pacing) are unchanged.
-// Revert to 0 when done.
-#define REPRO_SKIP_SD_WRITE 1
-
-// ── REPRO: set to 1 to suppress the per-file EPD progress repaint during
-// backup.  Testing the hypothesis that TPS65185 rail-cycle EMI / current
-// spikes during the panel paint are corrupting nearby WiFi packets and
-// causing TCP teardowns mid-backup.  The final BACKUP_DONE paint is
-// unaffected.  Revert to 0 when done.
-#define REPRO_SKIP_EPD_PAINT 1
-
 extern ServerPairing gServerPairing;
 
 // ── Layout constants ─────────────────────────────────────────────────────────
