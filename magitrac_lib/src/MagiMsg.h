@@ -254,11 +254,17 @@ inline uint8_t magiWifiChannelFromIdx(uint8_t idx) {
 // Sent as 4 header bytes + length data bytes (not the full SONG_PATCH_MAX payload).
 #define SONG_PATCH_MAX 64
 
+// Variable-length send: only the bytes actually carrying the patch are
+// sent.  Caller MUST set `length = 6 + dataLen` and pass `6 + dataLen`
+// to gMagiLink.send so the wire length matches the actual byte count.
+// NSDMI's default `length = sizeof(MsgSetSongData)` is wrong for this
+// message because trailing `data[]` bytes after `dataLen` are garbage.
 struct MsgSetSongData {
-    MagiMsgType type;              // MSG_SET_SONG_DATA
-    uint16_t    offset;            // byte offset into Song struct
-    uint8_t     length;            // bytes to patch (1..SONG_PATCH_MAX)
-    uint8_t     data[SONG_PATCH_MAX];
+    uint8_t  id     = MSG_SET_SONG_DATA;
+    uint16_t length = sizeof(MsgSetSongData);   // OVERRIDE before send
+    uint16_t offset;                            // byte offset into Song struct
+    uint8_t  dataLen;                           // payload bytes (1..SONG_PATCH_MAX)
+    uint8_t  data[SONG_PATCH_MAX];
 };
 
 // ── Song list ──────────────────────────────────────────────────────────────────

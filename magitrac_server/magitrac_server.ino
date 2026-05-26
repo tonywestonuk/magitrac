@@ -598,6 +598,7 @@ void setup() {
     gMagiLink.registerCallback(MSG_SONG_LIST_REQ,   controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_LOAD_REQ,   controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_DELETE,     controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SET_SONG_DATA,   controlCb, nullptr);
 
     // ── Song save (Phase 2 #6) — client streams Song bytes to us ───────────
     // Handlers live in commands_server.ino; they accumulate into srvActiveBuf

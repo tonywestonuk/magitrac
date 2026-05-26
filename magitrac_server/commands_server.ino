@@ -368,19 +368,19 @@ static void sendSongDataByName(const char* name) {
 static void applySongPatch(const MsgSetSongData* msg) {
     if (!srvHasActive) return;
     uint32_t start = SRV_HDR_SIZE + msg->offset;
-    if (start + msg->length > srvActiveBufLen) return;
-    memcpy(srvActiveBuf + start, msg->data, msg->length);
+    if (start + msg->dataLen > srvActiveBufLen) return;
+    memcpy(srvActiveBuf + start, msg->data, msg->dataLen);
 
     // If bpm was touched, update the live sequencer BPM immediately
     const Song* s = reinterpret_cast<const Song*>(srvActiveBuf + SRV_HDR_SIZE);
     uint16_t bpmOff = (uint16_t)offsetof(Song, bpm);
-    if (msg->offset <= bpmOff && msg->offset + msg->length > bpmOff + 1) {
+    if (msg->offset <= bpmOff && msg->offset + msg->dataLen > bpmOff + 1) {
         sequencerSetBPM(s->bpm);
     }
 
     // If performerMask was touched, send CC 115 immediately
     uint16_t pmOff = (uint16_t)offsetof(Song, performerMask);
-    if (msg->offset <= pmOff && msg->offset + msg->length > pmOff) {
+    if (msg->offset <= pmOff && msg->offset + msg->dataLen > pmOff) {
         seqSendSlotEnable();
     }
 }
@@ -1217,10 +1217,11 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             break;
 
         case MSG_SET_SONG_DATA:
-            if (len < 4) return;
+            // MagiLink wire: id(1) + length(2) + offset(2) + dataLen(1) + data[dataLen]
+            if (len < 6) return;
             {
                 const MsgSetSongData* p = (const MsgSetSongData*)data;
-                if (len < 4 + p->length) return;
+                if (len < (int)(6 + p->dataLen)) return;
                 applySongPatch(p);
             }
             break;
