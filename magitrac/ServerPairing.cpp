@@ -490,33 +490,6 @@ void ServerPairing::resetInstruments() {
 
 // ── Backup / Restore ─────────────────────────────────────────────────────────
 
-void ServerPairing::requestBackupFileList(uint8_t /*unused*/) {
-    if (_pairState != PairClientState::SUCCESS) return;
-    MsgBackupListReq msg;
-    msg.type = MSG_BACKUP_LIST_REQ;
-    bool ok = gComms.send(&msg, sizeof(msg));
-    Serial.printf("[SP] requestBackupFileList send=%s\n", ok ? "OK" : "FAIL");
-    _backupState = BackupState::WAITING_FILE_LIST;
-}
-
-void ServerPairing::requestBackupFile(const char* name) {
-    if (_pairState != PairClientState::SUCCESS) return;
-    MsgBackupFileReq msg;
-    msg.type = MSG_BACKUP_FILE_REQ;
-    strncpy(msg.name, name, sizeof(msg.name) - 1);
-    msg.name[sizeof(msg.name) - 1] = '\0';
-    _songBufLen  = 0;
-    _chunksGot   = 0;
-    _chunksTotal = 0;
-    _backupState = BackupState::WAITING_FILE;
-    gComms.send(&msg, sizeof(msg));
-}
-
-void ServerPairing::resetBackup() {
-    _backupState = BackupState::IDLE;
-    _bkFileCount = 0;
-}
-
 bool ServerPairing::sendRestoreFile(const char* name, bool isInstruments,
                                      const uint8_t* data, uint32_t dataLen) {
     if (_pairState != PairClientState::SUCCESS) return false;

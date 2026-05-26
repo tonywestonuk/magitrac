@@ -151,13 +151,6 @@ static char    srvLoadByNameStr[SL_NAME_LEN] = {};
 static bool    srvListPending       = false;
 static uint8_t srvListPendingPage   = 0;
 
-// ── Deferred backup file send ──────────────────────────────────────────────────
-static bool    srvBackupFilePending = false;
-static bool     srvTcpTestRunning    = false;   // set by MSG_TCP_TEST_START, cleared by MSG_TCP_TEST_STOP
-static uint8_t  srvTcpTestPattern    = 0;       // incrementing-u8 pattern, persists across blobs
-static char    srvBackupFileName[SRV_FNAME_MAX] = {};
-static bool    srvBackupListPending = false;
-
 // ── Restore upload state ──────────────────────────────────────────────────────
 static bool    srvRestoreActive          = false;
 static bool    srvRestoreFinaliseNeeded  = false;
@@ -567,147 +560,6 @@ static void sendInstrumentsData() {
                   (unsigned)total, ok ? "OK" : "FAIL");
 }
 
-// ── Backup: stream the full file list as a single framed blob ───────────────
-//
-// Wire payload: type(1) + numFiles(1) + BkFileEntry × numFiles.
-// All entries arrive in one round-trip — no paging.  Server enumerates
-// songs + instruments, stat()s each for its size, packs the entries into
-// the BkFileEntry layout, and ships them.  At SRV_MAX_FILES+1 = 33
-// entries the blob is 1+1+33*28 = 926 bytes — well under MAX_FRAME.
-static void sendBackupFileList(uint8_t /*unused*/) {
-    if (!srvSdOk) return;
-    extern MagiCommsTcp gTransportTcp;
-
-    BkFileEntry entries[SRV_MAX_FILES + 1];
-    int total = 0;
-
-    // Enumerate songs + instruments under a single SD lock — srvListSongs
-    // takes its own lock internally so we release ours around it.
-    char songNames[SRV_MAX_FILES][SRV_FNAME_MAX];
-    int songCount = srvListSongs(songNames, SRV_MAX_FILES);
-    {
-        SdLock _;
-        for (int i = 0; i < songCount && total < SRV_MAX_FILES; i++) {
-            memset(&entries[total], 0, sizeof(entries[total]));
-            strncpy(entries[total].name, songNames[i], SRV_FNAME_MAX - 1);
-            char path[48];
-            snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, songNames[i]);
-            File f = SD.open(path);
-            uint32_t sz = f ? (uint32_t)f.size() : 0;
-            if (f) f.close();
-            entries[total].sizeHi = (uint16_t)(sz >> 16);
-            entries[total].sizeLo = (uint16_t)(sz & 0xFFFF);
-            total++;
-        }
-        if (SD.exists(SRV_INSTRUMENTS_PATH) && total < (int)(sizeof(entries)/sizeof(entries[0]))) {
-            memset(&entries[total], 0, sizeof(entries[total]));
-            strncpy(entries[total].name, "instruments.mgt", SRV_FNAME_MAX - 1);
-            File f = SD.open(SRV_INSTRUMENTS_PATH);
-            uint32_t sz = f ? (uint32_t)f.size() : 0;
-            if (f) f.close();
-            entries[total].sizeHi = (uint16_t)(sz >> 16);
-            entries[total].sizeLo = (uint16_t)(sz & 0xFFFF);
-            total++;
-        }
-    }
-
-    size_t totalLen = 1 + 1 + (size_t)total * sizeof(BkFileEntry);
-    if (!gTransportTcp.streamBegin(totalLen)) {
-        Serial.printf("[CMD] backupList: streamBegin failed (len=%u)\n", (unsigned)totalLen);
-        return;
-    }
-    bool sendOk = true;
-    uint8_t type    = (uint8_t)MSG_BACKUP_LIST_BLOB;
-    uint8_t numByte = (uint8_t)total;
-    sendOk &= gTransportTcp.streamMore(&type,    1);
-    sendOk &= gTransportTcp.streamMore(&numByte, 1);
-    if (total > 0) {
-        sendOk &= gTransportTcp.streamMore(entries, (size_t)total * sizeof(BkFileEntry));
-    }
-    gTransportTcp.streamEnd();
-    Serial.printf("[CMD] backupList total=%d streamed=%s\n", total, sendOk ? "OK" : "FAIL");
-}
-
-// ── Backup: stream raw file as a single framed message ──────────────────────
-//
-// Wire payload (totalPayloadLen = 1 + 24 + 4 + fileSize):
-//   [type=MSG_BACKUP_FILE_BLOB][name 24B null-padded][fileSize u32 LE][bytes]
-//
-// SD is read in 1 KB pieces and shovelled straight into the TCP socket via
-// the streaming API — peer.write() blocks when the kernel send buffer fills,
-// so TCP flow control paces the SD reads naturally.  Peak RAM: one 1 KB
-// read buffer on the stack.
-static void sendBackupFileRaw(const char* name) {
-    if (!srvSdOk) return;
-    extern MagiCommsTcp gTransportTcp;
-
-    char path[48];
-    if (strcmp(name, "instruments.mgt") == 0) {
-        strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
-    } else {
-        snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, name);
-    }
-    path[sizeof(path) - 1] = '\0';
-
-#if REPRO_SKIP_SERVER_SD_READ
-    uint32_t fileSize = 4096;   // fake — actual SD never touched
-    Serial.printf("[CMD][REPRO] skip-SD-read '%s' (fake %u bytes)\n",
-                  name, (unsigned)fileSize);
-#else
-    File f;
-    uint32_t fileSize = 0;
-    {
-        SdLock _;
-        f = SD.open(path);
-        if (!f) {
-            Serial.printf("[CMD] backupFile: open failed '%s'\n", path);
-            return;
-        }
-        fileSize = (uint32_t)f.size();
-    }
-#endif
-    size_t totalLen = 1 + SRV_FNAME_MAX + 4 + fileSize;
-
-    if (!gTransportTcp.streamBegin(totalLen)) {
-        Serial.printf("[CMD] backupFile: streamBegin failed (len=%u)\n", (unsigned)totalLen);
-#if !REPRO_SKIP_SERVER_SD_READ
-        { SdLock _; f.close(); }
-#endif
-        return;
-    }
-    bool    sendOk = true;
-    uint8_t type = (uint8_t)MSG_BACKUP_FILE_BLOB;
-    char    namePadded[SRV_FNAME_MAX] = {};
-    strncpy(namePadded, name, SRV_FNAME_MAX - 1);
-    sendOk &= gTransportTcp.streamMore(&type, 1);
-    sendOk &= gTransportTcp.streamMore(namePadded, SRV_FNAME_MAX);
-    sendOk &= gTransportTcp.streamMore(&fileSize, 4);
-
-    uint8_t  buf[1024];
-    uint32_t sent = 0;
-    while (sent < fileSize && sendOk) {
-        size_t want = sizeof(buf);
-        if (fileSize - sent < want) want = fileSize - sent;
-        int got;
-#if REPRO_SKIP_SERVER_SD_READ
-        memset(buf, 0xAB, want);
-        got = (int)want;
-#else
-        { SdLock _; got = f.read(buf, want); }
-#endif
-        if (got <= 0) break;
-        sendOk = gTransportTcp.streamMore(buf, (size_t)got);
-        sent += got;
-    }
-    gTransportTcp.streamEnd();
-#if !REPRO_SKIP_SERVER_SD_READ
-    { SdLock _; f.close(); }
-#endif
-    Serial.printf("[CMD] backupFile '%s' %u bytes streamed=%s\n",
-                  name, fileSize, sendOk ? "OK" : "FAIL");
-}
-
-
 // ── MagiLink restore (client → server) state ───────────────────────────────
 // Streams bytes incrementally to SRV_RESTORE_TMP on SD as they arrive on
 // the worker task — same approach as the legacy onRestoreFileBlobStream.
@@ -1010,48 +862,6 @@ void sendBackupToClient() {
     Serial.printf("[BK-SRV] backup done (ok=%d)\n", ok ? 1 : 0);
 }
 
-// ── TCP/IP diagnostic test — sends a 4096-byte incrementing-u8 blob ────────
-//
-// Wire payload (totalPayloadLen = 1 + 4 + 4096 = 4101):
-//   [type=MSG_TCP_TEST_BLOB][size u32 LE = 4096][4096 incrementing u8 bytes]
-//
-// No SD, no I/O — same streamBegin/streamMore/streamEnd path the real backup
-// uses, but isolated from any subsystem outside WiFi+TCP.  Lets us tell
-// whether the wedge sits in the network stack under the actual magitrac
-// runtime environment (EPD task, MIDI, etc.) vs in something specific to
-// the backup data path (which we've already stubbed and which still wedges).
-static void sendTcpTestBlob() {
-    extern MagiCommsTcp gTransportTcp;
-
-    static const uint32_t PAYLOAD = 4096;
-    size_t totalLen = 1 + 4 + PAYLOAD;
-
-    if (!gTransportTcp.streamBegin(totalLen)) {
-        Serial.printf("[CMD] tcpTest: streamBegin failed (len=%u)\n",
-                      (unsigned)totalLen);
-        return;
-    }
-
-    bool sendOk = true;
-    uint8_t  type = (uint8_t)MSG_TCP_TEST_BLOB;
-    uint32_t size = PAYLOAD;
-    sendOk &= gTransportTcp.streamMore(&type, 1);
-    sendOk &= gTransportTcp.streamMore(&size, 4);
-
-    uint8_t buf[1024];
-    uint32_t sent = 0;
-    while (sent < PAYLOAD && sendOk) {
-        size_t want = sizeof(buf);
-        if (PAYLOAD - sent < want) want = PAYLOAD - sent;
-        for (size_t i = 0; i < want; ++i) buf[i] = srvTcpTestPattern++;
-        sendOk = gTransportTcp.streamMore(buf, want);
-        sent  += want;
-    }
-    gTransportTcp.streamEnd();
-    Serial.printf("[CMD] tcpTest %u bytes streamed=%s\n",
-                  (unsigned)PAYLOAD, sendOk ? "OK" : "FAIL");
-}
-
 // ── Reload the active song from SD into srvActiveBuf and push to client ──────
 static void reloadActiveSongFromSD() {
     extern bool sSongPushPending;
@@ -1273,20 +1083,6 @@ void commandsTick() {
         if (srvHasActive && strcmp(expectedActive, srvActiveName) == 0)
             srvHasActive = false;
     }
-    if (srvBackupFilePending) {
-        srvBackupFilePending = false;
-        sendBackupFileRaw(srvBackupFileName);
-    }
-    if (srvBackupListPending) {
-        srvBackupListPending = false;
-        sendBackupFileList(0);
-    }
-    // Pure-streaming test — emit one blob per tick while running.
-    // TCP backpressure naturally paces via blocking peer.write.
-    if (srvTcpTestRunning) {
-        sendTcpTestBlob();
-    }
-
     if (srvRestoreFinaliseNeeded) {
         srvRestoreFinaliseNeeded = false;
         finaliseRestore();
@@ -1471,22 +1267,6 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 const MsgNoteAudition* a = (const MsgNoteAudition*)data;
                 sequencerAuditionNote(a->pattern, a->row, a->col);
             }
-            break;
-
-        case MSG_BACKUP_LIST_REQ:
-            if (len < (int)sizeof(MsgBackupListReq)) return;
-            // Defer SD enumeration to the main loop — SD/SPI isn't
-            // thread-safe and inline access from the TCP reader task
-            // races with SamplePlayer SD reads on the MIDI task.
-            srvBackupListPending = true;
-            break;
-
-        case MSG_BACKUP_FILE_REQ:
-            if (len < (int)sizeof(MsgBackupFileReq)) return;
-            strncpy(srvBackupFileName, ((const MsgBackupFileReq*)data)->name,
-                    SRV_FNAME_MAX - 1);
-            srvBackupFileName[SRV_FNAME_MAX - 1] = '\0';
-            srvBackupFilePending = true;
             break;
 
         default:
