@@ -25,9 +25,8 @@
 // After a successful pairing the server calls ESP.restart() to come back
 // up in the other mode.  This keeps each boot single-transport — no
 // runtime switching, no AP-STA juggling on this end.
-static MagiCommsEspNow gTransportEspNow;
-static MagiUdpLink     gUdpLink;
-MagiComms gComms(gTransportEspNow);
+MagiCommsEspNow gTransportEspNow;   // exposed so pairing.ino can use it
+static MagiUdpLink gUdpLink;
 
 bool needsFullRedraw = false;   // set by pairing.ino to trigger song list redraw
 extern bool srvHasActive;       // defined in commands_server.ino
@@ -557,11 +556,10 @@ void setup() {
             gMagiLink.beginSta(4343, IPAddress(192, 168, 0, 1));
         } else {
             Serial.println("[SETUP] no TCP creds — booting on ESP-NOW for pairing");
-            gComms.setTransport(gTransportEspNow);
-            gComms.setOnReceive([](const uint8_t* data, int len) {
+            gTransportEspNow.setOnReceive([](const uint8_t* data, int len) {
                 pairingHandleMessage(data, len);
             });
-            gComms.begin();
+            gTransportEspNow.begin();
         }
     }
 

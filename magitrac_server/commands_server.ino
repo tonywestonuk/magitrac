@@ -1,5 +1,5 @@
 // commands_server.ino — handles song commands from client
-// Depends on: MagiComms (gComms), MagiMsg.h
+// Depends on: MagiLink (gMagiLink), MagiMsg.h
 
 #include <SD.h>
 #include "sd_mutex.h"
