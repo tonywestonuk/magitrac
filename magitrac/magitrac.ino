@@ -28,7 +28,6 @@
 #include "ColumnEditor.h"
 #include "SettingsPage.h"
 #include "BackupRestorePage.h"
-#include "TcpTestPage.h"
 #include "PerformancePage.h"
 #include "SetlistPage.h"
 #include "Battery.h"
@@ -83,7 +82,6 @@ SetlistPage        setlistPage(display, touch, song);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
 BackupRestorePage* backupRestorePage = nullptr;
-TcpTestPage*       tcpTestPage       = nullptr;
 
 bool gSdAvailable = false;
 int  gSdCs        = -1;   // chip-select pin used for SD; set in setup()
@@ -221,7 +219,6 @@ static bool     columnEditorOpen    = false;
 static bool     noteEditorPageOpen  = false;
 static bool     settingsPageOpen    = false;
 static bool     backupRestorePageOpen = false;
-static bool     tcpTestPageOpen       = false;
 static bool     performancePageOpen   = false;
 static bool     setlistPageOpen       = false;
 
@@ -304,7 +301,6 @@ void setup() {
     }
 
     backupRestorePage = new BackupRestorePage(display, touch, rtc);
-    tcpTestPage       = new TcpTestPage(display, touch);
 
 #if defined(EPD_PAINTER_PRESET_M5PAPER_S3)
     bool m5paper = true;
@@ -560,27 +556,6 @@ void loop() {
     if (backupRestorePageOpen && backupRestorePage) {
         if (backupRestorePage->poll()) {
             backupRestorePageOpen = false;
-            // If the close was triggered by the TCP/IP TEST button, open
-            // the test page instead of restoring the tracker UI.
-            if (backupRestorePage->consumeTcpTestRequest() && tcpTestPage) {
-                tcpTestPageOpen = true;
-                tcpTestPage->open();
-                display.clear();
-                tcpTestPage->draw();
-                display.paint();
-            } else {
-                display.clear();
-                ui.drawAll();
-                display.paintLater();
-            }
-        }
-        return;
-    }
-
-    // ── TCP/IP test page ────────────────────────────────────────────────────
-    if (tcpTestPageOpen && tcpTestPage) {
-        if (tcpTestPage->poll()) {
-            tcpTestPageOpen = false;
             display.clear();
             ui.drawAll();
             display.paintLater();

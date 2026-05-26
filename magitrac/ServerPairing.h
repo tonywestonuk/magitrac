@@ -131,18 +131,6 @@ public:
     const uint8_t* receivedFileData() const { return _songBuf; }
     uint32_t       receivedFileLen()  const { return _songBufLen; }
 
-    // ── TCP/IP diagnostic test ───────────────────────────────────────────────
-    // startTcpTest() tells the server to start emitting MSG_TCP_TEST_BLOB
-    // continuously (one per server main-loop tick, paced by TCP backpressure).
-    // stopTcpTest() tells it to stop.  Each arriving blob increments
-    // _tcpTestBlobCount and adds to _tcpTestByteCount — the page just
-    // reads those counters; no per-blob handshake.
-    bool startTcpTest();
-    bool stopTcpTest();
-    uint32_t tcpTestBlobCount() const { return _tcpTestBlobCount; }
-    uint64_t tcpTestByteCount() const { return _tcpTestByteCount; }
-    void     tcpTestResetCounters() { _tcpTestBlobCount = 0; _tcpTestByteCount = 0; }
-
     // ── MIDI passthrough ──────────────────────────────────────────────────────
     bool sendMidi(const uint8_t* bytes, uint8_t len);
 
@@ -183,18 +171,12 @@ public:
     bool        copySong(Song* out) const;
 
     // ── Internal (called by receive callbacks) ────────────────────────────────
-    // _onReceive  — data path, comes off MagiCommsTcp via gComms.
-    // _onPairReceive — pairing ceremony, comes off MagiCommsEspNow directly
-    //                  (bypassing MagiComms so the two recv streams stay
-    //                  segregated).
-    // _onSongBlobStream / _onInstrumentsBlobStream — streaming-receive
-    //                  handlers invoked by MagiCommsTcp's reader task when
-    //                  a MSG_*_BLOB arrives.  They pump bytes straight into
-    //                  the in-memory buffers via streamReadRecv().
+    // _onReceive — UDP datagrams only (row position, performer MIDI, preview
+    //              playhead).  TCP/MagiLink delivery goes via registered
+    //              MagiLink callbacks below.
+    // _onPairReceive — pairing ceremony, off the ESP-NOW transport.
     void _onReceive(const uint8_t* data, int len);
     void _onPairReceive(const uint8_t* data, int len);
-    void _onSongBlobStream(size_t remainingLen);
-    void _onInstrumentsBlobStream(size_t remainingLen);
     // MagiLink session handshake — called from the registered callback
     // (worker task, mutex held).  Sends MsgConnectAck and transitions
     // _pairState to SUCCESS.
@@ -214,12 +196,6 @@ public:
     // MagiLink sample list response (server → client).  Appends to the
     // cache; if more pages are pending, sends a request for the next.
     void _onMagiLinkSampleList(const uint8_t* msg, size_t len);
-    static void _onSongBlobStreamTrampoline(size_t n, void* ctx) {
-        static_cast<ServerPairing*>(ctx)->_onSongBlobStream(n);
-    }
-    static void _onInstrumentsBlobStreamTrampoline(size_t n, void* ctx) {
-        static_cast<ServerPairing*>(ctx)->_onInstrumentsBlobStream(n);
-    }
 
 private:
     void _setPairState(PairClientState s);

@@ -105,14 +105,6 @@ void ServerPairing::begin() {
     gUdpLink.setOnReceive(onCommsRecv);
     gUdpLink.beginListener(MAGI_PORT);
 
-    // Streaming receive — song-load and instruments-load blobs come in as
-    // single ~35 KB frames; we read them straight into the in-memory
-    // buffers without a giant rxBuf in the TCP transport.
-    gTransport.registerStreamRecv((uint8_t)MSG_SONG_BLOB,
-                                  &ServerPairing::_onSongBlobStreamTrampoline, this);
-    gTransport.registerStreamRecv((uint8_t)MSG_INSTRUMENTS_BLOB,
-                                  &ServerPairing::_onInstrumentsBlobStreamTrampoline, this);
-
     // MagiLink: register MSG_CONNECT handler.  Server (STA) initiates the
     // session handshake the moment its TCP connect succeeds; we reply
     // with ACK and transition to SUCCESS.  The session ends when
@@ -732,69 +724,18 @@ bool ServerPairing::copySong(Song* out) const {
 }
 
 // ── Receive ───────────────────────────────────────────────────────────────────
+// Receives UDP datagrams only — the TCP/MagiLink reliable path is dispatched
+// directly by MagiLink-registered callbacks.  UDP delivers loss-tolerant
+// updates from the server: row position, performer-MIDI passthrough, and the
+// column-preview playhead.
 void ServerPairing::_onReceive(const uint8_t* data, int len) {
     if (len < 1) return;
     MagiMsgType type = (MagiMsgType)data[0];
-    const uint8_t* senderMac = gComms.lastSenderAddr();
 
     switch (type) {
 
-        case MSG_CONNECT_ACK:
-            if (_pairState != PairClientState::REQUESTING &&
-                _pairState != PairClientState::AUTO_CONNECTING) return;
-            if (len < (int)sizeof(MsgConnectAck)) return;
-            {
-                gComms.addPeer(_serverMac);
-                Serial.printf("[SP] connected to %02X:%02X:%02X:%02X:%02X:%02X\n",
-                    _serverMac[0], _serverMac[1], _serverMac[2],
-                    _serverMac[3], _serverMac[4], _serverMac[5]);
-                _setPairState(PairClientState::SUCCESS);
-            }
-            break;
-
-        case MSG_DISCONNECT:
-            if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
-            gComms.removePeer(_serverMac);
-            _setBrowseState(BrowseState::IDLE);
-            _serverPlaying = false;
-            Serial.println("[SP] server ended session");
-            if (_hasPairing) {
-                memcpy(_serverMac, _storedServerMac, 6);
-                _tryAutoConnect();
-            } else {
-                _setPairState(PairClientState::IDLE);
-            }
-            break;
-
-        case MSG_SONG_LIST_RESP:
-            if (_browseState != BrowseState::WAITING_LIST) return;
-            if (len < (int)sizeof(MsgSongListResp)) return;
-            {
-                const MsgSongListResp* r = (const MsgSongListResp*)data;
-                _listPage       = r->page;
-                _listTotalPages = r->totalPages > 0 ? r->totalPages : 1;
-                _listCount      = r->count <= SL_PER_PKT ? r->count : SL_PER_PKT;
-                memset(_listNames, 0, sizeof(_listNames));
-                for (int i = 0; i < _listCount; i++) {
-                    strncpy(_listNames[i], r->names[i], SL_NAME_LEN - 1);
-                    _listNames[i][SL_NAME_LEN - 1] = '\0';
-                }
-                _setBrowseState(BrowseState::LIST_READY);
-            }
-            break;
-
-        // MSG_SONG_DATA (chunked song download) retired — replaced by the
-        // streaming MSG_SONG_BLOB path which lands in _onSongBlobStream.
-        // MSG_SAMPLE_LIST_RESP migrated to MagiLink callback
-        // (_onMagiLinkSampleList).  Legacy case removed.
-
-        // MSG_INSTRUMENTS_DATA (chunked) retired — replaced by streaming
-        // MSG_INSTRUMENTS_BLOB which lands in _onInstrumentsBlobStream.
-
         case MSG_SEQ_POS:
             if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
             if (len < (int)sizeof(MsgSeqPos)) return;
             {
                 const MsgSeqPos* p = (const MsgSeqPos*)data;
@@ -804,27 +745,8 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
             }
             break;
 
-        case MSG_PLAY:
-            if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
-            _serverPlaying = true;
-            break;
-
-        case MSG_STOP:
-            if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
-            _serverPlaying = false;
-            break;
-
-        case MSG_NO_SONG:
-            if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
-            _noSongPending = true;
-            break;
-
         case MSG_MIDI_NOTE_IN:
             if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
             if (len < (int)sizeof(MsgMidiNoteIn)) return;
             {
                 const MsgMidiNoteIn* m = (const MsgMidiNoteIn*)data;
@@ -836,7 +758,6 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
 
         case MSG_PREVIEW_ROW:
             if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
             if (len < (int)sizeof(MsgPreviewRow)) return;
             {
                 const MsgPreviewRow* m = (const MsgPreviewRow*)data;
@@ -845,129 +766,9 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
             }
             break;
 
-        case MSG_BACKUP_LIST_BLOB:
-            // Wire: type(1) + numFiles(1) + BkFileEntry × numFiles.
-            // The whole list arrives in one frame — UI just iterates
-            // backupFileCount() entries and goes.
-            if (_backupState != BackupState::WAITING_FILE_LIST) return;
-            if (len < 2) return;
-            {
-                int numFiles = data[1];
-                int hdrLen   = 2;
-                int expected = hdrLen + numFiles * (int)sizeof(BkFileEntry);
-                if (len != expected) return;
-                int cap = (int)(sizeof(_bkEntries) / sizeof(_bkEntries[0]));
-                if (numFiles > cap) numFiles = cap;
-                memcpy(_bkEntries, data + hdrLen,
-                       numFiles * sizeof(BkFileEntry));
-                _bkFileCount = numFiles;
-                _backupState = BackupState::FILE_LIST_READY;
-            }
-            break;
-
-        case MSG_BACKUP_FILE_BLOB:
-            // Layout: type(1) + name(SRV_FNAME_MAX=24) + size(u32 LE) + bytes.
-            // The whole file arrives as a single framed message — TCP did
-            // the segmentation/reassembly transparently.
-            Serial.printf("[SP] BACKUP_FILE_BLOB arrived len=%d bkState=%d\n",
-                          len, (int)_backupState);
-            if (_backupState != BackupState::WAITING_FILE) return;
-            if (len < 1 + (int)SRV_FNAME_MAX + 4) return;
-            {
-                uint32_t fileSize;
-                memcpy(&fileSize, data + 1 + SRV_FNAME_MAX, 4);
-                int hdrLen = 1 + SRV_FNAME_MAX + 4;
-                Serial.printf("[SP] BLOB fileSize=%u expectLen=%d\n",
-                              (unsigned)fileSize, hdrLen + (int)fileSize);
-                if (len != hdrLen + (int)fileSize) return;
-                if (fileSize > SONG_TRANSFER_MAX) return;
-                memcpy(_songBuf, data + hdrLen, fileSize);
-                _songBufLen  = fileSize;
-                _backupState = BackupState::FILE_RECEIVED;
-            }
-            break;
-
-        case MSG_TCP_TEST_BLOB:
-            // Pure streaming test — just count the blob and its bytes.
-            // No verification, no buffering, no per-blob handshake.
-            _tcpTestBlobCount++;
-            _tcpTestByteCount += (uint64_t)len;
-            break;
-
         default:
             break;
     }
-}
-
-bool ServerPairing::startTcpTest() {
-    if (_pairState != PairClientState::SUCCESS) return false;
-    uint8_t msg = (uint8_t)MSG_TCP_TEST_START;
-    return gComms.send(&msg, 1);
-}
-
-bool ServerPairing::stopTcpTest() {
-    if (_pairState != PairClientState::SUCCESS) return false;
-    uint8_t msg = (uint8_t)MSG_TCP_TEST_STOP;
-    return gComms.send(&msg, 1);
-}
-
-// ── Streaming receive: song load (server → client) ──────────────────────────
-//
-// Frame payload is SongFileHeader + Song (~35 KB) — too big for the 8 KB
-// reader buffer.  Pump it straight into _songBuf, advance the browse state
-// machine on completion.  Runs on the TCP reader task.
-void ServerPairing::_onSongBlobStream(size_t remainingLen) {
-    // Drain anything we can't store cleanly so the next frame stays
-    // aligned to the wire.
-    if (remainingLen > SONG_TRANSFER_MAX) {
-        uint8_t junk[256];
-        while (remainingLen > 0) {
-            size_t n = remainingLen > sizeof(junk) ? sizeof(junk) : remainingLen;
-            size_t got = gTransport.streamReadRecv(junk, n);
-            if (got == 0) break;
-            remainingLen -= got;
-        }
-        Serial.println("[SP] SONG_BLOB too big — dropped");
-        return;
-    }
-
-    size_t got = gTransport.streamReadRecv(_songBuf, remainingLen);
-    if (got != remainingLen) {
-        Serial.printf("[SP] SONG_BLOB short read: got=%u want=%u\n",
-                      (unsigned)got, (unsigned)remainingLen);
-        return;
-    }
-    _songBufLen  = got;
-    _chunksGot   = 0;
-    _chunksTotal = 0;
-    _setBrowseState(BrowseState::SONG_READY);
-}
-
-// ── Streaming receive: instruments load (server → client) ───────────────────
-void ServerPairing::_onInstrumentsBlobStream(size_t remainingLen) {
-    if (!_instBuf) return;
-    uint32_t cap = MAX_INSTRUMENTS * (uint32_t)sizeof(Instrument);
-    if (remainingLen > cap) {
-        uint8_t junk[256];
-        while (remainingLen > 0) {
-            size_t n = remainingLen > sizeof(junk) ? sizeof(junk) : remainingLen;
-            size_t got = gTransport.streamReadRecv(junk, n);
-            if (got == 0) break;
-            remainingLen -= got;
-        }
-        Serial.println("[SP] INSTRUMENTS_BLOB too big — dropped");
-        return;
-    }
-    size_t got = gTransport.streamReadRecv(_instBuf, remainingLen);
-    if (got != remainingLen) {
-        Serial.printf("[SP] INSTRUMENTS_BLOB short read: got=%u want=%u\n",
-                      (unsigned)got, (unsigned)remainingLen);
-        return;
-    }
-    _instBufLen      = got;
-    _instChunksGot   = 0;
-    _instChunksTotal = 0;
-    _instReady       = true;
 }
 
 bool ServerPairing::remoteSeqPos(uint8_t* pattern, uint8_t* row) {

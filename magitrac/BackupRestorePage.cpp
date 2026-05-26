@@ -134,18 +134,10 @@ void BackupRestorePage::drawHeader(const char* title) {
     uiButton(_d, BR_HOME_X, 0, BR_HOME_W, BR_HDR_H, "HOME", COL_BLACK, COL_WHITE, 3);
 }
 
-// TCP/IP test button — below the BACKUP/RESTORE pair.
-static const int BR_TCP_BTN_W = 300;
-static const int BR_TCP_BTN_H = 80;
-static const int BR_TCP_BTN_X = (960 - BR_TCP_BTN_W) / 2;       // = 330
-static const int BR_TCP_BTN_Y = BR_BTN_Y + BR_BTN_H + 40;       // = 340
-
 void BackupRestorePage::drawMenu() {
     drawHeader("BACKUP / RESTORE");
     uiButton(_d, BR_BTN1_X, BR_BTN_Y, BR_BTN_W, BR_BTN_H, "BACKUP",  COL_WHITE, COL_BLACK, 3);
     uiButton(_d, BR_BTN2_X, BR_BTN_Y, BR_BTN_W, BR_BTN_H, "RESTORE", COL_WHITE, COL_BLACK, 3);
-    uiButton(_d, BR_TCP_BTN_X, BR_TCP_BTN_Y, BR_TCP_BTN_W, BR_TCP_BTN_H,
-             "TCP/IP TEST", COL_WHITE, COL_BLACK, 2);
 }
 
 void BackupRestorePage::drawProgressBar(int x, int y, int w, int h,
@@ -786,13 +778,6 @@ bool BackupRestorePage::poll() {
                     _state = BRState::FOLDER_LIST;
                     draw(); _d.paint();
                     return false;
-                }
-                // TCP/IP TEST button — flag for main loop and close page.
-                if (sx >= BR_TCP_BTN_X && sx < BR_TCP_BTN_X + BR_TCP_BTN_W &&
-                    sy >= BR_TCP_BTN_Y && sy < BR_TCP_BTN_Y + BR_TCP_BTN_H) {
-                    _tcpTestRequested = true;
-                    _wasDown = down;
-                    return true;
                 }
                 break;
 

@@ -678,15 +678,6 @@ void setup() {
         3,        // low-ish priority — not on the critical path
         nullptr);
 
-    // Streaming-receive handlers for the big client→server uploads
-    // (song save, restore file).  Handler bodies live in
-    // commands_server.ino; declared extern here.
-    extern void onSongSaveBlobStream(size_t remainingLen, void* ctx);
-    extern void onRestoreFileBlobStream(size_t remainingLen, void* ctx);
-    gTransportTcp.registerStreamRecv((uint8_t)MSG_SONG_SAVE_BLOB,
-                                     onSongSaveBlobStream, nullptr);
-    gTransportTcp.registerStreamRecv((uint8_t)MSG_RESTORE_FILE_BLOB,
-                                     onRestoreFileBlobStream, nullptr);
     {
         uint8_t mac[6];
         WiFi.macAddress(mac);
