@@ -709,11 +709,11 @@ static void sendBackupFileRaw(const char* name) {
 
 
 // ── MagiLink restore (client → server) state ───────────────────────────────
-// Worker task accumulates bytes into a side buffer here so the SD write
-// can be deferred to commandsTick (per the SD-from-worker-task safety
-// rule).  35 KB matches the max song size — any file in a backup folder
-// will be at most this big.
-static uint8_t  sMagiRestoreBuf[SRV_SONG_XFER_MAX];
+// Streams bytes incrementally to SRV_RESTORE_TMP on SD as they arrive on
+// the worker task — same approach as the legacy onRestoreFileBlobStream.
+// SdLock serializes against SamplePlayer.  This avoids a 35 KB RAM
+// buffer that would blow DRAM on the M5 ESP32.
+static File     sMagiRestoreFile;
 static char     sMagiRestoreName[SRV_FNAME_MAX] = {};
 static bool     sMagiRestoreIsInstruments       = false;
 static uint32_t sMagiRestoreExpectedBytes       = 0;
@@ -723,18 +723,22 @@ static bool     sMagiRestorePending             = false;
 void onMagiLinkRestoreHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (len < sizeof(MsgRestoreHeader)) return;
     const MsgRestoreHeader* h = (const MsgRestoreHeader*)msg;
-    if (h->total_size > sizeof(sMagiRestoreBuf)) {
-        Serial.printf("[CMD] restore header rejected: %u > max %u\n",
-                      (unsigned)h->total_size,
-                      (unsigned)sizeof(sMagiRestoreBuf));
-        sMagiRestoreExpectedBytes = 0;
-        return;
-    }
     strncpy(sMagiRestoreName, h->name, sizeof(sMagiRestoreName) - 1);
     sMagiRestoreName[sizeof(sMagiRestoreName) - 1] = '\0';
     sMagiRestoreIsInstruments = (h->isInstruments != 0);
     sMagiRestoreExpectedBytes = h->total_size;
     sMagiRestoreReceivedBytes = 0;
+    {
+        SdLock _;
+        if (sMagiRestoreFile) sMagiRestoreFile.close();
+        SD.remove(SRV_RESTORE_TMP);
+        sMagiRestoreFile = SD.open(SRV_RESTORE_TMP, FILE_WRITE);
+    }
+    if (!sMagiRestoreFile) {
+        Serial.println("[CMD] restore: tmp open failed");
+        sMagiRestoreExpectedBytes = 0;
+        return;
+    }
     Serial.printf("[CMD] restore start: name='%s' instr=%d bytes=%u\n",
                   sMagiRestoreName, sMagiRestoreIsInstruments ? 1 : 0,
                   (unsigned)sMagiRestoreExpectedBytes);
@@ -743,25 +747,36 @@ void onMagiLinkRestoreHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
 void onMagiLinkRestoreBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (sMagiRestoreExpectedBytes == 0) return;
     if (len < sizeof(MsgRestoreBody)) return;
+    if (!sMagiRestoreFile) return;
     const MsgRestoreBody* b = (const MsgRestoreBody*)msg;
     if (b->data_len > 1024) return;
     if (sMagiRestoreReceivedBytes + b->data_len > sMagiRestoreExpectedBytes) {
-        Serial.println("[CMD] restore body overshoot — dropping");
+        Serial.println("[CMD] restore body overshoot — closing & dropping");
+        {
+            SdLock _;
+            sMagiRestoreFile.close();
+        }
         sMagiRestoreExpectedBytes = 0;
         return;
     }
-    memcpy(sMagiRestoreBuf + sMagiRestoreReceivedBytes, b->data, b->data_len);
+    {
+        SdLock _;
+        sMagiRestoreFile.write(b->data, b->data_len);
+    }
     sMagiRestoreReceivedBytes += b->data_len;
-    if (sMagiRestoreReceivedBytes == sMagiRestoreExpectedBytes) {
+    if (sMagiRestoreReceivedBytes >= sMagiRestoreExpectedBytes) {
+        {
+            SdLock _;
+            sMagiRestoreFile.close();
+        }
         sMagiRestoreExpectedBytes = 0;
         sMagiRestorePending       = true;
     }
 }
 
-// Called from commandsTick when sMagiRestorePending fires.  Writes the
-// accumulated bytes directly to the destination path on SD; reloads
-// instruments if relevant; pushes the active song back to the client
-// if the restored file matches the active name.
+// Called from commandsTick when sMagiRestorePending fires.  Moves the
+// temp file to its destination, reloads instruments if relevant, and
+// reloads the active song if the restored file matches.
 static void finaliseMagiLinkRestore() {
     char path[48];
     if (sMagiRestoreIsInstruments) {
@@ -774,24 +789,16 @@ static void finaliseMagiLinkRestore() {
     {
         SdLock _;
         if (SD.exists(path)) SD.remove(path);
-        File f = SD.open(path, FILE_WRITE);
-        if (!f) {
-            Serial.printf("[CMD] restore: open failed '%s'\n", path);
-            return;
-        }
-        size_t wrote = f.write(sMagiRestoreBuf, sMagiRestoreReceivedBytes);
-        f.close();
-        Serial.printf("[CMD] restored '%s' %u bytes (wrote=%u)\n",
-                      path, (unsigned)sMagiRestoreReceivedBytes,
-                      (unsigned)wrote);
+        SD.rename(SRV_RESTORE_TMP, path);
     }
+    Serial.printf("[CMD] restored '%s' (%u bytes)\n",
+                  path, (unsigned)sMagiRestoreReceivedBytes);
 
     if (sMagiRestoreIsInstruments) {
         loadInstrumentsFromSD();
         Serial.println("[CMD] instruments reloaded after restore");
     }
 
-    // If the restored file matches the currently active song, reload.
     if (!sMagiRestoreIsInstruments && srvHasActive && srvActiveName[0] != '\0'
         && strcmp(sMagiRestoreName, srvActiveName) == 0) {
         Serial.printf("[CMD] restored file is the active song — reloading\n");
