@@ -515,8 +515,9 @@ struct MsgMidiNoteIn {
 #define SAMPLES_PER_PKT   8    // entries per response packet
 
 struct MsgSampleListReq {
-    MagiMsgType type;    // MSG_SAMPLE_LIST_REQ
-    uint8_t     page;    // 0-based page
+    uint8_t  id     = MSG_SAMPLE_LIST_REQ;
+    uint16_t length = sizeof(MsgSampleListReq);
+    uint8_t  page;
 };
 
 struct MsgSampleListEntry {
@@ -525,14 +526,14 @@ struct MsgSampleListEntry {
 };
 
 struct MsgSampleListResp {
-    MagiMsgType        type;             // MSG_SAMPLE_LIST_RESP
+    uint8_t            id     = MSG_SAMPLE_LIST_RESP;
+    uint16_t           length = sizeof(MsgSampleListResp);
     uint8_t            page;
     uint8_t            totalPages;
     uint8_t            count;            // entries in this packet
     uint8_t            totalEntries;     // total across all pages
     MsgSampleListEntry entries[SAMPLES_PER_PKT];
 };
-// 5 + 8 * 25 = 205 bytes — fits ESP-NOW 250-byte limit
 
 // ── New struct-driven backup messages (v2 transport) ──────────────────────────
 // Every message starts with {id, length} so the receiver always knows how

@@ -211,6 +211,9 @@ public:
     // resets receive counters; PUSH_BODY appends into _instBuf; completion
     // sets _instReady.
     void _onMagiLinkInstrumentsMessage(const uint8_t* msg, size_t len);
+    // MagiLink sample list response (server → client).  Appends to the
+    // cache; if more pages are pending, sends a request for the next.
+    void _onMagiLinkSampleList(const uint8_t* msg, size_t len);
     static void _onSongBlobStreamTrampoline(size_t n, void* ctx) {
         static_cast<ServerPairing*>(ctx)->_onSongBlobStream(n);
     }
