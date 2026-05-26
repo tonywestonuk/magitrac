@@ -2,7 +2,6 @@
 #include "NoteGrid.h"
 #include "PairNVS.h"
 #include "MagiCommsEspNow.h"
-#include "MagiCommsTcp.h"
 #include "MagiUdpLink.h"
 #include "MagiLink.h"
 #include "MagiMsg.h"          // magiWifiChannelFromIdx()
@@ -10,28 +9,24 @@
 #include <WiFi.h>
 #include <esp_random.h>
 #include <esp_mac.h>
+#include <esp_netif.h>
 #include <string.h>
 
 #define CLI_NVS_NS "magitrac_cli"
 
 // ── Global instances ─────────────────────────────────────────────────────────
-// Three links running simultaneously on the magitrac client:
-//   • gTransport (TCP)     — main reliable data path; AP role at 192.168.0.1.
+// Two links running simultaneously on the magitrac client:
+//   • gMagiLink (TCP)          — main reliable data path; AP role at
+//                                192.168.0.1.  Defined in MagiLink.cpp.
 //   • gPairTransport (ESP-NOW) — pairing ceremony only; coexist mode.
-//   • gUdpLink (UDP)       — best-effort datagrams for loss-tolerant updates
-//                            (row position, preview playhead, MIDI note-in).
-//                            Listener bound to MAGI_PORT alongside the TCP
-//                            listener (TCP/UDP port namespaces are disjoint).
-// Only the TCP transport is wrapped in MagiComms — pairing code and UDP
-// callers go through their own direct APIs.
-MagiCommsTcp            gTransport;          // exposed for streamBegin/streamMore from save/restore paths
+//   • gUdpLink (UDP)           — best-effort datagrams for loss-tolerant
+//                                updates (row position, preview playhead,
+//                                MIDI note-in).
 static MagiCommsEspNow  gPairTransport;
 static MagiUdpLink      gUdpLink;
-MagiComms gComms(gTransport);
 ServerPairing gServerPairing;
 
-// ── Receive callbacks — data vs pairing, kept fully separate ────────────────
-static void onCommsRecv(const uint8_t* data, int len) {
+static void onUdpRecv(const uint8_t* data, int len) {
     gServerPairing._onReceive(data, len);
 }
 
@@ -81,28 +76,39 @@ void ServerPairing::begin() {
                       _apSsid, _nextHostOctet);
     }
 
-    // TCP transport — main data path.  AP role on 192.168.0.1, always on
-    // the user-configured channel (one of 1/6/11).  The server, when in
-    // pair mode, scans those three channels broadcasting MSG_PAIR_PROBE
-    // — so wherever our AP lives, the server will find it.  Once paired,
-    // the server STA-joins by SSID and tracks channel changes automatically.
+    // WiFi softAP — main data path.  192.168.0.1, always on the
+    // user-configured channel (one of 1/6/11).  The server, when in pair
+    // mode, scans those three channels broadcasting MSG_PAIR_PROBE — so
+    // wherever our AP lives, the server will find it.  Once paired the
+    // server STA-joins by SSID and tracks channel changes automatically.
+    // ESP-NOW pairing coexists on the STA interface (AP_STA mode).  DHCP
+    // is stopped because the server uses a static .2 that collides with
+    // the default pool.
     const uint8_t channel = magiWifiChannelFromIdx(gWifiChannelIdx);
-    Serial.printf("[SP] AP channel: %u\n", channel);
-    gTransport.configureAp(_apSsid, _apPsk, MAGI_PORT, channel);
-    gComms.setOnReceive(onCommsRecv);
-    gComms.begin();
+    Serial.printf("[SP] AP channel: %u  SSID=%s\n", channel, _apSsid);
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_AP_STA);
+    if (!WiFi.softAP(_apSsid, _apPsk, channel)) {
+        Serial.println("[SP] softAP FAILED");
+    }
+    WiFi.softAPConfig(IPAddress(192, 168, 0, 1),
+                      IPAddress(192, 168, 0, 1),
+                      IPAddress(255, 255, 255, 0));
+    if (esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
+        esp_netif_dhcps_stop(ap_netif);
+    }
+    Serial.printf("[SP] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
 
     // ESP-NOW transport — pairing ceremony only.  Coexist mode keeps it
-    // from clobbering the TCP transport's WiFi setup.
+    // from clobbering the AP's WiFi setup.
     gPairTransport.setCoexistMode(true);
     gPairTransport.setOnReceive(onPairRecv);
     gPairTransport.begin();
 
-    // UDP listener — shares MAGI_PORT with the TCP listener.  Loss-tolerant
-    // position/preview updates come in here.  Dispatches via the same
-    // _onReceive handler as TCP — the existing MAC check trivially passes
-    // because `lastSenderAddr()` returns the static `_storedServerMac`.
-    gUdpLink.setOnReceive(onCommsRecv);
+    // UDP listener — bound to MAGI_PORT alongside the MagiLink TCP listener
+    // (TCP/UDP port namespaces are disjoint).  Loss-tolerant position /
+    // preview / MIDI-in updates land here.
+    gUdpLink.setOnReceive(onUdpRecv);
     gUdpLink.beginListener(MAGI_PORT);
 
     // MagiLink: register MSG_CONNECT handler.  Server (STA) initiates the
@@ -161,7 +167,6 @@ void ServerPairing::begin() {
             _storedServerMac[0], _storedServerMac[1], _storedServerMac[2],
             _storedServerMac[3], _storedServerMac[4], _storedServerMac[5]);
         memcpy(_serverMac, _storedServerMac, 6);
-        gComms.addPeer(_storedServerMac);   // register MAC for TCP-side lastSenderAddr
         _tryAutoConnect();
     } else {
         Serial.println("[SP] no stored pairing");
@@ -226,7 +231,6 @@ void ServerPairing::confirmPairCode() {
     // a few seconds (reboot + WiFi join), then it sends MSG_CONNECT over
     // TCP and we transition to SUCCESS.
     gPairTransport.removePeer(_serverMac);    // ESP-NOW peer no longer needed
-    gComms.addPeer(_storedServerMac);         // register MAC label on TCP transport
     _tryAutoConnect();
 }
 

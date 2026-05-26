@@ -2,7 +2,6 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "MagiMsg.h"
-#include "MagiComms.h"
 #include "TrackerData.h"   // for Song / SongFileHeader
 
 enum class PairClientState : uint8_t {
@@ -269,4 +268,3 @@ private:
 };
 
 extern ServerPairing gServerPairing;
-extern MagiComms gComms;

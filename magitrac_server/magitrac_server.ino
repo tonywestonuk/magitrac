@@ -26,7 +26,6 @@
 // up in the other mode.  This keeps each boot single-transport — no
 // runtime switching, no AP-STA juggling on this end.
 static MagiCommsEspNow gTransportEspNow;
-MagiCommsTcp           gTransportTcp;          // exposed for streamed sends in commands_server.ino
 static MagiUdpLink     gUdpLink;
 MagiComms gComms(gTransportEspNow);
 
@@ -530,10 +529,10 @@ void setup() {
     // Forward declarations (defined in pairing.ino)
     extern void pairingHandleMessage(const uint8_t* data, int len);
 
-    // Boot-time transport pick.  If TCP creds are stored, we go straight
-    // into STA mode and connect to the magitrac client's AP.  Otherwise
-    // we stay on ESP-NOW for the pairing ceremony — and ESP.restart()
-    // after a successful MSG_PAIR_OFFER brings us back here in TCP mode.
+    // Boot-time transport pick.  If TCP creds are stored, we bring up
+    // WiFi STA + start MagiLink + UDP companion.  Otherwise we stay on
+    // ESP-NOW for the pairing ceremony — ESP.restart() after a successful
+    // MSG_PAIR_OFFER brings us back here in TCP mode.
     {
         char    tssid[33], tpsk[64];
         uint8_t tmyip[4], tgwip[4];
@@ -542,28 +541,29 @@ void setup() {
                 tssid,
                 tmyip[0], tmyip[1], tmyip[2], tmyip[3],
                 tgwip[0], tgwip[1], tgwip[2], tgwip[3]);
-            gTransportTcp.configureSta(tssid, tpsk, tmyip, tgwip, MAGI_PORT);
-            gComms.setTransport(gTransportTcp);
+            WiFi.persistent(false);
+            WiFi.mode(WIFI_STA);
+            WiFi.config(IPAddress(tmyip[0], tmyip[1], tmyip[2], tmyip[3]),
+                        IPAddress(tgwip[0], tgwip[1], tgwip[2], tgwip[3]),
+                        IPAddress(255, 255, 255, 0));
+            WiFi.begin(tssid, tpsk);
             // Best-effort UDP companion for loss-tolerant updates
             // (row position, preview playhead, MIDI note-in).  Send-only
             // from the server side — magitrac's gateway is the destination.
             gUdpLink.beginSender(tgwip, MAGI_PORT);
+            // MagiLink (reliable TCP).  Connects to the magitrac AP at
+            // 192.168.0.1:4343.  The MagiLink task internally waits for
+            // STA association before attempting connect.
+            gMagiLink.beginSta(4343, IPAddress(192, 168, 0, 1));
         } else {
             Serial.println("[SETUP] no TCP creds — booting on ESP-NOW for pairing");
             gComms.setTransport(gTransportEspNow);
+            gComms.setOnReceive([](const uint8_t* data, int len) {
+                pairingHandleMessage(data, len);
+            });
+            gComms.begin();
         }
     }
-
-    gComms.setOnReceive([](const uint8_t* data, int len) {
-        pairingHandleMessage(data, len);
-    });
-    gComms.begin();
-
-    // ── New comms link (alongside legacy MagiCommsTcp, separate port) ──────
-    // Connects to the magitrac AP at 192.168.0.1:4343.  The MagiLink task
-    // waits internally for WiFi STA association before attempting connect,
-    // so it's safe to start before the WiFi is fully up.
-    gMagiLink.beginSta(4343, IPAddress(192, 168, 0, 1));
 
     // ── Backup handler ─────────────────────────────────────────────────────
     // Client sends MSG_START_BACKUP → server streams every /songs/*.mgt

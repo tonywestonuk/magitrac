@@ -270,7 +270,7 @@ void setup() {
     loadWifiChannel();
     gServerPairing.begin();
 
-    // ── New comms link (alongside legacy MagiCommsTcp, separate port) ───────
+    // ── MagiLink (reliable TCP transport) ───────────────────────────────────
     // Coexists on port 4343 while the old transport keeps running on 4242.
     // Will take over 4242 once everything is migrated.
     gMagiLink.beginAp(4343);
