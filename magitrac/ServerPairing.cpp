@@ -156,6 +156,12 @@ void ServerPairing::begin() {
     gMagiLink.registerCallback(MSG_INSTRUMENTS_PUSH_HEADER, instCb, this);
     gMagiLink.registerCallback(MSG_INSTRUMENTS_PUSH_BODY,   instCb, this);
 
+    // MagiLink: sample list response (paged).
+    gMagiLink.registerCallback(MSG_SAMPLE_LIST_RESP,
+        [](const uint8_t* msg, size_t len, void* ctx) {
+            static_cast<ServerPairing*>(ctx)->_onMagiLinkSampleList(msg, len);
+        }, this);
+
     _ready = true;
 
     if (_hasPairing) {
@@ -688,9 +694,10 @@ void ServerPairing::requestSampleList() {
     if (_pairState != PairClientState::SUCCESS) return;
     resetSampleList();
     MsgSampleListReq req;
-    req.type = MSG_SAMPLE_LIST_REQ;
     req.page = 0;
-    gComms.send(&req, sizeof(req));
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&req, sizeof(req));
+    gMagiLink.releaseMutex();
     _sampleListState = SampleListState::WAITING;
 }
 
@@ -1134,6 +1141,40 @@ void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
 void ServerPairing::_onMagiLinkServerState(bool playing) {
     _serverPlaying = playing;
     Serial.printf("[SP] server sequencer %s\n", playing ? "PLAY" : "STOP");
+}
+
+// ── MagiLink sample list response ───────────────────────────────────────────
+// Runs on the worker task with the mutex held.  If more pages remain we
+// send the next request inline — same task already holds the mutex so the
+// re-acquire is a no-op.
+void ServerPairing::_onMagiLinkSampleList(const uint8_t* msg, size_t len) {
+    if (_pairState != PairClientState::SUCCESS) return;
+    if (len < sizeof(MsgSampleListResp)) return;
+    if (_sampleListState != SampleListState::WAITING &&
+        _sampleListState != SampleListState::PARTIAL) return;
+    const MsgSampleListResp* r = (const MsgSampleListResp*)msg;
+    _samplePage       = r->page;
+    _sampleTotalPages = r->totalPages > 0 ? r->totalPages : 1;
+    _sampleTotal      = r->totalEntries;
+
+    int n = r->count <= SAMPLES_PER_PKT ? r->count : SAMPLES_PER_PKT;
+    for (int i = 0; i < n && _sampleCount < SAMPLE_CACHE_MAX; i++) {
+        _sampleCache[_sampleCount].id = r->entries[i].id;
+        strncpy(_sampleCache[_sampleCount].name,
+                r->entries[i].name, SAMPLE_NAME_LEN - 1);
+        _sampleCache[_sampleCount].name[SAMPLE_NAME_LEN - 1] = '\0';
+        _sampleCount++;
+    }
+
+    if (_samplePage + 1 < _sampleTotalPages) {
+        _sampleListState = SampleListState::PARTIAL;
+        MsgSampleListReq req;
+        req.page = (uint8_t)(_samplePage + 1);
+        gMagiLink.send(&req, sizeof(req));
+    } else {
+        _sampleListState = SampleListState::READY;
+        Serial.printf("[SP] sample list ready: %d entries\n", _sampleCount);
+    }
 }
 
 // ── MagiLink instruments push ───────────────────────────────────────────────

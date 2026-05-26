@@ -261,12 +261,13 @@ static void sendSampleList(uint8_t page) {
     if (inPage < 0)               inPage = 0;
 
     MsgSampleListResp resp;
-    memset(&resp, 0, sizeof(resp));
-    resp.type         = MSG_SAMPLE_LIST_RESP;
+    // NSDMI sets id+length; zero the dynamic fields ourselves so
+    // unused entries don't carry garbage.
     resp.page         = page;
     resp.totalPages   = (uint8_t)totalPages;
     resp.count        = (uint8_t)inPage;
     resp.totalEntries = (uint8_t)(total > 255 ? 255 : total);
+    memset(resp.entries, 0, sizeof(resp.entries));
 
     for (int i = 0; i < inPage; i++) {
         const SmEntry* e = sampleManifestAt(start + i);
@@ -276,7 +277,9 @@ static void sendSampleList(uint8_t page) {
         resp.entries[i].name[SAMPLE_NAME_LEN - 1] = '\0';
     }
 
-    gComms.send(&resp, sizeof(resp));
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&resp, sizeof(resp));
+    gMagiLink.releaseMutex();
 }
 
 // ── Send song file in chunks ───────────────────────────────────────────────────
