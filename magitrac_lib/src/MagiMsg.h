@@ -126,6 +126,12 @@ enum MagiMsgType : uint8_t {
     MSG_SAVE_SONG_HEADER   = 0x86,
     MSG_SAVE_SONG_BODY     = 0x87,
 
+    // Instruments push (server → client).  HEADER + N×BODY, same shape
+    // as song push but the receiver writes into _instBuf instead of
+    // _songBuf.  Triggered by client sending MSG_INSTRUMENTS_REQ.
+    MSG_INSTRUMENTS_PUSH_HEADER = 0x88,
+    MSG_INSTRUMENTS_PUSH_BODY   = 0x89,
+
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
 
@@ -401,12 +407,15 @@ struct MsgInstrumentsData {
     uint8_t     payload[SONG_CHUNK_SIZE];
 };
 
-// Client → Server: patch bytes in instruments array (same wire layout as MsgSetSongData)
+// Client → Server: patch bytes in instruments array.  Same shape +
+// variable-length send convention as MsgSetSongData — caller must set
+// `length = 6 + dataLen` and pass `6 + dataLen` to gMagiLink.send.
 struct MsgInstrumentsPatch {
-    MagiMsgType type;    // MSG_INSTRUMENTS_PATCH
-    uint16_t    offset;  // byte offset into Instrument[MAX_INSTRUMENTS] array
-    uint8_t     length;  // bytes (1..SONG_PATCH_MAX)
-    uint8_t     data[SONG_PATCH_MAX];
+    uint8_t  id     = MSG_INSTRUMENTS_PATCH;
+    uint16_t length = sizeof(MsgInstrumentsPatch);   // OVERRIDE before send
+    uint16_t offset;                                 // byte offset into Instrument[MAX_INSTRUMENTS]
+    uint8_t  dataLen;                                // payload bytes (1..SONG_PATCH_MAX)
+    uint8_t  data[SONG_PATCH_MAX];
 };
 
 // Client → Server: set or clear a single note (migrated to MagiLink).
@@ -569,6 +578,32 @@ struct MsgNoSong {
     uint8_t  id     = MSG_NO_SONG;
     uint16_t length = sizeof(MsgNoSong);
 };
+
+// ── Instruments push (server → client) ─────────────────────────────────────
+// Triggered by MsgInstrumentsReq from client.  Server streams the full
+// Instrument[MAX_INSTRUMENTS] array as HEADER (total_size) + N×BODY.
+// Body shape matches MsgBackupBody/MsgSongPushBody so the server reuses
+// sStreamBody (id rewritten per use).
+
+struct MsgInstrumentsReq {
+    uint8_t  id     = MSG_INSTRUMENTS_REQ;
+    uint16_t length = sizeof(MsgInstrumentsReq);
+};
+
+struct MsgInstrumentsPushHeader {
+    uint8_t  id     = MSG_INSTRUMENTS_PUSH_HEADER;
+    uint16_t length = sizeof(MsgInstrumentsPushHeader);
+    uint32_t total_size;
+};
+// 7 bytes
+
+struct MsgInstrumentsPushBody {
+    uint8_t  id     = MSG_INSTRUMENTS_PUSH_BODY;
+    uint16_t length = sizeof(MsgInstrumentsPushBody);
+    uint16_t data_len;
+    uint8_t  data[1024];
+};
+// 1029 bytes — same shape as MsgBackupBody / MsgSongPushBody
 
 // ── Song save (client → server) ────────────────────────────────────────────
 // Client takes the MagiLink mutex, sends HEADER once, then loops sending

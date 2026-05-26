@@ -520,24 +520,39 @@ static void finaliseSongSave() {
     srvSaveActive = false;
 }
 
-// ── Send full instruments array as one streamed blob ─────────────────────────
+// ── Send full instruments array as HEADER + N×BODY over MagiLink ───────────
+// Triggered by MSG_INSTRUMENTS_REQ — server streams the in-memory
+// srvInstruments array to the client (~4-5 KB).  Reuses the shared
+// sStreamBody for the body chunks (id rewritten per-use).
 static void sendInstrumentsData() {
-    extern MagiCommsTcp gTransportTcp;
-    const uint8_t* raw   = (const uint8_t*)srvInstruments;
-    uint32_t       total = (uint32_t)sizeof(srvInstruments);
-    size_t         totalLen = 1 + total;
-    if (!gTransportTcp.streamBegin(totalLen)) {
-        Serial.printf("[CMD] sendInstruments: streamBegin failed (len=%u)\n",
-                      (unsigned)totalLen);
+    if (!gMagiLink.isConnected()) {
+        Serial.println("[CMD] sendInstruments: link not connected");
         return;
     }
-    uint8_t type = (uint8_t)MSG_INSTRUMENTS_BLOB;
-    bool ok = true;
-    ok &= gTransportTcp.streamMore(&type, 1);
-    ok &= gTransportTcp.streamMore(raw, total);
-    gTransportTcp.streamEnd();
-    Serial.printf("[CMD] sendInstruments: %u bytes streamed=%s\n",
-                  total, ok ? "OK" : "FAIL");
+    const uint8_t* raw   = (const uint8_t*)srvInstruments;
+    uint32_t       total = (uint32_t)sizeof(srvInstruments);
+
+    gMagiLink.acquireMutex();
+
+    MsgInstrumentsPushHeader hdr;
+    hdr.total_size = total;
+    bool ok = gMagiLink.send(&hdr, sizeof(hdr));
+
+    sStreamBody.id = MSG_INSTRUMENTS_PUSH_BODY;
+
+    uint32_t sent = 0;
+    while (ok && sent < total) {
+        uint32_t remain = total - sent;
+        uint16_t chunk  = remain > 1024 ? 1024 : (uint16_t)remain;
+        sStreamBody.data_len = chunk;
+        memcpy(sStreamBody.data, raw + sent, chunk);
+        ok = gMagiLink.send(&sStreamBody, sizeof(sStreamBody));
+        sent += chunk;
+    }
+
+    gMagiLink.releaseMutex();
+    Serial.printf("[CMD] sendInstruments: %u bytes (%s)\n",
+                  (unsigned)total, ok ? "OK" : "FAIL");
 }
 
 // ── Backup: stream the full file list as a single framed blob ───────────────
@@ -1260,12 +1275,14 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             break;
 
         case MSG_INSTRUMENTS_PATCH:
-            if (len < 4) return;
+            // MagiLink wire: id(1) + length(2) + offset(2) + dataLen(1) + data[dataLen]
+            if (len < 6) return;
             {
                 const MsgInstrumentsPatch* p = (const MsgInstrumentsPatch*)data;
-                uint32_t end = (uint32_t)p->offset + p->length;
+                if (len < (int)(6 + p->dataLen)) return;
+                uint32_t end = (uint32_t)p->offset + p->dataLen;
                 if (end <= sizeof(srvInstruments)) {
-                    memcpy((uint8_t*)srvInstruments + p->offset, p->data, p->length);
+                    memcpy((uint8_t*)srvInstruments + p->offset, p->data, p->dataLen);
                     srvInstSavePending = true;
                 }
             }

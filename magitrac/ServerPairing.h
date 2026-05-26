@@ -207,6 +207,10 @@ public:
     // MagiLink server-state notification: MSG_PLAY / MSG_STOP from server
     // tell us whether its sequencer is running.  Updates _serverPlaying.
     void _onMagiLinkServerState(bool playing);
+    // MagiLink instruments push (server → client).  PUSH_HEADER allocates +
+    // resets receive counters; PUSH_BODY appends into _instBuf; completion
+    // sets _instReady.
+    void _onMagiLinkInstrumentsMessage(const uint8_t* msg, size_t len);
     static void _onSongBlobStreamTrampoline(size_t n, void* ctx) {
         static_cast<ServerPairing*>(ctx)->_onSongBlobStream(n);
     }
@@ -284,6 +288,8 @@ private:
     // 0 means "not currently receiving a push" — stray body messages are
     // dropped if this is 0.
     uint32_t _songRecvExpected = 0;
+    // Same for instruments push.
+    uint32_t _instRecvExpected = 0;
 
     // Backup state — single-blob list (no paging) holds every entry the
     // server reported.  Sized to match the server's SRV_MAX_FILES upper
