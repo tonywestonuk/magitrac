@@ -149,6 +149,13 @@ void ServerPairing::begin() {
     gMagiLink.registerCallback(MSG_PLAY, playStopCb, this);
     gMagiLink.registerCallback(MSG_STOP, playStopCb, this);
 
+    // MagiLink: instruments push (HEADER + N×BODY) from server.
+    auto instCb = [](const uint8_t* msg, size_t len, void* ctx) {
+        static_cast<ServerPairing*>(ctx)->_onMagiLinkInstrumentsMessage(msg, len);
+    };
+    gMagiLink.registerCallback(MSG_INSTRUMENTS_PUSH_HEADER, instCb, this);
+    gMagiLink.registerCallback(MSG_INSTRUMENTS_PUSH_BODY,   instCb, this);
+
     _ready = true;
 
     if (_hasPairing) {
@@ -431,23 +438,29 @@ bool ServerPairing::sendSongToServer(const char* name, const Song* song) {
 
 void ServerPairing::requestInstruments() {
     if (_pairState != PairClientState::SUCCESS) return;
-    uint8_t msg = (uint8_t)MSG_INSTRUMENTS_REQ;
-    gComms.send(&msg, 1);
     _instReady       = false;
     _instBufLen      = 0;
     _instChunksGot   = 0;
     _instChunksTotal = 0;
+    MsgInstrumentsReq req;
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&req, sizeof(req));
+    gMagiLink.releaseMutex();
 }
 
 bool ServerPairing::sendInstrumentPatch(const Instrument* instruments, int idx) {
     if (_pairState != PairClientState::SUCCESS) return false;
     if (idx < 0 || idx >= MAX_INSTRUMENTS) return false;
     MsgInstrumentsPatch msg;
-    msg.type   = MSG_INSTRUMENTS_PATCH;
-    msg.offset = (uint16_t)((uint32_t)idx * sizeof(Instrument));
-    msg.length = (uint8_t)sizeof(Instrument);
+    msg.offset  = (uint16_t)((uint32_t)idx * sizeof(Instrument));
+    msg.dataLen = (uint8_t)sizeof(Instrument);
     memcpy(msg.data, &instruments[idx], sizeof(Instrument));
-    return gComms.send(&msg, 4 + sizeof(Instrument));
+    uint16_t wireLen = (uint16_t)(6 + sizeof(Instrument));
+    msg.length = wireLen;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, wireLen);
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::copyInstruments(Instrument* out) const {
@@ -1111,6 +1124,51 @@ void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
 void ServerPairing::_onMagiLinkServerState(bool playing) {
     _serverPlaying = playing;
     Serial.printf("[SP] server sequencer %s\n", playing ? "PLAY" : "STOP");
+}
+
+// ── MagiLink instruments push ───────────────────────────────────────────────
+// Same pattern as song push but writes into _instBuf and flips _instReady.
+void ServerPairing::_onMagiLinkInstrumentsMessage(const uint8_t* msg, size_t len) {
+    switch (msg[0]) {
+        case MSG_INSTRUMENTS_PUSH_HEADER: {
+            if (!_instBuf) return;
+            if (len < sizeof(MsgInstrumentsPushHeader)) return;
+            const MsgInstrumentsPushHeader* h = (const MsgInstrumentsPushHeader*)msg;
+            uint32_t cap = MAX_INSTRUMENTS * (uint32_t)sizeof(Instrument);
+            if (h->total_size > cap) {
+                Serial.printf("[SP] inst push too big: %u (max %u)\n",
+                              (unsigned)h->total_size, (unsigned)cap);
+                _instRecvExpected = 0;
+                return;
+            }
+            _instReady        = false;
+            _instBufLen       = 0;
+            _instRecvExpected = h->total_size;
+            Serial.printf("[SP] inst push start: %u bytes\n",
+                          (unsigned)_instRecvExpected);
+            break;
+        }
+        case MSG_INSTRUMENTS_PUSH_BODY: {
+            if (_instRecvExpected == 0) return;
+            if (len < sizeof(MsgInstrumentsPushBody)) return;
+            const MsgInstrumentsPushBody* b = (const MsgInstrumentsPushBody*)msg;
+            if (b->data_len > 1024) return;
+            if (_instBufLen + b->data_len > _instRecvExpected) {
+                Serial.println("[SP] inst push overshoot — dropping");
+                _instRecvExpected = 0;
+                return;
+            }
+            memcpy(_instBuf + _instBufLen, b->data, b->data_len);
+            _instBufLen += b->data_len;
+            if (_instBufLen == _instRecvExpected) {
+                _instReady        = true;
+                _instRecvExpected = 0;
+                Serial.printf("[SP] inst push done: %u bytes\n",
+                              (unsigned)_instBufLen);
+            }
+            break;
+        }
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
