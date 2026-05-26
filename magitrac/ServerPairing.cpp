@@ -786,40 +786,8 @@ void ServerPairing::_onReceive(const uint8_t* data, int len) {
 
         // MSG_SONG_DATA (chunked song download) retired — replaced by the
         // streaming MSG_SONG_BLOB path which lands in _onSongBlobStream.
-
-        case MSG_SAMPLE_LIST_RESP:
-            if (_pairState != PairClientState::SUCCESS) return;
-            if (memcmp(senderMac, _serverMac, 6) != 0) return;
-            if (len < (int)sizeof(MsgSampleListResp)) return;
-            if (_sampleListState != SampleListState::WAITING &&
-                _sampleListState != SampleListState::PARTIAL) return;
-            {
-                const MsgSampleListResp* r = (const MsgSampleListResp*)data;
-                _samplePage       = r->page;
-                _sampleTotalPages = r->totalPages > 0 ? r->totalPages : 1;
-                _sampleTotal      = r->totalEntries;
-
-                int n = r->count <= SAMPLES_PER_PKT ? r->count : SAMPLES_PER_PKT;
-                for (int i = 0; i < n && _sampleCount < SAMPLE_CACHE_MAX; i++) {
-                    _sampleCache[_sampleCount].id = r->entries[i].id;
-                    strncpy(_sampleCache[_sampleCount].name,
-                            r->entries[i].name, SAMPLE_NAME_LEN - 1);
-                    _sampleCache[_sampleCount].name[SAMPLE_NAME_LEN - 1] = '\0';
-                    _sampleCount++;
-                }
-
-                if (_samplePage + 1 < _sampleTotalPages) {
-                    // Request next page
-                    _sampleListState = SampleListState::PARTIAL;
-                    MsgSampleListReq req;
-                    req.type = MSG_SAMPLE_LIST_REQ;
-                    req.page = (uint8_t)(_samplePage + 1);
-                    gComms.send(&req, sizeof(req));
-                } else {
-                    _sampleListState = SampleListState::READY;
-                }
-            }
-            break;
+        // MSG_SAMPLE_LIST_RESP migrated to MagiLink callback
+        // (_onMagiLinkSampleList).  Legacy case removed.
 
         // MSG_INSTRUMENTS_DATA (chunked) retired — replaced by streaming
         // MSG_INSTRUMENTS_BLOB which lands in _onInstrumentsBlobStream.
