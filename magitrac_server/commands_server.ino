@@ -1011,6 +1011,28 @@ void commandsTick() {
     if (srvLoadByNamePending) {
         srvLoadByNamePending = false;
         sendSongDataByName(srvLoadByNameStr);
+        // Mirror the load-by-index path: stop+reset the sequencer and
+        // sync the on-screen cursor so the row highlight tracks the
+        // song the client just pushed to us via the setlist.
+        if (srvHasActive) {
+            sequencerStop();
+            sequencerReset();
+            int matchIdx = -1;
+            for (int i = 0; i < numSongs; i++) {
+                if (strcmp(songNames[i], srvLoadByNameStr) == 0) {
+                    matchIdx = i;
+                    break;
+                }
+            }
+            if (matchIdx >= 0) {
+                cursor = matchIdx + SONG_IDX_OFFSET;
+                if (cursor >= scrollOffset + UI_VISIBLE_ROWS)
+                    scrollOffset = cursor - UI_VISIBLE_ROWS + 1;
+                if (cursor < scrollOffset)
+                    scrollOffset = cursor;
+                needsFullRedraw = true;
+            }
+        }
     }
     if (srvLoadPending) {
         srvLoadPending = false;
