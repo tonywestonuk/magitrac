@@ -520,6 +520,15 @@ static void finaliseSongSave() {
     srvSaveActive = false;
 }
 
+// Shared 1029-byte streaming body buffer for backup, song push, and
+// instruments push.  MsgBackupBody / MsgSongPushBody / MsgInstrumentsPushBody
+// have identical wire shape — only the id byte differs — so we keep one
+// buffer and rewrite the id per-use.  Worker stack is 8 KB so this struct
+// is too big for it; the mutex serializes use sites so a single shared
+// static is safe.  Saves DRAM vs. a separate static body per function
+// (matters on the M5Stack ESP32 classic — its DRAM is tight).
+static MsgBackupBody sStreamBody;
+
 // ── Send full instruments array as HEADER + N×BODY over MagiLink ───────────
 // Triggered by MSG_INSTRUMENTS_REQ — server streams the in-memory
 // srvInstruments array to the client (~4-5 KB).  Reuses the shared
@@ -695,15 +704,6 @@ static void sendBackupFileRaw(const char* name) {
                   name, fileSize, sendOk ? "OK" : "FAIL");
 }
 
-
-// Shared 1029-byte streaming body buffer for backup and song push.
-// MsgBackupBody and MsgSongPushBody have identical wire shape — only the
-// id byte differs — so we keep one buffer and rewrite the id per-use.
-// Worker stack is 8 KB so this struct is too big for it; the mutex
-// serializes use sites so a single shared static is safe.  Saves ~1 KB
-// of DRAM vs. a separate static body per function (matters on the
-// M5Stack ESP32 classic — its DRAM is tight).
-static MsgBackupBody sStreamBody;
 
 // ── MagiLink song save (client → server) state ─────────────────────────────
 // Populated by the MSG_SAVE_SONG_HEADER and _BODY callbacks (worker task).
