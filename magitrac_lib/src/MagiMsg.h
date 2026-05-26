@@ -132,6 +132,12 @@ enum MagiMsgType : uint8_t {
     MSG_INSTRUMENTS_PUSH_HEADER = 0x88,
     MSG_INSTRUMENTS_PUSH_BODY   = 0x89,
 
+    // Restore (client → server).  HEADER carries filename + isInstruments
+    // flag + total_size; BODY carries raw file bytes.  Server accumulates
+    // into a side buffer and main-loop tick writes to SD.
+    MSG_RESTORE_HEADER          = 0x8A,
+    MSG_RESTORE_BODY            = 0x8B,
+
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
 
@@ -620,6 +626,28 @@ struct MsgInstrumentsPushBody {
     uint8_t  data[1024];
 };
 // 1029 bytes — same shape as MsgBackupBody / MsgSongPushBody
+
+// ── Restore (client → server) ──────────────────────────────────────────────
+// Client streams an arbitrary file (song or instruments) to be written
+// to SD on the server.  HEADER carries destination filename, the
+// isInstruments flag, and total_size.  BODY chunks carry raw file bytes.
+
+struct MsgRestoreHeader {
+    uint8_t  id     = MSG_RESTORE_HEADER;
+    uint16_t length = sizeof(MsgRestoreHeader);
+    char     name[SRV_FNAME_MAX];   // 24 — filename (with extension)
+    uint8_t  isInstruments;         // 1 = /instruments.mgt, 0 = /songs/<name>
+    uint32_t total_size;            // bytes that follow across BODY messages
+};
+// 1 + 2 + 24 + 1 + 4 = 32 bytes
+
+struct MsgRestoreBody {
+    uint8_t  id     = MSG_RESTORE_BODY;
+    uint16_t length = sizeof(MsgRestoreBody);
+    uint16_t data_len;
+    uint8_t  data[1024];
+};
+// 1029 bytes (shares wire shape with other body messages)
 
 // ── Song save (client → server) ────────────────────────────────────────────
 // Client takes the MagiLink mutex, sends HEADER once, then loops sending

@@ -708,6 +708,97 @@ static void sendBackupFileRaw(const char* name) {
 }
 
 
+// ── MagiLink restore (client → server) state ───────────────────────────────
+// Worker task accumulates bytes into a side buffer here so the SD write
+// can be deferred to commandsTick (per the SD-from-worker-task safety
+// rule).  35 KB matches the max song size — any file in a backup folder
+// will be at most this big.
+static uint8_t  sMagiRestoreBuf[SRV_SONG_XFER_MAX];
+static char     sMagiRestoreName[SRV_FNAME_MAX] = {};
+static bool     sMagiRestoreIsInstruments       = false;
+static uint32_t sMagiRestoreExpectedBytes       = 0;
+static uint32_t sMagiRestoreReceivedBytes       = 0;
+static bool     sMagiRestorePending             = false;
+
+void onMagiLinkRestoreHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (len < sizeof(MsgRestoreHeader)) return;
+    const MsgRestoreHeader* h = (const MsgRestoreHeader*)msg;
+    if (h->total_size > sizeof(sMagiRestoreBuf)) {
+        Serial.printf("[CMD] restore header rejected: %u > max %u\n",
+                      (unsigned)h->total_size,
+                      (unsigned)sizeof(sMagiRestoreBuf));
+        sMagiRestoreExpectedBytes = 0;
+        return;
+    }
+    strncpy(sMagiRestoreName, h->name, sizeof(sMagiRestoreName) - 1);
+    sMagiRestoreName[sizeof(sMagiRestoreName) - 1] = '\0';
+    sMagiRestoreIsInstruments = (h->isInstruments != 0);
+    sMagiRestoreExpectedBytes = h->total_size;
+    sMagiRestoreReceivedBytes = 0;
+    Serial.printf("[CMD] restore start: name='%s' instr=%d bytes=%u\n",
+                  sMagiRestoreName, sMagiRestoreIsInstruments ? 1 : 0,
+                  (unsigned)sMagiRestoreExpectedBytes);
+}
+
+void onMagiLinkRestoreBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (sMagiRestoreExpectedBytes == 0) return;
+    if (len < sizeof(MsgRestoreBody)) return;
+    const MsgRestoreBody* b = (const MsgRestoreBody*)msg;
+    if (b->data_len > 1024) return;
+    if (sMagiRestoreReceivedBytes + b->data_len > sMagiRestoreExpectedBytes) {
+        Serial.println("[CMD] restore body overshoot — dropping");
+        sMagiRestoreExpectedBytes = 0;
+        return;
+    }
+    memcpy(sMagiRestoreBuf + sMagiRestoreReceivedBytes, b->data, b->data_len);
+    sMagiRestoreReceivedBytes += b->data_len;
+    if (sMagiRestoreReceivedBytes == sMagiRestoreExpectedBytes) {
+        sMagiRestoreExpectedBytes = 0;
+        sMagiRestorePending       = true;
+    }
+}
+
+// Called from commandsTick when sMagiRestorePending fires.  Writes the
+// accumulated bytes directly to the destination path on SD; reloads
+// instruments if relevant; pushes the active song back to the client
+// if the restored file matches the active name.
+static void finaliseMagiLinkRestore() {
+    char path[48];
+    if (sMagiRestoreIsInstruments) {
+        strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
+    } else {
+        snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, sMagiRestoreName);
+    }
+    path[sizeof(path) - 1] = '\0';
+
+    {
+        SdLock _;
+        if (SD.exists(path)) SD.remove(path);
+        File f = SD.open(path, FILE_WRITE);
+        if (!f) {
+            Serial.printf("[CMD] restore: open failed '%s'\n", path);
+            return;
+        }
+        size_t wrote = f.write(sMagiRestoreBuf, sMagiRestoreReceivedBytes);
+        f.close();
+        Serial.printf("[CMD] restored '%s' %u bytes (wrote=%u)\n",
+                      path, (unsigned)sMagiRestoreReceivedBytes,
+                      (unsigned)wrote);
+    }
+
+    if (sMagiRestoreIsInstruments) {
+        loadInstrumentsFromSD();
+        Serial.println("[CMD] instruments reloaded after restore");
+    }
+
+    // If the restored file matches the currently active song, reload.
+    if (!sMagiRestoreIsInstruments && srvHasActive && srvActiveName[0] != '\0'
+        && strcmp(sMagiRestoreName, srvActiveName) == 0) {
+        Serial.printf("[CMD] restored file is the active song — reloading\n");
+        reloadActiveSongFromSD();
+    }
+}
+
 // ── MagiLink song save (client → server) state ─────────────────────────────
 // Populated by the MSG_SAVE_SONG_HEADER and _BODY callbacks (worker task).
 // On stream completion, the BODY callback sets sMagiSavePending; the main
@@ -1140,6 +1231,10 @@ void commandsTick() {
     if (sMagiSavePending) {
         sMagiSavePending = false;
         finaliseMagiLinkSongSave();
+    }
+    if (sMagiRestorePending) {
+        sMagiRestorePending = false;
+        finaliseMagiLinkRestore();
     }
     if (srvInstLoadPending) {
         srvInstLoadPending = false;

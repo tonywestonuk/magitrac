@@ -526,22 +526,32 @@ void ServerPairing::resetBackup() {
 bool ServerPairing::sendRestoreFile(const char* name, bool isInstruments,
                                      const uint8_t* data, uint32_t dataLen) {
     if (_pairState != PairClientState::SUCCESS) return false;
+    if (!gMagiLink.isConnected()) return false;
 
-    // Wire payload: type(1) + name(SRV_FNAME_MAX) + isInstruments(1) + size(u32) + bytes.
-    char namePadded[SRV_FNAME_MAX] = {};
-    strncpy(namePadded, name, SRV_FNAME_MAX - 1);
-    uint8_t isInstrByte = isInstruments ? 1 : 0;
+    MsgRestoreHeader hdr;
+    memset(hdr.name, 0, sizeof(hdr.name));
+    if (name) strncpy(hdr.name, name, sizeof(hdr.name) - 1);
+    hdr.isInstruments = isInstruments ? 1 : 0;
+    hdr.total_size    = dataLen;
 
-    size_t totalLen = 1 + SRV_FNAME_MAX + 1 + 4 + dataLen;
-    if (!gTransport.streamBegin(totalLen)) return false;
-    uint8_t type = (uint8_t)MSG_RESTORE_FILE_BLOB;
-    bool ok = true;
-    ok &= gTransport.streamMore(&type, 1);
-    ok &= gTransport.streamMore(namePadded, SRV_FNAME_MAX);
-    ok &= gTransport.streamMore(&isInstrByte, 1);
-    ok &= gTransport.streamMore(&dataLen, 4);
-    if (dataLen > 0) ok &= gTransport.streamMore(data, dataLen);
-    gTransport.streamEnd();
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&hdr, sizeof(hdr));
+
+    MsgRestoreBody body;
+    const uint8_t* p = data;
+    uint32_t remaining = dataLen;
+    while (ok && remaining > 0) {
+        uint16_t chunk = remaining > 1024 ? 1024 : (uint16_t)remaining;
+        body.data_len = chunk;
+        memcpy(body.data, p, chunk);
+        ok = gMagiLink.send(&body, sizeof(body));
+        p         += chunk;
+        remaining -= chunk;
+    }
+
+    gMagiLink.releaseMutex();
+    Serial.printf("[SP] restore '%s' %u bytes (%s)\n",
+                  hdr.name, (unsigned)dataLen, ok ? "OK" : "FAIL");
     return ok;
 }
 

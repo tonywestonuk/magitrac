@@ -617,6 +617,12 @@ void setup() {
     gMagiLink.registerCallback(MSG_SAVE_SONG_HEADER, onMagiLinkSaveHeader, nullptr);
     gMagiLink.registerCallback(MSG_SAVE_SONG_BODY,   onMagiLinkSaveBody,   nullptr);
 
+    // ── Restore (Phase: symmetric to song save, for any backup file) ──────
+    extern void onMagiLinkRestoreHeader(const uint8_t* msg, size_t len, void* ctx);
+    extern void onMagiLinkRestoreBody  (const uint8_t* msg, size_t len, void* ctx);
+    gMagiLink.registerCallback(MSG_RESTORE_HEADER, onMagiLinkRestoreHeader, nullptr);
+    gMagiLink.registerCallback(MSG_RESTORE_BODY,   onMagiLinkRestoreBody,   nullptr);
+
     // ── MSG_DISCONNECT (Phase 1 #2) ────────────────────────────────────────
     // Either side may send.  Server-side: tear down the session.  No ACK
     // needed — fire-and-forget.  TCP socket stays up; re-establishment
