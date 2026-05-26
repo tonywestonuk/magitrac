@@ -1390,7 +1390,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             if (len < (int)sizeof(MsgMidiData)) return;
             {
                 const MsgMidiData* m = (const MsgMidiData*)data;
-                for (uint8_t i = 0; i < m->len && i < 3; i++)
+                for (uint8_t i = 0; i < m->midiLen && i < 3; i++)
                     midi.write(m->data[i]);
             }
             break;
