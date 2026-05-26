@@ -343,11 +343,17 @@ bool ServerPairing::sendSongPatch(const Song& song, const void* fieldPtr, uint8_
     if (_pairState != PairClientState::SUCCESS) return false;
     if (length == 0 || length > SONG_PATCH_MAX) return false;
     MsgSetSongData msg;
-    msg.type   = MSG_SET_SONG_DATA;
-    msg.offset = (uint16_t)((const uint8_t*)fieldPtr - (const uint8_t*)&song);
-    msg.length = length;
+    msg.offset  = (uint16_t)((const uint8_t*)fieldPtr - (const uint8_t*)&song);
+    msg.dataLen = length;
     memcpy(msg.data, fieldPtr, length);
-    return gComms.send(&msg, 4 + length);
+    // Variable-length send: override NSDMI wire length, send only the bytes
+    // carrying meaningful payload (6-byte header + dataLen bytes).
+    uint16_t wireLen = (uint16_t)(6 + length);
+    msg.length = wireLen;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, wireLen);
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, uint8_t col) {
