@@ -356,10 +356,12 @@ bool ServerPairing::sendMidi(const uint8_t* bytes, uint8_t len) {
     if (_pairState != PairClientState::SUCCESS) return false;
     if (len == 0 || len > 3) return false;
     MsgMidiData msg;
-    msg.type = MSG_MIDI_DATA;
-    msg.len  = len;
+    msg.midiLen = len;
     memcpy(msg.data, bytes, len);
-    return gComms.send(&msg, sizeof(msg));
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendSongPatch(const Song& song, const void* fieldPtr, uint8_t length) {

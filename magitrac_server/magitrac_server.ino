@@ -607,6 +607,7 @@ void setup() {
     gMagiLink.registerCallback(MSG_PREVIEW_STOP,     controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SET_WIFI_CHANNEL, controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SAMPLE_LIST_REQ,  controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_MIDI_DATA,        controlCb, nullptr);
 
     // ── Song save (Phase 2 #6) — client streams Song bytes to us ───────────
     // Handlers live in commands_server.ino; they accumulate into srvActiveBuf

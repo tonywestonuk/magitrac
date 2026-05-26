@@ -355,11 +355,15 @@ struct MsgSongDelete {
     char     name[SRV_NAME_MAX];   // filename to delete (no extension)
 };
 
-// Client → Server: raw MIDI bytes to forward directly to MIDI out
+// Client → Server: raw MIDI bytes to forward directly to MIDI out.
+// High-frequency, latency-sensitive — each note-on/off is one of these.
+// Payload field `len` (1..3) renamed from the legacy struct's same name
+// only because we now also have a wire `length`.
 struct MsgMidiData {
-    MagiMsgType type;    // MSG_MIDI_DATA
-    uint8_t     len;     // number of MIDI bytes (1–3)
-    uint8_t     data[3]; // raw MIDI bytes
+    uint8_t  id     = MSG_MIDI_DATA;
+    uint16_t length = sizeof(MsgMidiData);
+    uint8_t  midiLen;     // number of MIDI bytes in data[] (1..3)
+    uint8_t  data[3];
 };
 
 // Server → Client: current sequencer position
