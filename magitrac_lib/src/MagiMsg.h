@@ -9,53 +9,41 @@
 
 // ── Message types ─────────────────────────────────────────────────────────────
 enum MagiMsgType : uint8_t {
-    // Session
-    MSG_BEACON       = 0x01,  // (legacy — no longer sent; kept to avoid reusing the value)
-    MSG_CONNECT      = 0x02,  // client → server unicast: "connect to me" (includes HMAC)
-    MSG_CONNECT_ACK  = 0x03,  // server → client: "connected" (includes session nonce)
+    // MagiLink session
+    MSG_CONNECT      = 0x02,  // server → client (over TCP): "session up"
+    MSG_CONNECT_ACK  = 0x03,  // client → server: "ack"
     MSG_DISCONNECT   = 0x04,  // either → other:  "ending session"
-    MSG_PING         = 0x05,  // retired — liveness now via TCP keepalive (id reserved)
-    MSG_PONG         = 0x06,  // retired — liveness now via TCP keepalive (id reserved)
 
-    // Pairing ceremony (one-time setup).  Server scans channels 1/6/11
-    // broadcasting MSG_PAIR_PROBE; magitrac client (when in pair mode)
-    // replies with MSG_PAIR_CHALLENGE carrying a 4-digit PIN it generated.
-    // The PIN is shown on both screens; user taps Confirm on magitrac;
-    // magitrac then unicasts MSG_PAIR_OFFER with the AP creds + static IP.
-    // Server saves and reboots into TCP-STA mode.
+    // Pairing ceremony (one-time setup, over ESP-NOW).  Server scans
+    // channels 1/6/11 broadcasting MSG_PAIR_PROBE; magitrac client (when
+    // in pair mode) replies with MSG_PAIR_CHALLENGE carrying a 4-digit
+    // PIN it generated.  User confirms on magitrac; magitrac then
+    // unicasts MSG_PAIR_OFFER with the AP creds + static IP.  Server
+    // saves to NVS and reboots into TCP-STA mode.
     MSG_PAIR_PROBE     = 0x07,  // server → broadcast: "magitrac, are you there?"
     MSG_PAIR_CHALLENGE = 0x08,  // client → server:    PIN to display + confirm
-    MSG_PAIR_OFFER     = 0x0B,  // client → server:    AP creds + assigned IP (TCP transport handoff)
+    MSG_PAIR_OFFER     = 0x0B,  // client → server:    AP creds + assigned IP
 
     // Playback control
     MSG_PLAY             = 0x10,
     MSG_STOP             = 0x11,
-    MSG_SET_BPM          = 0x12,
     MSG_SET_SONG_DATA    = 0x13,  // client → server: generic song memory patch
     MSG_PAUSE            = 0x14,  // client → server: freeze position, keep state
     MSG_UNPAUSE          = 0x15,  // client → server: resume from frozen position
     MSG_SET_WIFI_CHANNEL = 0x16,  // client → server: switch WiFi channel (idx 0/1/2 → 1/6/11)
 
-    // Song transfer — server → client (load)
+    // Song transfer
     MSG_SONG_LIST_REQ  = 0x20,
     MSG_SONG_LIST_RESP = 0x21,
     MSG_SONG_LOAD_REQ  = 0x22,
-    MSG_SONG_DATA      = 0x23,  // (retired — superseded by MSG_SONG_BLOB)
-
-    // Song transfer — client → server (save)
-    MSG_SONG_SAVE      = 0x24,  // (retired — superseded by MSG_SONG_SAVE_BLOB)
-    MSG_SONG_SAVE_DATA = 0x25,  // (retired — superseded by MSG_SONG_SAVE_BLOB)
     MSG_SONG_DELETE    = 0x26,  // client → server: delete file by name
-    MSG_CHUNK_ACK      = 0x27,  // reserved — formerly per-chunk app ACK; link-layer ACK is the only reliability now
     MSG_SONG_LOAD_NAME = 0x28,  // client → server: request song by bare name (no .mgt)
-    MSG_SONG_BLOB      = 0x29,  // server → client: whole song in one streamed message
-    MSG_SONG_SAVE_BLOB = 0x2A,  // client → server: whole song save in one streamed message
 
     // MIDI passthrough — client → server
     MSG_MIDI_DATA      = 0x30,  // client → server: raw MIDI bytes to forward to MIDI out
 
-    // Sequencer position — server → client
-    MSG_SEQ_POS        = 0x31,  // server → client: current pattern + row
+    // Sequencer position — server → client (UDP, loss-tolerant)
+    MSG_SEQ_POS        = 0x31,
 
     // Scrub seek — client → server
     MSG_SEEK           = 0x32,  // client → server: jump to pattern+row and play it (audible scrub)
@@ -68,45 +56,22 @@ enum MagiMsgType : uint8_t {
     // Column preview — single-column looping playback for the column-note editor
     MSG_PREVIEW_START  = 0x37,  // client → server: start preview of (pattern, column)
     MSG_PREVIEW_STOP   = 0x38,  // client → server: stop preview
-    MSG_PREVIEW_ROW    = 0x39,  // server → client: preview playhead is at this row
+    MSG_PREVIEW_ROW    = 0x39,  // server → client: preview playhead is at this row (UDP)
 
-    // Instruments — bidirectional
+    // Instruments
     MSG_INSTRUMENTS_REQ   = 0x40,  // client → server: request full instruments array
-    MSG_INSTRUMENTS_DATA  = 0x41,  // (retired — superseded by MSG_INSTRUMENTS_BLOB)
     MSG_INSTRUMENTS_PATCH = 0x42,  // client → server: patch bytes in instruments array
-    MSG_INSTRUMENTS_BLOB  = 0x43,  // server → client: whole instruments array in one streamed message
 
     // Note edit
     MSG_NOTE_SET = 0x50,  // client → server: set or clear one note by (pattern, row, col)
 
     // Audition — play a freshly-entered note through MIDI for ~500ms
-    MSG_NOTE_AUDITION = 0x3A,  // client → server: play (pattern, row, col) briefly
+    MSG_NOTE_AUDITION = 0x3A,
 
-    // Backup/Restore — bidirectional
-    MSG_BACKUP_LIST_REQ    = 0x70,  // client → server: request full file list (no paging)
-    MSG_BACKUP_LIST_RESP   = 0x71,  // (retired — superseded by MSG_BACKUP_LIST_BLOB)
-    MSG_BACKUP_FILE_REQ    = 0x72,  // client → server: request raw file by name
-    MSG_BACKUP_FILE_START  = 0x73,  // (retired — superseded by MSG_BACKUP_FILE_BLOB)
-    MSG_BACKUP_FILE_DATA   = 0x74,  // (retired — superseded by MSG_BACKUP_FILE_BLOB)
-    MSG_RESTORE_FILE_START = 0x75,  // (retired — superseded by MSG_RESTORE_FILE_BLOB)
-    MSG_RESTORE_FILE_DATA  = 0x76,  // (retired — superseded by MSG_RESTORE_FILE_BLOB)
-    MSG_BACKUP_FILE_BLOB   = 0x77,  // server → client: whole file in one streamed message
-    MSG_BACKUP_LIST_BLOB   = 0x78,  // server → client: all file entries in one streamed message
-    MSG_RESTORE_FILE_BLOB  = 0x79,  // client → server: whole restore file in one streamed message
-
-    // TCP/IP diagnostic test — minimal continuous streamer.  After START,
-    // server emits MSG_TCP_TEST_BLOB on every main-loop tick (paced only
-    // by TCP backpressure) until STOP.  Client just counts bytes.  No
-    // SD, no request/response per frame — pure WiFi+TCP throughput test.
-    MSG_TCP_TEST_START     = 0x7A,  // client → server: start streaming blobs
-    MSG_TCP_TEST_BLOB      = 0x7B,  // server → client: 4096-byte payload
-    MSG_TCP_TEST_STOP      = 0x7C,  // client → server: stop streaming
-
-    // New struct-driven backup transport (v2).  Client sends START_BACKUP
-    // once; server streams a continuous sequence of (HEADER + N×BODY) per
-    // file, finishing with END_OF_DATA.  Every message is a fixed-size
-    // struct in MagiMsg.h — receiver dispatches by id alone, no per-file
-    // request/response handshake.
+    // Backup transport (client → server one-shot trigger, then server
+    // streams a continuous sequence of (HEADER + N×BODY) per file,
+    // finishing with END_OF_DATA).  Every message is a fixed-size struct
+    // — receiver dispatches by id alone, no per-file handshake.
     MSG_START_BACKUP       = 0x80,  // client → server: start the backup
     MSG_BACKUP_HEADER      = 0x81,  // server → client: filename + size + index/total
     MSG_BACKUP_BODY        = 0x82,  // server → client: 1024-byte data slot + data_len
@@ -151,12 +116,6 @@ enum MagiMsgType : uint8_t {
 };
 
 #pragma pack(push, 1)
-
-// Server broadcasts this while in Client-Server mode (waiting for client)
-struct MsgBeacon {
-    MagiMsgType type;     // MSG_BEACON
-    char        name[16]; // e.g. "MagiTrac"
-};
 
 // MagiLink session handshake.  Server (STA) sends MsgConnect once TCP
 // is up; client (AP) replies with MsgConnectAck.  No payload — identity
@@ -319,34 +278,8 @@ struct MsgSongLoadNameReq {
     char     name[SL_NAME_LEN];   // null-terminated, no extension
 };
 
-// Server → Client: one chunk of song file data (download)
-#define SONG_CHUNK_SIZE 240
-
-struct MsgSongData {
-    MagiMsgType type;        // MSG_SONG_DATA
-    uint8_t     chunk;       // 0-based
-    uint8_t     totalChunks;
-    uint8_t     dataLen;     // bytes in payload (1..SONG_CHUNK_SIZE)
-    uint8_t     payload[SONG_CHUNK_SIZE];
-};
-
-// Client → Server: begin song upload
+// Max destination filename for song save (no extension).
 #define SRV_NAME_MAX 24
-
-struct MsgSongSaveStart {
-    MagiMsgType type;              // MSG_SONG_SAVE
-    char        name[SRV_NAME_MAX]; // destination filename (no extension)
-    uint8_t     totalChunks;
-};
-
-// Client → Server: one chunk of song file data (upload) — same layout as MsgSongData
-struct MsgSongSaveData {
-    MagiMsgType type;        // MSG_SONG_SAVE_DATA
-    uint8_t     chunk;
-    uint8_t     totalChunks;
-    uint8_t     dataLen;
-    uint8_t     payload[SONG_CHUNK_SIZE];
-};
 
 // Client → Server: delete a file by name
 struct MsgSongDelete {
@@ -423,15 +356,6 @@ struct MsgPreviewRow {
     uint8_t     row;
 };
 
-// Server → Client: one chunk of instruments array (same wire layout as MsgSongData)
-struct MsgInstrumentsData {
-    MagiMsgType type;        // MSG_INSTRUMENTS_DATA
-    uint8_t     chunk;
-    uint8_t     totalChunks;
-    uint8_t     dataLen;
-    uint8_t     payload[SONG_CHUNK_SIZE];
-};
-
 // Client → Server: patch bytes in instruments array.  Same shape +
 // variable-length send convention as MsgSetSongData — caller must set
 // `length = 6 + dataLen` and pass `6 + dataLen` to gMagiLink.send.
@@ -462,50 +386,6 @@ struct MsgNoteAudition {
     uint8_t  pattern;
     uint8_t  row;
     uint8_t  col;
-};
-
-// ── Backup / Restore ──────────────────────────────────────────────────────────
-
-struct BkFileEntry {
-    char     name[SRV_FNAME_MAX];  // 24 bytes — filename with extension
-    uint16_t sizeHi;               // file size >> 16
-    uint16_t sizeLo;               // file size & 0xFFFF
-};
-
-struct MsgBackupListReq {
-    MagiMsgType type;      // MSG_BACKUP_LIST_REQ
-};
-
-// MSG_BACKUP_LIST_BLOB wire layout (streamed via MagiCommsTcp):
-//   type(1) + numFiles(1) + BkFileEntry × numFiles
-// No struct definition because the body is variable-length.  At
-// SRV_MAX_FILES+1 = 33 entries the blob is 1+1+33*28 = 926 bytes — well
-// under the reader buffer.  Old MsgBackupListResp + paging retired.
-
-struct MsgBackupFileReq {
-    MagiMsgType type;              // MSG_BACKUP_FILE_REQ
-    char        name[SRV_FNAME_MAX]; // filename to fetch
-};
-
-// MsgBackupFileStart / MsgBackupFileData (ESP-NOW-era chunked transfer)
-// retired — replaced by a single streamed MSG_BACKUP_FILE_BLOB whose wire
-// layout is: type(1) + name(SRV_FNAME_MAX) + size(u32 LE) + bytes.  No
-// struct definition because the body is variable-length raw bytes; the
-// sender uses MagiCommsTcp::streamMore() to shovel SD→socket directly.
-
-struct MsgRestoreFileStart {
-    MagiMsgType type;              // MSG_RESTORE_FILE_START
-    char        name[SRV_FNAME_MAX];
-    uint8_t     totalChunks;
-    uint8_t     isInstruments;     // 1 = /instruments.mgt, 0 = /songs/<name>
-};
-
-struct MsgRestoreFileData {
-    MagiMsgType type;        // MSG_RESTORE_FILE_DATA
-    uint8_t     chunk;
-    uint8_t     totalChunks;
-    uint8_t     dataLen;
-    uint8_t     payload[SONG_CHUNK_SIZE];
 };
 
 // Server → Client: MIDI note-on received while sequencer is stopped
