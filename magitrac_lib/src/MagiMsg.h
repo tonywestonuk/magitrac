@@ -246,8 +246,9 @@ struct MsgUnpause {
 // idx is encoded the same way as pixel_post's MSG_CHG_WIFI_CHANNEL so we can
 // later send the same payload bytes to both magitrac server and pixel_post.
 struct MsgSetWifiChannel {
-    MagiMsgType type;     // MSG_SET_WIFI_CHANNEL
-    uint8_t     idx;      // 0, 1, 2 → channels 1, 6, 11
+    uint8_t  id     = MSG_SET_WIFI_CHANNEL;
+    uint16_t length = sizeof(MsgSetWifiChannel);
+    uint8_t  idx;   // 0, 1, 2 → channels 1, 6, 11
 };
 
 // Map a channel index (0..2) to the WiFi channel number (1, 6, or 11).
@@ -381,15 +382,29 @@ struct MsgGoto {
 
 // Client → Server: queue a block to play after current block ends
 struct MsgQueueBlock {
-    MagiMsgType type;    // MSG_QUEUE_BLOCK
-    uint8_t     pattern; // block index to queue
+    uint8_t  id     = MSG_QUEUE_BLOCK;
+    uint16_t length = sizeof(MsgQueueBlock);
+    uint8_t  pattern;
+};
+
+// Client → Server: cancel a queued block.
+struct MsgCancelQueue {
+    uint8_t  id     = MSG_CANCEL_QUEUE;
+    uint16_t length = sizeof(MsgCancelQueue);
 };
 
 // Client → Server: start column preview
 struct MsgPreviewStart {
-    MagiMsgType type;     // MSG_PREVIEW_START
-    uint8_t     pattern;  // pattern to loop
-    uint8_t     col;      // 1..MAX_COLUMNS-1 — col 0 makes no MIDI sound
+    uint8_t  id     = MSG_PREVIEW_START;
+    uint16_t length = sizeof(MsgPreviewStart);
+    uint8_t  pattern;
+    uint8_t  col;   // 1..MAX_COLUMNS-1 — col 0 makes no MIDI sound
+};
+
+// Client → Server: stop column preview.
+struct MsgPreviewStop {
+    uint8_t  id     = MSG_PREVIEW_STOP;
+    uint16_t length = sizeof(MsgPreviewStop);
 };
 
 // Server → Client: preview playhead position (row within the previewed pattern)

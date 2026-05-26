@@ -1,6 +1,7 @@
 #include "SettingsPage.h"
-#include "ServerPairing.h"     // for gComms
+#include "ServerPairing.h"
 #include "MagiMsg.h"
+#include "MagiLink.h"
 #include <WiFi.h>
 #include <Preferences.h>
 #include <string.h>
@@ -300,19 +301,17 @@ void SettingsPage::changeWifiChannel(uint8_t idx) {
     gWifiChannelIdx = idx;
     saveWifiChannel();
 
+    // Send the new channel over the current TCP link first — server
+    // receives, persists, and applies (which kills its end of the
+    // socket).  Then we change our own AP channel.  No ESP-NOW-era
+    // sweep needed: TCP delivers reliably on the current channel.
     MsgSetWifiChannel msg;
-    msg.type = MSG_SET_WIFI_CHANNEL;
-    msg.idx  = idx;
+    msg.idx = idx;
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
 
-    // Sweep across all 3 channels so a mismatched server still gets it.
-    static const uint8_t SWEEP[3] = { 1, 6, 11 };
-    for (int i = 0; i < 3; i++) {
-        WiFi.setChannel(SWEEP[i]);
-        delay(50);
-        gComms.send(&msg, sizeof(msg));
-        delay(50);
-    }
-    // Settle on the requested channel.
+    delay(100);   // give the server a moment to consume and persist
     WiFi.setChannel(magiWifiChannelFromIdx(idx));
     Serial.printf("[WIFI] channel → %u\n", (unsigned)magiWifiChannelFromIdx(idx));
 }

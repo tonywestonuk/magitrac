@@ -303,30 +303,40 @@ bool ServerPairing::sendGoto(uint8_t pattern, uint8_t row) {
 bool ServerPairing::sendQueueBlock(uint8_t pattern) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgQueueBlock msg;
-    msg.type    = MSG_QUEUE_BLOCK;
     msg.pattern = pattern;
-    return gComms.send(&msg, sizeof(msg));
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendCancelQueue() {
     if (_pairState != PairClientState::SUCCESS) return false;
-    uint8_t msg = (uint8_t)MSG_CANCEL_QUEUE;
-    return gComms.send(&msg, 1);
+    MsgCancelQueue msg;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendPreviewStart(uint8_t pattern, uint8_t col) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPreviewStart msg;
-    msg.type    = MSG_PREVIEW_START;
     msg.pattern = pattern;
     msg.col     = col;
-    return gComms.send(&msg, sizeof(msg));
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendPreviewStop() {
     if (_pairState != PairClientState::SUCCESS) return false;
-    uint8_t msg = (uint8_t)MSG_PREVIEW_STOP;
-    return gComms.send(&msg, 1);
+    MsgPreviewStop msg;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::pollPreviewRow(uint8_t* row) {
