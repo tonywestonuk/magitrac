@@ -11,14 +11,6 @@
 #include "midi_player.h"
 #include "SampleManifest.h"
 
-// ── REPRO: set to 1 to stub the SD reads in sendBackupFileRaw — pretend
-// every backup file is 4096 fake bytes (memset 0xAB) instead of reading
-// real data from the SD card.  Pairs with the magitrac-side
-// REPRO_SKIP_SD_WRITE so both sides are SD-free during backup.  Lets us
-// test whether the wedge involves SD/SDIO contention or current draw on
-// either device.  Revert to 0 when done.
-#define REPRO_SKIP_SERVER_SD_READ 1
-
 // ── WiFi channel persistence ──────────────────────────────────────────────────
 // Shared namespace name with the client side ("magitrac_wifi") so the channel
 // setting is conceptually one thing across both devices, just stored locally.
