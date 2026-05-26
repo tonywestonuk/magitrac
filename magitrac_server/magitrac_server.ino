@@ -601,6 +601,11 @@ void setup() {
     gMagiLink.registerCallback(MSG_SET_SONG_DATA,    controlCb, nullptr);
     gMagiLink.registerCallback(MSG_INSTRUMENTS_REQ,  controlCb, nullptr);
     gMagiLink.registerCallback(MSG_INSTRUMENTS_PATCH, controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_QUEUE_BLOCK,      controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_CANCEL_QUEUE,     controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_PREVIEW_START,    controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_PREVIEW_STOP,     controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SET_WIFI_CHANNEL, controlCb, nullptr);
 
     // ── Song save (Phase 2 #6) — client streams Song bytes to us ───────────
     // Handlers live in commands_server.ino; they accumulate into srvActiveBuf
