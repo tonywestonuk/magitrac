@@ -136,19 +136,6 @@ void enterPairingMode() {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-__attribute__((unused))
-static void endSession(bool sendDisconnect) {
-    if (serverMode == SERVER_CONNECTED) {
-        if (sendDisconnect) {
-            MsgDisconnect msg;
-            gComms.send(&msg, sizeof(msg));
-        }
-        gComms.removePeer(clientMac);
-    }
-    serverMode = SERVER_STANDALONE;
-    needsFullRedraw = true;
-}
-
 // ── Public queries ────────────────────────────────────────────────────────────
 bool pairingIsActive()    { return serverMode != SERVER_STANDALONE; }
 bool pairingIsConnected() { return serverMode == SERVER_CONNECTED; }
@@ -168,18 +155,10 @@ void pairingClearAndRestart() {
     ESP.restart();
 }
 
-void pairingSendToClient(const void* data, size_t len) {
-    if (serverMode != SERVER_CONNECTED) return;
-    gComms.send(data, len);
-}
-
 // ── MagiLink session hooks ──────────────────────────────────────────────────
 // Called from the MagiLink session task in magitrac_server.ino after the
 // MSG_CONNECT / MSG_CONNECT_ACK handshake completes (or fails).  These
-// own the SERVER_STANDALONE ↔ SERVER_CONNECTED transition for the new
-// transport.  Legacy gComms path is parallel and currently disabled —
-// when it's deleted, the MSG_CONNECT branch in pairingHandleMessage
-// goes too.
+// own the SERVER_STANDALONE ↔ SERVER_CONNECTED transition.
 void pairingOnMagiLinkConnected() {
     if (serverMode == SERVER_CONNECTED) return;
     serverMode       = SERVER_CONNECTED;
@@ -197,40 +176,15 @@ void pairingOnMagiLinkDisconnected() {
 }
 
 // ── Handle incoming messages ─────────────────────────────────────────────────
+// Pairing-ceremony messages only — the data session is owned by MagiLink
+// (CONNECT/DISCONNECT + command dispatch handled via registered callbacks
+// in magitrac_server.ino).
 void pairingHandleMessage(const uint8_t* data, int len) {
     if (len < 1) return;
     MagiMsgType type = (MagiMsgType)data[0];
     const uint8_t* senderMac = gComms.lastSenderAddr();
 
     switch (type) {
-
-        case MSG_CONNECT:
-            // Accept only from the stored paired client.  Over TCP the
-            // sender MAC is whatever `addPeer` stamped on `_peerMac`
-            // — the magitrac client calls `gComms.addPeer(serverMac)`
-            // (its end of the pairing memory), and on this side we have
-            // sStoredClientMac as the corresponding label.
-            if (!sHasPairing) return;
-            if (len < (int)sizeof(MsgConnect)) return;
-            if (memcmp(senderMac, sStoredClientMac, 6) != 0) return;
-            if (serverMode == SERVER_CONNECTED) return;
-            {
-                memcpy(clientMac, senderMac, 6);
-                gComms.addPeer(clientMac);
-
-                MsgConnectAck ack;
-                gComms.send(&ack, sizeof(ack));
-
-                serverMode       = SERVER_CONNECTED;
-                sSongPushPending = true;
-                sCancelArmed     = false;
-
-                needsFullRedraw  = true;
-                Serial.printf("[PAIR] client connected: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                    clientMac[0], clientMac[1], clientMac[2],
-                    clientMac[3], clientMac[4], clientMac[5]);
-            }
-            break;
 
         case MSG_PAIR_CHALLENGE:
             // Reply to our PROBE — magitrac generated a PIN and is
@@ -282,20 +236,7 @@ void pairingHandleMessage(const uint8_t* data, int len) {
             }
             break;
 
-        case MSG_DISCONNECT:
-            if (serverMode != SERVER_CONNECTED) return;
-            if (memcmp(senderMac, clientMac, 6) != 0) return;
-            gComms.removePeer(clientMac);
-            serverMode = SERVER_STANDALONE;
-            needsFullRedraw = true;
-            break;
-
         default:
-            // Route commands from the connected client
-            if (serverMode == SERVER_CONNECTED &&
-                memcmp(senderMac, clientMac, 6) == 0) {
-                handleCommand(type, data, len);
-            }
             break;
     }
 }

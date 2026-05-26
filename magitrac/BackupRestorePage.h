@@ -43,15 +43,6 @@ public:
     void draw();
     bool poll();   // returns true when page should close
 
-    // After poll() returns true, main loop checks this — if true, opens
-    // TcpTestPage instead of restoring whatever was behind us.  One-shot
-    // (consumed by reading).
-    bool consumeTcpTestRequest() {
-        bool r = _tcpTestRequested;
-        _tcpTestRequested = false;
-        return r;
-    }
-
 private:
     EPD_PainterAdafruit& _d;
     GT911_Lite&          _touch;
@@ -71,10 +62,6 @@ private:
     // Number of files fully written to SD this backup run.  Used by
     // drawBackupDone to show "N of M saved" (especially after a cancel).
     int _bkFilesSaved = 0;
-
-
-    // TCP/IP test request flag (set when user taps the TCP TEST menu button)
-    bool     _tcpTestRequested = false;
 
     // Restore state
     char     _rsFolders[BR_MAX_FOLDERS][BR_FOLDER_MAX];
