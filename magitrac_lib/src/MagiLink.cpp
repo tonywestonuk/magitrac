@@ -21,9 +21,14 @@ static const uint32_t LINK_POLL_MS      = 100;   // peer.connected() polling
 // TCP keepalive — detects silently-dropped connections (server power-cycle,
 // WiFi blackhole, etc.).  Probes only fire when the link is idle; active
 // data flow proves liveness for free.  Worst-case detection of a dead
-// idle connection: IDLE + INTVL * CNT seconds.
-static const int KEEPALIVE_IDLE_S  = 5;
-static const int KEEPALIVE_INTVL_S = 2;
+// idle connection: IDLE + INTVL * CNT seconds = 30s.
+//
+// 30s gives a real-world out-of-range window enough time to come back
+// without the user losing their session — e.g. moving the LilyGo briefly
+// away from the M5 during a backup and back into range should resume the
+// transfer rather than throw a "connection lost".
+static const int KEEPALIVE_IDLE_S  = 15;
+static const int KEEPALIVE_INTVL_S = 5;
 static const int KEEPALIVE_CNT     = 3;
 
 static void applyTcpKeepalive(WiFiClient& peer) {
@@ -172,14 +177,16 @@ void MagiLink::_runStaLoop() {
 
         // Main loop while peer is alive: take mutex, drain one message if
         // there is one, release, yield.  Same shape as AP side.
-        while (_impl->peer.connected() && WiFi.status() == WL_CONNECTED) {
+        //
+        // Liveness is driven by TCP keepalive alone (30s grace).  We
+        // deliberately do NOT exit on WiFi.status() != WL_CONNECTED here —
+        // a brief WiFi blip should leave the socket in place so that when
+        // association recovers, in-flight transactions (e.g. a backup
+        // stream) resume.  If WiFi stays gone past the keepalive window
+        // peer.connected() returns false and we tear down normally.
+        while (_impl->peer.connected()) {
             acquireMutex();
             if (_impl->peer.available() > 0) {
-                // Worker drains one message and dispatches via registered
-                // callback (if any).  Messages without a registered handler
-                // are silently dropped here — sender tasks that need them
-                // must be inside a transaction (which would have the mutex
-                // already, preventing the worker from running this code).
                 if (_readMessageRaw()) {
                     _dispatch(_recvBuf, /*len=*/ (size_t)
                               ((uint16_t)_recvBuf[1] | ((uint16_t)_recvBuf[2] << 8)));
