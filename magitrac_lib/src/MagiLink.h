@@ -88,9 +88,11 @@ private:
     volatile bool _connected = false;
 
     // Registration table for per-id callbacks.  Worker task dispatches
-    // matching incoming messages here.
+    // matching incoming messages here.  Server registers ~28 entries
+    // (full command set + the two streaming HEADER/BODY pairs); 48
+    // leaves headroom for future additions without another overflow.
     struct RegisteredHandler { uint8_t msgType; MessageCb cb; void* ctx; };
-    static const int MAX_REGISTERED = 16;
+    static const int MAX_REGISTERED = 48;
     RegisteredHandler _registered[MAX_REGISTERED];
     int               _registeredCount = 0;
 
