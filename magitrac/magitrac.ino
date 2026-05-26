@@ -271,9 +271,9 @@ void setup() {
     gServerPairing.begin();
 
     // ── MagiLink (reliable TCP transport) ───────────────────────────────────
-    // Coexists on port 4343 while the old transport keeps running on 4242.
-    // Will take over 4242 once everything is migrated.
-    gMagiLink.beginAp(4343);
+    // Listens on MAGI_PORT (4242) — the UDP companion uses the same number
+    // on the disjoint UDP namespace.
+    gMagiLink.beginAp(MAGI_PORT);
 
     // Backlight — only available on LilyGo T5 boards (BOARD_BL_EN conflicts
     // with display pins on M5PaperS3)
@@ -371,11 +371,9 @@ void loop() {
         PairClientState ps = gServerPairing.pairState();
         BrowseState     bs = gServerPairing.browseState();
 
-        // Status now driven by the new MagiLink — the legacy pairState is
-        // still updating in the background (old transport runs on 4242),
-        // but the visible word reflects the new link's socket state on
-        // port 4343.  Will collapse back to one signal after the
-        // migration finishes.
+        // Status reflects the MagiLink socket state.  The legacy pairState
+        // is still computed for the pairing-ceremony UI (PAIRING_REQUEST /
+        // PAIRING_CONFIRM); browse state isn't surfaced here.
         (void)ps; (void)bs;
         if (gMagiLink.isConnected()) {
             strncpy(sStatusBuf, "Connected", 31);

@@ -551,9 +551,9 @@ void setup() {
             // from the server side — magitrac's gateway is the destination.
             gUdpLink.beginSender(tgwip, MAGI_PORT);
             // MagiLink (reliable TCP).  Connects to the magitrac AP at
-            // 192.168.0.1:4343.  The MagiLink task internally waits for
-            // STA association before attempting connect.
-            gMagiLink.beginSta(4343, IPAddress(192, 168, 0, 1));
+            // 192.168.0.1:MAGI_PORT.  The MagiLink task internally waits
+            // for STA association before attempting connect.
+            gMagiLink.beginSta(MAGI_PORT, IPAddress(192, 168, 0, 1));
         } else {
             Serial.println("[SETUP] no TCP creds — booting on ESP-NOW for pairing");
             gTransportEspNow.setOnReceive([](const uint8_t* data, int len) {

@@ -1,6 +1,6 @@
 // MagiUdpLink — best-effort UDP datagram link.
 //
-// Companion to MagiCommsTcp for messages that are latency-sensitive but
+// Companion to MagiLink for messages that are latency-sensitive but
 // loss-tolerant — e.g. sequencer row position, preview playhead.  Using
 // UDP avoids head-of-line blocking: a stale "row 23" sitting in TCP's
 // retransmit queue can't delay a fresh "row 25" anymore.
