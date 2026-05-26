@@ -24,15 +24,6 @@ enum class BrowseState : uint8_t {
     ERROR,
 };
 
-enum class BackupState : uint8_t {
-    IDLE,
-    WAITING_FILE_LIST,  // waiting for MSG_BACKUP_LIST_BLOB
-    FILE_LIST_READY,    // list received
-    WAITING_FILE,       // waiting for MSG_BACKUP_FILE_BLOB
-    FILE_RECEIVED,      // all chunks received for current file
-    ERROR,
-};
-
 enum class SampleListState : uint8_t {
     IDLE,
     WAITING,    // request sent, waiting for first MSG_SAMPLE_LIST_RESP
@@ -114,22 +105,9 @@ public:
     // if not present (id 0 = "no sample", or cache not fetched).
     const char* sampleListNameFor(uint8_t id) const;
 
-    // ── Backup / Restore ──────────────────────────────────────────────────────
-    void requestBackupFileList(uint8_t page = 0);
-    void requestBackupFile(const char* name);
-    void resetBackup();
+    // ── Restore ───────────────────────────────────────────────────────────────
     bool sendRestoreFile(const char* name, bool isInstruments,
                          const uint8_t* data, uint32_t dataLen);
-
-    BackupState backupState()       const { return _backupState; }
-    int         backupFileCount()   const { return _bkFileCount; }
-    uint8_t     backupTotalFiles()  const { return (uint8_t)_bkFileCount; }
-    const char* backupFileName(int i) const { return _bkEntries[i].name; }
-    uint32_t    backupFileSize(int i) const {
-        return ((uint32_t)_bkEntries[i].sizeHi << 16) | _bkEntries[i].sizeLo;
-    }
-    const uint8_t* receivedFileData() const { return _songBuf; }
-    uint32_t       receivedFileLen()  const { return _songBufLen; }
 
     // ── MIDI passthrough ──────────────────────────────────────────────────────
     bool sendMidi(const uint8_t* bytes, uint8_t len);
@@ -269,13 +247,6 @@ private:
     uint32_t _songRecvExpected = 0;
     // Same for instruments push.
     uint32_t _instRecvExpected = 0;
-
-    // Backup state — single-blob list (no paging) holds every entry the
-    // server reported.  Sized to match the server's SRV_MAX_FILES upper
-    // bound plus one for the instruments file.
-    BackupState _backupState    = BackupState::IDLE;
-    BkFileEntry _bkEntries[SRV_MAX_FILES + 1];
-    int         _bkFileCount    = 0;
 
     // Instruments receive buffer
     uint8_t* _instBuf         = nullptr;

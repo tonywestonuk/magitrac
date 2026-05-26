@@ -24,7 +24,6 @@
 
 enum class BRState : uint8_t {
     MENU,
-    BACKUP_WAITING_LIST,
     BACKUP_PROGRESS,
     BACKUP_DONE,
     FOLDER_LIST,
@@ -96,7 +95,6 @@ private:
 
     // Backup logic
     void startBackup();
-    void backupTick();
 
     // Restore logic
     void scanBackupFolders();

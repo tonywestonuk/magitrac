@@ -111,7 +111,6 @@ void BackupRestorePage::draw() {
     _d.fillScreen(COL_WHITE);
     switch (_state) {
         case BRState::MENU:                drawMenu();            break;
-        case BRState::BACKUP_WAITING_LIST: drawBackupProgress();  break;
         case BRState::BACKUP_PROGRESS:     drawBackupProgress();  break;
         case BRState::BACKUP_DONE:         drawBackupDone();      break;
         case BRState::FOLDER_LIST:         drawFolderList();      break;
@@ -156,10 +155,7 @@ void BackupRestorePage::drawBackupProgress() {
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
 
-    if (_state == BRState::BACKUP_WAITING_LIST) {
-        _d.setCursor(250, 200);
-        _d.print("Requesting file list...");
-    } else {
+    {
         // File name
         _d.setCursor(100, 180);
         _d.print("Backing up: ");
@@ -488,120 +484,6 @@ void BackupRestorePage::startBackup() {
     draw(); _d.paintLater();
 }
 
-void BackupRestorePage::backupTick() {
-    BackupState bs = gServerPairing.backupState();
-
-    if (_state == BRState::BACKUP_WAITING_LIST) {
-        if (bs == BackupState::FILE_LIST_READY) {
-            // Single-blob list — all entries arrived in one frame.
-            int count = gServerPairing.backupFileCount();
-            for (int i = 0; i < count && _bkFileTotal < BR_MAX_FILES; i++) {
-                strncpy(_bkFileNames[_bkFileTotal],
-                        gServerPairing.backupFileName(i),
-                        SRV_FNAME_MAX - 1);
-                _bkFileNames[_bkFileTotal][SRV_FNAME_MAX - 1] = '\0';
-                _bkFileTotal++;
-            }
-
-            if (_bkFileTotal == 0) {
-                strncpy(_errMsg, "No files on server", sizeof(_errMsg));
-                _state = BRState::ERROR_SCREEN;
-                draw(); _d.paint();
-                return;
-            }
-
-            // Create backup folder with timestamp
-            if (_rtc) {
-                I2C_BM8563_TimeTypeDef t;
-                I2C_BM8563_DateTypeDef d;
-                _rtc->getTime(&t);
-                _rtc->getDate(&d);
-                int yr = d.year;
-                if (yr > 2000) yr -= 2000;
-                snprintf(_bkFolder, sizeof(_bkFolder),
-                         "%s/bk_%02d%02d%02d_%02d%02d%02d",
-                         BR_BACKUPS_DIR, yr, d.month, d.date,
-                         t.hours, t.minutes, t.seconds);
-            } else {
-                snprintf(_bkFolder, sizeof(_bkFolder),
-                         "%s/bk_%lu", BR_BACKUPS_DIR, millis());
-            }
-            if (!SD.exists(BR_BACKUPS_DIR)) SD.mkdir(BR_BACKUPS_DIR);
-            SD.mkdir(_bkFolder);
-
-            // Start downloading files
-            _bkFileCurrent = 0;
-            _state = BRState::BACKUP_PROGRESS;
-            gServerPairing.resetBackup();
-            gServerPairing.requestBackupFile(_bkFileNames[0]);
-
-#if REPRO_SKIP_EPD_PAINT
-            Serial.println("[BK][REPRO] skip-paint after file-list received");
-#else
-            draw(); _d.paint();
-#endif
-        }
-        return;
-    }
-
-    if (_state == BRState::BACKUP_PROGRESS) {
-        if (bs == BackupState::FILE_RECEIVED) {
-            // Write received file to SD
-            char path[80];
-            snprintf(path, sizeof(path), "%s/%s",
-                     _bkFolder, _bkFileNames[_bkFileCurrent]);
-#if REPRO_SKIP_SD_WRITE
-            Serial.printf("[BK][REPRO] skip-SD '%s' %u bytes  heap=%u  psram=%u\n",
-                          path,
-                          gServerPairing.receivedFileLen(),
-                          (unsigned)ESP.getFreeHeap(),
-                          (unsigned)ESP.getFreePsram());
-#else
-            if (SD.exists(path)) SD.remove(path);
-            File f = SD.open(path, FILE_WRITE);
-            if (f) {
-                f.write(gServerPairing.receivedFileData(),
-                        gServerPairing.receivedFileLen());
-                f.close();
-                Serial.printf("[BK] saved '%s' %u bytes  heap=%u  psram=%u\n",
-                              path,
-                              gServerPairing.receivedFileLen(),
-                              (unsigned)ESP.getFreeHeap(),
-                              (unsigned)ESP.getFreePsram());
-            }
-#endif
-
-            _bkFileCurrent++;
-            if (_bkFileCurrent >= _bkFileTotal || _bkCancelled) {
-                _state = BRState::BACKUP_DONE;
-                gServerPairing.resetBackup();
-                draw(); _d.paint();
-                return;
-            }
-
-            // Brief pacing — spreads the WiFi-TX + EPD-repaint + SD-write peak
-            // current draw across files so we don't brown-out the LilyGo.
-            delay(80);
-
-            // Request next file
-            gServerPairing.resetBackup();
-            gServerPairing.requestBackupFile(_bkFileNames[_bkFileCurrent]);
-
-#if REPRO_SKIP_EPD_PAINT
-            // Per-file progress paint suppressed for EMI/wedge investigation.
-            // BACKUP_DONE paint above still runs.
-            Serial.printf("[BK][REPRO] skip-paint after file %u/%u\n",
-                          _bkFileCurrent, _bkFileTotal);
-#else
-            // Update progress display (partial)
-            _d.fillRect(0, BR_HDR_H, 960, 540 - BR_HDR_H, COL_WHITE);
-            drawBackupProgress();
-            _d.paint();
-#endif
-        }
-    }
-}
-
 // ── Restore logic ────────────────────────────────────────────────────────────
 
 void BackupRestorePage::scanBackupFolders() {
@@ -744,9 +626,8 @@ void BackupRestorePage::restoreTick() {
 // ── Poll ──────────────────────────────────────────────────────────────────────
 
 bool BackupRestorePage::poll() {
-    // Drive backup/restore state machines
-    if (_state == BRState::BACKUP_WAITING_LIST || _state == BRState::BACKUP_PROGRESS)
-        backupTick();
+    // Backup is fully synchronous in startBackup() — no per-tick driver
+    // needed.  Restore still streams file-by-file off the UI loop.
     if (_state == BRState::RESTORE_PROGRESS)
         restoreTick();
 
