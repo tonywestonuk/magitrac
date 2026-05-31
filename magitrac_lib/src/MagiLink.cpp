@@ -17,18 +17,23 @@ static const uint32_t WIFI_WAIT_POLL_MS = 250;   // wait-for-WiFi-ready spacing
 static const uint32_t ACCEPT_POLL_MS    = 50;    // accept() retry on AP
 static const uint32_t CONNECT_RETRY_MS  = 1000;  // connect() retry on STA
 static const uint32_t LINK_POLL_MS      = 100;   // peer.connected() polling
+// Upper bound on a single send().  A half-open socket (peer alive at L2 but
+// not draining its window) makes write() return 0 forever while
+// peer.connected() stays true; without this the worker would spin here
+// holding the mutex until keepalive declares the socket dead (~10s), stalling
+// the whole link.  Reset on every byte of progress, so it bounds stalls, not
+// total transfer time.
+static const uint32_t SEND_TIMEOUT_MS   = 3000;
 
 // TCP keepalive — detects silently-dropped connections (server power-cycle,
 // WiFi blackhole, etc.).  Probes only fire when the link is idle; active
 // data flow proves liveness for free.  Worst-case detection of a dead
-// idle connection: IDLE + INTVL * CNT seconds = 30s.
+// idle connection: IDLE + INTVL * CNT seconds = 10s.
 //
-// 30s gives a real-world out-of-range window enough time to come back
-// without the user losing their session — e.g. moving the LilyGo briefly
-// away from the M5 during a backup and back into range should resume the
-// transfer rather than throw a "connection lost".
-static const int KEEPALIVE_IDLE_S  = 15;
-static const int KEEPALIVE_INTVL_S = 5;
+// Trade-off: a brief WiFi blip (LilyGo moved out of range mid-backup, etc.)
+// has to come back inside this window or the session drops.
+static const int KEEPALIVE_IDLE_S  = 4;
+static const int KEEPALIVE_INTVL_S = 2;
 static const int KEEPALIVE_CNT     = 3;
 
 static void applyTcpKeepalive(WiFiClient& peer) {
@@ -58,30 +63,30 @@ MagiLink gMagiLink;
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
-void MagiLink::beginAp(uint16_t port) {
+void MagiLink::beginAccept(uint16_t port) {
     if (!_impl) _impl = new Impl();
     if (!_impl->mutex) {
         _impl->mutex = xSemaphoreCreateBinary();
         xSemaphoreGive(_impl->mutex);
     }
     if (_impl->task) return;            // already started
-    _role = Role::Ap;
+    _role = Role::Accept;
     _port = port;
-    xTaskCreate(&MagiLink::_trampoline, "magilink_ap",
+    xTaskCreate(&MagiLink::_trampoline, "magilink_acc",
                 LINK_TASK_STACK, this, LINK_TASK_PRIO, &_impl->task);
 }
 
-void MagiLink::beginSta(uint16_t port, IPAddress gateway) {
+void MagiLink::beginConnect(uint16_t port, IPAddress peer) {
     if (!_impl) _impl = new Impl();
     if (!_impl->mutex) {
         _impl->mutex = xSemaphoreCreateBinary();
         xSemaphoreGive(_impl->mutex);
     }
     if (_impl->task) return;
-    _role    = Role::Sta;
-    _port    = port;
-    _gateway = gateway;
-    xTaskCreate(&MagiLink::_trampoline, "magilink_sta",
+    _role = Role::Connect;
+    _port = port;
+    _peer = peer;
+    xTaskCreate(&MagiLink::_trampoline, "magilink_con",
                 LINK_TASK_STACK, this, LINK_TASK_PRIO, &_impl->task);
 }
 
@@ -89,20 +94,31 @@ void MagiLink::beginSta(uint16_t port, IPAddress gateway) {
 
 void MagiLink::_trampoline(void* arg) {
     MagiLink* self = static_cast<MagiLink*>(arg);
-    if (self->_role == Role::Ap)  self->_runApLoop();
-    else                          self->_runStaLoop();
+    if (self->_role == Role::Accept) self->_runAcceptLoop();
+    else                             self->_runConnectLoop();
     // Loops never return; if they ever do, drop the task.
     vTaskDelete(nullptr);
 }
 
-void MagiLink::_runApLoop() {
-    // Wait until softAP has an IP (handles the case where begin() is called
-    // before the AP is fully up).
-    while (WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) {
+// Return the first non-zero local IP we have — either the softAP's IP
+// (if the caller brought up an AP) or the STA's IP (if the caller is
+// associated to an AP).  Used by the accept loop to be topology-agnostic.
+static IPAddress firstLocalIp() {
+    IPAddress ap  = WiFi.softAPIP();
+    if ((uint32_t)ap != 0) return ap;
+    if (WiFi.status() == WL_CONNECTED) return WiFi.localIP();
+    return IPAddress((uint32_t)0);
+}
+
+void MagiLink::_runAcceptLoop() {
+    // Wait until *any* local IP is available — softAP or STA, doesn't
+    // matter to the listener.
+    IPAddress local;
+    while ((uint32_t)(local = firstLocalIp()) == 0) {
         vTaskDelay(pdMS_TO_TICKS(WIFI_WAIT_POLL_MS));
     }
-    Serial.printf("[LINK-AP] listening on %s:%u\n",
-                  WiFi.softAPIP().toString().c_str(), (unsigned)_port);
+    Serial.printf("[LINK-ACC] listening on %s:%u\n",
+                  local.toString().c_str(), (unsigned)_port);
 
     _impl->server = new WiFiServer(_port);
     _impl->server->begin();
@@ -110,15 +126,16 @@ void MagiLink::_runApLoop() {
 
     while (true) {
         // Wait for a client to connect.
-        Serial.println("[LINK-AP] waiting for peer...");
+        Serial.println("[LINK-ACC] waiting for peer...");
         while (true) {
             WiFiClient c = _impl->server->accept();
             if (c) {
                 _impl->peer = c;
                 _impl->peer.setNoDelay(true);
                 applyTcpKeepalive(_impl->peer);
+                _generation++;
                 _connected = true;
-                Serial.printf("[LINK-AP] connected from %s\n",
+                Serial.printf("[LINK-ACC] connected from %s\n",
                               _impl->peer.remoteIP().toString().c_str());
                 break;
             }
@@ -142,26 +159,70 @@ void MagiLink::_runApLoop() {
                 }
             }
             releaseMutex();
-            vTaskDelay(pdMS_TO_TICKS(1));   // tight loop — short yield
+
+            // Preempt-on-new-accept: a fresh client connecting is a perfect
+            // death signal for the current peer.  TCP keepalive would
+            // eventually notice (~14s+, masked by WiFi association hysteresis),
+            // but the new SYN tells us *now*.  Toggle _connected false→true
+            // around the swap so the upper-layer session task (polling
+            // isConnected() at 200ms) sees a falling edge (tears down old
+            // session) followed by a rising edge (does the MSG_CONNECT/ACK
+            // handshake on the new socket).
+            WiFiClient incoming = _impl->server->accept();
+            if (incoming) {
+                Serial.printf("[LINK-ACC] preempted by new peer %s\n",
+                              incoming.remoteIP().toString().c_str());
+                _connected = false;
+                acquireMutex();
+                _impl->peer.stop();
+                _impl->peer = incoming;
+                _impl->peer.setNoDelay(true);
+                applyTcpKeepalive(_impl->peer);
+                releaseMutex();
+                vTaskDelay(pdMS_TO_TICKS(300));   // let session task see edge
+                _generation++;
+                _connected = true;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
 
+        Serial.println("[LINK-ACC] peer disconnected");
         _connected = false;
         _impl->peer.stop();
-        Serial.println("[LINK-AP] peer disconnected — looping back to accept");
     }
 }
 
-void MagiLink::_runStaLoop() {
+void MagiLink::_runConnectLoop() {
     while (true) {
-        // Wait until WiFi STA is associated.
+        // Wait until WiFi STA is associated.  Auto-reconnect alone isn't
+        // enough: if the STA's first reassociation attempt fails (AP not
+        // quite back yet after server reset), arduino-esp32 parks in
+        // WL_CONNECT_FAILED and never tries again.  Kick it explicitly
+        // every 3s while stuck.
+        uint32_t waitStartMs   = millis();
+        uint32_t lastReconnect = 0;
+        bool     waited        = false;
         while (WiFi.status() != WL_CONNECTED) {
+            waited = true;
+            WiFi.setAutoReconnect(true);
+            uint32_t now = millis();
+            if (now - lastReconnect >= 3000) {
+                lastReconnect = now;
+                WiFi.reconnect();
+            }
             vTaskDelay(pdMS_TO_TICKS(WIFI_WAIT_POLL_MS));
+        }
+        if (waited) {
+            Serial.printf("[LINK-CON] WiFi associated after %ums (IP=%s)\n",
+                          (unsigned)(millis() - waitStartMs),
+                          WiFi.localIP().toString().c_str());
         }
 
         // Try to connect (retry indefinitely).
-        Serial.printf("[LINK-STA] connecting to %s:%u\n",
-                      _gateway.toString().c_str(), (unsigned)_port);
-        while (!_impl->peer.connect(_gateway, _port, 5000)) {
+        Serial.printf("[LINK-CON] connecting to %s:%u\n",
+                      _peer.toString().c_str(), (unsigned)_port);
+        while (!_impl->peer.connect(_peer, _port, 5000)) {
             vTaskDelay(pdMS_TO_TICKS(CONNECT_RETRY_MS));
             // If WiFi dropped while we were retrying, jump back to outer
             // wait-for-association loop.
@@ -171,20 +232,23 @@ void MagiLink::_runStaLoop() {
 
         _impl->peer.setNoDelay(true);
         applyTcpKeepalive(_impl->peer);
+        _generation++;
         _connected = true;
-        Serial.printf("[LINK-STA] connected (local=%s)\n",
+        Serial.printf("[LINK-CON] connected (local=%s)\n",
                       WiFi.localIP().toString().c_str());
 
         // Main loop while peer is alive: take mutex, drain one message if
         // there is one, release, yield.  Same shape as AP side.
         //
-        // Liveness is driven by TCP keepalive alone (30s grace).  We
-        // deliberately do NOT exit on WiFi.status() != WL_CONNECTED here —
-        // a brief WiFi blip should leave the socket in place so that when
-        // association recovers, in-flight transactions (e.g. a backup
-        // stream) resume.  If WiFi stays gone past the keepalive window
-        // peer.connected() returns false and we tear down normally.
+        // Exit on EITHER peer.connected() going false OR WiFi association
+        // dropping.  The WiFi check is the client's analog of the server's
+        // preempt-on-accept: if the AP went down (e.g. server reset), L2
+        // tells us instantly, where lwIP keepalive would take 10-30s.
         while (_impl->peer.connected()) {
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.println("[LINK-CON] WiFi disassociated");
+                break;
+            }
             acquireMutex();
             if (_impl->peer.available() > 0) {
                 if (_readMessageRaw()) {
@@ -195,10 +259,9 @@ void MagiLink::_runStaLoop() {
             releaseMutex();
             vTaskDelay(pdMS_TO_TICKS(1));
         }
-
+        Serial.println("[LINK-CON] peer disconnected");
         _connected = false;
         _impl->peer.stop();
-        Serial.println("[LINK-STA] peer disconnected — looping back to connect");
     }
 }
 
@@ -225,30 +288,55 @@ bool MagiLink::send(const void* msg, size_t len) {
     if (!_connected || !_impl) return false;
     if (len == 0 || len > RECV_BUF_BYTES) return false;
 
+    // If this task already holds the mutex it's running an explicit
+    // transaction and owns the lock — leave it held on failure so the
+    // transaction semantics are preserved.  But if send() acquired the mutex
+    // itself, release it on any failure path: otherwise a caller that writes
+    // `if (!send(...)) return;` (forgetting releaseMutex) would wedge the
+    // worker task forever, killing the whole link until reboot.
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    bool weAcquired = (_impl->txHolder != me);
     acquireMutex();
-    if (!_impl->peer.connected()) return false;
+    if (!_impl->peer.connected()) {
+        if (weAcquired) releaseMutex();
+        return false;
+    }
 
     // Write the struct bytes directly — no extra framing prefix.
     size_t off = 0;
     const uint8_t* p = (const uint8_t*)msg;
+    uint32_t lastProgressMs = millis();
     while (off < len) {
         int w = _impl->peer.write(p + off, len - off);
         if (w <= 0) {
-            if (!_impl->peer.connected()) return false;
+            if (!_impl->peer.connected() ||
+                (millis() - lastProgressMs) > SEND_TIMEOUT_MS) {
+                if (weAcquired) releaseMutex();
+                return false;
+            }
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
         off += w;
+        lastProgressMs = millis();   // forward progress resets the stall timer
     }
     return true;
 }
 
 const uint8_t* MagiLink::read() {
     if (!_impl) return nullptr;
+    // Same mutex-ownership rule as send(): release on failure only if read()
+    // took the lock itself, so a missing releaseMutex() at the call site
+    // can't deadlock the link.
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    bool weAcquired = (_impl->txHolder != me);
     acquireMutex();
     // No dispatch here — caller is explicitly draining the response and
     // takes ownership of the message bytes via the returned pointer.
-    if (!_readMessageRaw()) return nullptr;
+    if (!_readMessageRaw()) {
+        if (weAcquired) releaseMutex();
+        return nullptr;
+    }
     return _recvBuf;
 }
 

@@ -48,6 +48,8 @@ public:
 
     void clearLoadedFile() { _loadedFilename[0] = '\0'; }
     void setServerLoadedName(const char* name);   // mark song as loaded from server (enables save)
+    const char* loadedFilename() const { return _loadedFilename; }   // empty if no SD file loaded
+    const char* srvLoadedName() const { return _srvLoadedName; }     // empty if no server file loaded
 
 private:
     EPD_PainterAdafruit& _d;

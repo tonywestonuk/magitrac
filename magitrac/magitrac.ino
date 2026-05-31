@@ -26,11 +26,14 @@
 #include "InstrumentsPage.h"
 #include "SongConfigPage.h"
 #include "ColumnEditor.h"
+#include "DrumTrackImportPage.h"
 #include "SettingsPage.h"
 #include "BackupRestorePage.h"
 #include "PerformancePage.h"
 #include "SetlistPage.h"
+#include "WiFiSettingsPage.h"
 #include "Battery.h"
+#include "Autosave.h"
 #include <SD.h>
 #include <I2C_BM8563.h>
 
@@ -77,10 +80,12 @@ BootMenu           bootMenu(display, touch);
 InstrumentsPage    instrumentsPage(display, touch, gInstruments);
 SongConfigPage     songConfigPage(display, touch, song);
 ColumnEditor       columnEditor(display, touch, song, gInstruments);
+DrumTrackImportPage drumTrackImportPage(display, touch, song);
 PerformancePage    performancePage(display, touch, song);
 SetlistPage        setlistPage(display, touch, song);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
+WiFiSettingsPage   wifiSettingsPage(display, touch);
 BackupRestorePage* backupRestorePage = nullptr;
 
 bool gSdAvailable = false;
@@ -216,11 +221,35 @@ static bool     songPageOpen        = false;
 static bool     instrumentsPageOpen = false;
 static bool     songConfigPageOpen  = false;
 static bool     columnEditorOpen    = false;
+static bool     drumTrackImportOpen = false;
 static bool     noteEditorPageOpen  = false;
-static bool     settingsPageOpen    = false;
+static bool     settingsPageOpen     = false;
+static bool     wifiSettingsPageOpen = false;
 static bool     backupRestorePageOpen = false;
 static bool     performancePageOpen   = false;
 static bool     setlistPageOpen       = false;
+
+// ── Autosave state ───────────────────────────────────────────────────────
+// markSongDirty() is called from ServerPairing::sendSongPatch / sendNoteSet,
+// which sit on every song-mutation path.  30 s after the last edit, if we're
+// idle on the tracker page and there's a loaded SD filename, loop() shows a
+// "Saving..." indicator and writes the song to SD.
+static bool     gSongDirty = false;
+static uint32_t gLastEditMs = 0;
+static const uint32_t AUTOSAVE_DELAY_MS = 30000;
+// After autosave we delay the tracker repaint by ~500 ms so the "Saving..."
+// indicator stays visible (paint() already flushed it).  0 = no pending paint.
+static uint32_t gAutosaveRepaintAtMs    = 0;
+static const uint32_t AUTOSAVE_BANNER_MS = 500;
+
+void markSongDirty() {
+    gSongDirty  = true;
+    gLastEditMs = millis();
+}
+
+void markSongClean() {
+    gSongDirty = false;
+}
 
 // ── Grid pause state ─────────────────────────────────────────────────────
 // When the user touches the grid while the server is playing we PAUSE (not STOP)
@@ -241,10 +270,10 @@ void setup() {
     delay(200);
 
     // Pre-init the WiFi driver BEFORE display.begin() takes LCD_CAM.
-    // This claims WiFi's internal resources (netifs, driver structs)
-    // so that the heavier softAP() call later — after display init —
-    // doesn't hit the ieee80211_hostap_attach panic that was diagnosed
-    // when softAP ran on a fully-initialised LCD_CAM with no WiFi prep.
+    // This claims WiFi's internal resources (netifs, driver structs) so
+    // the WiFi.begin() call later — after display init — doesn't fight
+    // with LCD_CAM for resources.  Keep AP_STA mode so ESP-NOW (for the
+    // pairing ceremony) coexists with the STA association.
     // persistent(false) suppresses WiFi's own NVS writes of SSID/PSK.
     WiFi.persistent(false);
     WiFi.mode(WIFI_AP_STA);
@@ -262,18 +291,36 @@ void setup() {
     display.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
     display.clear();
 
-    // Display is up.  Now bring up the AP and pairing transport.
-    // loadWifiChannel() must run before gServerPairing.begin() so the
-    // SoftAP comes up on the user-persisted channel — not channel 1.
-    // If we reach here, display.begin() did NOT take the shutdown path
-    // (which is [[noreturn]]), so we're committed to a full boot.
-    loadWifiChannel();
+    // Display is up.  Bring up the pairing transport + (if paired) the
+    // WiFi STA association to the server's AP.  Server is the AP at
+    // 192.168.0.1; we get the static slot 192.168.0.2 issued at pair time.
+    loadWifiChannel();   // populates gWifiChannelIdx for the settings UI
     gServerPairing.begin();
 
     // ── MagiLink (reliable TCP transport) ───────────────────────────────────
-    // Listens on MAGI_PORT (4242) — the UDP companion uses the same number
-    // on the disjoint UDP namespace.
-    gMagiLink.beginAp(MAGI_PORT);
+    // Client is always a STA at MAGI_CLIENT_IP regardless of apMode —
+    // the mode only tells the server what to do.  No creds → no
+    // MagiLink (user must pair first).
+    {
+        char    creds_ssid[33] = {};
+        char    creds_psk[64]  = {};
+        uint8_t apMode         = 0;
+        if (pairNvsLoadCreds("magitrac_cli", creds_ssid, creds_psk, &apMode)) {
+            Serial.printf("[SETUP] WiFi creds present — STA→%s (apMode=%u)\n",
+                creds_ssid, (unsigned)apMode);
+            WiFi.config(IPAddress(MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1,
+                                  MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3),
+                        IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                  MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                        IPAddress(255, 255, 255, 0));
+            WiFi.begin(creds_ssid, creds_psk);
+            gMagiLink.beginConnect(MAGI_PORT,
+                IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                          MAGI_SERVER_IP_2, MAGI_SERVER_IP_3));
+        } else {
+            Serial.println("[SETUP] no WiFi creds — open WiFi page + pair to connect");
+        }
+    }
 
     // Backlight — only available on LilyGo T5 boards (BOARD_BL_EN conflicts
     // with display pins on M5PaperS3)
@@ -446,6 +493,66 @@ void loop() {
         display.paintLater();
     }
 
+    // ── Deferred post-autosave repaint ───────────────────────────────────────
+    // Fires AUTOSAVE_BANNER_MS after the autosave finished, replacing the
+    // "Saving..." indicator with the freshly-drawn tracker UI.
+    if (gAutosaveRepaintAtMs != 0 && now >= gAutosaveRepaintAtMs) {
+        gAutosaveRepaintAtMs = 0;
+        display.paintLater();
+    }
+
+    // ── Autosave tick ────────────────────────────────────────────────────────
+    // Fires only when sitting idle on the tracker page (no overlay open) with
+    // a known server filename, paired, and 30 s have passed since the last
+    // edit.  Edits mark dirty via markSongDirty() called from
+    // ServerPairing::sendSongPatch / sendNoteSet — they sit on every
+    // song-mutation path.  The save streams the song to the server, which
+    // writes its own SD copy (the source of truth).
+    if (gSongDirty && (now - gLastEditMs >= AUTOSAVE_DELAY_MS) &&
+        gServerPairing.isPaired() && gMagiLink.isConnected() &&
+        !bootMenu.isOpen() && !gPairingUiOpen &&
+        !songPageOpen && !instrumentsPageOpen && !songConfigPageOpen &&
+        !columnEditorOpen && !noteEditorPageOpen && !settingsPageOpen &&
+        !wifiSettingsPageOpen && !backupRestorePageOpen &&
+        !drumTrackImportOpen &&
+        !performancePageOpen && !setlistPageOpen &&
+        !noteEditor.isOpen() &&
+        pageManager.currentPage() == Page::TRACKER) {
+        const char* srvName = songPage.srvLoadedName();
+        if (srvName && srvName[0]) {
+            // Small "Saving..." indicator overlaid on the bottom-left corner.
+            const int bx = 8, by = 506, bw = 130, bh = 28;
+            display.fillRect(bx, by, bw, bh, COL_WHITE);
+            display.drawRect(bx, by, bw, bh, COL_BLACK);
+            display.setTextSize(2);
+            display.setTextColor(COL_BLACK);
+            display.setCursor(bx + 14, by + 7);
+            display.print("Saving...");
+            display.paint();   // synchronous — make sure the indicator is visible
+
+            // Tiny "save your in-memory song to SD under this name" — the
+            // server already has every edit via the patch / note-set stream,
+            // so we don't need to ship the song bytes again.
+            bool ok = gServerPairing.sendSaveActive(srvName);
+            if (ok) gSongDirty = false;
+            // If !ok (link dropped between the isConnected() gate and here)
+            // push the retry out a full AUTOSAVE_DELAY_MS instead of leaving
+            // it dirty — otherwise we'd re-attempt and re-paint the
+            // synchronous "Saving..." banner on every loop iteration until
+            // the link returns (an e-paper repaint storm).
+            else    gLastEditMs = now;
+
+            // Stage the tracker UI back into the framebuffer, but don't
+            // flush yet — the display still shows the "Saving..." indicator
+            // from the synchronous paint() above.  We let it sit for
+            // AUTOSAVE_BANNER_MS, then a later loop tick fires paintLater
+            // to push the framebuffer (which clears the indicator).
+            ui.drawAll();
+            gAutosaveRepaintAtMs = millis() + AUTOSAVE_BANNER_MS;
+        }
+        // No server filename: leave dirty; user can Save As to give it one.
+    }
+
     // ── Boot menu overlay ─────────────────────────────────────────────────────
     if (bootMenu.isOpen()) {
         BootMenuResult bmr = bootMenu.poll();
@@ -581,9 +688,15 @@ void loop() {
                 gSongSource = SongSource::SD;
                 songPage.clearLoadedFile();
             }
-            // Stay on PerformancePage with the freshly-loaded song.
+            // Stay on PerformancePage with the freshly-loaded song,
+            // and start the server playing — the user picked a song to
+            // perform, not to inspect.  Server-side song load stops the
+            // sequencer, so serverPlaying() will be false here.
             performancePage.open(engine.currentPattern());
             performancePage.setTitleOverride(setlistPage.loadedDisplayName());
+            if (gServerPairing.isPaired()) {
+                gServerPairing.sendControl(MSG_PLAY);
+            }
             display.clear();
             performancePage.draw();
             display.paint();
@@ -681,12 +794,37 @@ void loop() {
         return;
     }
 
+    // ── WiFi settings page ────────────────────────────────────────────────────
+    if (wifiSettingsPageOpen) {
+        if (wifiSettingsPage.poll()) {
+            wifiSettingsPageOpen = false;
+            if (settingsPageOpen && settingsPage) {
+                // Return to the parent SettingsPage.
+                display.clear();
+                settingsPage->draw();
+                display.paintLater();
+            } else {
+                display.clear();
+                ui.drawAll();
+                display.paintLater();
+            }
+        }
+        return;
+    }
+
     // ── Settings page ─────────────────────────────────────────────────────────
     if (settingsPageOpen && settingsPage) {
-        if (settingsPage->poll()) {
+        int rc = settingsPage->poll();
+        if (rc == 1) {
             settingsPageOpen = false;
             display.clear();
             ui.drawAll();
+            display.paintLater();
+        } else if (rc == 2) {
+            wifiSettingsPageOpen = true;
+            wifiSettingsPage.open();
+            display.clear();
+            wifiSettingsPage.draw();
             display.paintLater();
         }
         return;
@@ -710,7 +848,7 @@ void loop() {
         if (gServerPairing.isPaired() && columnEditor.resyncMask()) {
             // After COPY / SWAP / CLEAR: push settings + every cell of every
             // affected column across all patterns up to its used length.
-            uint16_t mask = columnEditor.resyncMask();
+            uint32_t mask = columnEditor.resyncMask();
             for (uint8_t c = 0; c < MAX_COLUMNS; c++) {
                 if (!(mask & (1u << c))) continue;
                 const uint8_t* colStart = (const uint8_t*)&song.columns[c];
@@ -733,6 +871,48 @@ void loop() {
         }
         if (columnEditor.poll()) {
             columnEditorOpen = false;
+            if (columnEditor.importRequested()) {
+                columnEditor.clearImportRequest();
+                drumTrackImportOpen = true;
+                drumTrackImportPage.open(columnEditor.editPattern(),
+                                          columnEditor.editCol());
+            } else {
+                display.clear();
+                ui.drawAll();
+                display.paintLater();
+            }
+        }
+        return;
+    }
+
+    // ── Drum-track import page ─────────────────────────────────────────────
+    if (drumTrackImportOpen) {
+        if (drumTrackImportPage.poll()) {
+            // On successful import, push every changed column's settings
+            // (midiChannel + name) AND notes (this pattern only) to the server.
+            if (gServerPairing.isPaired() && drumTrackImportPage.importDidComplete()) {
+                uint32_t mask = drumTrackImportPage.resyncMask();
+                uint8_t pat = columnEditor.editPattern();
+                uint8_t len = song.patterns[pat].length;
+                for (uint8_t c = 0; c < MAX_COLUMNS; c++) {
+                    if (!(mask & (1u << c))) continue;
+                    const uint8_t* colStart = (const uint8_t*)&song.columns[c];
+                    uint16_t colSize = (uint16_t)sizeof(ColumnSettings);
+                    uint16_t off = 0;
+                    while (off < colSize) {
+                        uint8_t chunk = (colSize - off) > SONG_PATCH_MAX
+                                      ? SONG_PATCH_MAX : (uint8_t)(colSize - off);
+                        gServerPairing.sendSongPatch(song, colStart + off, chunk);
+                        off += chunk;
+                    }
+                    for (uint8_t r = 0; r < len; r++) {
+                        gServerPairing.sendNoteSet(song, pat, r, c);
+                    }
+                }
+                markSongDirty();
+            }
+            drumTrackImportPage.clearResync();
+            drumTrackImportOpen = false;
             display.clear();
             ui.drawAll();
             display.paintLater();

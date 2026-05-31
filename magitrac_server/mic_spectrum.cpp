@@ -11,6 +11,7 @@
 // the legacy and new I²S drivers in the same firmware.
 
 #include "mic_spectrum.h"
+#include "SamplePlayer.h"     // samplePlayerReleaseDac (I²S0 mutex with DAC)
 #include <Arduino.h>
 #include <math.h>
 #include <ESP_I2S.h>
@@ -23,17 +24,21 @@
 #define PDM_CLK_PIN     22     // Grove Port A — G22 → PDM clock (out, ~2 MHz)
 #define PDM_DATA_PIN    21     // Grove Port A — G21 → PDM data  (in from mic)
 #define SAMPLE_RATE     32000
-#define SAMPLES_PER_READ 2048
+// 1024 (was 2048): halves the working-set by 10 KB.  Frequency bin width
+// goes from ~15.6 Hz to ~31.25 Hz — still plenty for the 5 octave bands
+// starting at 130 Hz — and the frame rate doubles to ~31 Hz, which
+// slightly *improves* beat-detection latency.
+#define SAMPLES_PER_READ 1024
 
 extern void pixelpostEnqueue(const uint8_t* payload, size_t len);
 
-// Static so they live in BSS, not on the task stack — 16 KB for the two
-// float arrays plus 4 KB for the int16 sample buffer.
-static float   vReal[SAMPLES_PER_READ];
-static float   vImag[SAMPLES_PER_READ];
-static int16_t samples[SAMPLES_PER_READ];
-
-static ArduinoFFT<float> FFT(vReal, vImag, SAMPLES_PER_READ, (float)SAMPLE_RATE);
+// Heap-allocated in startMic / freed in stopMic.  10 KB total (4 KB each
+// for vReal/vImag floats + 2 KB for the int16 sample buffer) — kept off
+// BSS so they cost nothing while the mic is idle.
+static float*             vReal   = nullptr;
+static float*             vImag   = nullptr;
+static int16_t*           samples = nullptr;
+static ArduinoFFT<float>* FFT     = nullptr;
 
 static I2SClass          I2S;
 static SemaphoreHandle_t sActiveSem = nullptr;
@@ -64,12 +69,35 @@ static float bandMagnitude(float fLow, float fHigh) {
     return sum / (float)(k1 - k0 + 1);
 }
 
+static void freeMicBuffers() {
+    delete FFT;     FFT     = nullptr;
+    free(vReal);    vReal   = nullptr;
+    free(vImag);    vImag   = nullptr;
+    free(samples);  samples = nullptr;
+}
+
 static bool startMic() {
     if (sI2sUp) return true;
+    // SamplePlayer may be holding a dac_continuous channel on I²S0.
+    // Release it before claiming I²S0 for PDM RX — the DAC reallocates
+    // lazily on the next samplePlayerPlay.
+    samplePlayerReleaseDac();
+
+    vReal   = (float*)  malloc(SAMPLES_PER_READ * sizeof(float));
+    vImag   = (float*)  malloc(SAMPLES_PER_READ * sizeof(float));
+    samples = (int16_t*)malloc(SAMPLES_PER_READ * sizeof(int16_t));
+    if (!vReal || !vImag || !samples) {
+        Serial.println("[MIC] buffer alloc FAILED");
+        freeMicBuffers();
+        return false;
+    }
+    FFT = new ArduinoFFT<float>(vReal, vImag, SAMPLES_PER_READ, (float)SAMPLE_RATE);
+
     I2S.setPinsPdmRx(PDM_CLK_PIN, PDM_DATA_PIN);
     if (!I2S.begin(I2S_MODE_PDM_RX, SAMPLE_RATE,
                    I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO)) {
         Serial.println("[MIC] I2S.begin FAILED");
+        freeMicBuffers();
         return false;
     }
     sI2sUp = true;
@@ -81,6 +109,7 @@ static void stopMic() {
     if (!sI2sUp) return;
     I2S.end();
     sI2sUp = false;
+    freeMicBuffers();
     Serial.println("[MIC] stopped");
 }
 
@@ -105,9 +134,9 @@ static void spectrumTask(void*) {
             vImag[i] = 0.0f;
         }
 
-        FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
-        FFT.compute(FFTDirection::Forward);
-        FFT.complexToMagnitude();
+        FFT->windowing(FFTWindow::Hamming, FFTDirection::Forward);
+        FFT->compute(FFTDirection::Forward);
+        FFT->complexToMagnitude();
 
         // ── Beat detection (Patin-style energy threshold on bass band) ───
         // Raw 50–200 Hz magnitude — captures kick fundamental + 1st harmonic
@@ -182,4 +211,14 @@ void spectrumSetActive(bool active) {
     if (active == sActive) return;
     sActive = active;
     if (active) xSemaphoreGive(sActiveSem);
+}
+
+bool spectrumIsActive()  { return sActive; }
+bool spectrumIsRunning() { return sI2sUp; }
+
+void spectrumWaitStopped(uint32_t timeout_ms) {
+    uint32_t deadline = millis() + timeout_ms;
+    while (sI2sUp && (int32_t)(millis() - deadline) < 0) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 }

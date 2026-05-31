@@ -1,4 +1,11 @@
-# MagiTrac — Server (MIDI player)
+# MagiTrac — Server (MIDI player)  ⚠️ SUNSET
+
+> **SUNSET 2026-05-31.** This M5Stack Core Basic / ESP32-classic build is a
+> frozen fall-back, kept only for reference. The live server is
+> **`magitrac_server_s3/`** (M5Stack CoreS3 + Module Audio v2.2 / ES8388
+> full-duplex codec). Land all server-side changes in that sketch; treat this
+> tree as read-only history. Note the S3 codec is full-duplex, so the I²S0
+> mic↔sample-player mutual-exclusion documented below no longer applies there.
 
 The playback half of MagiTrac, running on an **M5Stack Core Basic** (ESP32).
 Receives the song from the LilyGo client over ESP-NOW, runs the sequencer,

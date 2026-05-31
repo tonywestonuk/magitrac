@@ -340,27 +340,29 @@ void BlockSettingsPage::drawEndNavRow() {
     _d.print("NEXT:");
 
     uint8_t nav  = pat().blockEndNav;
+    bool    isRnt = (nav == NAV_RNT);
     uint8_t mode = nav & NAV_MODE_MASK;
 
     btn(BSP_END_LOOP_X, btnY, BSP_END_LOOP_W, BSP_BTN_H, "LOOP",
-        mode == NAV_LOOP);
+        !isRnt && mode == NAV_LOOP);
     btn(BSP_END_FWD_X, btnY, BSP_END_FWD_W, BSP_BTN_H, "FWD",
-        mode == NAV_FWD);
+        !isRnt && mode == NAV_FWD);
     btn(BSP_END_BACK_X, btnY, BSP_END_BACK_W, BSP_BTN_H, "BACK",
-        mode == NAV_BACK);
+        !isRnt && mode == NAV_BACK);
     btn(BSP_END_ABS_X, btnY, BSP_END_ABS_W, BSP_BTN_H, "ABS",
-        mode == NAV_ABS);
+        !isRnt && mode == NAV_ABS);
+    btn(BSP_END_RNT_X, btnY, BSP_END_RNT_W, BSP_BTN_H, "RNT", isRnt);
 
-    bool active = (mode != NAV_LOOP);
+    // Value cell only active for FWD / BACK / ABS — LOOP and RNT carry no target.
+    bool active = !isRnt && (mode != NAV_LOOP);
     uint8_t target = nav & NAV_TARGET_MASK;
 
     btn(BSP_END_MINUS_X, btnY, BSP_END_ARROW_W, BSP_BTN_H, "-", false, !active);
 
     char val[4];
-    if (mode == NAV_ABS)
-        snprintf(val, sizeof(val), "%02d", target + 1);  // 1-based display
-    else
-        snprintf(val, sizeof(val), "%d", target);
+    if (!active)            val[0] = '\0';
+    else if (mode == NAV_ABS) snprintf(val, sizeof(val), "%02d", target + 1);
+    else                      snprintf(val, sizeof(val), "%d", target);
 
     _d.fillRect(BSP_END_VAL_X, btnY, BSP_END_VAL_W, BSP_BTN_H, active ? 0 : 1);
     _d.drawRect(BSP_END_VAL_X, btnY, BSP_END_VAL_W, BSP_BTN_H, active ? 3 : 1);
@@ -679,8 +681,10 @@ bool BlockSettingsPage::poll() {
     // ── End-nav row (NEXT BLK) ───────────────────────────────────────────────
     if (ty >= BSP_END_Y && ty < BSP_END_Y + BSP_END_H) {
         uint8_t nav    = pat().blockEndNav;
+        bool    isRnt  = (nav == NAV_RNT);
         uint8_t mode   = nav & NAV_MODE_MASK;
-        uint8_t target = nav & NAV_TARGET_MASK;
+        // RNT has no target — treat it as 0 when re-encoding into another mode.
+        uint8_t target = isRnt ? 0 : (nav & NAV_TARGET_MASK);
 
         if (tx >= BSP_END_LOOP_X && tx < BSP_END_LOOP_X + BSP_END_LOOP_W) {
             pat().blockEndNav = NAV_LOOP;
@@ -702,7 +706,12 @@ bool BlockSettingsPage::poll() {
             _navChangePending = true; _navChangePat = _patIdx;
             drawEndNavRow(); _d.paint();
 
-        } else if (mode != NAV_LOOP) {
+        } else if (tx >= BSP_END_RNT_X && tx < BSP_END_RNT_X + BSP_END_RNT_W) {
+            pat().blockEndNav = NAV_RNT;
+            _navChangePending = true; _navChangePat = _patIdx;
+            drawEndNavRow(); _d.paint();
+
+        } else if (!isRnt && mode != NAV_LOOP) {
             if (tx >= BSP_END_MINUS_X && tx < BSP_END_MINUS_X + BSP_END_ARROW_W) {
                 if (target > 0) {
                     pat().blockEndNav = mode | (target - 1);

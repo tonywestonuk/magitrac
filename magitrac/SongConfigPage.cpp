@@ -19,6 +19,7 @@ SongConfigPage::SongConfigPage(EPD_PainterAdafruit& display, GT911_Lite& touch,
     , _song(song)
     , _wasDown(false)
     , _patchPending(false)
+    , _picker(display, touch)
 {}
 
 // ── open / draw ───────────────────────────────────────────────────────────────
@@ -116,13 +117,24 @@ void SongConfigPage::drawMidiInRow(int field) {
 
     char val[8];
     midiInValue(field, val);
-    _d.drawRect(SC_ROW_VAL_X, btnY, SC_ROW_VAL_W, SC_ROW_BTN_H, COL_BLACK);
-    int vw = (int)strlen(val) * 18;
-    _d.setCursor(SC_ROW_VAL_X + (SC_ROW_VAL_W - vw) / 2, btnY + (SC_ROW_BTN_H - 24) / 2);
-    _d.print(val);
 
-    uiButton(_d, SC_ROW_MINUS_X, btnY, SC_ROW_BTN_W, SC_ROW_BTN_H, "-", COL_WHITE, COL_BLACK, 3);
-    uiButton(_d, SC_ROW_PLUS_X,  btnY, SC_ROW_BTN_W, SC_ROW_BTN_H, "+", COL_WHITE, COL_BLACK, 3);
+    if (field == 0) {
+        // CHANNEL — keep the +/- stepper.
+        _d.drawRect(SC_ROW_VAL_X, btnY, SC_ROW_VAL_W, SC_ROW_BTN_H, COL_BLACK);
+        int vw = (int)strlen(val) * 18;
+        _d.setCursor(SC_ROW_VAL_X + (SC_ROW_VAL_W - vw) / 2,
+                     btnY + (SC_ROW_BTN_H - 24) / 2);
+        _d.print(val);
+        uiButton(_d, SC_ROW_MINUS_X, btnY, SC_ROW_BTN_W, SC_ROW_BTN_H,
+                 "-", COL_WHITE, COL_BLACK, 3);
+        uiButton(_d, SC_ROW_PLUS_X,  btnY, SC_ROW_BTN_W, SC_ROW_BTN_H,
+                 "+", COL_WHITE, COL_BLACK, 3);
+    } else {
+        // NOTE LOW / NOTE HIGH — single wide tappable button opens picker.
+        int x = SC_ROW_VAL_X;
+        int w = SC_ROW_PLUS_X + SC_ROW_BTN_W - SC_ROW_VAL_X;
+        uiButton(_d, x, btnY, w, SC_ROW_BTN_H, val, COL_WHITE, COL_BLACK, 3);
+    }
 }
 
 // ── Slot Enable section ──────────────────────────────────────────────────────
@@ -227,6 +239,28 @@ void SongConfigPage::fireHeld() {
 
 bool SongConfigPage::poll() {
 
+    // ── Note picker overlay takes precedence ──────────────────────────────────
+    if (_pickerField >= 0) {
+        if (_picker.poll()) {
+            if (_picker.accepted()) {
+                uint8_t v = _picker.value();
+                if (_pickerField == 1) {
+                    if (v > _song.midiInNoteMax) v = _song.midiInNoteMax;
+                    _song.midiInNoteMin = v;
+                } else if (_pickerField == 2) {
+                    if (v < _song.midiInNoteMin) v = _song.midiInNoteMin;
+                    _song.midiInNoteMax = v;
+                }
+                _patchPending = true;
+            }
+            _pickerField = -1;
+            _wasDown     = _touch.isTouched;
+            draw();
+            _d.paintLater();
+        }
+        return false;
+    }
+
     // ── Hold-repeat ───────────────────────────────────────────────────────────
     if (_wasDown && _hold.active() && _hold.tickSlow()) fireHeld();
 
@@ -242,8 +276,8 @@ bool SongConfigPage::poll() {
         int fi;
         if      ((fi = hitRowMinus(SC_BPM_Y, SC_BPM_ROW_H, SC_NUM_BPM, sx, sy)) >= 0) _hold.start(fi, -1, 1);
         else if ((fi = hitRowPlus (SC_BPM_Y, SC_BPM_ROW_H, SC_NUM_BPM, sx, sy)) >= 0) _hold.start(fi, +1, 1);
-        else if ((fi = hitRowMinus(SC_MI_Y,  SC_MI_ROW_H,  SC_NUM_MI,  sx, sy)) >= 0) _hold.start(fi, -1, 2);
-        else if ((fi = hitRowPlus (SC_MI_Y,  SC_MI_ROW_H,  SC_NUM_MI,  sx, sy)) >= 0) _hold.start(fi, +1, 2);
+        else if ((fi = hitRowMinus(SC_MI_Y,  SC_MI_ROW_H,  1,          sx, sy)) >= 0) _hold.start(fi, -1, 2);
+        else if ((fi = hitRowPlus (SC_MI_Y,  SC_MI_ROW_H,  1,          sx, sy)) >= 0) _hold.start(fi, +1, 2);
         return false;
     }
 
@@ -253,6 +287,20 @@ bool SongConfigPage::poll() {
         _hold.release();
 
         if (hitHome(sx, sy)) return true;
+
+        // NOTE LOW / NOTE HIGH row tap → open picker
+        for (int f = 1; f <= 2; f++) {
+            int rowY = SC_MI_Y + f * SC_MI_ROW_H;
+            if (sy >= rowY && sy < rowY + SC_MI_ROW_H) {
+                _pickerField = f;
+                uint8_t initial = (f == 1) ? _song.midiInNoteMin : _song.midiInNoteMax;
+                const char* title = (f == 1) ? "MIDI-IN NOTE LOW" : "MIDI-IN NOTE HIGH";
+                _picker.open(initial, 0, 127, title);
+                _picker.draw();
+                _d.paintLater();
+                return false;
+            }
+        }
 
         // Slot toggle (falling edge only, no hold-repeat)
         int slot = hitSlot(sx, sy);

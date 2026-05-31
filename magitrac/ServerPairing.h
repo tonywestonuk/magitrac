@@ -31,6 +31,26 @@ enum class SampleListState : uint8_t {
     ERROR,
 };
 
+enum class FileListState : uint8_t {
+    IDLE,
+    WAITING,    // request sent, waiting for first MSG_FILE_LIST_RESP
+    PARTIAL,    // got some pages, more to come
+    READY,      // all pages received
+    ERROR,
+};
+
+enum class FileLoadState : uint8_t {
+    IDLE,
+    WAITING_HEADER,  // request sent, waiting for MSG_FILE_LOAD_HEADER
+    WAITING_BODY,    // got HEADER, accumulating BODY chunks
+    READY,           // EndOfData received, buffer ready to consume
+    NOT_FOUND,       // server returned found=0
+    ERROR,
+};
+
+#define FILE_LIST_CACHE_MAX 64   // ceiling on names cached client-side
+#define FILE_LOAD_BUF_MAX   8192 // ceiling on a single fetched file
+
 // Upper bound on samples we cache client-side.  Sized for the editor picker;
 // matches PROG range (1..127) + 1 reserved slot for "no sample".
 #define SAMPLE_CACHE_MAX 128
@@ -74,12 +94,22 @@ public:
     // ── Server file write / delete ────────────────────────────────────────────
     bool sendSongToServer(const char* name, const Song* song);
     bool deleteSongOnServer(const char* name);
+    // Tell the server to write its current in-memory song to SD under `name`.
+    // Cheap (one small message) — server already has the song bytes thanks
+    // to the patch / note-set stream.  Used by autosave.
+    bool sendSaveActive(const char* name);
+    // Tell the server to call initSong() on its in-memory copy — keeps
+    // client and server in sync after the user creates a new blank song.
+    bool sendNewSong();
 
     // ── Live song sync ────────────────────────────────────────────────────────
     bool sendSongPatch(const Song& song, const void* fieldPtr, uint8_t length);
     bool sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, uint8_t col);
     bool sendNoteSetReliable(const Song& song, uint8_t pattern, uint8_t row, uint8_t col);
     bool sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col);
+    // Fire a raw MIDI note-on (no note-off).  Used by DrumTrackImportPage to
+    // audition drum blocks before import.
+    bool sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity);
 
     // ── Instruments sync ─────────────────────────────────────────────────────
     void requestInstruments();
@@ -103,6 +133,26 @@ public:
     // Look up filename for a stable id (1..127) in the cache.  Returns nullptr
     // if not present (id 0 = "no sample", or cache not fetched).
     const char* sampleListNameFor(uint8_t id) const;
+
+    // ── Generic server-SD file fetch ────────────────────────────────────────
+    // `kind` is a FileKind enum value; the server holds the actual SD path
+    // whitelist.  Used by DrumTrackImportPage and (planned) any future PC
+    // tool that wants to enumerate / download server files.  List is paged;
+    // load is a chunked stream terminated by MsgEndOfData.  Buffer caps at
+    // FILE_LOAD_BUF_MAX bytes — anything larger is rejected ERROR.
+    void requestFileList(uint8_t kind, uint8_t page = 0);
+    void resetFileList();
+    FileListState fileListState()      const { return _fileListState; }
+    int           fileListCount()      const { return _fileListCount; }
+    const char*   fileListName(int i)  const {
+        return (i >= 0 && i < _fileListCount) ? _fileListNames[i] : nullptr;
+    }
+
+    void requestFileLoad(uint8_t kind, const char* name);
+    void resetFileLoad();
+    FileLoadState   fileLoadState() const { return _fileLoadState; }
+    const uint8_t*  fileLoadData()  const { return _fileLoadBuf; }
+    uint32_t        fileLoadLen()   const { return _fileLoadBufLen; }
 
     // ── Restore ───────────────────────────────────────────────────────────────
     bool sendRestoreFile(const char* name, bool isInstruments,
@@ -173,6 +223,11 @@ public:
     // MagiLink sample list response (server → client).  Appends to the
     // cache; if more pages are pending, sends a request for the next.
     void _onMagiLinkSampleList(const uint8_t* msg, size_t len);
+    // MagiLink generic file list response.  Same paging pattern as samples.
+    void _onMagiLinkFileList(const uint8_t* msg, size_t len);
+    // MagiLink generic file load dispatcher: handles HEADER, BODY chunks,
+    // and the trailing MsgEndOfData (id byte routed in).
+    void _onMagiLinkFileLoad(const uint8_t* msg, size_t len);
 
 private:
     void _setPairState(PairClientState s);
@@ -192,25 +247,11 @@ private:
     uint8_t _storedServerMac[6]  = {};
     uint8_t _storedSecret[16]    = {};
 
-    // Client-owned AP info — generated once on first boot, persisted forever.
-    // Handed to the server inside MsgPairOffer so it can STA-join the AP.
-    // _nextHostOctet is the next static IP to allocate (starts at 3 — .1 is
-    // the AP itself, .2 is reserved for magitrac_server).
-    char    _apSsid[33]    = {};
-    char    _apPsk[64]     = {};
-    uint8_t _nextHostOctet = 3;
-
-    // TCP/IP diagnostic test — receiver just counts, no buffering needed
-    uint32_t _tcpTestBlobCount = 0;
-    uint64_t _tcpTestByteCount = 0;
-
-    // Pairing ceremony
+    // Pairing ceremony — PIN received from the server in MSG_PAIR_CHALLENGE.
     uint8_t _pairCode[4] = {};
-    // Set by the PROBE handler; consumed by tick().  Sending the CHALLENGE
-    // from inside the ESP-NOW recv callback would block waiting for the
-    // send-cb on the same WiFi task, so the ACK always times out.  Defer
-    // to the main loop instead.
-    bool    _challengePending = false;
+
+    // PROBE broadcast pacing.  Pairing is always on ch1 — no channel hop.
+    uint32_t _scanLastProbeMs  = 0;
 
     // Browse
     BrowseState _browseState      = BrowseState::IDLE;
@@ -261,6 +302,21 @@ private:
     int              _sampleTotal     = 0;
     uint8_t          _samplePage      = 0;
     uint8_t          _sampleTotalPages = 0;
+
+    // Generic file-server list cache + per-file load buffer.
+    FileListState _fileListState  = FileListState::IDLE;
+    uint8_t       _fileListKind   = 0;
+    char          _fileListNames[FILE_LIST_CACHE_MAX][FILE_NAME_LEN];
+    int           _fileListCount  = 0;
+    uint8_t       _fileListPage   = 0;
+    uint8_t       _fileListTotalPages = 0;
+
+    FileLoadState _fileLoadState   = FileLoadState::IDLE;
+    uint8_t       _fileLoadKind    = 0;
+    uint8_t       _fileLoadBuf[FILE_LOAD_BUF_MAX] = {};
+    uint32_t      _fileLoadBufLen  = 0;
+    uint32_t      _fileLoadExpected = 0;
+    char          _fileLoadName[FILE_NAME_LEN] = {};
 
     static const uint32_t CONNECT_TIMEOUT_MS    = 10000;
     static const uint32_t AUTO_CONNECT_RETRY_MS  = 5000;

@@ -12,6 +12,33 @@
 // coexist).
 #define MAGI_PORT 4242
 
+// ── Network topology constants ──────────────────────────────────────────────
+//
+// Server and client always sit at these IPs regardless of who hosts the AP.
+// In SERVER_AP mode the server is also the AP (so the softAP IP == server IP).
+// In EXTERNAL_AP mode both devices are STAs against an external AP that must
+// live on the 192.168.0.0/24 subnet and avoid .1/.2.
+//
+// Octet arrays for use with PairNVS / WiFi.config (which take 4-byte arrays).
+#define MAGI_SERVER_IP_0  192
+#define MAGI_SERVER_IP_1  168
+#define MAGI_SERVER_IP_2  0
+#define MAGI_SERVER_IP_3  1
+#define MAGI_CLIENT_IP_0  192
+#define MAGI_CLIENT_IP_1  168
+#define MAGI_CLIENT_IP_2  0
+#define MAGI_CLIENT_IP_3  2
+
+// ── AP topology mode ────────────────────────────────────────────────────────
+//
+// Lives in MsgPairOffer + per-device NVS.  Tells the server whether it
+// should host an AP itself or join an external one.  The client is
+// always a STA — it doesn't branch on this value at boot.
+enum MagiApMode : uint8_t {
+    MAGI_AP_MODE_SERVER   = 0,  // server hosts the AP at MAGI_SERVER_IP
+    MAGI_AP_MODE_EXTERNAL = 1,  // external AP; server joins as STA
+};
+
 // ── Message types ─────────────────────────────────────────────────────────────
 enum MagiMsgType : uint8_t {
     // MagiLink session
@@ -19,15 +46,22 @@ enum MagiMsgType : uint8_t {
     MSG_CONNECT_ACK  = 0x03,  // client → server: "ack"
     MSG_DISCONNECT   = 0x04,  // either → other:  "ending session"
 
-    // Pairing ceremony (one-time setup, over ESP-NOW).  Server scans
-    // channels 1/6/11 broadcasting MSG_PAIR_PROBE; magitrac client (when
-    // in pair mode) replies with MSG_PAIR_CHALLENGE carrying a 4-digit
-    // PIN it generated.  User confirms on magitrac; magitrac then
-    // unicasts MSG_PAIR_OFFER with the AP creds + static IP.  Server
-    // saves to NVS and reboots into TCP-STA mode.
-    MSG_PAIR_PROBE     = 0x07,  // server → broadcast: "magitrac, are you there?"
-    MSG_PAIR_CHALLENGE = 0x08,  // client → server:    PIN to display + confirm
-    MSG_PAIR_OFFER     = 0x0B,  // client → server:    AP creds + assigned IP
+    // Pairing ceremony (one-time setup, over ESP-NOW, always on ch1).
+    // The client owns the WiFi credentials (set via the WiFi settings
+    // page on the touch screen) and ships them to the server in OFFER.
+    //
+    //   1. Client (pair mode) sits on ch1, broadcasts MSG_PAIR_PROBE.
+    //   2. Server (pair mode) sits on ch1 listening.  On PROBE: gen PIN,
+    //      unicast MSG_PAIR_CHALLENGE back, display PIN on LCD.
+    //   3. Client displays the received PIN on the touch screen.  User
+    //      compares + taps Confirm on the client.
+    //   4. Client unicasts MSG_PAIR_OFFER {apMode, apSsid, apPsk}.
+    //   5. Server persists creds + reboots into the chosen WiFi mode.
+    //
+    // No channel scan — both sides force ch1 on enterPairing.
+    MSG_PAIR_PROBE     = 0x07,  // client → broadcast: "magitrac server, are you there?"
+    MSG_PAIR_CHALLENGE = 0x08,  // server → client:    PIN to display + confirm
+    MSG_PAIR_OFFER     = 0x0B,  // client → server:    WiFi creds + apMode
 
     // Playback control
     MSG_PLAY             = 0x10,
@@ -108,6 +142,38 @@ enum MagiMsgType : uint8_t {
     MSG_RESTORE_HEADER          = 0x8A,
     MSG_RESTORE_BODY            = 0x8B,
 
+    // Save active (client → server).  Tells the server to write its
+    // current in-memory song to SD under `name`.  No payload beyond the
+    // name — the server already has the song bytes in srvActiveBuf
+    // (kept in sync by patch / note-set messages), so this is much
+    // cheaper than streaming the full song.
+    MSG_SAVE_ACTIVE             = 0x8C,
+
+    // New song (client → server).  Tells the server to initSong() its
+    // own in-memory copy — keeps server / client in sync after the
+    // client wipes the song without streaming any bytes.
+    MSG_NEW_SONG                = 0x8D,
+
+    // ── Generic file server ─────────────────────────────────────────────
+    // Used by anything that wants to enumerate / fetch a known kind of
+    // file on the server SD without needing its own dedicated message
+    // type.  The `kind` byte (FileKind enum) names the directory; the
+    // server holds a whitelist mapping kinds to actual SD paths.  Current
+    // users: drum-track imports (FK_DRUMTRACKS).  Future: presets,
+    // palettes, the planned Java/Swing PC tool for SD upload/download.
+    // IDs 0x93..0x96 reserved for SAVE/DELETE/ACK once an uploader needs
+    // them.
+    MSG_FILE_LIST_REQ           = 0x8E,
+    MSG_FILE_LIST_RESP          = 0x8F,
+    MSG_FILE_LOAD_REQ           = 0x90,
+    MSG_FILE_LOAD_HEADER        = 0x91,
+    MSG_FILE_LOAD_BODY          = 0x92,
+
+    // Client → server: fire-and-forget MIDI note-on for audition (no note-off,
+    // assumes percussion-style one-shot envelope on the receiving channel).
+    // Used by DrumTrackImportPage to play through a drum block before import.
+    MSG_AUDITION_RAW_NOTE       = 0x97,
+
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
 
@@ -150,37 +216,37 @@ struct MsgConnectAck {
 // against random traffic on shared channels.
 #define MAGI_PAIR_MAGIC  "MAGITRAC"   // 8 chars, no terminator
 
-// Server → broadcast (on channels 1, 6, 11 in turn): "magitrac, are you
-// there?"  Magitrac client replies (if in pair mode) with MSG_PAIR_CHALLENGE.
+// Client → broadcast (on channels 1, 6, 11 in turn): "magitrac server,
+// are you there?"  Server (if in pair mode) replies on its AP channel
+// with MSG_PAIR_CHALLENGE.
 struct MsgPairProbe {
     MagiMsgType type;         // MSG_PAIR_PROBE
     char        magic[8];     // must equal MAGI_PAIR_MAGIC
-    uint8_t     senderMac[6]; // server's own MAC (informational; wire src has it too)
+    uint8_t     senderMac[6]; // client's own MAC (informational; wire src has it too)
 };
 
-// Client → server unicast: PIN to display on both screens.  Magitrac
-// generates the PIN locally, sends it here, and shows it to the user.
-// Server displays the received PIN.  User taps Confirm on magitrac.
+// Server → client unicast: PIN to display on both screens.  Server
+// generates the PIN locally, sends it here, and shows it on its LCD.
+// Client displays the received PIN on its touch screen.  User taps
+// Confirm on the magitrac.
 struct MsgPairChallenge {
     MagiMsgType type;    // MSG_PAIR_CHALLENGE
     uint8_t     pin[4];  // 4 ASCII digit bytes, e.g. {'4','7','1','9'}
 };
 
-// Client → server unicast: AP credentials and assigned IP — sent only
-// after the user confirms on the magitrac side.  Server saves to NVS and
-// reboots into TCP-STA mode to join the AP.
+// Client → server unicast: WiFi credentials + apMode.  Sent after the
+// user confirms the PIN on the touch screen.  Server persists to NVS
+// and reboots into the chosen WiFi mode (host AP or join external AP).
 //
-// SSID/PSK lengths are tight to fit the format we generate
-// ("magitrac-XXXXXX" + 16 hex chars).  Bump if longer creds are ever
-// needed.
-#define MAGI_OFFER_SSID_LEN 20
-#define MAGI_OFFER_PSK_LEN  20
+// SSID/PSK fields sized to the WPA2 maxima (32/63 chars + null) so the
+// user can pick any normal home/venue network in EXTERNAL_AP mode.
+#define MAGI_OFFER_SSID_LEN 33
+#define MAGI_OFFER_PSK_LEN  64
 struct MsgPairOffer {
     MagiMsgType type;                             // MSG_PAIR_OFFER
-    char        apSsid[MAGI_OFFER_SSID_LEN];      // null-terminated, ≤ 19 chars
-    char        apPsk [MAGI_OFFER_PSK_LEN];       // null-terminated, ≤ 19 chars
-    uint8_t     assignedIp[4];                    // {192,168,0,2}
-    uint8_t     gatewayIp [4];                    // {192,168,0,1}
+    uint8_t     apMode;                           // MagiApMode enum
+    char        apSsid[MAGI_OFFER_SSID_LEN];      // null-terminated, ≤ 32 chars
+    char        apPsk [MAGI_OFFER_PSK_LEN];       // null-terminated, ≤ 63 chars
 };
 
 // Either side → other: session ended
@@ -393,6 +459,17 @@ struct MsgNoteAudition {
     uint8_t  col;
 };
 
+// Client → Server: fire a raw MIDI note-on on (channel, note, velocity).
+// No note-off is sent; intended for short percussion samples whose synth
+// envelope finishes them naturally.
+struct MsgAuditionRawNote {
+    uint8_t  id       = MSG_AUDITION_RAW_NOTE;
+    uint16_t length   = sizeof(MsgAuditionRawNote);
+    uint8_t  channel;   // 1..16
+    uint8_t  note;      // 0..127
+    uint8_t  velocity;  // 0..127
+};
+
 // Server → Client: MIDI note-on received while sequencer is stopped
 struct MsgMidiNoteIn {
     MagiMsgType type;        // MSG_MIDI_NOTE_IN
@@ -561,5 +638,88 @@ struct MsgSongSaveBody {
     uint8_t  data[1024];
 };
 // 1029 bytes (same shape as MsgBackupBody / MsgSongPushBody)
+
+// ── Save active (client → server) ─────────────────────────────────────────
+// Tells the server to write its current in-memory song (srvActiveBuf) to
+// SD under `name`.  Server already has every edit (via patch / note-set),
+// so the wire payload is just the filename.
+
+struct MsgSaveActive {
+    uint8_t  id     = MSG_SAVE_ACTIVE;
+    uint16_t length = sizeof(MsgSaveActive);
+    char     name[SRV_NAME_MAX];     // 24 — destination filename (no .mgt)
+};
+// 1 + 2 + 24 = 27 bytes
+
+// ── New song (client → server) ────────────────────────────────────────────
+// Asks the server to call initSong() on srvActiveBuf so its in-memory
+// song matches the client's freshly-wiped copy.  No payload needed.
+
+struct MsgNewSong {
+    uint8_t  id     = MSG_NEW_SONG;
+    uint16_t length = sizeof(MsgNewSong);
+};
+// 3 bytes
+
+// ── Generic file server ─────────────────────────────────────────────────────
+// Kinds are an enum (not free-form paths) so the server controls the
+// directory whitelist.  Extend by adding a new entry on both sides and a
+// path row in the server's lookup table.
+#define FILE_NAME_LEN     48    // generic file server filename cap (with extension)
+#define FILE_LIST_PER_PKT  7    // mirrors SL_PER_PKT
+
+enum FileKind : uint8_t {
+    FK_DRUMTRACKS = 0,   // /drumtracks/*.txt   (drum-patterns.com format)
+    // Add future kinds here.  Server's `fileKindToPath()` must mirror.
+    FK__COUNT             // sentinel for bounds checks
+};
+
+// Client → server: ask for one page of the file list for `kind`.
+struct MsgFileListReq {
+    uint8_t  id     = MSG_FILE_LIST_REQ;
+    uint16_t length = sizeof(MsgFileListReq);
+    uint8_t  kind;     // FileKind value
+    uint8_t  page;     // 0-based
+};
+
+// Server → client: one page of filenames (with extension).  `kind` is
+// echoed so the receiver can demux against any in-flight requests.
+struct MsgFileListResp {
+    uint8_t  id     = MSG_FILE_LIST_RESP;
+    uint16_t length = sizeof(MsgFileListResp);
+    uint8_t  kind;
+    uint8_t  page;
+    uint8_t  totalPages;
+    uint8_t  count;
+    char     names[FILE_LIST_PER_PKT][FILE_NAME_LEN];
+};
+
+// Client → server: request the contents of a named file in `kind`.
+struct MsgFileLoadReq {
+    uint8_t  id     = MSG_FILE_LOAD_REQ;
+    uint16_t length = sizeof(MsgFileLoadReq);
+    uint8_t  kind;
+    char     name[FILE_NAME_LEN];   // with extension
+};
+
+// Server → client: header preceding the chunked body stream.  `found=0`
+// (file missing) means no BODY chunks will follow.  `kind` echoed.
+struct MsgFileLoadHeader {
+    uint8_t  id     = MSG_FILE_LOAD_HEADER;
+    uint16_t length = sizeof(MsgFileLoadHeader);
+    uint8_t  kind;
+    uint32_t total_size;
+    uint8_t  found;
+};
+
+// Server → client: one chunk of raw file bytes.  Stream is closed by the
+// existing MsgEndOfData (id 0x83).
+struct MsgFileLoadBody {
+    uint8_t  id     = MSG_FILE_LOAD_BODY;
+    uint16_t length = sizeof(MsgFileLoadBody);
+    uint16_t data_len;     // 0..1024
+    uint8_t  data[1024];
+};
+// 1029 bytes
 
 #pragma pack(pop)

@@ -5,6 +5,7 @@
 #include "TrackerData.h"
 #include "UIHelpers.h"
 #include "HoldRepeat.h"
+#include "MidiNotePicker.h"
 
 // ── SongConfigPage — BPM + MIDI IN + SLOT ENABLE settings ───────────────────
 //
@@ -78,6 +79,10 @@ private:
     bool                 _patchPending; // set whenever any song config value changes
 
     HoldRepeat _hold;  // type: 1=BPM, 2=MIDIIN
+
+    // Note picker overlay — opened by tapping NOTE LOW / NOTE HIGH row.
+    MidiNotePicker _picker;
+    int            _pickerField = -1;  // -1 = inactive, 1 = NOTE LOW, 2 = NOTE HIGH
 
     void drawPage0();
     void drawHeader();
