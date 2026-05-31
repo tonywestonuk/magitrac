@@ -98,13 +98,14 @@ static const int BSP_KCH_H       = 52;
 static const int BSP_KCH_SPOS_X  = 160; static const int BSP_KCH_SPOS_W  = 170;
 static const int BSP_KCH_TOP_X   = 340; static const int BSP_KCH_TOP_W   = 100;
 
-// End-navigation row (block-end behaviour: loop/fwd/back/abs)
+// End-navigation row (block-end behaviour: loop/fwd/back/abs/rnt)
 static const int BSP_END_Y       = 472;
 static const int BSP_END_H       = 68;
-static const int BSP_END_LOOP_X  = 160; static const int BSP_END_LOOP_W  = 100;
-static const int BSP_END_FWD_X   = 260; static const int BSP_END_FWD_W   = 100;
-static const int BSP_END_BACK_X  = 360; static const int BSP_END_BACK_W  = 100;
-static const int BSP_END_ABS_X   = 460; static const int BSP_END_ABS_W   = 100;
+static const int BSP_END_LOOP_X  = 160; static const int BSP_END_LOOP_W  = 80;
+static const int BSP_END_FWD_X   = 240; static const int BSP_END_FWD_W   = 80;
+static const int BSP_END_BACK_X  = 320; static const int BSP_END_BACK_W  = 80;
+static const int BSP_END_ABS_X   = 400; static const int BSP_END_ABS_W   = 80;
+static const int BSP_END_RNT_X   = 480; static const int BSP_END_RNT_W   = 80;
 static const int BSP_END_MINUS_X = 600; static const int BSP_END_ARROW_W = 70;
 static const int BSP_END_VAL_X   = 670; static const int BSP_END_VAL_W   = 90;
 static const int BSP_END_PLUS_X  = 760;

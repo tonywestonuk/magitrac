@@ -16,15 +16,20 @@
 #include "esp_wifi.h"
 
 // ── Communications ───────────────────────────────────────────────────────────
-// Both transports are constructed up front; setup() picks the active one
-// at boot based on whether the server has TCP creds stored in NVS.
+// Server is the WiFi AP at 192.168.0.1 and owns the AP credentials
+// (generated once on first boot, persisted forever).  Both transports
+// come up unconditionally at boot:
 //
-//   • No creds  → ESP-NOW transport, ready to run the pairing ceremony.
-//   • Has creds → TCP transport, STA-join the magitrac client's SoftAP.
+//   • MagiLink AP    → reliable TCP listener on MAGI_PORT for the paired
+//                      magitrac client.
+//   • MagiUdpLink    → sender to the paired client (192.168.0.2) for
+//                      loss-tolerant updates (sequencer pos, preview row,
+//                      MIDI note-in).
+//   • ESP-NOW        → pairing ceremony only.  Coexists on the STA
+//                      interface (WIFI_AP_STA mode).
 //
-// After a successful pairing the server calls ESP.restart() to come back
-// up in the other mode.  This keeps each boot single-transport — no
-// runtime switching, no AP-STA juggling on this end.
+// No restart on pair — the AP stays up; the client reboots into STA mode
+// after receiving the OFFER and joins the existing AP.
 MagiCommsEspNow gTransportEspNow;   // exposed so pairing.ino can use it
 static MagiUdpLink gUdpLink;
 
@@ -525,43 +530,78 @@ void setup() {
     lcd.setBrightness(200);
 
     Serial.println("[SETUP] comms init");
-    // Forward declarations (defined in pairing.ino)
     extern void pairingHandleMessage(const uint8_t* data, int len);
+    extern uint8_t wifiChannelLoad();   // defined in commands_server.ino
 
-    // Boot-time transport pick.  If TCP creds are stored, we bring up
-    // WiFi STA + start MagiLink + UDP companion.  Otherwise we stay on
-    // ESP-NOW for the pairing ceremony — ESP.restart() after a successful
-    // MSG_PAIR_OFFER brings us back here in TCP mode.
-    {
-        char    tssid[33], tpsk[64];
-        uint8_t tmyip[4], tgwip[4];
-        if (pairNvsLoadCreds("magitrac_srv", tssid, tpsk, tmyip, tgwip)) {
-            Serial.printf("[SETUP] TCP creds present — STA→%s ip=%u.%u.%u.%u gw=%u.%u.%u.%u\n",
-                tssid,
-                tmyip[0], tmyip[1], tmyip[2], tmyip[3],
-                tgwip[0], tgwip[1], tgwip[2], tgwip[3]);
-            WiFi.persistent(false);
-            WiFi.mode(WIFI_STA);
-            WiFi.config(IPAddress(tmyip[0], tmyip[1], tmyip[2], tmyip[3]),
-                        IPAddress(tgwip[0], tgwip[1], tgwip[2], tgwip[3]),
-                        IPAddress(255, 255, 255, 0));
-            WiFi.begin(tssid, tpsk);
-            // Best-effort UDP companion for loss-tolerant updates
-            // (row position, preview playhead, MIDI note-in).  Send-only
-            // from the server side — magitrac's gateway is the destination.
-            gUdpLink.beginSender(tgwip, MAGI_PORT);
-            // MagiLink (reliable TCP).  Connects to the magitrac AP at
-            // 192.168.0.1:MAGI_PORT.  The MagiLink task internally waits
-            // for STA association before attempting connect.
-            gMagiLink.beginSta(MAGI_PORT, IPAddress(192, 168, 0, 1));
-        } else {
-            Serial.println("[SETUP] no TCP creds — booting on ESP-NOW for pairing");
-            gTransportEspNow.setOnReceive([](const uint8_t* data, int len) {
-                pairingHandleMessage(data, len);
-            });
-            gTransportEspNow.begin();
+    // Dispatch on apMode from NVS.  Three boot paths:
+    //   • SERVER_AP   → host softAP at MAGI_SERVER_IP, MagiLink accepts.
+    //   • EXTERNAL_AP → STA-join the external AP at MAGI_SERVER_IP.
+    //   • unset       → no WiFi config; ESP-NOW only, awaiting pairing.
+    //
+    // In all three cases MagiLink + UDP + ESP-NOW come up; MagiLink's
+    // worker task waits for any local IP before listening, so it's safe
+    // to call unconditionally.
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_AP_STA);
+
+    char    creds_ssid[33] = {};
+    char    creds_psk[64]  = {};
+    uint8_t apMode         = 0;
+    bool hasCreds = pairNvsLoadCreds("magitrac_srv", creds_ssid, creds_psk, &apMode);
+
+    if (hasCreds && apMode == MAGI_AP_MODE_SERVER) {
+        const uint8_t apChannel = magiWifiChannelFromIdx(wifiChannelLoad());
+        Serial.printf("[SETUP] branch=SERVER_AP ch=%u ssid='%s'\n",
+                      (unsigned)apChannel, creds_ssid);
+        bool apOk = WiFi.softAP(creds_ssid, creds_psk, apChannel);
+        if (!apOk) {
+            Serial.println("[SETUP] softAP FAILED — common causes: PSK < 8 chars, SSID empty, channel out of range");
         }
+        WiFi.softAPConfig(IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                          IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                          IPAddress(255, 255, 255, 0));
+        if (esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
+            esp_netif_dhcps_stop(ap_netif);
+        }
+        Serial.printf("[SETUP] AP IP: %s  SSID broadcast: %s\n",
+                      WiFi.softAPIP().toString().c_str(),
+                      WiFi.softAPSSID().c_str());
+    } else if (hasCreds && apMode == MAGI_AP_MODE_EXTERNAL) {
+        Serial.printf("[SETUP] branch=EXTERNAL_AP ssid='%s' — STA join\n", creds_ssid);
+        WiFi.config(IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                              MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                    IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                              MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                    IPAddress(255, 255, 255, 0));
+        WiFi.begin(creds_ssid, creds_psk);
+        // WIFI_AP_STA above brings up a stray default softAP at 192.168.4.1
+        // that MagiLink's firstLocalIp() would prefer over the eventual
+        // STA-assigned MAGI_SERVER_IP.  Drop AP mode — ESP-NOW still
+        // works in STA-only, and pair mode doesn't need AP either.
+        WiFi.mode(WIFI_STA);
+    } else {
+        Serial.printf("[SETUP] branch=NONE (hasCreds=%d apMode=%u) — pair via BtnC long-press\n",
+                      hasCreds ? 1 : 0, (unsigned)apMode);
     }
+
+    // UDP companion — send-only; destination is the paired client at
+    // the reserved static IP.
+    static const uint8_t kClientIp[4] = {
+        MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1, MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3 };
+    gUdpLink.beginSender(kClientIp, MAGI_PORT);
+
+    // MagiLink listener — waits for any local IP before accepting.
+    gMagiLink.beginAccept(MAGI_PORT);
+
+    // ESP-NOW for pairing.  Coexist mode keeps it from clobbering the
+    // WiFi setup (whether softAP or STA).
+    gTransportEspNow.setCoexistMode(true);
+    gTransportEspNow.setOnReceive([](const uint8_t* data, int len) {
+        pairingHandleMessage(data, len);
+    });
+    gTransportEspNow.begin();
 
     // ── Backup handler ─────────────────────────────────────────────────────
     // Client sends MSG_START_BACKUP → server streams every /songs/*.mgt
@@ -613,8 +653,12 @@ void setup() {
     // worker task (SD-on-worker would race with SamplePlayer).
     extern void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* ctx);
     extern void onMagiLinkSaveBody  (const uint8_t* msg, size_t len, void* ctx);
+    extern void onMagiLinkSaveActive(const uint8_t* msg, size_t len, void* ctx);
+    extern void onMagiLinkNewSong   (const uint8_t* msg, size_t len, void* ctx);
     gMagiLink.registerCallback(MSG_SAVE_SONG_HEADER, onMagiLinkSaveHeader, nullptr);
     gMagiLink.registerCallback(MSG_SAVE_SONG_BODY,   onMagiLinkSaveBody,   nullptr);
+    gMagiLink.registerCallback(MSG_SAVE_ACTIVE,      onMagiLinkSaveActive, nullptr);
+    gMagiLink.registerCallback(MSG_NEW_SONG,         onMagiLinkNewSong,    nullptr);
 
     // ── Restore (Phase: symmetric to song save, for any backup file) ──────
     extern void onMagiLinkRestoreHeader(const uint8_t* msg, size_t len, void* ctx);
@@ -682,21 +726,9 @@ void setup() {
         Serial.printf("[SETUP] my MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
-    extern void wifiChannelInit();   // defined in commands_server.ino
-    // Only honour the persisted channel when we're already in TCP-STA mode
-    // (paired) — in ESP-NOW pairing mode the channel must stay at 1 so the
-    // ceremony works (client AP also drops to channel 1 in pair mode).
-    // Once paired, the channel is determined by AP scan anyway, so this is
-    // largely cosmetic at that point.
+    // Diagnostic — log the actual channel the WiFi driver thinks it's on
+    // (was already set by the softAP call above).
     {
-        char ssid[33], psk[64];
-        uint8_t ip[4], gw[4];
-        if (pairNvsLoadCreds("magitrac_srv", ssid, psk, ip, gw)) {
-            wifiChannelInit();
-        } else {
-            Serial.println("[SETUP] not paired — leaving channel at 1 for ESP-NOW pairing");
-        }
-        // Diagnostic — log the actual channel the WiFi driver thinks it's on.
         uint8_t prim = 0;
         wifi_second_chan_t sec;
         esp_wifi_get_channel(&prim, &sec);
@@ -916,11 +948,9 @@ void loop() {
         }
 
         // ── BTN_C: short press = navigate down, long press = pair / re-pair ──
-        // When paired (TCP-STA mode), long-press clears creds + reboots so
-        // the next boot comes up in ESP-NOW pair-ready mode.  Otherwise it
-        // enters the pair-scan ceremony directly.
-        extern bool pairingIsPaired();
-        extern void pairingClearAndRestart();
+        // Long-press always enters pair mode.  The AP stays up across
+        // pairings — a successful pair just overwrites the stored client
+        // MAC, no restart needed.
         if (BtnC.wasPressed()) {
             BtnC._held      = true;
             BtnC._longFired = false;
@@ -935,8 +965,7 @@ void loop() {
                 }
             } else if (!BtnC._longFired && (millis() - BtnC._pressedMs >= 2000)) {
                 BtnC._longFired = true;
-                if (pairingIsPaired()) pairingClearAndRestart();
-                else                   enterPairingMode();
+                enterPairingMode();
             }
         }
 

@@ -56,6 +56,7 @@ void ColumnEditor::open(uint8_t patternIdx, uint8_t col) {
     _actionDst     = 0;
     _resyncMask    = 0;
     _pressedOnName = false;
+    _importRequested = false;
     // If the column is on SFX, trigger a sample-list refresh now so the
     // picker / PROG +/- has fresh data by the time the user reaches them.
     // Spec: refresh every time the editor sees an SFX column.
@@ -322,16 +323,18 @@ void ColumnEditor::drawActionBar() {
     _d.drawFastHLine(0, CE_ACT_Y, CE_W, COL_LTGREY);
 
     char clearLabel[20], copyLabel[20], swapLabel[20];
-    snprintf(clearLabel, sizeof(clearLabel), "CLEAR COL %d",   _col + 1);
-    snprintf(copyLabel,  sizeof(copyLabel),  "COPY COL %d TO...", _col + 1);
-    snprintf(swapLabel,  sizeof(swapLabel),  "SWAP COL %d WITH...", _col + 1);
+    snprintf(clearLabel, sizeof(clearLabel), "CLEAR %d", _col + 1);
+    snprintf(copyLabel,  sizeof(copyLabel),  "COPY %d TO...", _col + 1);
+    snprintf(swapLabel,  sizeof(swapLabel),  "SWAP %d WITH...", _col + 1);
 
-    uiButton(_d, CE_CLEAR_X, btnY, CE_CLEAR_W, CE_ACT_BTN_H,
-             clearLabel, COL_WHITE, COL_BLACK, 2);
-    uiButton(_d, CE_COPY_X,  btnY, CE_COPY_W,  CE_ACT_BTN_H,
-             copyLabel,  COL_WHITE, COL_BLACK, 2);
-    uiButton(_d, CE_SWAP_X,  btnY, CE_SWAP_W,  CE_ACT_BTN_H,
-             swapLabel,  COL_WHITE, COL_BLACK, 2);
+    uiButton(_d, CE_CLEAR_X,  btnY, CE_CLEAR_W,  CE_ACT_BTN_H,
+             clearLabel,    COL_WHITE, COL_BLACK, 2);
+    uiButton(_d, CE_COPY_X,   btnY, CE_COPY_W,   CE_ACT_BTN_H,
+             copyLabel,     COL_WHITE, COL_BLACK, 2);
+    uiButton(_d, CE_SWAP_X,   btnY, CE_SWAP_W,   CE_ACT_BTN_H,
+             swapLabel,     COL_WHITE, COL_BLACK, 2);
+    uiButton(_d, CE_IMPORT_X, btnY, CE_IMPORT_W, CE_ACT_BTN_H,
+             "IMPORT DRUMS", COL_WHITE, COL_BLACK, 2);
 }
 
 // ── Column-picker overlay (COPY/SWAP destination) ────────────────────────────
@@ -490,7 +493,7 @@ void ColumnEditor::doCopyColumn(uint8_t srcCol, uint8_t dstCol) {
         }
     }
 
-    _resyncMask |= (uint16_t)(1u << dstCol);
+    _resyncMask |= (1u << dstCol);
 }
 
 void ColumnEditor::doSwapColumn(uint8_t a, uint8_t b) {
@@ -514,7 +517,7 @@ void ColumnEditor::doSwapColumn(uint8_t a, uint8_t b) {
         }
     }
 
-    _resyncMask |= (uint8_t)((1u << a) | (1u << b));
+    _resyncMask |= ((1u << a) | (1u << b));
 }
 
 void ColumnEditor::doClearColumn(uint8_t col) {
@@ -533,7 +536,7 @@ void ColumnEditor::doClearColumn(uint8_t col) {
         }
     }
 
-    _resyncMask |= (uint8_t)(1u << col);
+    _resyncMask |= (1u << col);
 }
 
 // ── Field adjustment ─────────────────────────────────────────────────────────
@@ -946,6 +949,13 @@ bool ColumnEditor::poll() {
             drawColumnPicker();
             _d.paint();
             return false;
+        }
+        if (tx >= CE_IMPORT_X && tx < CE_IMPORT_X + CE_IMPORT_W) {
+            // Signal to the outer page loop that the user wants to leave
+            // this editor and open the drum-track import flow.  The .ino
+            // observes _importRequested after poll() returns true.
+            _importRequested = true;
+            return true;
         }
     }
 

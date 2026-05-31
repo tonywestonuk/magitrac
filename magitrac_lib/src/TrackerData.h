@@ -5,7 +5,7 @@
 
 #define MAX_PATTERNS      50
 #define MAX_ROWS          64
-#define MAX_COLUMNS        9   // 1 input (col 0) + 8 outputs (cols 1..8)
+#define MAX_COLUMNS       21   // 1 input (col 0) + 20 outputs (cols 1..20)
 #define MAX_SONG_NOTES  4000   // sparse pool shared across all patterns
 #define MAX_INSTRUMENTS  256
 #define INSTRUMENT_NAME_LEN 12  // 11 chars + null
@@ -38,12 +38,17 @@ struct NoteNode {
 // Block-end navigation — stored in Pattern::blockEndNav as xxyyyyyy
 //   xx = mode:  00=loop, 01=forward, 10=backward, 11=absolute
 //   yyyyyy = target (0–63), meaning depends on mode
+// Special whole-byte sentinel NAV_RNT means "return to whichever block last
+// passed control to this one" (subroutine-style).  Encoded as 0x3F so it
+// occupies an otherwise unused combination (LOOP ignores its target field,
+// so a non-zero target with mode==LOOP can only happen via NAV_RNT).
 #define NAV_MODE_MASK   0xC0
 #define NAV_TARGET_MASK 0x3F
 #define NAV_LOOP        0x00  // 00: loop current pattern
 #define NAV_FWD         0x40  // 01: jump forward by y patterns
 #define NAV_BACK        0x80  // 10: jump backward by y patterns
 #define NAV_ABS         0xC0  // 11: absolute jump to pattern y
+#define NAV_RNT         0x3F  // sentinel: return to the calling block
 
 // ── Structs ──────────────────────────────────────────────────────────────────
 
@@ -225,10 +230,10 @@ struct SerializedNote {
     uint8_t param;
 };
 
-// .mgt file layout (v17 compact):
+// .mgt file layout (v18 compact):
 //   [ SongFileHeader              ]  (8 bytes)
 //   [ Pattern x MAX_PATTERNS      ]  (72 x 50 = 3600 bytes; noteHead ignored on load)
-//   [ ColumnSettings x MAX_COLUMNS ] (20 x 9 = 180 bytes; per-song column config)
+//   [ ColumnSettings x MAX_COLUMNS ] (20 x 21 = 420 bytes; per-song column config)
 //   [ Song tail                   ]  (numPatterns ... _songPad)
 //   [ uint16_t noteCount          ]  (2 bytes)
 //   [ SerializedNote x noteCount  ]  (7 bytes each)
@@ -239,7 +244,7 @@ struct SerializedNote {
 // or when MAX_COLUMNS changes (it sizes Song::columns).
 
 #define SONG_FILE_MAGIC   0x4D414754UL   // "MAGT" as uint32
-#define SONG_FILE_VERSION 17
+#define SONG_FILE_VERSION 18
 
 struct SongFileHeader {
     uint32_t magic;    // must equal SONG_FILE_MAGIC

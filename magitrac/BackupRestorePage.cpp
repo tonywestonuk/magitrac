@@ -26,25 +26,39 @@ static const int BR_BACK_H   = 60;
 static const int BR_BACK_X   = (960 - BR_BACK_W) / 2;
 static const int BR_BACK_Y   = 460;
 
-// List items
-static const int BR_LIST_Y   = 100;
-static const int BR_LIST_H   = 50;
-static const int BR_LIST_W   = 440;
-static const int BR_LIST_X0  = 20;
-static const int BR_LIST_X1  = 500;
+// Folder list (single-column drag-scroll)
+static const int BR_FL_Y           = 70;
+static const int BR_FL_ROW_H       = 70;
+static const int BR_FL_ROWS        = 6;
+static const int BR_FL_X           = 20;
+static const int BR_FL_W           = 920;
+static const int BR_FL_DRAG_THRESH = 12;
 
-// Restore All button
-static const int BR_RALL_X   = 20;
-static const int BR_RALL_Y   = 60;
-static const int BR_RALL_W   = 200;
-static const int BR_RALL_H   = 35;
+// File list — same row metrics as folder list, but one fewer visible row
+// to make space for the bottom-centred RESTORE ALL action button.
+static const int BR_FILE_Y         = 70;
+static const int BR_FILE_ROWS      = 5;
 
-// Nav buttons
-static const int BR_NAV_Y    = 60;
-static const int BR_NAV_W    = 100;
-static const int BR_NAV_H    = 35;
-static const int BR_PREV_X   = 700;
-static const int BR_NEXT_X   = 820;
+// Header BACK button — mirrors HOME on the left.
+static const int BR_HBACK_X = 0;
+static const int BR_HBACK_W = 130;
+
+// Restore-confirm dialog
+static const int BR_CONF_TITLE_Y = 200;
+static const int BR_CONF_BODY_Y  = 290;
+static const int BR_CONF_BTN_W   = 200;
+static const int BR_CONF_BTN_H   = 70;
+static const int BR_CONF_BTN_Y   = 410;
+static const int BR_CONF_GAP     = 80;
+static const int BR_CONF_YES_X   = (960 - 2 * BR_CONF_BTN_W - BR_CONF_GAP) / 2;
+static const int BR_CONF_NO_X    = BR_CONF_YES_X + BR_CONF_BTN_W + BR_CONF_GAP;
+
+// Restore All — bottom-centred primary action button on FILE_LIST.
+static const int BR_RALL_W   = 280;
+static const int BR_RALL_H   = 60;
+static const int BR_RALL_X   = (960 - BR_RALL_W) / 2;
+static const int BR_RALL_Y   = 460;
+
 
 // Progress bar
 static const int BR_PB_X     = 130;
@@ -57,6 +71,36 @@ static const int BR_CANCEL_W = 200;
 static const int BR_CANCEL_H = 60;
 static const int BR_CANCEL_X = (960 - BR_CANCEL_W) / 2;
 static const int BR_CANCEL_Y = 400;
+
+static const char* const BR_MONTHS[12] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
+
+// Parse "bk_YYMMDD_HHMMSS" → "DD Mon YYYY  HH:MM:SS".  Returns false
+// (and leaves `out` empty) if the name doesn't match.
+static bool formatBackupTimestamp(const char* name, char* out, size_t outSize) {
+    if (!name || !out || outSize == 0) return false;
+    if (strncmp(name, "bk_", 3) != 0) { out[0] = '\0'; return false; }
+    if (strlen(name) < 16) { out[0] = '\0'; return false; }
+    static const uint8_t digitPositions[] = {3,4,5,6,7,8,10,11,12,13,14,15};
+    for (size_t k = 0; k < sizeof(digitPositions); k++) {
+        char c = name[digitPositions[k]];
+        if (c < '0' || c > '9') { out[0] = '\0'; return false; }
+    }
+    if (name[9] != '_') { out[0] = '\0'; return false; }
+    int yy = (name[3]-'0')*10 + (name[4]-'0');
+    int mm = (name[5]-'0')*10 + (name[6]-'0');
+    int dd = (name[7]-'0')*10 + (name[8]-'0');
+    int hr = (name[10]-'0')*10 + (name[11]-'0');
+    int mn = (name[12]-'0')*10 + (name[13]-'0');
+    int sc = (name[14]-'0')*10 + (name[15]-'0');
+    if (mm < 1 || mm > 12 || dd < 1 || dd > 31 ||
+        hr > 23 || mn > 59 || sc > 59) { out[0] = '\0'; return false; }
+    snprintf(out, outSize, "%02d %s 20%02d  %02d:%02d:%02d",
+             dd, BR_MONTHS[mm-1], yy, hr, mn, sc);
+    return true;
+}
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -72,11 +116,21 @@ BackupRestorePage::BackupRestorePage(EPD_PainterAdafruit& display,
     , _bkFileCurrent(0)
     , _bkCancelled(false)
     , _rsFolderCount(0)
-    , _rsFolderPage(0)
+    , _rsFolderScroll(0)
+    , _rsDragStartY(0)
+    , _rsDragStartScroll(0)
+    , _rsDragMoved(false)
     , _rsFileTotal(0)
     , _rsFileCurrent(0)
     , _rsRestoreCount(0)
     , _rsCancelled(false)
+    , _rsConfirmIdx(-1)
+    , _rsFileScroll(0)
+    , _rsFileDragStartY(0)
+    , _rsFileDragStartScroll(0)
+    , _rsFileDragMoved(false)
+    , _rsFolderScanIdx(0)
+    , _rsFolderListDirty(false)
 {
     _bkFolder[0] = '\0';
     _rsSelectedFolder[0] = '\0';
@@ -100,6 +154,7 @@ void BackupRestorePage::draw() {
         case BRState::BACKUP_DONE:         drawBackupDone();      break;
         case BRState::FOLDER_LIST:         drawFolderList();      break;
         case BRState::FILE_LIST:           drawFileList();        break;
+        case BRState::RESTORE_CONFIRM:     drawRestoreConfirm();  break;
         case BRState::RESTORE_PROGRESS:    drawRestoreProgress(); break;
         case BRState::RESTORE_DONE:        drawRestoreDone();     break;
         case BRState::ERROR_SCREEN:        drawError();           break;
@@ -108,13 +163,17 @@ void BackupRestorePage::draw() {
 
 // ── Drawing helpers ───────────────────────────────────────────────────────────
 
-void BackupRestorePage::drawHeader(const char* title) {
+void BackupRestorePage::drawHeader(const char* title, bool withBack) {
     _d.fillRect(0, 0, 960, BR_HDR_H, COL_BLACK);
     _d.setTextSize(3);
     _d.setTextColor(COL_WHITE);
     int tw = (int)strlen(title) * 18;
     _d.setCursor((960 - tw) / 2, (BR_HDR_H - 24) / 2);
     _d.print(title);
+    if (withBack) {
+        uiButton(_d, BR_HBACK_X, 0, BR_HBACK_W, BR_HDR_H, "BACK",
+                 COL_BLACK, COL_WHITE, 3);
+    }
     uiButton(_d, BR_HOME_X, 0, BR_HOME_W, BR_HDR_H, "HOME", COL_BLACK, COL_WHITE, 3);
 }
 
@@ -187,62 +246,161 @@ void BackupRestorePage::drawBackupDone() {
 }
 
 void BackupRestorePage::drawFolderList() {
-    drawHeader("SELECT BACKUP");
-
-    // Nav
-    uiButton(_d, 20, BR_NAV_Y, 100, BR_NAV_H, "BACK", COL_WHITE, COL_BLACK, 2);
-    if (_rsFolderCount > BR_LIST_PER_PAGE) {
-        uiButton(_d, BR_PREV_X, BR_NAV_Y, BR_NAV_W, BR_NAV_H, "PREV", COL_WHITE, COL_BLACK, 2);
-        uiButton(_d, BR_NEXT_X, BR_NAV_Y, BR_NAV_W, BR_NAV_H, "NEXT", COL_WHITE, COL_BLACK, 2);
-    }
-
-    // Folder list
-    int start = _rsFolderPage * BR_LIST_PER_PAGE;
-    int count = _rsFolderCount - start;
-    if (count > BR_LIST_PER_PAGE) count = BR_LIST_PER_PAGE;
-
-    _d.setTextSize(2);
-    _d.setTextColor(COL_BLACK);
-    for (int i = 0; i < count; i++) {
-        int col = i / BR_LIST_ROWS;
-        int row = i % BR_LIST_ROWS;
-        int x = (col == 0) ? BR_LIST_X0 : BR_LIST_X1;
-        int y = BR_LIST_Y + row * BR_LIST_H;
-        _d.drawRect(x, y, BR_LIST_W, BR_LIST_H - 2, COL_BLACK);
-        _d.setCursor(x + 10, y + (BR_LIST_H - 18) / 2);
-        _d.print(_rsFolders[start + i]);
-    }
+    drawHeader("SELECT BACKUP", /*withBack=*/true);
 
     if (_rsFolderCount == 0) {
         _d.setTextSize(3);
+        _d.setTextColor(COL_BLACK);
         _d.setCursor(280, 250);
         _d.print("No backups found");
+        return;
+    }
+
+    int start = _rsFolderScroll;
+    int count = _rsFolderCount - start;
+    if (count > BR_FL_ROWS) count = BR_FL_ROWS;
+
+    _d.setTextColor(COL_BLACK);
+    for (int i = 0; i < count; i++) {
+        int idx = start + i;
+        int y   = BR_FL_Y + i * BR_FL_ROW_H;
+        _d.drawRect(BR_FL_X, y, BR_FL_W, BR_FL_ROW_H - 4, COL_BLACK);
+
+        char dateBuf[40];
+        if (!formatBackupTimestamp(_rsFolders[idx], dateBuf, sizeof(dateBuf))) {
+            strncpy(dateBuf, _rsFolders[idx], sizeof(dateBuf) - 1);
+            dateBuf[sizeof(dateBuf) - 1] = '\0';
+        }
+        _d.setTextSize(3);
+        _d.setCursor(BR_FL_X + 16, y + (BR_FL_ROW_H - 4 - 24) / 2);
+        _d.print(dateBuf);
+
+        int songs = _rsFolderSongCount[idx];
+        if (songs >= 0) {
+            char countBuf[24];
+            snprintf(countBuf, sizeof(countBuf), "%d song%s",
+                     songs, songs == 1 ? "" : "s");
+            int tw = (int)strlen(countBuf) * 18;
+            _d.setCursor(BR_FL_X + BR_FL_W - 16 - tw,
+                         y + (BR_FL_ROW_H - 4 - 24) / 2);
+            _d.print(countBuf);
+        }
+    }
+
+    // Scroll hint at the bottom (replaces the old PREV/NEXT row).
+    if (_rsFolderCount > BR_FL_ROWS) {
+        char hint[40];
+        int firstVis = _rsFolderScroll + 1;
+        int lastVis  = _rsFolderScroll + BR_FL_ROWS;
+        if (lastVis > _rsFolderCount) lastVis = _rsFolderCount;
+        snprintf(hint, sizeof(hint), "%d-%d of %d  (drag to scroll)",
+                 firstVis, lastVis, _rsFolderCount);
+        _d.setTextSize(2);
+        int tw = (int)strlen(hint) * 12;
+        _d.setCursor((960 - tw) / 2, BR_FL_Y + BR_FL_ROWS * BR_FL_ROW_H + 4);
+        _d.print(hint);
     }
 }
 
 void BackupRestorePage::drawFileList() {
-    drawHeader("RESTORE FILES");
+    drawHeader("RESTORE FILES", /*withBack=*/true);
 
-    // Buttons
-    uiButton(_d, 20, BR_NAV_Y, 100, BR_NAV_H, "BACK", COL_WHITE, COL_BLACK, 2);
-    uiButton(_d, BR_RALL_X + 120, BR_RALL_Y, BR_RALL_W, BR_RALL_H,
-             "RESTORE ALL", COL_WHITE, COL_BLACK, 2);
+    if (_rsFileTotal == 0) {
+        _d.setTextSize(3);
+        _d.setTextColor(COL_BLACK);
+        _d.setCursor(330, 250);
+        _d.print("No files found");
+    } else {
+        int start = _rsFileScroll;
+        int count = _rsFileTotal - start;
+        if (count > BR_FILE_ROWS) count = BR_FILE_ROWS;
 
-    // File list
-    _d.setTextSize(2);
-    _d.setTextColor(COL_BLACK);
-    int count = _rsFileTotal;
-    if (count > BR_LIST_PER_PAGE) count = BR_LIST_PER_PAGE;
+        _d.setTextColor(COL_BLACK);
+        for (int i = 0; i < count; i++) {
+            int idx = start + i;
+            int y   = BR_FILE_Y + i * BR_FL_ROW_H;
+            _d.drawRect(BR_FL_X, y, BR_FL_W, BR_FL_ROW_H - 4, COL_BLACK);
 
-    for (int i = 0; i < count; i++) {
-        int col = i / BR_LIST_ROWS;
-        int row = i % BR_LIST_ROWS;
-        int x = (col == 0) ? BR_LIST_X0 : BR_LIST_X1;
-        int y = BR_LIST_Y + row * BR_LIST_H;
-        _d.drawRect(x, y, BR_LIST_W, BR_LIST_H - 2, COL_BLACK);
-        _d.setCursor(x + 10, y + (BR_LIST_H - 18) / 2);
-        _d.print(_rsFileNames[i]);
+            // Strip ".mgt" for display; show "instruments" as a special label.
+            char nameBuf[40];
+            strncpy(nameBuf, _rsFileNames[idx], sizeof(nameBuf) - 1);
+            nameBuf[sizeof(nameBuf) - 1] = '\0';
+            int len = (int)strlen(nameBuf);
+            if (len >= 4) {
+                const char* ext = nameBuf + len - 4;
+                if (ext[0] == '.' &&
+                    (ext[1] == 'm' || ext[1] == 'M') &&
+                    (ext[2] == 'g' || ext[2] == 'G') &&
+                    (ext[3] == 't' || ext[3] == 'T')) {
+                    nameBuf[len - 4] = '\0';
+                }
+            }
+
+            _d.setTextSize(3);
+            _d.setCursor(BR_FL_X + 16, y + (BR_FL_ROW_H - 4 - 24) / 2);
+            _d.print(nameBuf);
+        }
+
+        if (_rsFileTotal > BR_FILE_ROWS) {
+            char hint[40];
+            int firstVis = _rsFileScroll + 1;
+            int lastVis  = _rsFileScroll + BR_FILE_ROWS;
+            if (lastVis > _rsFileTotal) lastVis = _rsFileTotal;
+            snprintf(hint, sizeof(hint), "%d-%d of %d  (drag to scroll)",
+                     firstVis, lastVis, _rsFileTotal);
+            _d.setTextSize(2);
+            int tw = (int)strlen(hint) * 12;
+            _d.setCursor((960 - tw) / 2, BR_FILE_Y + BR_FILE_ROWS * BR_FL_ROW_H + 4);
+            _d.print(hint);
+        }
     }
+
+    uiButton(_d, BR_RALL_X, BR_RALL_Y, BR_RALL_W, BR_RALL_H,
+             "RESTORE ALL", COL_WHITE, COL_BLACK, 3);
+}
+
+void BackupRestorePage::drawRestoreConfirm() {
+    drawHeader("CONFIRM RESTORE");
+
+    char title[64];
+    if (_rsConfirmIdx < 0) {
+        snprintf(title, sizeof(title), "Restore All?");
+    } else {
+        char nameBuf[40];
+        strncpy(nameBuf, _rsFileNames[_rsConfirmIdx], sizeof(nameBuf) - 1);
+        nameBuf[sizeof(nameBuf) - 1] = '\0';
+        int len = (int)strlen(nameBuf);
+        if (len >= 4) {
+            const char* ext = nameBuf + len - 4;
+            if (ext[0] == '.' &&
+                (ext[1] == 'm' || ext[1] == 'M') &&
+                (ext[2] == 'g' || ext[2] == 'G') &&
+                (ext[3] == 't' || ext[3] == 'T')) {
+                nameBuf[len - 4] = '\0';
+            }
+        }
+        snprintf(title, sizeof(title), "Restore %s?", nameBuf);
+    }
+
+    _d.setTextSize(4);
+    _d.setTextColor(COL_BLACK);
+    int tw = (int)strlen(title) * 24;
+    _d.setCursor((960 - tw) / 2, BR_CONF_TITLE_Y);
+    _d.print(title);
+
+    const char* body = (_rsConfirmIdx < 0)
+        ? "Overwrites every file on the server from this backup."
+        : "Overwrites this file on the server.";
+    _d.setTextSize(2);
+    _d.setTextColor(COL_DKGREY);
+    int bw = (int)strlen(body) * 12;
+    _d.setCursor((960 - bw) / 2, BR_CONF_BODY_Y);
+    _d.print(body);
+
+    uiButton(_d, BR_CONF_YES_X, BR_CONF_BTN_Y, BR_CONF_BTN_W, BR_CONF_BTN_H,
+             "YES", COL_BLACK, COL_WHITE, 4);
+    uiButton(_d, BR_CONF_NO_X,  BR_CONF_BTN_Y, BR_CONF_BTN_W, BR_CONF_BTN_H,
+             "NO",  COL_WHITE, COL_BLACK, 4);
 }
 
 void BackupRestorePage::drawRestoreProgress() {
@@ -472,8 +630,10 @@ void BackupRestorePage::startBackup() {
 // ── Restore logic ────────────────────────────────────────────────────────────
 
 void BackupRestorePage::scanBackupFolders() {
-    _rsFolderCount = 0;
-    _rsFolderPage  = 0;
+    _rsFolderCount     = 0;
+    _rsFolderScroll    = 0;
+    _rsFolderScanIdx   = 0;
+    _rsFolderListDirty = false;
     if (!SD.exists(BR_BACKUPS_DIR)) return;
     File d = SD.open(BR_BACKUPS_DIR);
     if (!d || !d.isDirectory()) return;
@@ -486,15 +646,73 @@ void BackupRestorePage::scanBackupFolders() {
             if (slash) name = slash + 1;
             strncpy(_rsFolders[_rsFolderCount], name, BR_FOLDER_MAX - 1);
             _rsFolders[_rsFolderCount][BR_FOLDER_MAX - 1] = '\0';
+            _rsFolderSongCount[_rsFolderCount] = -1;   // pending
             _rsFolderCount++;
         }
         entry.close();
     }
     d.close();
+
+    // Sort descending by folder name (lex order on bk_YYMMDD_HHMMSS == reverse chronological).
+    for (int i = 1; i < _rsFolderCount; i++) {
+        char keyName[BR_FOLDER_MAX];
+        memcpy(keyName, _rsFolders[i], BR_FOLDER_MAX);
+        int j = i - 1;
+        while (j >= 0 && strcmp(_rsFolders[j], keyName) < 0) {
+            memcpy(_rsFolders[j+1], _rsFolders[j], BR_FOLDER_MAX);
+            j--;
+        }
+        memcpy(_rsFolders[j+1], keyName, BR_FOLDER_MAX);
+    }
+    // Song counts stay at -1; they'll be filled in by scanFolderSongsTick().
+}
+
+void BackupRestorePage::scanFolderSongsTick() {
+    if (_rsFolderScanIdx >= _rsFolderCount) return;
+    int idx = _rsFolderScanIdx++;
+
+    int songs = 0;
+    char sub[80];
+    snprintf(sub, sizeof(sub), "%s/%s", BR_BACKUPS_DIR, _rsFolders[idx]);
+    File sd = SD.open(sub);
+    if (sd && sd.isDirectory()) {
+        while (true) {
+            File e = sd.openNextFile();
+            if (!e) break;
+            if (!e.isDirectory()) {
+                const char* n = e.name();
+                const char* sl = strrchr(n, '/');
+                if (sl) n = sl + 1;
+                int len = (int)strlen(n);
+                if (len >= 4) {
+                    const char* ext = n + len - 4;
+                    if (ext[0] == '.' &&
+                        (ext[1] == 'm' || ext[1] == 'M') &&
+                        (ext[2] == 'g' || ext[2] == 'G') &&
+                        (ext[3] == 't' || ext[3] == 'T') &&
+                        strcasecmp(n, "instruments.mgt") != 0) {
+                        songs++;
+                    }
+                }
+            }
+            e.close();
+        }
+        sd.close();
+    }
+    _rsFolderSongCount[idx] = songs;
+
+    // Only flag the list for redraw if the row we just updated is on screen.
+    int start = _rsFolderScroll;
+    int end   = start + BR_FL_ROWS;
+    if (idx >= start && idx < end) {
+        _rsFolderListDirty = true;
+    }
 }
 
 void BackupRestorePage::scanFolderFiles(const char* folder) {
-    _rsFileTotal = 0;
+    _rsFileTotal     = 0;
+    _rsFileScroll    = 0;
+    _rsFileDragMoved = false;
     snprintf(_rsSelectedFolder, sizeof(_rsSelectedFolder),
              "%s/%s", BR_BACKUPS_DIR, folder);
 
@@ -524,6 +742,19 @@ void BackupRestorePage::scanFolderFiles(const char* folder) {
         entry.close();
     }
     d.close();
+
+    // Sort alphabetically (case-insensitive) — keeps related songs together
+    // and puts "instruments" wherever it falls naturally.
+    for (int i = 1; i < _rsFileTotal; i++) {
+        char keyName[SRV_FNAME_MAX];
+        memcpy(keyName, _rsFileNames[i], SRV_FNAME_MAX);
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(_rsFileNames[j], keyName) > 0) {
+            memcpy(_rsFileNames[j+1], _rsFileNames[j], SRV_FNAME_MAX);
+            j--;
+        }
+        memcpy(_rsFileNames[j+1], keyName, SRV_FNAME_MAX);
+    }
 }
 
 void BackupRestorePage::startRestore(int fileIdx) {
@@ -616,15 +847,102 @@ bool BackupRestorePage::poll() {
     if (_state == BRState::RESTORE_PROGRESS)
         restoreTick();
 
+    // Background song-count scan for the folder list.  One folder per tick
+    // keeps the SD work off the initial display path.  Don't redraw while
+    // the user is touching (could interfere with a drag-scroll); the dirty
+    // flag is consumed on the next idle tick.
+    if (_state == BRState::FOLDER_LIST) {
+        if (_rsFolderScanIdx < _rsFolderCount) {
+            scanFolderSongsTick();
+        }
+        if (_rsFolderListDirty && !_touch.isTouched) {
+            _rsFolderListDirty = false;
+            _d.fillRect(0, BR_HDR_H, 960, 540 - BR_HDR_H, COL_WHITE);
+            drawFolderList();
+            _d.paintLater();
+        }
+    }
+
     if (!_touch.read()) return false;
 
     bool down = _touch.isTouched;
     int sx, sy;
     rawToScreen(_touch.x, _touch.y, sx, sy);
 
+    // ── Drag-scroll for the FOLDER_LIST view ────────────────────────────────
+    // Rising edge: capture start position so we can decide tap-vs-drag later.
+    if (_state == BRState::FOLDER_LIST) {
+        if (down && !_wasDown) {
+            _rsDragStartY      = sy;
+            _rsDragStartScroll = _rsFolderScroll;
+            _rsDragMoved       = false;
+        } else if (down && _wasDown) {
+            int dy = sy - _rsDragStartY;
+            if (!_rsDragMoved &&
+                (dy >= BR_FL_DRAG_THRESH || dy <= -BR_FL_DRAG_THRESH)) {
+                _rsDragMoved = true;
+            }
+            if (_rsDragMoved) {
+                // Drag finger DOWN → reveal earlier rows → smaller offset.
+                int rowDelta = -dy / BR_FL_ROW_H;
+                int newOff   = _rsDragStartScroll + rowDelta;
+                int maxOff   = _rsFolderCount - BR_FL_ROWS;
+                if (maxOff < 0) maxOff = 0;
+                if (newOff < 0)      newOff = 0;
+                if (newOff > maxOff) newOff = maxOff;
+                if (newOff != _rsFolderScroll) {
+                    _rsFolderScroll = newOff;
+                    _d.fillRect(0, BR_HDR_H, 960, 540 - BR_HDR_H, COL_WHITE);
+                    drawFolderList();
+                    _d.paintLater();
+                }
+            }
+            _wasDown = true;
+            return false;
+        }
+    }
+
+    // ── Drag-scroll for the FILE_LIST view ──────────────────────────────────
+    // Same shape as the FOLDER_LIST handler above; the bottom RESTORE ALL
+    // button keeps working because the drag-mode flip suppresses the tap.
+    if (_state == BRState::FILE_LIST) {
+        if (down && !_wasDown) {
+            _rsFileDragStartY      = sy;
+            _rsFileDragStartScroll = _rsFileScroll;
+            _rsFileDragMoved       = false;
+        } else if (down && _wasDown) {
+            int dy = sy - _rsFileDragStartY;
+            if (!_rsFileDragMoved &&
+                (dy >= BR_FL_DRAG_THRESH || dy <= -BR_FL_DRAG_THRESH)) {
+                _rsFileDragMoved = true;
+            }
+            if (_rsFileDragMoved) {
+                int rowDelta = -dy / BR_FL_ROW_H;
+                int newOff   = _rsFileDragStartScroll + rowDelta;
+                int maxOff   = _rsFileTotal - BR_FILE_ROWS;
+                if (maxOff < 0) maxOff = 0;
+                if (newOff < 0)      newOff = 0;
+                if (newOff > maxOff) newOff = maxOff;
+                if (newOff != _rsFileScroll) {
+                    _rsFileScroll = newOff;
+                    _d.fillRect(0, BR_HDR_H, 960, 540 - BR_HDR_H, COL_WHITE);
+                    drawFileList();
+                    _d.paintLater();
+                }
+            }
+            _wasDown = true;
+            return false;
+        }
+    }
+
     // Only act on falling edge
     if (!down && _wasDown) {
         _wasDown = false;
+
+        // If the user was drag-scrolling, swallow the release entirely so
+        // it can't fire HOME / BACK / row taps under the lift-off point.
+        if (_rsDragMoved)     { _rsDragMoved = false;     return false; }
+        if (_rsFileDragMoved) { _rsFileDragMoved = false; return false; }
 
         // HOME always closes
         if (hitHome(sx, sy)) return true;
@@ -659,37 +977,19 @@ bool BackupRestorePage::poll() {
                 break;
 
             case BRState::FOLDER_LIST: {
-                // BACK button
-                if (sx >= 20 && sx < 120 && sy >= BR_NAV_Y && sy < BR_NAV_Y + BR_NAV_H) {
+                if (hitHeaderBack(sx, sy)) {
                     _state = BRState::MENU;
                     draw(); _d.paint();
                     return false;
                 }
-                // PREV/NEXT
-                if (_rsFolderCount > BR_LIST_PER_PAGE) {
-                    if (sx >= BR_PREV_X && sx < BR_PREV_X + BR_NAV_W &&
-                        sy >= BR_NAV_Y && sy < BR_NAV_Y + BR_NAV_H) {
-                        if (_rsFolderPage > 0) { _rsFolderPage--; draw(); _d.paint(); }
-                        return false;
-                    }
-                    if (sx >= BR_NEXT_X && sx < BR_NEXT_X + BR_NAV_W &&
-                        sy >= BR_NAV_Y && sy < BR_NAV_Y + BR_NAV_H) {
-                        int maxPage = (_rsFolderCount - 1) / BR_LIST_PER_PAGE;
-                        if (_rsFolderPage < maxPage) { _rsFolderPage++; draw(); _d.paint(); }
-                        return false;
-                    }
-                }
-                // Folder tap
-                int start = _rsFolderPage * BR_LIST_PER_PAGE;
+                // Folder tap (single column, drag-scrolled)
+                int start = _rsFolderScroll;
                 int count = _rsFolderCount - start;
-                if (count > BR_LIST_PER_PAGE) count = BR_LIST_PER_PAGE;
+                if (count > BR_FL_ROWS) count = BR_FL_ROWS;
                 for (int i = 0; i < count; i++) {
-                    int col = i / BR_LIST_ROWS;
-                    int row = i % BR_LIST_ROWS;
-                    int lx = (col == 0) ? BR_LIST_X0 : BR_LIST_X1;
-                    int ly = BR_LIST_Y + row * BR_LIST_H;
-                    if (sx >= lx && sx < lx + BR_LIST_W &&
-                        sy >= ly && sy < ly + BR_LIST_H) {
+                    int ly = BR_FL_Y + i * BR_FL_ROW_H;
+                    if (sx >= BR_FL_X && sx < BR_FL_X + BR_FL_W &&
+                        sy >= ly && sy < ly + BR_FL_ROW_H - 4) {
                         scanFolderFiles(_rsFolders[start + i]);
                         _state = BRState::FILE_LIST;
                         draw(); _d.paint();
@@ -700,31 +1000,49 @@ bool BackupRestorePage::poll() {
             }
 
             case BRState::FILE_LIST: {
-                // BACK button
-                if (sx >= 20 && sx < 120 && sy >= BR_NAV_Y && sy < BR_NAV_Y + BR_NAV_H) {
+                if (hitHeaderBack(sx, sy)) {
                     _state = BRState::FOLDER_LIST;
                     draw(); _d.paint();
                     return false;
                 }
-                // RESTORE ALL button
-                if (sx >= BR_RALL_X + 120 && sx < BR_RALL_X + 120 + BR_RALL_W &&
+                // RESTORE ALL button (bottom-centred) → confirm
+                if (sx >= BR_RALL_X && sx < BR_RALL_X + BR_RALL_W &&
                     sy >= BR_RALL_Y && sy < BR_RALL_Y + BR_RALL_H) {
-                    startRestore(-1);
+                    _rsConfirmIdx = -1;
+                    _state = BRState::RESTORE_CONFIRM;
+                    draw(); _d.paint();
                     return false;
                 }
-                // Individual file tap
-                int count = _rsFileTotal;
-                if (count > BR_LIST_PER_PAGE) count = BR_LIST_PER_PAGE;
+                // Individual file tap → confirm
+                int start = _rsFileScroll;
+                int count = _rsFileTotal - start;
+                if (count > BR_FILE_ROWS) count = BR_FILE_ROWS;
                 for (int i = 0; i < count; i++) {
-                    int col = i / BR_LIST_ROWS;
-                    int row = i % BR_LIST_ROWS;
-                    int lx = (col == 0) ? BR_LIST_X0 : BR_LIST_X1;
-                    int ly = BR_LIST_Y + row * BR_LIST_H;
-                    if (sx >= lx && sx < lx + BR_LIST_W &&
-                        sy >= ly && sy < ly + BR_LIST_H) {
-                        startRestore(i);
+                    int ly = BR_FILE_Y + i * BR_FL_ROW_H;
+                    if (sx >= BR_FL_X && sx < BR_FL_X + BR_FL_W &&
+                        sy >= ly && sy < ly + BR_FL_ROW_H - 4) {
+                        _rsConfirmIdx = start + i;
+                        _state = BRState::RESTORE_CONFIRM;
+                        draw(); _d.paint();
                         return false;
                     }
+                }
+                break;
+            }
+
+            case BRState::RESTORE_CONFIRM: {
+                // YES → kick off the restore
+                if (sx >= BR_CONF_YES_X && sx < BR_CONF_YES_X + BR_CONF_BTN_W &&
+                    sy >= BR_CONF_BTN_Y && sy < BR_CONF_BTN_Y + BR_CONF_BTN_H) {
+                    startRestore(_rsConfirmIdx);
+                    return false;
+                }
+                // NO → back to the file list
+                if (sx >= BR_CONF_NO_X && sx < BR_CONF_NO_X + BR_CONF_BTN_W &&
+                    sy >= BR_CONF_BTN_Y && sy < BR_CONF_BTN_Y + BR_CONF_BTN_H) {
+                    _state = BRState::FILE_LIST;
+                    draw(); _d.paint();
+                    return false;
                 }
                 break;
             }
@@ -742,6 +1060,11 @@ bool BackupRestorePage::poll() {
 
 bool BackupRestorePage::hitHome(int sx, int sy) const {
     return (sx >= BR_HOME_X && sx < BR_HOME_X + BR_HOME_W &&
+            sy >= 0 && sy < BR_HDR_H);
+}
+
+bool BackupRestorePage::hitHeaderBack(int sx, int sy) const {
+    return (sx >= BR_HBACK_X && sx < BR_HBACK_X + BR_HBACK_W &&
             sy >= 0 && sy < BR_HDR_H);
 }
 

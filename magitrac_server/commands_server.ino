@@ -17,15 +17,15 @@
 static const char* WIFI_NVS_NS = "magitrac_wifi";
 static uint8_t     sWifiChannelIdx = 0;   // 0/1/2 → 1/6/11
 
-void wifiChannelInit() {
+// Load the persisted channel idx without touching WiFi.  Used by setup()
+// to pick the softAP channel before WiFi.softAP() is called.
+uint8_t wifiChannelLoad() {
     Preferences prefs;
     prefs.begin(WIFI_NVS_NS, true);
     sWifiChannelIdx = prefs.getUChar("idx", 0);
     if (sWifiChannelIdx > 2) sWifiChannelIdx = 0;
     prefs.end();
-    uint8_t ch = magiWifiChannelFromIdx(sWifiChannelIdx);
-    WiFi.setChannel(ch);
-    Serial.printf("[WIFI] boot channel: %u\n", (unsigned)ch);
+    return sWifiChannelIdx;
 }
 
 static void wifiChannelApply(uint8_t idx) {
@@ -35,9 +35,21 @@ static void wifiChannelApply(uint8_t idx) {
     prefs.begin(WIFI_NVS_NS, false);
     prefs.putUChar("idx", idx);
     prefs.end();
-    uint8_t ch = magiWifiChannelFromIdx(idx);
-    WiFi.setChannel(ch);
-    Serial.printf("[WIFI] channel → %u\n", (unsigned)ch);
+    // Only meaningful in SERVER_AP mode (we own the AP).  Re-bring-up
+    // softAP on the new channel using the persisted creds.  In
+    // EXTERNAL_AP mode this is a no-op — the channel is the external
+    // AP's choice.
+    char    ssid[33] = {};
+    char    psk[64]  = {};
+    uint8_t apMode   = 0;
+    if (pairNvsLoadCreds("magitrac_srv", ssid, psk, &apMode) &&
+        apMode == MAGI_AP_MODE_SERVER) {
+        uint8_t ch = magiWifiChannelFromIdx(idx);
+        WiFi.softAP(ssid, psk, ch);
+        Serial.printf("[WIFI] AP moved to channel %u\n", (unsigned)ch);
+    } else {
+        Serial.println("[WIFI] channel change ignored — not in SERVER_AP mode");
+    }
 }
 
 extern HardwareSerial midi;
@@ -703,6 +715,77 @@ void onMagiLinkSaveBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
     }
 }
 
+// ── Save-active (autosave shortcut): client → server ─────────────────────
+// Tells us to write the current srvActiveBuf to SD under the given name.
+// No song bytes on the wire — patches + note-sets have kept srvActiveBuf
+// in sync with the client's memory.  SD work deferred to commandsTick.
+static char sSaveActiveName[SRV_NAME_MAX] = {};
+static bool sSaveActivePending            = false;
+
+void onMagiLinkSaveActive(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (len < sizeof(MsgSaveActive)) return;
+    const MsgSaveActive* m = (const MsgSaveActive*)msg;
+    strncpy(sSaveActiveName, m->name, sizeof(sSaveActiveName) - 1);
+    sSaveActiveName[sizeof(sSaveActiveName) - 1] = '\0';
+    sSaveActivePending = true;
+}
+
+// Called from commandsTick when sSaveActivePending fires.
+static void finaliseSaveActive() {
+    if (!srvHasActive) {
+        Serial.println("[CMD] save-active: no active song — ignoring");
+        return;
+    }
+    if (sSaveActiveName[0] == '\0') {
+        Serial.println("[CMD] save-active: empty name — ignoring");
+        return;
+    }
+    char path[48];
+    snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, sSaveActiveName);
+    Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
+    SdLock _;
+    SD.remove(path);
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) {
+        Serial.printf("[CMD] save-active: open failed '%s'\n", path);
+        return;
+    }
+    bool ok = songWriteCompact(f, song);
+    uint32_t sz = (uint32_t)f.size();
+    f.close();
+    Serial.printf("[CMD] save-active: wrote '%s' %u bytes %s\n",
+                  path, sz, ok ? "OK" : "FAIL");
+    snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", sSaveActiveName);
+}
+
+// ── New-song: client → server ────────────────────────────────────────────
+// Server runs initSong() on its in-memory copy so it matches the
+// freshly-wiped client copy.  No bytes streamed.
+static bool sNewSongPending = false;
+
+void onMagiLinkNewSong(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (len < sizeof(MsgNewSong)) return;
+    sNewSongPending = true;
+}
+
+static void finaliseNewSong() {
+    sequencerStop();
+    // Stamp a fresh SongFileHeader at the front of srvActiveBuf, then
+    // initSong() the Song body that follows.
+    SongFileHeader hdr;
+    hdr.magic   = SONG_FILE_MAGIC;
+    hdr.version = SONG_FILE_VERSION;
+    memset(hdr._pad, 0, sizeof(hdr._pad));
+    memcpy(srvActiveBuf, &hdr, sizeof(SongFileHeader));
+    Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
+    initSong(song);
+    srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
+    srvHasActive    = true;
+    srvActiveName[0] = '\0';
+    sequencerReset();
+    Serial.println("[CMD] new-song: server memory wiped");
+}
+
 // Called from commandsTick when sMagiSavePending fires.  Writes the
 // in-memory song to SD if a name was provided; either way, marks
 // srvHasActive and resets the sequencer.
@@ -1062,6 +1145,14 @@ void commandsTick() {
     if (sMagiSavePending) {
         sMagiSavePending = false;
         finaliseMagiLinkSongSave();
+    }
+    if (sSaveActivePending) {
+        sSaveActivePending = false;
+        finaliseSaveActive();
+    }
+    if (sNewSongPending) {
+        sNewSongPending = false;
+        finaliseNewSong();
     }
     if (sMagiRestorePending) {
         sMagiRestorePending = false;

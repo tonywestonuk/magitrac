@@ -1,6 +1,7 @@
 #include "SongPage.h"
 #include "ServerPairing.h"
 #include "SongSource.h"
+#include "Autosave.h"
 #include <Arduino.h>
 #include <SD.h>
 #include <string.h>
@@ -186,7 +187,13 @@ SongPageResult SongPage::poll() {
             if (_keyboard.isDone() && _pendingSaveName[0] != '\0') {
                 strncpy(_song.name, _pendingSaveName, sizeof(_song.name) - 1);
                 _song.name[sizeof(_song.name) - 1] = '\0';
-                gServerPairing.sendSongToServer(_pendingSaveName, &_song);
+                // Patch the server's in-memory song.name to match (so the
+                // saved file carries the new display name), then ask it to
+                // write to SD.  No full-song stream needed — server already
+                // has every edit via the patch / note-set stream.
+                gServerPairing.sendSongPatch(_song, _song.name, sizeof(_song.name));
+                gServerPairing.sendSaveActive(_pendingSaveName);
+                markSongClean();
                 strncpy(_srvLoadedName, _pendingSaveName, sizeof(_srvLoadedName) - 1);
                 _srvLoadedName[sizeof(_srvLoadedName) - 1] = '\0';
                 // Refresh list so the newly saved file appears
@@ -277,11 +284,15 @@ SongPageResult SongPage::poll() {
             initSong(&_song);
             _srvLoadedName[0] = '\0';
             gSongSource = SongSource::NONE;
-            gServerPairing.sendSongToServer("", &_song);  // push blank song to server (no SD save)
+            // Tell server to wipe its in-memory copy too (initSong on its side).
+            gServerPairing.sendNewSong();
             return SongPageResult::SONG_LOADED;
 
         case FileBrowserEvent::SAVE:
-            gServerPairing.sendSongToServer(_srvLoadedName, &_song);
+            // Server already has every edit via the patch / note-set stream;
+            // ask it to write its own in-memory copy to SD under this name.
+            gServerPairing.sendSaveActive(_srvLoadedName);
+            markSongClean();
             gServerPairing.requestSongList(_srvPage);
             _srvListDrawn = false;
             _browser.setHasPrev(false);

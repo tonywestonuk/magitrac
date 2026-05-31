@@ -1,27 +1,33 @@
 #include "ServerPairing.h"
+#include "Autosave.h"
 #include "NoteGrid.h"
 #include "PairNVS.h"
 #include "MagiCommsEspNow.h"
 #include "MagiUdpLink.h"
 #include "MagiLink.h"
-#include "MagiMsg.h"          // magiWifiChannelFromIdx()
-#include "SettingsPage.h"     // extern gWifiChannelIdx
+#include "MagiMsg.h"
 #include <WiFi.h>
 #include <esp_random.h>
 #include <esp_mac.h>
 #include <esp_netif.h>
+#include <esp_wifi.h>
 #include <string.h>
 
 #define CLI_NVS_NS "magitrac_cli"
 
+// PROBE broadcast cadence while in PAIRING_REQUEST.  Both sides are on
+// ch1 — no channel hopping needed.
+static const uint32_t PAIR_SCAN_DWELL_MS = 250;
+
 // ── Global instances ─────────────────────────────────────────────────────────
-// Two links running simultaneously on the magitrac client:
-//   • gMagiLink (TCP)          — main reliable data path; AP role at
-//                                192.168.0.1.  Defined in MagiLink.cpp.
+// Three links running on the magitrac client (AP/STA roles inverted
+// 2026-05-27 — the server is now the AP):
+//   • gMagiLink (TCP)          — reliable data path; STA role.  Connects
+//                                to the server at 192.168.0.1:MAGI_PORT.
 //   • gPairTransport (ESP-NOW) — pairing ceremony only; coexist mode.
 //   • gUdpLink (UDP)           — best-effort datagrams for loss-tolerant
 //                                updates (row position, preview playhead,
-//                                MIDI note-in).
+//                                MIDI note-in).  Listens on MAGI_PORT.
 static MagiCommsEspNow  gPairTransport;
 static MagiUdpLink      gUdpLink;
 ServerPairing gServerPairing;
@@ -35,79 +41,27 @@ static void onPairRecv(const uint8_t* data, int len) {
 }
 
 // ── begin() ───────────────────────────────────────────────────────────────────
+//
+// WiFi mode setup + STA association live in magitrac.ino's setup() because
+// they're ordering-sensitive (must happen around display.begin()).  This
+// function handles the rest: pairing-NVS load, ESP-NOW pair transport,
+// UDP listener, MagiLink callback registrations.
 void ServerPairing::begin() {
     if (!_songBuf) _songBuf = new uint8_t[SONG_TRANSFER_MAX]();
     if (!_instBuf) _instBuf = new uint8_t[MAX_INSTRUMENTS * sizeof(Instrument)]();
     if (_ready) return;
 
-    // DEBUG: dump raw NVS state at boot — temporary, for NVS-corruption hunt.
-    pairNvsDump(CLI_NVS_NS);
-
     // Load existing pairing (server MAC + secret).
     _hasPairing = pairNvsLoad(CLI_NVS_NS, _storedServerMac, _storedSecret);
 
-    // Load or generate the AP info.  PSK is generated once on first boot
-    // and persisted forever — it's our identity as an AP, not part of any
-    // particular pairing.  Survives clearPairing().
-    //
-    // Also regenerate if a previous build saved a degenerate SSID (all-zero
-    // MAC bytes, e.g. "magitrac-000000") — that came from calling
-    // WiFi.macAddress() before WiFi was initialised; we now use
-    // esp_read_mac() which works pre-init.
-    bool loaded = pairNvsLoadApInfo(CLI_NVS_NS, _apSsid, _apPsk, &_nextHostOctet);
-    bool bogus  = loaded && (strstr(_apSsid, "000000") != nullptr);
-    if (!loaded || bogus) {
-        uint8_t myMac[6] = {};
-        esp_read_mac(myMac, ESP_MAC_WIFI_STA);   // factory MAC from eFuse — no WiFi needed
-        snprintf(_apSsid, sizeof(_apSsid), "magitrac-%02X%02X%02X",
-                 myMac[3], myMac[4], myMac[5]);
-        for (int i = 0; i < 16; i++) {
-            uint8_t v = esp_random() & 0xF;
-            _apPsk[i] = "0123456789abcdef"[v];
-        }
-        _apPsk[16] = 0;
-        _nextHostOctet = 3;
-        pairNvsSaveApInfo(CLI_NVS_NS, _apSsid, _apPsk, _nextHostOctet);
-        Serial.printf("[SP] %s AP: SSID=%s PSK=%s\n",
-                      bogus ? "regenerated" : "generated",
-                      _apSsid, _apPsk);
-    } else {
-        Serial.printf("[SP] AP ready: SSID=%s next-IP=.%u\n",
-                      _apSsid, _nextHostOctet);
-    }
-
-    // WiFi softAP — main data path.  192.168.0.1, always on the
-    // user-configured channel (one of 1/6/11).  The server, when in pair
-    // mode, scans those three channels broadcasting MSG_PAIR_PROBE — so
-    // wherever our AP lives, the server will find it.  Once paired the
-    // server STA-joins by SSID and tracks channel changes automatically.
-    // ESP-NOW pairing coexists on the STA interface (AP_STA mode).  DHCP
-    // is stopped because the server uses a static .2 that collides with
-    // the default pool.
-    const uint8_t channel = magiWifiChannelFromIdx(gWifiChannelIdx);
-    Serial.printf("[SP] AP channel: %u  SSID=%s\n", channel, _apSsid);
-    WiFi.persistent(false);
-    WiFi.mode(WIFI_AP_STA);
-    if (!WiFi.softAP(_apSsid, _apPsk, channel)) {
-        Serial.println("[SP] softAP FAILED");
-    }
-    WiFi.softAPConfig(IPAddress(192, 168, 0, 1),
-                      IPAddress(192, 168, 0, 1),
-                      IPAddress(255, 255, 255, 0));
-    if (esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
-        esp_netif_dhcps_stop(ap_netif);
-    }
-    Serial.printf("[SP] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
-
     // ESP-NOW transport — pairing ceremony only.  Coexist mode keeps it
-    // from clobbering the AP's WiFi setup.
+    // from clobbering the STA's WiFi setup.
     gPairTransport.setCoexistMode(true);
     gPairTransport.setOnReceive(onPairRecv);
     gPairTransport.begin();
 
-    // UDP listener — bound to MAGI_PORT alongside the MagiLink TCP listener
-    // (TCP/UDP port namespaces are disjoint).  Loss-tolerant position /
-    // preview / MIDI-in updates land here.
+    // UDP listener — bound to MAGI_PORT for SEQ_POS / MIDI_NOTE_IN /
+    // PREVIEW_ROW updates from the server.
     gUdpLink.setOnReceive(onUdpRecv);
     gUdpLink.beginListener(MAGI_PORT);
 
@@ -160,6 +114,19 @@ void ServerPairing::begin() {
             static_cast<ServerPairing*>(ctx)->_onMagiLinkSampleList(msg, len);
         }, this);
 
+    // MagiLink: generic file list + load.  Load is a 3-part stream (HEADER,
+    // N×BODY, EndOfData) so we route all three IDs into one dispatcher.
+    gMagiLink.registerCallback(MSG_FILE_LIST_RESP,
+        [](const uint8_t* msg, size_t len, void* ctx) {
+            static_cast<ServerPairing*>(ctx)->_onMagiLinkFileList(msg, len);
+        }, this);
+    auto fileLoadCb = [](const uint8_t* msg, size_t len, void* ctx) {
+        static_cast<ServerPairing*>(ctx)->_onMagiLinkFileLoad(msg, len);
+    };
+    gMagiLink.registerCallback(MSG_FILE_LOAD_HEADER, fileLoadCb, this);
+    gMagiLink.registerCallback(MSG_FILE_LOAD_BODY,   fileLoadCb, this);
+    gMagiLink.registerCallback(MSG_END_OF_DATA,      fileLoadCb, this);
+
     _ready = true;
 
     if (_hasPairing) {
@@ -184,58 +151,101 @@ void ServerPairing::_tryAutoConnect() {
     _setPairState(PairClientState::AUTO_CONNECTING);
 }
 
-// ── Pairing ceremony (over ESP-NOW; AP stays on user channel) ───────────────
+// ── Pairing ceremony (over ESP-NOW; always on ch1) ──────────────────────────
 //
-// Flow (new, post-2026-05-24 redesign):
-//   1. User enters pair mode here → state = PAIRING_REQUEST (listening).
-//   2. Server (in its own pair mode) scans channels 1/6/11 broadcasting
-//      MSG_PAIR_PROBE.  When the server's current scan channel matches
-//      our AP channel, we receive the probe — see _onPairReceive.
-//   3. We generate a 4-digit PIN, register the server as ESP-NOW peer,
-//      unicast MSG_PAIR_CHALLENGE back with the PIN, show PIN on screen,
-//      → PAIRING_CONFIRM.
-//   4. User taps Confirm → confirmPairCode() unicasts MSG_PAIR_OFFER with
-//      AP creds + assigned static IP, persists the server MAC, → AUTO_CONNECTING.
-//   5. Server saves creds and reboots into TCP-STA mode.  TCP-side
-//      MSG_CONNECT closes the loop and we go to SUCCESS.
+// Client owns the WiFi credentials (via WiFiSettingsPage → magitrac_cli
+// NVS).  Pairing's job is to deliver them to the server.
+//
+//   1. User enters pair mode → force radio to ch1, broadcast PROBE every
+//      PAIR_SCAN_DWELL_MS.
+//   2. Server (in its own pair mode, also on ch1) replies with CHALLENGE
+//      carrying a 4-digit PIN.
+//   3. _onPairReceive captures PIN + server MAC → PAIRING_CONFIRM.
+//   4. User taps Confirm on the touch screen → confirmPairCode() unicasts
+//      MSG_PAIR_OFFER { apMode, apSsid, apPsk } and persists the server
+//      MAC + the creds we just shipped.
+//   5. Server saves + reboots.  We stay up; in-place WiFi reconnect to
+//      the (possibly new) AP picks the session back up via MagiLink.
 void ServerPairing::startPairCeremony() {
-    Serial.println("[SP] entering pair mode — listening for PROBE");
-    _challengePending = false;
+    Serial.println("[SP] entering pair mode on ch1");
+    // STA may be in a tight retry loop trying to associate with a
+    // non-existent or out-of-range AP (e.g. user just changed creds on
+    // the WiFi page).  That hogs the radio and makes unicast ESP-NOW
+    // sends fail with "wifi:sta is connecting, return error".  Kill
+    // auto-reconnect first, then disconnect, then poll until the STA
+    // is actually idle (or give up after ~500 ms).
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(/*wifioff=*/false, /*eraseap=*/false);
+    esp_wifi_disconnect();
+    for (int i = 0; i < 10; i++) {
+        wl_status_t st = WiFi.status();
+        if (st != WL_CONNECTED && st != WL_IDLE_STATUS) break;
+        delay(50);
+    }
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    delay(50);
+    _scanLastProbeMs  = 0;
     _setPairState(PairClientState::PAIRING_REQUEST);
 }
 
 void ServerPairing::confirmPairCode() {
     if (_pairState != PairClientState::PAIRING_CONFIRM) return;
 
+    // Load the user-configured WiFi creds + apMode.  If unset, refuse.
+    char    ssid[33] = {};
+    char    psk[64]  = {};
+    uint8_t apMode   = 0;
+    if (!pairNvsLoadCreds(CLI_NVS_NS, ssid, psk, &apMode)) {
+        Serial.println("[SP] confirmPairCode: no WiFi creds set — open WiFi page first");
+        _setPairState(PairClientState::IDLE);
+        return;
+    }
+
     MsgPairOffer offer;
     memset(&offer, 0, sizeof(offer));
-    offer.type = MSG_PAIR_OFFER;
-    strncpy(offer.apSsid, _apSsid, sizeof(offer.apSsid) - 1);
-    strncpy(offer.apPsk,  _apPsk,  sizeof(offer.apPsk)  - 1);
-    offer.assignedIp[0] = 192; offer.assignedIp[1] = 168;
-    offer.assignedIp[2] = 0;   offer.assignedIp[3] = 2;
-    offer.gatewayIp[0]  = 192; offer.gatewayIp[1]  = 168;
-    offer.gatewayIp[2]  = 0;   offer.gatewayIp[3]  = 1;
-    bool ok = gPairTransport.sendRaw(&offer, sizeof(offer));
-    Serial.printf("[SP] sent MSG_PAIR_OFFER unicast (%s)\n", ok ? "OK" : "FAIL");
+    offer.type   = MSG_PAIR_OFFER;
+    offer.apMode = apMode;
+    strncpy(offer.apSsid, ssid, sizeof(offer.apSsid) - 1);
+    strncpy(offer.apPsk,  psk,  sizeof(offer.apPsk)  - 1);
 
-    // Persist server MAC — needed for TCP-side `lastSenderAddr` matching
-    // after the server reboots into STA mode and connects.  Secret is
-    // unused (no per-frame signing) but kept in the NVS schema.
+    // Retry — the WiFi radio may be in a brief scan window where
+    // unicast esp_now_send is rejected.  150 ms × 6 covers most.
+    bool ok = false;
+    for (int attempt = 0; attempt < 6 && !ok; attempt++) {
+        ok = gPairTransport.sendRaw(&offer, sizeof(offer));
+        if (!ok) {
+            Serial.printf("[SP-DBG] OFFER attempt %d FAIL, retrying\n", attempt);
+            delay(150);
+        }
+    }
+    Serial.printf("[SP] sent MSG_PAIR_OFFER apMode=%u size=%u (%s)\n",
+                  (unsigned)apMode, (unsigned)sizeof(offer),
+                  ok ? "OK" : "FAIL_ALL_RETRIES");
+
+    // Persist server MAC for our own NVS records.
     uint8_t zeroSecret[16] = {};
     pairNvsSave(CLI_NVS_NS, _serverMac, zeroSecret);
     memcpy(_storedServerMac, _serverMac, 6);
     _hasPairing = true;
+    gPairTransport.removePeer(_serverMac);
 
-    // Hand off to the auto-connect path.  Server will be unreachable for
-    // a few seconds (reboot + WiFi join), then it sends MSG_CONNECT over
-    // TCP and we transition to SUCCESS.
-    gPairTransport.removePeer(_serverMac);    // ESP-NOW peer no longer needed
+    // Server is rebooting; reconnect our STA on top of the (possibly
+    // new) AP creds.  WiFi.disconnect + WiFi.begin handles both
+    // "same network as before" and "switched networks" cases.
+    WiFi.disconnect(false, false);
+    WiFi.config(IPAddress(MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1,
+                          MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3),
+                IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                          MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                IPAddress(255, 255, 255, 0));
+    WiFi.begin(ssid, psk);
+    WiFi.setAutoReconnect(true);
+
     _tryAutoConnect();
 }
 
 void ServerPairing::cancelPairing() {
-    _challengePending = false;
+    WiFi.setAutoReconnect(true);
     if (_hasPairing) {
         memcpy(_serverMac, _storedServerMac, 6);
         _tryAutoConnect();
@@ -361,6 +371,8 @@ bool ServerPairing::sendMidi(const uint8_t* bytes, uint8_t len) {
 }
 
 bool ServerPairing::sendSongPatch(const Song& song, const void* fieldPtr, uint8_t length) {
+    // Any song mutation routes through here — that's our autosave trigger.
+    markSongDirty();
     if (_pairState != PairClientState::SUCCESS) return false;
     if (length == 0 || length > SONG_PATCH_MAX) return false;
     MsgSetSongData msg;
@@ -378,6 +390,7 @@ bool ServerPairing::sendSongPatch(const Song& song, const void* fieldPtr, uint8_
 }
 
 bool ServerPairing::sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, uint8_t col) {
+    markSongDirty();
     if (_pairState != PairClientState::SUCCESS) return false;
     if (pattern >= MAX_PATTERNS) return false;
     MsgNoteSet msg;
@@ -404,11 +417,46 @@ bool ServerPairing::sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col) 
     return ok;
 }
 
+bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgAuditionRawNote msg;
+    msg.channel  = channel;
+    msg.note     = note;
+    msg.velocity = velocity;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
 bool ServerPairing::sendNoteSetReliable(const Song& song, uint8_t pattern, uint8_t row, uint8_t col) {
     // TCP delivery is already reliable, so this is identical to sendNoteSet now.
     // The legacy "sendReliable" had a row-keyed retransmit ring on top of
     // ESP-NOW; with MagiLink it's a no-op distinction.
     return sendNoteSet(song, pattern, row, col);
+}
+
+bool ServerPairing::sendSaveActive(const char* name) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    if (!gMagiLink.isConnected()) return false;
+    if (!name || !name[0]) return false;
+    MsgSaveActive msg;
+    memset(msg.name, 0, sizeof(msg.name));
+    strncpy(msg.name, name, sizeof(msg.name) - 1);
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendNewSong() {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    if (!gMagiLink.isConnected()) return false;
+    MsgNewSong msg;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 bool ServerPairing::sendSongToServer(const char* name, const Song* song) {
@@ -562,28 +610,23 @@ void ServerPairing::tick() {
             }
             break;
 
-        case PairClientState::PAIRING_REQUEST:
-            if (_challengePending) {
-                _challengePending = false;
-                gPairTransport.addPeer(_serverMac);
-                MsgPairChallenge ch;
-                ch.type = MSG_PAIR_CHALLENGE;
-                memcpy(ch.pin, _pairCode, 4);
-                bool ok = gPairTransport.sendRaw(&ch, sizeof(ch));
-                Serial.printf("[SP] got PROBE → PIN %c%c%c%c, CHALLENGE send=%s\n",
-                    _pairCode[0], _pairCode[1], _pairCode[2], _pairCode[3],
-                    ok ? "OK" : "FAIL");
-                _setPairState(PairClientState::PAIRING_CONFIRM);
-                // We just transitioned — skip the timeout check this tick
-                // (else if).  Otherwise `now` (sampled before _setPairState)
-                // is older than the freshly-stamped _pairStateMs and the
-                // uint32_t subtraction underflows, firing the timeout
-                // immediately.
-            } else if (now - _pairStateMs >= PAIR_REQUEST_TIMEOUT_MS) {
+        case PairClientState::PAIRING_REQUEST: {
+            // Both sides are on ch1.  Broadcast PROBE every PAIR_SCAN_DWELL_MS
+            // until the server (in pair mode) replies with CHALLENGE.
+            if (now - _scanLastProbeMs >= PAIR_SCAN_DWELL_MS) {
+                _scanLastProbeMs = now;
+                MsgPairProbe probe;
+                probe.type = MSG_PAIR_PROBE;
+                memcpy(probe.magic, MAGI_PAIR_MAGIC, sizeof(probe.magic));
+                gPairTransport.localAddr(probe.senderMac);
+                gPairTransport.sendBroadcast(&probe, sizeof(probe));
+            }
+            if (now - _pairStateMs >= PAIR_REQUEST_TIMEOUT_MS) {
                 Serial.println("[SP] pair window timeout");
                 _setPairState(PairClientState::IDLE);
             }
             break;
+        }
 
         case PairClientState::PAIRING_CONFIRM:
             if (now - _pairStateMs >= PAIR_REQUEST_TIMEOUT_MS) {
@@ -690,6 +733,52 @@ const char* ServerPairing::sampleListNameFor(uint8_t id) const {
     return nullptr;
 }
 
+// ── Generic file list + load ───────────────────────────────────────────────
+void ServerPairing::resetFileList() {
+    _fileListState      = FileListState::IDLE;
+    _fileListKind       = 0;
+    _fileListCount      = 0;
+    _fileListPage       = 0;
+    _fileListTotalPages = 0;
+}
+
+void ServerPairing::requestFileList(uint8_t kind, uint8_t page) {
+    if (_pairState != PairClientState::SUCCESS) return;
+    if (page == 0) resetFileList();
+    _fileListKind = kind;
+    MsgFileListReq req;
+    req.kind = kind;
+    req.page = page;
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&req, sizeof(req));
+    gMagiLink.releaseMutex();
+    _fileListState = FileListState::WAITING;
+}
+
+void ServerPairing::resetFileLoad() {
+    _fileLoadState    = FileLoadState::IDLE;
+    _fileLoadKind     = 0;
+    _fileLoadBufLen   = 0;
+    _fileLoadExpected = 0;
+    _fileLoadName[0]  = '\0';
+}
+
+void ServerPairing::requestFileLoad(uint8_t kind, const char* name) {
+    if (_pairState != PairClientState::SUCCESS || !name) return;
+    resetFileLoad();
+    _fileLoadKind = kind;
+    strncpy(_fileLoadName, name, FILE_NAME_LEN - 1);
+    _fileLoadName[FILE_NAME_LEN - 1] = '\0';
+    MsgFileLoadReq req;
+    req.kind = kind;
+    memset(req.name, 0, sizeof(req.name));
+    strncpy(req.name, _fileLoadName, FILE_NAME_LEN - 1);
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&req, sizeof(req));
+    gMagiLink.releaseMutex();
+    _fileLoadState = FileLoadState::WAITING_HEADER;
+}
+
 bool ServerPairing::copySong(Song* out) const {
     if (_browseState != BrowseState::SONG_READY) return false;
     const SongFileHeader* hdr = (const SongFileHeader*)_songBuf;
@@ -772,23 +861,23 @@ void ServerPairing::_onPairReceive(const uint8_t* data, int len) {
 
     switch (type) {
 
-        case MSG_PAIR_PROBE:
+        case MSG_PAIR_CHALLENGE:
+            // Server's reply to our PROBE.  Lock the PIN + server MAC and
+            // move to PAIRING_CONFIRM so the user can read the code and
+            // tap Confirm.  Register the server as ESP-NOW peer so the
+            // subsequent OFFER unicast can reach it.
             if (_pairState != PairClientState::PAIRING_REQUEST) return;
-            if (len < (int)sizeof(MsgPairProbe)) return;
-            if (_challengePending) return;   // already queued from an earlier probe
+            if (len < (int)sizeof(MsgPairChallenge)) return;
             {
-                // Generate 4-digit PIN; record the server MAC.  The
-                // CHALLENGE itself is sent from tick() — we're on the
-                // WiFi task here and esp_now_send's send-cb runs on the
-                // same task, so blocking on the ACK semaphore inline
-                // would time out every time.
-                uint32_t r = esp_random();
-                _pairCode[0] = '0' + (r % 10); r /= 10;
-                _pairCode[1] = '0' + (r % 10); r /= 10;
-                _pairCode[2] = '0' + (r % 10); r /= 10;
-                _pairCode[3] = '0' + (r % 10);
+                const MsgPairChallenge* c = (const MsgPairChallenge*)data;
+                memcpy(_pairCode, c->pin, 4);
                 memcpy(_serverMac, senderMac, 6);
-                _challengePending = true;
+                gPairTransport.addPeer(_serverMac);
+                Serial.printf("[SP] got CHALLENGE PIN=%c%c%c%c from %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    _pairCode[0], _pairCode[1], _pairCode[2], _pairCode[3],
+                    _serverMac[0], _serverMac[1], _serverMac[2],
+                    _serverMac[3], _serverMac[4], _serverMac[5]);
+                _setPairState(PairClientState::PAIRING_CONFIRM);
             }
             break;
 
@@ -932,6 +1021,96 @@ void ServerPairing::_onMagiLinkSampleList(const uint8_t* msg, size_t len) {
     } else {
         _sampleListState = SampleListState::READY;
         Serial.printf("[SP] sample list ready: %d entries\n", _sampleCount);
+    }
+}
+
+// ── MagiLink generic file list response ───────────────────────────────────
+void ServerPairing::_onMagiLinkFileList(const uint8_t* msg, size_t len) {
+    if (_pairState != PairClientState::SUCCESS) return;
+    if (len < sizeof(MsgFileListResp)) return;
+    if (_fileListState != FileListState::WAITING &&
+        _fileListState != FileListState::PARTIAL) return;
+
+    const MsgFileListResp* r = (const MsgFileListResp*)msg;
+    if (r->kind != _fileListKind) return;   // ignore stray response
+
+    _fileListPage       = r->page;
+    _fileListTotalPages = r->totalPages > 0 ? r->totalPages : 1;
+
+    int n = r->count <= FILE_LIST_PER_PKT ? r->count : FILE_LIST_PER_PKT;
+    for (int i = 0; i < n && _fileListCount < FILE_LIST_CACHE_MAX; i++) {
+        strncpy(_fileListNames[_fileListCount], r->names[i], FILE_NAME_LEN - 1);
+        _fileListNames[_fileListCount][FILE_NAME_LEN - 1] = '\0';
+        _fileListCount++;
+    }
+
+    if (_fileListPage + 1 < _fileListTotalPages) {
+        _fileListState = FileListState::PARTIAL;
+        MsgFileListReq req;
+        req.kind = _fileListKind;
+        req.page = (uint8_t)(_fileListPage + 1);
+        gMagiLink.send(&req, sizeof(req));
+    } else {
+        _fileListState = FileListState::READY;
+        Serial.printf("[SP] file list ready: kind=%u, %d entries\n",
+                      (unsigned)_fileListKind, _fileListCount);
+    }
+}
+
+// ── MagiLink generic file load: HEADER → BODY × N → EndOfData ─────────────
+void ServerPairing::_onMagiLinkFileLoad(const uint8_t* msg, size_t len) {
+    if (_pairState != PairClientState::SUCCESS) return;
+    uint8_t id = msg[0];
+
+    if (id == MSG_FILE_LOAD_HEADER) {
+        if (_fileLoadState != FileLoadState::WAITING_HEADER) return;
+        if (len < sizeof(MsgFileLoadHeader)) {
+            _fileLoadState = FileLoadState::ERROR;
+            return;
+        }
+        const MsgFileLoadHeader* h = (const MsgFileLoadHeader*)msg;
+        if (h->kind != _fileLoadKind) return;
+        if (!h->found) {
+            _fileLoadState = FileLoadState::NOT_FOUND;
+            return;
+        }
+        if (h->total_size > FILE_LOAD_BUF_MAX) {
+            Serial.printf("[SP] file '%s' too big (%u > %u)\n",
+                          _fileLoadName, (unsigned)h->total_size,
+                          (unsigned)FILE_LOAD_BUF_MAX);
+            _fileLoadState = FileLoadState::ERROR;
+            return;
+        }
+        _fileLoadExpected = h->total_size;
+        _fileLoadBufLen   = 0;
+        _fileLoadState    = FileLoadState::WAITING_BODY;
+    }
+    else if (id == MSG_FILE_LOAD_BODY) {
+        if (_fileLoadState != FileLoadState::WAITING_BODY) return;
+        if (len < sizeof(MsgFileLoadBody)) return;
+        const MsgFileLoadBody* b = (const MsgFileLoadBody*)msg;
+        uint16_t n = b->data_len > 1024 ? 1024 : b->data_len;
+        if (_fileLoadBufLen + n > FILE_LOAD_BUF_MAX) {
+            _fileLoadState = FileLoadState::ERROR;
+            return;
+        }
+        memcpy(_fileLoadBuf + _fileLoadBufLen, b->data, n);
+        _fileLoadBufLen += n;
+    }
+    else if (id == MSG_END_OF_DATA) {
+        // BackupRestorePage takes the MagiLink mutex and consumes EndOfData
+        // directly — that path bypasses this dispatcher.  Only react if
+        // we're actively expecting one.
+        if (_fileLoadState != FileLoadState::WAITING_BODY) return;
+        if (_fileLoadBufLen != _fileLoadExpected) {
+            Serial.printf("[SP] file short read: got %u expected %u\n",
+                          (unsigned)_fileLoadBufLen, (unsigned)_fileLoadExpected);
+            _fileLoadState = FileLoadState::ERROR;
+            return;
+        }
+        _fileLoadState = FileLoadState::READY;
+        Serial.printf("[SP] file '%s' ready (%u bytes)\n",
+                      _fileLoadName, (unsigned)_fileLoadBufLen);
     }
 }
 

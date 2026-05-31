@@ -13,13 +13,16 @@
 //                 [Header(8)] [50×Pattern(72)] [Song::columns(160)] [tail] [noteCount] [notes]
 // v17 (compact):  MAX_COLUMNS grew from 8 → 9 (one input + 8 outputs)
 //                 [Header(8)] [50×Pattern(72)] [Song::columns(180)] [tail] [noteCount] [notes]
+// v18 (compact):  MAX_COLUMNS grew from 9 → 21 (one input + 20 outputs)
+//                 [Header(8)] [50×Pattern(72)] [Song::columns(420)] [tail] [noteCount] [notes]
 //
 // In v11–v15, ColumnSettings sat inside Pattern (228+pad bytes). In v16 it lives
 // in Song. Migration lifts pattern[0]'s columns into Song::columns and discards
 // per-block columns from other patterns.
 
-// Historical column count for v11..v16 file layouts (do NOT track current MAX_COLUMNS).
+// Historical column counts (do NOT track current MAX_COLUMNS).
 static const int V16_MAX_COLUMNS = 8;
+static const int V17_MAX_COLUMNS = 9;
 
 static const int V11_MAX_PATTERNS   = 32;
 static const int V11_MAX_SONG_NOTES = 2048;
@@ -403,7 +406,72 @@ static inline bool songMigrateV16FromFile(File& f, Song* out) {
     return true;
 }
 
-// ── Compact format: write (v17) ─────────────────────────────────────────────
+// ── v17 migration (stream from file) ────────────────────────────────────────
+// File must be seeked past the SongFileHeader.
+// v17 differs from current only in Song::columns size (9 cols vs current MAX).
+static inline bool songMigrateV17FromFile(File& f, Song* out) {
+    memset(out, 0, sizeof(Song));
+
+    // 1. Patterns (current Pattern layout — unchanged since v16)
+    if (f.read((uint8_t*)out->patterns, sizeof(out->patterns)) != (int)sizeof(out->patterns)) return false;
+
+    // 2. Per-song column settings — historical 9 entries; remaining cols zeroed
+    static const size_t V17_COLS_BYTES = (size_t)V17_MAX_COLUMNS * sizeof(ColumnSettings);
+    ColumnSettings v17cols[V17_MAX_COLUMNS];
+    if (f.read((uint8_t*)v17cols, V17_COLS_BYTES) != (int)V17_COLS_BYTES) return false;
+    for (int c = 0; c < V17_MAX_COLUMNS && c < MAX_COLUMNS; c++) {
+        out->columns[c] = v17cols[c];
+    }
+
+    // 3. Song tail (numPatterns through _songPad — unchanged since v15)
+    static const size_t TAIL_SIZE = sizeof(Song) - offsetof(Song, numPatterns);
+    if (f.read((uint8_t*)&out->numPatterns, TAIL_SIZE) != (int)TAIL_SIZE) return false;
+
+    // 4. Note count
+    uint16_t noteCount = 0;
+    if (f.read((uint8_t*)&noteCount, sizeof(noteCount)) != (int)sizeof(noteCount)) return false;
+    if (noteCount > MAX_SONG_NOTES) return false;
+
+    // 5. Reset noteHeads (disk values are stale)
+    for (int p = 0; p < MAX_PATTERNS; p++)
+        out->patterns[p].noteHead = NOTE_NULL;
+
+    // 6. Read notes
+    uint16_t tail[MAX_PATTERNS];
+    for (int p = 0; p < MAX_PATTERNS; p++) tail[p] = NOTE_NULL;
+    for (uint16_t i = 0; i < noteCount; i++) {
+        SerializedNote sn;
+        if (f.read((uint8_t*)&sn, sizeof(sn)) != (int)sizeof(sn)) return false;
+        if (sn.pattern >= MAX_PATTERNS) return false;
+
+        NoteNode& node = out->notePool[i];
+        node.row = sn.row; node.col = sn.col; node.note = sn.note;
+        node.velocity = sn.velocity; node.effect = sn.effect; node.param = sn.param;
+        node.next = i;
+
+        uint8_t p = sn.pattern;
+        if (out->patterns[p].noteHead == NOTE_NULL) { out->patterns[p].noteHead = i; tail[p] = i; }
+        else { out->notePool[tail[p]].next = i; tail[p] = i; }
+    }
+
+    // 7. Close circular lists + build free list
+    for (int p = 0; p < MAX_PATTERNS; p++) {
+        if (out->patterns[p].noteHead != NOTE_NULL)
+            out->notePool[tail[p]].next = out->patterns[p].noteHead;
+    }
+    if (noteCount < MAX_SONG_NOTES) {
+        out->noteFreeHead = noteCount;
+        for (uint16_t i = noteCount; i < MAX_SONG_NOTES - 1; i++)
+            out->notePool[i].next = i + 1;
+        out->notePool[MAX_SONG_NOTES - 1].next = NOTE_NULL;
+    } else {
+        out->noteFreeHead = NOTE_NULL;
+    }
+
+    return true;
+}
+
+// ── Compact format: write (v18) ─────────────────────────────────────────────
 // Layout: header + patterns + Song::columns + tail + noteCount + notes.
 
 static inline bool songWriteCompact(File& f, const Song* song) {
