@@ -1,0 +1,75 @@
+{
+  "": {
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/master.swiftdeps"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/ByteBuffer.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ByteBuffer.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ByteBuffer.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ByteBuffer~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ByteBuffer.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ByteBuffer.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/ColumnSettings.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ColumnSettings.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ColumnSettings.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ColumnSettings~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ColumnSettings.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/ColumnSettings.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/Constants.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Constants.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Constants.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Constants~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Constants.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Constants.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/Effect.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Effect.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Effect.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Effect~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Effect.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Effect.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/Instrument.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Instrument.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Instrument.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Instrument~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Instrument.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Instrument.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/Note.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Note.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Note.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Note~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Note.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Note.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/Pattern.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pattern.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pattern.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pattern~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pattern.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pattern.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/PerfPad.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/PerfPad.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/PerfPad.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/PerfPad~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/PerfPad.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/PerfPad.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/Pitch.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pitch.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pitch.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pitch~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pitch.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Pitch.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Sources/MagiTrackCore/Song.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Song.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Song.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Song~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Song.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackCore.build/Song.dia"
+  }
+}

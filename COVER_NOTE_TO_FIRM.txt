@@ -1,0 +1,237 @@
+COVER NOTE TO PATENT SEARCH FIRM
+===========================================================
+Re: Prior-art / patentability search instructions
+From: Tony Weston
+Date: [insert date]
+===========================================================
+
+
+1. WHAT I AM SENDING
+--------------------
+
+Two technical briefs covering two related but distinct inventions in
+the field of music sequencer software, both implemented in my device
+"MagiTrac":
+
+  PATENT_SEARCH_BRIEF.txt   - "Method of deriving tempo and position
+                              in a musical sequence from a live
+                              performer's MIDI input."  Covers a
+                              role-typed gating column in a step-
+                              sequencer grid (WAIT / SYNC / NOISE
+                              cells) consulted in real time on every
+                              performer keystroke.
+
+  PATENT_SEARCH_BRIEF_2.txt - "Method of authoring and traversing a
+                              branching song structure in a step-
+                              sequencer under live performer
+                              control."  Covers a per-pattern branch
+                              table indexed by performer pitch class
+                              that selects which pattern plays next.
+
+The two mechanisms operate on the same MIDI input stream and are
+designed to integrate.  A single performer keystroke can simultane-
+ously change pattern (Brief 2) and snap-resolve within the new
+pattern (Brief 1).  Please consider that integration in your search.
+
+I would value your view on whether they should be filed as one
+application with multiple independent claims, or as two separate
+applications.
+
+
+2. WHY I AM RAISING THIS NOW
+----------------------------
+
+Before instructing you, I performed a brief web-only scan of patent
+databases (Google Patents, Espacenet by web), academic papers, and
+commercial product documentation, to identify obvious prior art.
+The scan surfaced several near-misses that I want you to be aware of
+up-front, both so you can confirm or refute my distinctions and so
+that no time is wasted re-deriving what I have already found.
+
+The scan was not exhaustive.  I have no access to subscription patent
+databases (Derwent, Orbit, PatBase) or to most non-English-language
+filings; please treat my findings as a starting point, not a complete
+list.
+
+
+3. CONCERNING PRIOR ART - BRIEF 1 (gating-cell sync engine)
+-----------------------------------------------------------
+
+3.1  WO1994028539A2 - Coda Music "Intelligent Accompaniment"
+     (Vivace / SmartMusic family).  *Most concerning patent.*
+
+     Derives tempo from the time delta between a matched performer
+     event and the corresponding expected-score event.  This is
+     direct overlap on the bare "tempo from performer keystroke
+     timing" idea.
+
+     Distinction I am drawing:  Vivace is a SCORE-FOLLOWER over a
+     continuous performance score with tolerance windows and skip
+     thresholds.  It has no authored gating-cell column, no
+     composer-marked halt-and-resume points, and no equivalent of
+     the NOISE absorption marker.
+
+     What I want from you:  please pull the full Coda / Vivace /
+     SmartMusic patent family (continuations, divisionals, foreign
+     filings) and compare element-by-element against Section 7 of
+     Brief 1.  If the distinction I am drawing does not hold, I
+     need to know that before filing.
+
+3.2  B-Keeper - Robertson & Plumbley, Queen Mary University of
+     London (2007 NIME paper; extended in Computer Music Journal
+     vol. 37 issue 2, 2013).  *Closest academic prior art.*
+
+     A real-time beat tracker that re-tempos a sequencer from a
+     live drummer's kick-drum onsets.  No patent (academic
+     publication) but on-point for the bare "sync a sequencer to
+     a live performer" goal.
+
+     Distinction I am drawing:  B-Keeper is a continuous beat
+     tracker over kick onsets, effectively a clock follower.  No
+     authored cue rows, no halt/resume, no noise filter.
+
+     What I want from you:  include in the literature search.
+     Confirm whether any of its successors or related QMUL Centre
+     for Digital Music outputs add gating-cell or halt-resume
+     semantics.
+
+3.3  Antescofo (IRCAM) and the broader score-following research
+     literature (Cont, Raphael "Music Plus One", Dannenberg).
+
+     Distinct mechanism (operates on continuous audio with HMM
+     alignment, not on per-row MIDI cues).  Acknowledged in the
+     brief.  Standard search target.
+
+3.4  Conductor / gesture-tempo patents (US20130032023A1,
+     US5275082).
+
+     Distinct (no grid, no cues).  Listed for completeness.
+
+3.5  Tap-tempo and audio-BPM-detection patents (JP2780475B2,
+     US6518492B2).
+
+     Distinct.  Listed for completeness.
+
+
+4. CONCERNING PRIOR ART - BRIEF 2 (branching arrangement)
+---------------------------------------------------------
+
+4.1  Senode (iOS application, ~2017) and MIDINOUS (desktop
+     application, 2024).  *Most concerning category.*
+
+     Both are step-sequencers explicitly modelled as a directed
+     graph of musical nodes connected by edges, with run-time
+     traversal.  This overlaps the headline "graph not list"
+     claim.
+
+     The web documentation for both is shallow.  Per what I could
+     find, neither selects edges by external performer pitch
+     class - Senode appears self-driving, MIDINOUS selects edges
+     by random / immediate / path-creation-order - but I cannot
+     rule out an undocumented feature.
+
+     What I want from you:  obtain the full product documenta-
+     tion (including manuals, marketing copy, and any developer
+     blogs or interviews) for both products and confirm whether
+     either supports a per-node branch table indexed by external
+     performer keystroke pitch class.  This is the single most
+     important diligence item for Brief 2.
+
+4.2  LucasArts iMUSE (US5315057 and continuations, 1994).
+
+     The canonical interactive music branching system.  Branches
+     are decided at composer-authored decision points based on
+     game-state events, not on the pitch of a performer's
+     keystroke.
+
+     What I want from you:  pull the full LucasArts /
+     Lucasfilm patent family from that period.  Although the
+     trigger mechanism is distinct (game-state vs. pitch-class),
+     the broader "graph of musical segments with run-time
+     branching" structure is firmly established prior art and
+     I expect this to be the principal citation in any
+     examination.
+
+4.3  Audiokinetic Wwise / Firelight FMOD interactive-music
+     engines (current commercial products with various filings).
+
+     Same family as iMUSE; game-state-parameter-driven
+     branching.  Distinct from pitch-class-keyed performer
+     trigger.  Standard search target.
+
+4.4  Yamaha PSR / Genos / Tyros style section change (MAIN A/B/
+     C/D + FILL + INTRO + ENDING).
+
+     Performer-driven section change in real time, but via
+     dedicated control buttons on the instrument, not via the
+     pitch class of a played note.  Yamaha hold a substantial
+     patent family in this area; please pull it.
+
+     This is the closest "performer-driven real-time section
+     change" prior art I am aware of.  The distinction rests on:
+     (a) selection by pitch class of a played note rather than
+     by dedicated section button, (b) per-pattern branch table
+     of up to 12 entries rather than a fixed global set of
+     section variations, and (c) integration with the per-
+     pattern performer-sync engine of Brief 1.
+
+4.5  Tracker pattern-jump / pattern-break effects (MOD/XM/IT
+     formats: Bxx, Dxx).
+
+     Composer-authored, deterministic.  Distinct.
+
+
+5. WHAT I AM ASKING YOU TO DELIVER
+----------------------------------
+
+  (a) Confirmation, with citations, of whether any single piece of
+      prior art anticipates either invention as a whole.  Focus on
+      the COMBINATION of features in Section 7 of each brief, not
+      individual elements.
+
+  (b) Identification of "near-miss" prior art that does not
+      anticipate but may need to be distinguished in claim
+      drafting.
+
+  (c) Your view on patentability in the United Kingdom (UKIPO),
+      the European Patent Office (EPO), and the United States
+      Patent and Trademark Office (USPTO).  Software-related
+      patentability differs significantly between these
+      jurisdictions and a route recommendation would be
+      appreciated.
+
+  (d) Your view on whether the two mechanisms are best filed as a
+      single application with multiple independent claims, or as
+      two separate applications.
+
+  (e) An estimate of cost and timeline before you commence the
+      substantive search, broken down by jurisdiction.
+
+
+6. PUBLIC-DISCLOSURE STATUS
+---------------------------
+
+[Tony to fill in.  Please list every public demonstration, sale,
+online posting, video, forum mention, GitHub commit on a public
+repository, or any other event that may constitute a prior public
+disclosure of either mechanism, with dates.
+
+Note for the firm: under UK and EPO law, any public disclosure
+before the filing date is generally fatal to novelty.  The USA
+provides a 12-month grace period (35 USC 102(b)) for the inventor's
+own disclosures.  Please advise on the implications for filing
+strategy once the disclosure history is supplied.]
+
+
+7. CONTACT
+----------
+
+[Insert contact details.]
+
+I am happy to answer any clarifying questions, demonstrate the
+device, or supply source code references for any aspect of either
+mechanism.
+
+Best regards,
+
+Tony Weston

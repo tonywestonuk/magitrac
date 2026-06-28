@@ -1,0 +1,480 @@
+METHOD OF AUTHORING AND TRAVERSING A BRANCHING SONG STRUCTURE
+IN A STEP-SEQUENCER UNDER LIVE PERFORMER CONTROL
+==============================================================
+
+Brief for prior-art search.  Inventor: Tony Weston, 2026.
+
+This is the second of two related briefs.  The first
+("METHOD OF DERIVING TEMPO AND POSITION...") covers the per-pattern
+performer-sync mechanism (WAIT / SYNC / NOISE).  This brief covers
+the SONG-LEVEL ARRANGEMENT mechanism: how individual patterns are
+linked into a complete song, and how the performer chooses the path
+through that arrangement at performance time.
+
+----------------------------------------------------------------------
+1. FIELD
+----------------------------------------------------------------------
+
+A music sequencer in which the song's macro-structure - the order in
+which patterns ("blocks") are played - is authored as a directed
+graph rather than a linear list, and in which the choice of which
+outgoing edge to follow at each pattern's end is determined in real
+time by which note the human performer plays on a live MIDI input.
+
+The composer therefore authors a SET OF POSSIBLE SONG STRUCTURES,
+not a single fixed structure; the performer's playing selects one
+specific traversal of that graph each time the song is played.
+
+Distinct from:
+
+  - Linear pattern playlists (tracker "order list" formats: MOD, XM,
+    IT, S3M; Octatrack/Elektron arranger; Roland MC-series songs;
+    Korg Electribe songs; most DAW arrangement views) - these specify
+    a fixed, deterministic order of patterns at composition time.
+
+  - Manual clip-launching systems (Ableton Live Session view, Push,
+    Maschine clip slots) - performer triggers any clip from any slot
+    at any time, but there is no composer-authored per-clip set of
+    outgoing branch targets and no keystroke-pitch-to-target mapping.
+
+  - Probabilistic / generative pattern selection (Reaktor patches,
+    some modular setups, certain Roland/Korg "scene" features) -
+    branches are selected by random / weighted choice, not by which
+    pitch the performer plays.
+
+  - Interactive game music (iMUSE, FMOD, Wwise) - branches at musical
+    boundaries, but transitions are driven by GAME-STATE EVENTS
+    (player location, combat state, scripted cues), not by the
+    performer's MIDI keystroke pitch.
+
+----------------------------------------------------------------------
+2. CONVENTIONAL (LINEAR) ARRANGEMENT - THE PRIOR ART
+----------------------------------------------------------------------
+
+A standard tracker / DAW / groovebox song mode looks like:
+
+    [intro] -> [verse] -> [chorus] -> [verse] -> [chorus] ->
+    [bridge] -> [chorus] -> [outro]
+
+The arranger plays each pattern in turn, in the authored order.
+The performance is identical every time; the arrangement is fixed.
+
+Some systems add jumps and loops (e.g. "play [chorus] x2", "jump
+back to position 4") but these are also pre-programmed.  No system
+in the prior art (to the inventor's knowledge) lets the composer
+author a per-pattern set of MULTIPLE outgoing transitions where the
+choice is selected by the LIVE PITCH of a performer keystroke.
+
+----------------------------------------------------------------------
+3. THE BRANCHING ARRANGEMENT - THIS INVENTION
+----------------------------------------------------------------------
+
+3.1  Per-pattern branch table
+
+Each pattern carries a 12-entry branch table indexed by pitch class
+(C, C#, D, D#, E, F, F#, G, G#, A, A#, B).  Each entry specifies an
+optional target pattern and a transition mode:
+
+    Pattern A's branch table:
+    ---------------------------------------
+    pitch C     -> target = pattern B,  mode = TOP
+    pitch C#    -> (none)
+    pitch D     -> target = pattern C,  mode = TOP
+    pitch D#    -> (none)
+    pitch E     -> target = pattern D,  mode = CONTINUE
+    pitch F     -> (none)
+    ... etc ...
+
+Modes:
+    STAY      - default; no branch on this pitch.
+    TOP       - on this pitch, switch to the target pattern and
+                start at row 0.
+    CONTINUE  - on this pitch, switch to the target pattern but
+                preserve the current row position.
+
+3.2  Branch evaluation
+
+The branch table is consulted on EVERY performer keystroke.  Pitch
+class is extracted from the MIDI note number; the corresponding row
+of the branch table is read.  If the mode is not STAY, the
+sequencer:
+
+    - Sets active pattern  := target.
+    - Sets row position    := 0  (if mode == TOP)
+                              or current row (if mode == CONTINUE).
+    - Re-emits MIDI bank/program/volume setup for all output
+      columns of the new pattern.
+    - Re-applies the new pattern's transpose rules (which may
+      themselves be per-pitch-class).
+
+The branch evaluation runs alongside, and independently of, the
+WAIT/SYNC/NOISE snap engine described in the first brief.  A single
+performer keystroke can therefore both BRANCH (change the active
+pattern) and SNAP (resolve a WAIT, or jump forward to a SYNC) within
+the new pattern.
+
+3.3  Default fall-through (block-end navigation)
+
+When the playhead reaches the end of a pattern without any branch
+having fired, the pattern's BLOCK-END-NAV property determines what
+happens next.  This is a per-pattern attribute (not a per-pitch-
+class entry):
+
+    NAV_FWD  +N    advance by N patterns in the song's pattern list
+    NAV_BACK -N    retreat by N patterns
+    NAV_ABS   M    jump to absolute pattern M
+    NAV_LOOP       repeat the same pattern
+
+The fall-through path is what the song does in the absence of any
+performer-driven branching - effectively the "default backbone" of
+the arrangement.  The performer's keystrokes overlay branches on
+top of this default.
+
+3.4  Key-change branching (secondary mechanism)
+
+Each pattern also carries a KEY-CHANGE-MODE flag.  When set to TOP,
+any change in the performer's pitch class (octave-independent)
+triggers an automatic branch following the pattern's BLOCK-END-NAV
+to row 0 of the resulting pattern.  This provides an alternative
+"automatic" branching mechanism where the trigger is not WHICH note
+the performer plays but THAT it is a different note class than
+before.
+
+----------------------------------------------------------------------
+4. ASCII REPRESENTATION OF AUTHORED STRUCTURES
+----------------------------------------------------------------------
+
+4.1  Linear (prior art) - one possible playback:
+
+    +-------+   +-------+   +-------+   +-------+   +-------+
+    | intro |-->| verse |-->|chorus |-->| verse |-->|chorus |
+    +-------+   +-------+   +-------+   +-------+   +-------+
+                                                       |
+                                                       v
+                                                  +--------+
+                                                  | bridge |
+                                                  +--------+
+                                                       |
+                                                       v
+                                                  +-------+
+                                                  | outro |
+                                                  +-------+
+
+    Always plays in this order.  Performer plays along; arrangement
+    does not respond to performer.
+
+
+4.2  Branching (this invention) - many possible playbacks:
+
+                         +-------+
+                         | intro |
+                         +---+---+
+                             |  (default fall-through)
+                             v
+                         +-------+
+                         |  A    |<-----------------+
+                         +---+---+                  |
+                          / / | \ \                 |
+              note C     /  | |  \  note B          |
+                        v   | |   \                 |
+                 +-------+  | |    +-------+        |
+                 |   B   |  | |    |   E   |        |
+                 +---+---+  | |    +---+---+        |
+                     |      | |        |            |
+              note F |      | | note G |  default   |
+                     v      | |        v            |
+                 +-------+  | |    +-------+        |
+                 |   C   |  | |    |   F   |--------+
+                 +---+---+  | |    +-------+
+                     |      | |
+              default|      | | note D
+                     v      | v
+                 +-------+ +-------+
+                 | coda  | |   D   |
+                 +-------+ +---+---+
+                                |
+                          default|
+                                v
+                            +-------+
+                            | outro |
+                            +-------+
+
+    Pattern A has multiple authored outgoing edges (one per pitch
+    class plus a default fall-through).  The performer chooses which
+    edge to take by which note they play next.  Pattern F can loop
+    back to A.  Different performances follow different paths
+    through the same authored graph.
+
+
+4.3  A pattern's branch table viewed in isolation:
+
+       Pattern A
+      +---------+
+      |  rows   |
+      |   0     |       branch table (12 entries):
+      |   1     |
+      |   ...   |       C    -> B  (TOP)
+      |   31    |       C#   -> -
+      +----+----+       D    -> D  (TOP)
+           |            D#   -> -
+       end of pattern   E    -> -
+           |            F    -> -
+           v            F#   -> -
+       BLOCK-END-NAV    G    -> -
+       = NAV_FWD +1     G#   -> -
+           |            A    -> -
+           v            A#   -> -
+       Pattern A+1      B    -> E  (TOP)
+
+
+4.4  Branch with CONTINUE mode (preserves row position):
+
+      Pattern X (currently at row 17)
+              |
+              | performer plays note matching X's branch entry,
+              | mode = CONTINUE
+              v
+      Pattern Y (resumes at row 17, NOT row 0)
+
+    Mode CONTINUE is musically useful for "alternate harmonisation"
+    or "instrumentation swap" patterns that share row layout with
+    the source pattern.
+
+----------------------------------------------------------------------
+5. INTERACTION WITH THE SNAP / WAIT / NOISE MECHANISM
+----------------------------------------------------------------------
+
+Both mechanisms read the same performer MIDI input on the same
+keystroke event:
+
+    performer keystroke arrives
+              |
+              v
+    +----------------------+
+    | extract pitch class  |
+    +----+-------------+---+
+         |             |
+         v             v
+    +---------+    +---------+
+    | branch  |    | snap    |
+    | table   |    | engine  |
+    | lookup  |    | (WAIT/  |
+    |         |    |  SYNC/  |
+    |         |    |  NOISE) |
+    +----+----+    +----+----+
+         |              |
+         | (1) branch   | (2) within the (possibly new)
+         |     applied  |     pattern, find and execute
+         |     first    |     the snap.
+         v              v
+    new pattern set     playhead snapped, MIDI emitted
+
+A single keystroke can therefore:
+  (a) Switch to a new pattern,
+  (b) Within the new pattern, snap forward to that pattern's next
+      WAIT/SYNC matching the same pitch class,
+  (c) Re-derive BPM from the snap-event timing,
+  (d) Update transpose state,
+  (e) Emit the new row's MIDI output.
+
+All of the above happens with sub-millisecond latency from MIDI-in
+to MIDI-out.
+
+----------------------------------------------------------------------
+6. WORKED EXAMPLE
+----------------------------------------------------------------------
+
+A song with three patterns:  V (verse), C (chorus), B (bridge).
+
+  V's branch table:    note G  -> C (TOP)        - "go to chorus"
+                       note A  -> B (TOP)        - "go to bridge"
+                       (other) -> stay in V
+                       default fall-through: loop V
+
+  C's branch table:    note A  -> B (TOP)        - "drop to bridge"
+                       (other) -> stay in C
+                       default fall-through: V (TOP)  -- back to verse
+
+  B's branch table:    note G  -> C (TOP)        - "lift to chorus"
+                       (other) -> stay in B
+                       default fall-through: V (TOP)  -- back to verse
+
+Performance 1: performer plays a melody using only notes that miss
+all branch entries, ending each pattern naturally:
+
+    V -> V -> V -> V -> V -> ...   (forever, never reaches C or B)
+
+Performance 2: performer plays a G during V, then later plays an A
+during C:
+
+    V -> [G] -> C -> [A] -> B -> (default fall-through) -> V -> ...
+
+Performance 3: performer plays an A during V (skipping straight to
+bridge), then a G during B:
+
+    V -> [A] -> B -> [G] -> C -> (default fall-through) -> V -> ...
+
+The same composition supports all three performances, plus many
+others, without any pre-programmed branching choices.  The composer
+authors the GRAPH; the performer authors the PATH.
+
+----------------------------------------------------------------------
+7. ELEMENTS THE SEARCH SHOULD FOCUS ON
+----------------------------------------------------------------------
+
+The novelty claim is the COMBINATION of all of:
+
+  (a) A step-sequencer / tracker arrangement model in which the
+      song is represented as a DIRECTED GRAPH of patterns
+      (composer-authored), not a linear list.
+
+  (b) A per-pattern BRANCH TABLE indexed by performer pitch class
+      (typically 12 entries), each specifying an optional target
+      pattern and a transition mode.
+
+  (c) Real-time evaluation of the branch table on every live
+      performer MIDI keystroke, with the matching pitch class
+      selecting the outgoing edge to follow.
+
+  (d) Branch transition modes that distinguish between "start
+      target at row 0" (TOP) and "carry current row position into
+      target" (CONTINUE).
+
+  (e) A per-pattern default fall-through (BLOCK-END-NAV) that
+      provides the path taken when no performer keystroke has
+      triggered a branch by the end of the pattern.
+
+  (f) The combination of (a)-(e) co-existing with a per-pattern
+      live-performer-sync mechanism (the subject of the first
+      brief), so that a single keystroke can simultaneously
+      change pattern and snap-resolve within the new pattern.
+
+----------------------------------------------------------------------
+8. PRIOR-ART CATEGORIES TO RULE OUT
+----------------------------------------------------------------------
+
+Categories likely to surface; expected to NOT cover the combination:
+
+  - Linear order lists / song mode (any tracker, any groovebox,
+    any DAW arrangement view): pattern order is fixed at
+    composition time, not selected by performer pitch.
+
+  - Pattern chaining / arranger blocks (Elektron Octatrack arranger
+    rows, Roland MC arranger, Korg song mode): allow programmed
+    repeats and conditional jumps, but the conditions are step-
+    counters / fixed counts, not live keystroke pitches.
+
+  - Manual clip launching (Ableton Live, Bitwig, Maschine, Push):
+    performer triggers any clip directly; there is no per-clip
+    branch-table-by-pitch and no composer-authored set of outgoing
+    edges.  This is "performer is also the arranger", whereas the
+    invention is "composer authors the possibility space, performer
+    selects the realisation".
+
+  - Generative / probabilistic branching (Reaktor patches, Patcher
+    arrangements, modular Marbles/Branches): non-deterministic
+    selection, not pitch-class-driven authored selection.
+
+  - Graph-based / non-linear sequencers - the closest prior art on
+    the bare "graph not list" claim and the area requiring the
+    most careful diligence:
+
+      Senode (iOS app, ~2017): explicitly a graph of Nodes
+      connected by Edges, with run-time traversal.  Per surveyed
+      documentation, edges are traversed by the sequencer's own
+      signal-routing logic.
+
+      MIDINOUS (desktop application, 2024): explicitly a graph of
+      Points connected by Paths.  Per surveyed documentation,
+      branching between Points is selected by random choice,
+      immediate selection, or path-creation order.
+
+    In neither case did the surveyed documentation describe a
+    PER-NODE BRANCH TABLE INDEXED BY EXTERNAL PERFORMER PITCH
+    CLASS - i.e. neither lets the composer author "if the
+    performer plays C, take this edge; if D, take that edge" on a
+    per-node basis.  The full product documentation for both
+    should be obtained and confirmed.  The distinguishing feature
+    of this invention is the per-pattern, per-pitch-class branch
+    table consulted on every live performer keystroke.
+
+  - LucasArts iMUSE (US5315057 and continuations, 1994; product
+    used in Monkey Island 2 onwards).  The canonical interactive
+    game music branching system, with composed musical segments
+    linked into a branchable structure traversed at run-time.
+    Branch decisions are taken at composer-authored "decision
+    points" based on GAME-STATE EVENTS (script calls, parameter
+    changes, flag transitions), not on the pitch class of a
+    performer's keystroke.  The audio-engine descendants (FMOD
+    Studio, Audiokinetic Wwise, Elias) inherit the same game-
+    state-driven decision model.  Full LucasArts/Lucasfilm
+    patent family should be pulled.
+
+  - Interactive game music engines (iMUSE LucasArts, FMOD Studio,
+    Audiokinetic Wwise, Elias): segments are linked into branch-
+    able structures, BUT the branch trigger is a game-state event
+    (script call, parameter cross-fade, beat-sync transition queue),
+    not a performer's MIDI keystroke pitch.  Also, these systems
+    are not step-sequencer / tracker grid-based.
+
+  - HyperMIDI / Mango / sketch-based interactive music systems
+    (1990s research and a handful of commercial tools): conducting
+    or gesture-driven branching exists in research, but
+    implementations target either continuous-audio score-following
+    or high-level "next section / louder / softer" gestures, not
+    composer-authored per-pitch-class branch tables in a
+    sequencer grid.
+
+  - "Conditional triggers" / per-step probability / per-pattern
+    fills (Elektron Digitakt fill mode, Polyend Tracker
+    conditions): operate within a pattern at the step level, not
+    at the pattern-graph level.
+
+  - Auto-accompaniment with multiple variations (Yamaha Genos
+    style "MAIN A/B/C/D + FILL IN + ENDING" buttons): performer
+    presses dedicated section buttons to switch variations.  This
+    is closer than most prior art - it does have multiple authored
+    sections selectable in real time - but the selection is via
+    DEDICATED CONTROL BUTTONS, not via the pitch of a played note.
+    There is also no per-section branch-table-by-pitch.
+
+The closest "near miss" is therefore Yamaha-style auto-accompaniment
+section selection.  The patent argument should focus on:
+  - Branches keyed to PITCH CLASS of a played note rather than to
+    dedicated control buttons.
+  - Per-pattern branch table (12 entries) rather than fixed global
+    section buttons (typically 4-8).
+  - Integration with a per-pattern performer-sync engine that uses
+    the same input notes for snap / tempo derivation.
+  - Step-sequencer / tracker grid as the underlying composition
+    medium, not pre-canned style files.
+
+----------------------------------------------------------------------
+9. TERMINOLOGY USED IN THIS DOCUMENT
+----------------------------------------------------------------------
+
+  Pattern / block: one section of authored notes (typically 16, 32,
+    64 rows tall, several columns wide), playable as a unit.
+
+  Song / arrangement: the full composition; in this invention, a
+    directed graph of patterns linked by branch tables and default
+    fall-throughs.
+
+  Branch table: per-pattern lookup from performer pitch class (12
+    entries) to (target pattern, transition mode).
+
+  Default fall-through (BLOCK-END-NAV): per-pattern action taken
+    when the playhead reaches the end of the pattern without any
+    branch having been triggered.
+
+  Pitch class: pitch modulo 12 (octave-independent note name).
+
+  Transition mode (TOP / CONTINUE): whether the destination pattern
+    starts from row 0 or inherits the source pattern's current row.
+
+  Performer / live MIDI input: a human playing a separate MIDI part
+    on a controller keyboard, distinct from the sequencer's
+    output.  The performer's keystrokes drive both the snap engine
+    (first brief) and the branch table (this brief).
+
+End of brief.

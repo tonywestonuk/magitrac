@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackPainterTests.build/master.swiftdeps"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Tests/MagiTrackPainterTests/PainterTests.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackPainterTests.build/PainterTests.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackPainterTests.build/PainterTests.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackPainterTests.build/PainterTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackPainterTests.build/PainterTests.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackPainterTests.build/PainterTests.dia"
+  }
+}

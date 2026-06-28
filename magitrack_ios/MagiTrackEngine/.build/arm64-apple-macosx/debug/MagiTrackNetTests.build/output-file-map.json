@@ -1,0 +1,19 @@
+{
+  "": {
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/master.swiftdeps"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Tests/MagiTrackNetTests/DiscoveryLoopbackTests.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/DiscoveryLoopbackTests.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/DiscoveryLoopbackTests.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/DiscoveryLoopbackTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/DiscoveryLoopbackTests.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/DiscoveryLoopbackTests.dia"
+  },
+  "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/Tests/MagiTrackNetTests/NetLoopbackTests.swift": {
+    "dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/NetLoopbackTests.d",
+    "object": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/NetLoopbackTests.swift.o",
+    "swiftmodule": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/NetLoopbackTests~partial.swiftmodule",
+    "swift-dependencies": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/NetLoopbackTests.swiftdeps",
+    "diagnostics": "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNetTests.build/NetLoopbackTests.dia"
+  }
+}

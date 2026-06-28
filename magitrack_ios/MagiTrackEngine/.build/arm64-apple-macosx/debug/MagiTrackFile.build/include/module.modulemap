@@ -1,0 +1,3 @@
+module MagiTrackFile {
+    header "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackFile.build/include/MagiTrackFile-Swift.h"
+}
