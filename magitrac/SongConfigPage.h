@@ -16,7 +16,9 @@
 //  y=240  ├─ 3 MIDI IN rows × 50px: CHANNEL / NOTE LOW / NOTE HIGH
 //  y=390  ├─ "SLOT ENABLE" label strip (20px)
 //  y=410  ├─ 4 toggle buttons: [A] [B] [C] [D]  (80px)
-//  y=490  └─
+//  y=490  ├─ "TRANSPOSE CH" label strip (15px)
+//  y=505  ├─ 16 toggle buttons: [1]..[16]  (35px)
+//  y=540  └─
 
 // ── Shared header ─────────────────────────────────────────────────────────────
 static const int SC_HDR_H       = 50;
@@ -57,6 +59,20 @@ static const int SC_SL_COUNT    = 4;
 // Centred horizontally: total = 4*160 + 3*20 = 700, margin = (960-700)/2 = 130
 static const int SC_SL_X0       = 130;
 
+// ── TRANSPOSE CHANNELS section ────────────────────────────────────────────────
+// 16 toggle buttons (1..16) — one per MIDI channel.  On = follows performer
+// transpose; off = fixed pitch.  Default disables ch 10 (drums).
+static const int SC_TR_LBL_Y    = SC_SL_Y + SC_SL_H;                     // 490
+static const int SC_TR_LBL_H    = 15;
+static const int SC_TR_Y        = SC_TR_LBL_Y + SC_TR_LBL_H;             // 505
+static const int SC_TR_H        = 35;
+static const int SC_TR_BTN_W    = 50;
+static const int SC_TR_BTN_H    = 30;
+static const int SC_TR_GAP      = 4;
+static const int SC_TR_COUNT    = 16;
+// Centred: total = 16*50 + 15*4 = 860, margin = (960-860)/2 = 50
+static const int SC_TR_X0       = 50;
+
 // ── Class ─────────────────────────────────────────────────────────────────────
 
 class SongConfigPage {
@@ -91,6 +107,7 @@ private:
     void drawMidiInSection();
     void drawMidiInRow(int field);
     void drawSlotSection();
+    void drawTransposeSection();
 
     void bpmLabel(int field, char* out) const;
     void bpmValue(int field, char* out) const;
@@ -105,6 +122,7 @@ private:
     int  hitRowMinus  (int baseY, int rowH, int numRows, int sx, int sy) const;
     int  hitRowPlus   (int baseY, int rowH, int numRows, int sx, int sy) const;
     int  hitSlot      (int sx, int sy) const;
+    int  hitTranspose (int sx, int sy) const;
 
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

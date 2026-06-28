@@ -19,22 +19,25 @@ PerformancePage::PerformancePage(EPD_PainterAdafruit& display,
     , _holdTarget(HoldTarget::NONE)
     , _holdStartMs(0)
     , _holdFired(false)
+    , _holdPadIdx(-1)
     , _editing(false)
     , _keyboard(display, touch)
     , _kbdPadIdx(-1)
 {}
 
-void PerformancePage::open(uint8_t currentPattern) {
+void PerformancePage::open(uint8_t currentPattern, bool stopped) {
     _wasDown        = _touch.isTouched;
-    _playingPattern = currentPattern;
+    _playingPattern = stopped ? (int8_t)-1 : (int8_t)currentPattern;
     _queuedPattern  = -1;
     _flashState     = false;
     _lastFlashMs    = millis();
     _holdTarget     = HoldTarget::NONE;
     _holdFired      = false;
+    _holdPadIdx     = -1;
     _editing        = false;
     _patchPending   = false;
     _kbdPadIdx      = -1;
+    _lightArmedBtn  = -1;
     _titleOverride[0] = '\0';
 }
 
@@ -54,14 +57,15 @@ void PerformancePage::draw() {
     } else {
         drawPerfHeader();
         drawPads();
+        drawLightStrip();
     }
 }
 
 void PerformancePage::setPlayingPattern(uint8_t pat) {
     if (_editing) return;  // don't update pads while editing
-    if (pat == _playingPattern) return;
-    uint8_t oldPlaying = _playingPattern;
-    _playingPattern = pat;
+    if ((int8_t)pat == _playingPattern) return;
+    int8_t oldPlaying = _playingPattern;
+    _playingPattern = (int8_t)pat;
 
     // If the queued block just became the playing block, clear the queue
     if (_queuedPattern >= 0 && (uint8_t)_queuedPattern == pat) {
@@ -70,7 +74,7 @@ void PerformancePage::setPlayingPattern(uint8_t pat) {
         if (oldQueued < PP_PAD_COUNT) drawPad(oldQueued);
     }
 
-    if (oldPlaying < PP_PAD_COUNT) drawPad(oldPlaying);
+    if (oldPlaying >= 0 && oldPlaying < PP_PAD_COUNT) drawPad(oldPlaying);
     if (pat < PP_PAD_COUNT) drawPad(pat);
     _d.paintLater();
 }
@@ -98,6 +102,7 @@ PerformancePage::Result PerformancePage::poll() {
             _d.fillScreen(COL_WHITE);
             drawPerfHeader();
             drawPads();
+            drawLightStrip();
             _d.paint();
         }
         return Result::NONE;
@@ -121,9 +126,31 @@ PerformancePage::Result PerformancePage::pollPerf() {
         }
     }
 
-    // ── Hold timer — checked every loop, independent of touch data ───────────
-    if (_holdTarget != HoldTarget::NONE && !_holdFired) {
-        if (millis() - _holdStartMs >= PP_HOLD_MS) {
+    // Anti-phantom validation: redraw the rejected-touch counter when it
+    // changes, rate-limited so the redraw (an EPD refresh) can't drive its own
+    // phantom→reject→redraw storm.
+    if (_touch.rejectedTouches != _lastRejShown &&
+        millis() - _lastRejDrawMs >= 2000) {
+        _lastRejDrawMs = millis();
+        drawRej();
+        _d.paintLater();
+    }
+
+    // Refresh touch state once per poll.  read() returns true only on a
+    // state change (rising/falling); when false, _touch.isTouched still
+    // holds the last-seen value, which is what the hold timer needs.
+    bool hadEvent = _touch.read();
+    bool down     = _touch.isTouched;
+
+    // ── Hold timer — gated on `down` so a slow main-loop tick that misses
+    //   the finger-up between polls can't time out a quick pad tap into a
+    //   STOP.  Previously this fired on elapsed-time alone; a >1s stall
+    //   anywhere in the main loop would convert a 200ms tap into a hold. ──
+    if (down && _holdTarget != HoldTarget::NONE && !_holdFired) {
+        uint32_t needed = (_holdTarget == HoldTarget::PAD)
+                              ? PP_PAD_HOLD_MS
+                              : PP_HOLD_MS;
+        if (millis() - _holdStartMs >= needed) {
             _holdFired = true;
             if (_holdTarget == HoldTarget::HOME) {
                 _holdTarget = HoldTarget::NONE;
@@ -142,12 +169,27 @@ PerformancePage::Result PerformancePage::pollPerf() {
                 _d.paint();
                 return Result::NONE;
             }
+            if (_holdTarget == HoldTarget::PAD) {
+                // 1-second pad hold → STOP playback and dark all pads.
+                // Keep _holdTarget = PAD so the eventual finger-up release
+                // is swallowed by the falling-edge handler (no pad tap).
+                if (gServerPairing.isPaired()) {
+                    gServerPairing.sendControl(MSG_STOP);
+                }
+                int8_t oldPlaying = _playingPattern;
+                int8_t oldQueued  = _queuedPattern;
+                _playingPattern = -1;
+                _queuedPattern  = -1;
+                if (oldPlaying >= 0 && oldPlaying < PP_PAD_COUNT) drawPad(oldPlaying);
+                if (oldQueued  >= 0 && oldQueued  < PP_PAD_COUNT) drawPad(oldQueued);
+                _d.paintLater();
+                return Result::NONE;
+            }
         }
     }
 
-    if (!_touch.read()) return Result::NONE;
+    if (!hadEvent) return Result::NONE;
 
-    bool down = _touch.isTouched;
     int sx, sy;
     rawToScreen(_touch.x, _touch.y, sx, sy);
 
@@ -155,7 +197,7 @@ PerformancePage::Result PerformancePage::pollPerf() {
     bool falling = (!down && _wasDown);
     _wasDown = down;
 
-    // ── Start hold on finger-down over header buttons ────────────────────────
+    // ── Start hold on finger-down over header buttons or a pad ───────────────
     if (rising) {
         if (hitHome(sx, sy)) {
             _holdTarget  = HoldTarget::HOME;
@@ -169,22 +211,85 @@ PerformancePage::Result PerformancePage::pollPerf() {
             _holdTarget  = HoldTarget::SETLIST;
             _holdStartMs = millis();
             _holdFired   = false;
+        } else if (hitLightBtn(sx, sy) >= 0) {
+            // Arm on press; FX/RELEASE fire on release (tap), WHITE is momentary.
+            _lightArmedBtn = (int8_t)hitLightBtn(sx, sy);
+            _holdTarget    = HoldTarget::NONE;
+            if (_lightArmedBtn == 2 && gServerPairing.isPaired()) {
+                gServerPairing.sendPixelpostOverride(PPO_WHITE_ON);   // ramp to white
+                _lightManual = true;
+                drawLightStrip();        // light the button while held
+                _d.paintLater();
+            }
         } else {
-            _holdTarget = HoldTarget::NONE;
+            int padIdx = hitPad(sx, sy);
+            if (padIdx >= 0 && padIdx < _song.numPatterns) {
+                _holdTarget  = HoldTarget::PAD;
+                _holdPadIdx  = (int8_t)padIdx;
+                _holdStartMs = millis();
+                _holdFired   = false;
+            } else {
+                _holdTarget = HoldTarget::NONE;
+            }
         }
     }
 
-    // ── Cancel hold on finger-up ─────────────────────────────────────────────
+    // ── Finger-up ────────────────────────────────────────────────────────────
     if (falling) {
-        if (_holdTarget != HoldTarget::NONE) {
+        // Light strip release.  WHITE (momentary) fires OFF regardless of where
+        // the finger lifts, so a drift-off can't leave the lights stuck on.  The
+        // tap buttons (FX/RELEASE) only fire if released over the same button.
+        if (_lightArmedBtn >= 0) {
+            int lb = _lightArmedBtn;
+            _lightArmedBtn = -1;
             _holdTarget = HoldTarget::NONE;
+            if (lb == 2) {
+                if (gServerPairing.isPaired()) gServerPairing.sendPixelpostOverride(PPO_WHITE_OFF);
+                drawLightStrip();        // un-light the button
+                _d.paintLater();
+            } else if (hitLightBtn(sx, sy) == lb) {
+                fireLightButton(lb);
+            }
+            return Result::NONE;
+        }
+        HoldTarget tgt   = _holdTarget;
+        bool       fired = _holdFired;
+        _holdTarget = HoldTarget::NONE;
+        _holdFired  = false;
+
+        // Header buttons: any release (held or not) is swallowed — the held
+        // action already fired, and a brief tap is intentionally a no-op.
+        if (tgt == HoldTarget::HOME || tgt == HoldTarget::EDIT
+            || tgt == HoldTarget::SETLIST) {
             return Result::NONE;
         }
 
-        // Pad tap
+        // Pad hold already fired (STOP applied): swallow the release so the
+        // pad-tap path below doesn't immediately seek+play again.
+        if (tgt == HoldTarget::PAD && fired) {
+            return Result::NONE;
+        }
+
+        // Quick pad release (< PP_PAD_HOLD_MS) → existing pad-tap behaviour.
+        // Re-detect the pad at the release point to preserve drag-to-pad.
         int padIdx = hitPad(sx, sy);
         if (padIdx >= 0 && padIdx < _song.numPatterns) {
             uint8_t pat = (uint8_t)padIdx;
+
+            // If the server is stopped (e.g. fresh song just loaded from the
+            // setlist), any pad press seeks to that block AND starts playback.
+            // Pad mode (IMM/QUE) is only meaningful while running.
+            if (gServerPairing.isPaired() && !gServerPairing.serverPlaying()) {
+                gServerPairing.sendSeek(pat, 0);
+                gServerPairing.sendControl(MSG_PLAY);
+                int8_t oldPlaying = _playingPattern;
+                _playingPattern = (int8_t)pat;
+                if (oldPlaying >= 0 && oldPlaying < PP_PAD_COUNT) drawPad(oldPlaying);
+                drawPad(padIdx);
+                _d.paintLater();
+                return Result::NONE;
+            }
+
             uint8_t padMode = _song.perfPads[padIdx].mode;
 
             if (padMode == 0) {
@@ -192,9 +297,9 @@ PerformancePage::Result PerformancePage::pollPerf() {
                 if (gServerPairing.isPaired()) {
                     gServerPairing.sendSeek(pat, 0);
                 }
-                uint8_t oldPlaying = _playingPattern;
-                _playingPattern = pat;
-                if (oldPlaying < PP_PAD_COUNT) drawPad(oldPlaying);
+                int8_t oldPlaying = _playingPattern;
+                _playingPattern = (int8_t)pat;
+                if (oldPlaying >= 0 && oldPlaying < PP_PAD_COUNT) drawPad(oldPlaying);
                 drawPad(padIdx);
                 _d.paintLater();
             } else {
@@ -248,6 +353,21 @@ void PerformancePage::drawPerfHeader() {
              COL_BLACK, COL_WHITE, 3);
     uiButton(_d, PP_HOME_X, 0, PP_HOME_W, PP_HDR_H, "HOME",
              COL_BLACK, COL_WHITE, 3);
+    drawRej();
+}
+
+// Anti-phantom validation counter — small "R:N" at the far-left of the header
+// showing how many single-frame phantom touches the driver has rejected.
+// Temporary; remove with the rest of the diagnostics once proven in the field.
+void PerformancePage::drawRej() {
+    _lastRejShown = _touch.rejectedTouches;
+    _d.fillRect(0, 0, 70, 16, COL_BLACK);
+    _d.setTextSize(1);
+    _d.setTextColor(COL_WHITE);
+    _d.setCursor(4, 4);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "R:%lu", (unsigned long)_lastRejShown);
+    _d.print(buf);
 }
 
 void PerformancePage::drawPads() {
@@ -365,6 +485,54 @@ int PerformancePage::hitPad(int sx, int sy) const {
             return i;
     }
     return -1;
+}
+
+// ── Light-control strip (PixelPost) ──────────────────────────────────────────
+// PREV / NEXT cycle the PixelPost effect, POW blacks the lights out — all three
+// grab control away from the PXL POST track.  RELEASE hands it back.  The first
+// three are always live (when paired); RELEASE is only enabled once we've
+// grabbed control, so it reads as "nothing to release" until then.
+
+void PerformancePage::drawLightStrip() {
+    _d.fillRect(0, PP_LIGHT_Y, 960, PP_LIGHT_H, COL_WHITE);
+    bool paired = gServerPairing.isPaired();
+    static const char* const LABELS[PP_LIGHT_COUNT] = { "< FX", "FX >", "WHITE", "RELEASE" };
+    for (int i = 0; i < PP_LIGHT_COUNT; i++) {
+        int x = PP_LIGHT_MARGIN + i * (PP_LIGHT_W + PP_LIGHT_GAP);
+        uint8_t bg, fg;
+        if (!paired)        { bg = COL_WHITE;  fg = COL_DKGREY; }   // no server → inert
+        else if (i == 2)    {                                       // WHITE — momentary
+            if (_lightArmedBtn == 2) { bg = COL_BLACK;  fg = COL_WHITE; }  // held = lit
+            else                     { bg = COL_LTGREY; fg = COL_BLACK; }
+        }
+        else if (i == 3)    {                                       // RELEASE
+            if (_lightManual) { bg = COL_LTGREY; fg = COL_BLACK; }
+            else              { bg = COL_WHITE;  fg = COL_DKGREY; } // nothing to release yet
+        }
+        else                { bg = COL_LTGREY; fg = COL_BLACK; }    // PREV / NEXT
+        uiButton(_d, x, PP_LIGHT_Y + 2, PP_LIGHT_W, PP_LIGHT_H - 4, LABELS[i], bg, fg, 3);
+    }
+}
+
+int PerformancePage::hitLightBtn(int sx, int sy) const {
+    if (sy < PP_LIGHT_Y || sy >= PP_LIGHT_Y + PP_LIGHT_H) return -1;
+    for (int i = 0; i < PP_LIGHT_COUNT; i++) {
+        int x = PP_LIGHT_MARGIN + i * (PP_LIGHT_W + PP_LIGHT_GAP);
+        if (sx >= x && sx < x + PP_LIGHT_W) return i;
+    }
+    return -1;
+}
+
+void PerformancePage::fireLightButton(int btn) {
+    if (!gServerPairing.isPaired()) return;
+    switch (btn) {
+        case 0: gServerPairing.sendPixelpostOverride(PPO_PREV);    _lightManual = true;  break;
+        case 1: gServerPairing.sendPixelpostOverride(PPO_NEXT);    _lightManual = true;  break;
+        case 3: gServerPairing.sendPixelpostOverride(PPO_RELEASE); _lightManual = false; break;
+        default: return;   // case 2 (WHITE) is momentary — handled inline in pollPerf
+    }
+    drawLightStrip();
+    _d.paintLater();
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

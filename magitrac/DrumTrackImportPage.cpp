@@ -2,6 +2,7 @@
 #include "ServerPairing.h"
 #include "UIHelpers.h"
 #include "NoteGrid.h"
+#include "DrumKits.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -16,6 +17,8 @@ static const int TRACKER_TO_MIDI_OFFSET = 11;
 // ── gm_map.txt cache (session-wide) ─────────────────────────────────────────
 static DrumGmMap sGmMap;            // initialised with hardcoded defaults
 static bool      sGmMapFetched = false;   // true once server returned the file
+
+// Drum kit table (SAM2695 GS slots) is shared with ColumnEditor — see DrumKits.h.
 
 // ── Layout ───────────────────────────────────────────────────────────────────
 static const int DT_HDR_H    = 50;
@@ -40,9 +43,14 @@ static const int DT_BC_MINUS_X     = 60;
 static const int DT_BC_PLUS_X      = 760;
 static const int DT_BC_PM_W        = 140;
 static const int DT_BC_PM_H        = 100;
-static const int DT_BC_INFO_Y      = 250;
-static const int DT_BC_ALLOC_Y     = 310;
-static const int DT_BC_WARN_Y      = 370;
+static const int DT_BC_INFO_Y      = 248;
+static const int DT_BC_ALLOC_Y     = 294;
+static const int DT_BC_KIT_Y       = 336;   // kit selector row
+static const int DT_BC_KIT_BTN_W   = 80;
+static const int DT_BC_KIT_BTN_H   = 50;
+static const int DT_BC_KIT_MINUS_X = 60;
+static const int DT_BC_KIT_PLUS_X  = 960 - 60 - DT_BC_KIT_BTN_W;
+static const int DT_BC_WARN_Y      = 398;
 static const int DT_BC_BTN_Y       = 450;
 static const int DT_BC_BTN_W       = 240;
 static const int DT_BC_BTN_H       = 80;
@@ -72,6 +80,20 @@ DrumTrackImportPage::DrumTrackImportPage(EPD_PainterAdafruit& display,
 void DrumTrackImportPage::open(uint8_t patternIdx, uint8_t startCol) {
     _patIdx        = patternIdx;
     _startCol      = startCol;
+    _mode          = Mode::COLUMN_EDITOR;
+    _resyncMask    = 0;
+    _imported      = false;
+    _wasDown       = false;
+    _scroll        = 0;
+    _dragMoved     = false;
+    _selectedBlock = 0;
+    enterLoadingList();
+}
+
+void DrumTrackImportPage::openForDrumEditor(uint8_t patternIdx) {
+    _patIdx        = patternIdx;
+    _startCol      = 1;   // unused in this mode
+    _mode          = Mode::DRUM_EDITOR;
     _resyncMask    = 0;
     _imported      = false;
     _wasDown       = false;
@@ -283,6 +305,21 @@ void DrumTrackImportPage::drawBlockChoose() {
     _d.setCursor(60, DT_BC_ALLOC_Y);
     _d.print(allocLine);
 
+    // Kit selector row — drives audition program-change + import program.
+    uiButton(_d, DT_BC_KIT_MINUS_X, DT_BC_KIT_Y, DT_BC_KIT_BTN_W, DT_BC_KIT_BTN_H,
+             "-", COL_WHITE, COL_BLACK, 4);
+    uiButton(_d, DT_BC_KIT_PLUS_X,  DT_BC_KIT_Y, DT_BC_KIT_BTN_W, DT_BC_KIT_BTN_H,
+             "+", COL_WHITE, COL_BLACK, 4);
+    {
+        char kitBuf[48];
+        snprintf(kitBuf, sizeof(kitBuf), "Kit: %s", DRUM_KITS[_kitIdx].name);
+        _d.setTextSize(3);
+        _d.setTextColor(COL_BLACK);
+        int tw = (int)strlen(kitBuf) * 18;
+        _d.setCursor((960 - tw) / 2, DT_BC_KIT_Y + (DT_BC_KIT_BTN_H - 24) / 2);
+        _d.print(kitBuf);
+    }
+
     // Warning if any destination col already has notes in this pattern.
     bool overflow = (activeN > 0 && (int)_startCol + activeN - 1 >= MAX_COLUMNS);
     bool hasExisting = false;
@@ -474,6 +511,20 @@ void DrumTrackImportPage::pollBlockChoose() {
             }
         }
 
+        if (sy >= DT_BC_KIT_Y && sy < DT_BC_KIT_Y + DT_BC_KIT_BTN_H) {
+            bool changed = false;
+            if (sx >= DT_BC_KIT_MINUS_X && sx < DT_BC_KIT_MINUS_X + DT_BC_KIT_BTN_W) {
+                if (_kitIdx > 0) { _kitIdx--; changed = true; }
+            } else if (sx >= DT_BC_KIT_PLUS_X && sx < DT_BC_KIT_PLUS_X + DT_BC_KIT_BTN_W) {
+                if (_kitIdx < DRUM_KIT_COUNT - 1) { _kitIdx++; changed = true; }
+            }
+            if (changed) {
+                sendDrumProgram();   // update synth so audition uses new kit
+                wipeFB(_d); drawBlockChoose(); _d.paintLater();
+                return;
+            }
+        }
+
         if (sy >= DT_BC_BTN_Y && sy < DT_BC_BTN_Y + DT_BC_BTN_H) {
             if (sx >= DT_BC_CANCEL_X && sx < DT_BC_CANCEL_X + DT_BC_BTN_W) {
                 auditionStop();
@@ -487,6 +538,13 @@ void DrumTrackImportPage::pollBlockChoose() {
             }
             if (sx >= DT_BC_IMPORT_X && sx < DT_BC_IMPORT_X + DT_BC_BTN_W) {
                 auditionStop();
+                if (_mode == Mode::DRUM_EDITOR) {
+                    // Caller handles the actual placement via pickedFile()
+                    // + pickedBlock() + pickedKit().
+                    _imported = true;
+                    _state    = State::DONE;
+                    return;
+                }
                 _state = State::APPLYING;
                 wipeFB(_d); drawLoading("Applying..."); _d.paintLater();
                 if (applyImport()) {
@@ -532,6 +590,12 @@ bool DrumTrackImportPage::poll() {
 }
 
 // ── Audition ─────────────────────────────────────────────────────────────────
+void DrumTrackImportPage::sendDrumProgram() {
+    // Routed through the server's MIDI task (not a raw MidiData write) so the
+    // program change stays coherent with the sequencer's running-status cache.
+    gServerPairing.sendAuditionProgram(DRUM_MIDI_CHANNEL, DRUM_KITS[_kitIdx].program);
+}
+
 void DrumTrackImportPage::auditionStart() {
     int tempo = _file.tempo();
     if (tempo < 30 || tempo > 300) tempo = 120;
@@ -539,6 +603,7 @@ void DrumTrackImportPage::auditionStart() {
     _audStep   = 0;
     _audNextMs = millis();
     _audPlaying = true;
+    sendDrumProgram();   // select the chosen kit before the first hit
 }
 
 void DrumTrackImportPage::auditionStop() {
@@ -614,7 +679,8 @@ bool DrumTrackImportPage::applyImport() {
 
         ColumnSettings& cs = _song.columns[col];
         memset(&cs, 0, sizeof(cs));
-        cs.midiChannel = 10;
+        cs.midiChannel = DRUM_MIDI_CHANNEL;
+        cs.program     = DRUM_KITS[_kitIdx].program;    // playback matches audition
         cs.volume      = 100;
         strncpy(cs.name, m->name, INSTRUMENT_NAME_LEN - 1);
         cs.name[INSTRUMENT_NAME_LEN - 1] = '\0';

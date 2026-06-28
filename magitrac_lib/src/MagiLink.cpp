@@ -24,6 +24,10 @@ static const uint32_t LINK_POLL_MS      = 100;   // peer.connected() polling
 // the whole link.  Reset on every byte of progress, so it bounds stalls, not
 // total transfer time.
 static const uint32_t SEND_TIMEOUT_MS   = 3000;
+// Force a fresh WiFi association if connect() keeps failing while
+// WiFi.status() still reports WL_CONNECTED — a stale association left behind
+// when the server's AP power-cycled.  See _runConnectLoop.
+static const uint32_t STALE_ASSOC_MS    = 8000;
 
 // TCP keepalive — detects silently-dropped connections (server power-cycle,
 // WiFi blackhole, etc.).  Probes only fire when the link is idle; active
@@ -74,6 +78,12 @@ void MagiLink::beginAccept(uint16_t port) {
     _port = port;
     xTaskCreate(&MagiLink::_trampoline, "magilink_acc",
                 LINK_TASK_STACK, this, LINK_TASK_PRIO, &_impl->task);
+}
+
+IPAddress MagiLink::peerIP() const {
+    if (!_connected || !_impl) return IPAddress((uint32_t)0);
+    if (_role == Role::Accept) return _impl->peer.remoteIP();
+    return _peer;
 }
 
 void MagiLink::beginConnect(uint16_t port, IPAddress peer) {
@@ -222,11 +232,26 @@ void MagiLink::_runConnectLoop() {
         // Try to connect (retry indefinitely).
         Serial.printf("[LINK-CON] connecting to %s:%u\n",
                       _peer.toString().c_str(), (unsigned)_port);
+        uint32_t connectStartMs = millis();
         while (!_impl->peer.connect(_peer, _port, 5000)) {
             vTaskDelay(pdMS_TO_TICKS(CONNECT_RETRY_MS));
             // If WiFi dropped while we were retrying, jump back to outer
             // wait-for-association loop.
             if (WiFi.status() != WL_CONNECTED) break;
+            // Stale-association guard: after the server's AP vanishes and
+            // returns (power-cycle / crash-reboot), WiFi.status() can keep
+            // reporting WL_CONNECTED against a dead association.  connect()
+            // then fails forever and the outer re-association loop is never
+            // re-entered — the link wedges until a manual client reboot
+            // (exactly the "client wouldn't reconnect" gig failure).  Force a
+            // fresh association if connects keep failing despite "connected".
+            if (millis() - connectStartMs > STALE_ASSOC_MS) {
+                Serial.println("[LINK-CON] connect stuck w/ WL_CONNECTED — forcing reassoc");
+                WiFi.disconnect();
+                vTaskDelay(pdMS_TO_TICKS(200));
+                WiFi.reconnect();
+                break;   // re-enter outer wait-for-association loop
+            }
         }
         if (!_impl->peer.connected()) continue;  // either way, try again
 

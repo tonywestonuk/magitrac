@@ -637,34 +637,44 @@ void BackupRestorePage::scanBackupFolders() {
     if (!SD.exists(BR_BACKUPS_DIR)) return;
     File d = SD.open(BR_BACKUPS_DIR);
     if (!d || !d.isDirectory()) return;
-    while (_rsFolderCount < BR_MAX_FOLDERS) {
+    // Enumerate EVERY backup folder, keeping the newest BR_MAX_FOLDERS.  Folder
+    // names (bk_YYMMDD_HHMMSS) sort lexicographically == reverse-chronologically,
+    // so insert each into a descending-sorted array and drop the oldest once
+    // full.  (The old code stopped enumerating at BR_MAX_FOLDERS *before* sorting
+    // — so once more than 16 backups existed, the newest ones, handed back last
+    // by FAT, were dropped and never appeared on the restore list.)
+    while (true) {
         File entry = d.openNextFile();
         if (!entry) break;
         if (entry.isDirectory()) {
             const char* name = entry.name();
             const char* slash = strrchr(name, '/');
             if (slash) name = slash + 1;
-            strncpy(_rsFolders[_rsFolderCount], name, BR_FOLDER_MAX - 1);
-            _rsFolders[_rsFolderCount][BR_FOLDER_MAX - 1] = '\0';
-            _rsFolderSongCount[_rsFolderCount] = -1;   // pending
-            _rsFolderCount++;
+
+            char cand[BR_FOLDER_MAX];
+            strncpy(cand, name, BR_FOLDER_MAX - 1);
+            cand[BR_FOLDER_MAX - 1] = '\0';
+
+            // When full, skip anything older than the oldest one we're keeping.
+            if (!(_rsFolderCount == BR_MAX_FOLDERS &&
+                  strcmp(cand, _rsFolders[BR_MAX_FOLDERS - 1]) <= 0)) {
+                int pos = (_rsFolderCount < BR_MAX_FOLDERS)
+                              ? _rsFolderCount : (BR_MAX_FOLDERS - 1);
+                while (pos > 0 && strcmp(_rsFolders[pos - 1], cand) < 0) {
+                    memcpy(_rsFolders[pos], _rsFolders[pos - 1], BR_FOLDER_MAX);
+                    pos--;
+                }
+                memcpy(_rsFolders[pos], cand, BR_FOLDER_MAX);
+                if (_rsFolderCount < BR_MAX_FOLDERS) _rsFolderCount++;
+            }
         }
         entry.close();
     }
     d.close();
 
-    // Sort descending by folder name (lex order on bk_YYMMDD_HHMMSS == reverse chronological).
-    for (int i = 1; i < _rsFolderCount; i++) {
-        char keyName[BR_FOLDER_MAX];
-        memcpy(keyName, _rsFolders[i], BR_FOLDER_MAX);
-        int j = i - 1;
-        while (j >= 0 && strcmp(_rsFolders[j], keyName) < 0) {
-            memcpy(_rsFolders[j+1], _rsFolders[j], BR_FOLDER_MAX);
-            j--;
-        }
-        memcpy(_rsFolders[j+1], keyName, BR_FOLDER_MAX);
-    }
-    // Song counts stay at -1; they'll be filled in by scanFolderSongsTick().
+    // Array is already sorted newest-first by construction; counts fill in via
+    // scanFolderSongsTick().
+    for (int i = 0; i < _rsFolderCount; i++) _rsFolderSongCount[i] = -1;
 }
 
 void BackupRestorePage::scanFolderSongsTick() {
@@ -725,14 +735,15 @@ void BackupRestorePage::scanFolderFiles(const char* folder) {
             const char* name = entry.name();
             const char* slash = strrchr(name, '/');
             if (slash) name = slash + 1;
-            // Accept .mgt files
+            // Accept every backup file type so they all restore: .mgt
+            // (songs + instruments), .set (setlists), .txt (drumtracks).
+            // The server routes each back to the right dir by extension.
             int len = (int)strlen(name);
-            if (len >= 4) {
-                const char* ext = name + len - 4;
-                if (ext[0] == '.' &&
-                    (ext[1] == 'm' || ext[1] == 'M') &&
-                    (ext[2] == 'g' || ext[2] == 'G') &&
-                    (ext[3] == 't' || ext[3] == 'T')) {
+            if (len >= 4 && name[len - 4] == '.') {
+                const char* ext = name + len - 3;
+                if (strcasecmp(ext, "mgt") == 0 ||
+                    strcasecmp(ext, "set") == 0 ||
+                    strcasecmp(ext, "txt") == 0) {
                     strncpy(_rsFileNames[_rsFileTotal], name, SRV_FNAME_MAX - 1);
                     _rsFileNames[_rsFileTotal][SRV_FNAME_MAX - 1] = '\0';
                     _rsFileTotal++;

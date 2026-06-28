@@ -32,8 +32,8 @@ static MagiCommsEspNow  gPairTransport;
 static MagiUdpLink      gUdpLink;
 ServerPairing gServerPairing;
 
-static void onUdpRecv(const uint8_t* data, int len) {
-    gServerPairing._onReceive(data, len);
+static void onUdpRecv(const uint8_t* data, int len, const IPAddress& src) {
+    gServerPairing._onReceive(data, len, src);
 }
 
 static void onPairRecv(const uint8_t* data, int len) {
@@ -195,10 +195,29 @@ void ServerPairing::confirmPairCode() {
     char    ssid[33] = {};
     char    psk[64]  = {};
     uint8_t apMode   = 0;
-    if (!pairNvsLoadCreds(CLI_NVS_NS, ssid, psk, &apMode)) {
-        Serial.println("[SP] confirmPairCode: no WiFi creds set — open WiFi page first");
-        _setPairState(PairClientState::IDLE);
-        return;
+    bool    haveCreds = pairNvsLoadCreds(CLI_NVS_NS, ssid, psk, &apMode);
+
+    // SERVER_AP is the supported architecture, and the server always advertises
+    // its own Magitrac_XXXX creds in the CHALLENGE.  So a client with no
+    // configured apMode — e.g. a freshly NVS-erased one — defaults to SERVER_AP
+    // and pairs out of the box; no WiFi-page setup needed first.  Only an
+    // explicit EXTERNAL_AP choice (which persists apMode + external creds) takes
+    // the other path.
+    if (!haveCreds) apMode = MAGI_AP_MODE_SERVER;
+
+    // SERVER_AP: the server owns its Magitrac_XXXX SSID/PSK — we use what
+    // came in MSG_PAIR_CHALLENGE, not what the user typed on the WiFi page.
+    // Re-persist into client NVS so STA can find/join the AP after reboot.
+    if (apMode == MAGI_AP_MODE_SERVER) {
+        if (_pairOfferedSsid[0] == '\0') {
+            Serial.println("[SP] confirmPairCode: no SERVER_AP creds in challenge — abort");
+            _setPairState(PairClientState::IDLE);
+            return;
+        }
+        strncpy(ssid, _pairOfferedSsid, sizeof(ssid) - 1); ssid[sizeof(ssid) - 1] = '\0';
+        strncpy(psk,  _pairOfferedPsk,  sizeof(psk)  - 1); psk [sizeof(psk)  - 1] = '\0';
+        pairNvsSaveCreds(CLI_NVS_NS, ssid, psk, apMode);
+        Serial.printf("[SP] adopted server-supplied SERVER_AP creds ssid='%s'\n", ssid);
     }
 
     MsgPairOffer offer;
@@ -322,6 +341,87 @@ bool ServerPairing::sendQueueBlock(uint8_t pattern) {
     return ok;
 }
 
+bool ServerPairing::sendPixelpostEffect(uint8_t effectIdx) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgPixelpostSetEffect msg;
+    msg.effectIdx = effectIdx;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendPixelpostSlider(uint8_t value) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgPixelpostSetSlider msg;
+    msg.value = value;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendPixelpostTouchpad(uint8_t x, uint8_t y, bool touched) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgPixelpostSetTouchpad msg;
+    msg.x       = x;
+    msg.y       = y;
+    msg.touched = touched ? 1 : 0;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendPixelpostPowerOff(bool off) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgPixelpostPowerOff msg;
+    msg.off = off ? 1 : 0;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendPixelpostOverride(uint8_t op) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgPixelpostOverride msg;
+    msg.op = op;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendPixelpostPostCount(uint8_t count) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgPixelpostSetPostCount msg;
+    msg.count = count;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendPixelpostFirmwareUpdate() {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgPixelpostFirmwareUpdate msg;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendPixelpostFlashCtrl(uint8_t value) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgPixelpostSetFlashCtrl msg;
+    msg.flashCtrl = value;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
 bool ServerPairing::sendCancelQueue() {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgCancelQueue msg;
@@ -429,6 +529,17 @@ bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t v
     return ok;
 }
 
+bool ServerPairing::sendAuditionProgram(uint8_t channel, uint8_t program) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgAuditionProgram msg;
+    msg.channel = channel;
+    msg.program = program;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
 bool ServerPairing::sendNoteSetReliable(const Song& song, uint8_t pattern, uint8_t row, uint8_t col) {
     // TCP delivery is already reliable, so this is identical to sendNoteSet now.
     // The legacy "sendReliable" had a row-keyed retransmit ring on top of
@@ -436,13 +547,14 @@ bool ServerPairing::sendNoteSetReliable(const Song& song, uint8_t pattern, uint8
     return sendNoteSet(song, pattern, row, col);
 }
 
-bool ServerPairing::sendSaveActive(const char* name) {
+bool ServerPairing::sendSaveActive(const char* name, bool isAutosave) {
     if (_pairState != PairClientState::SUCCESS) return false;
     if (!gMagiLink.isConnected()) return false;
     if (!name || !name[0]) return false;
     MsgSaveActive msg;
     memset(msg.name, 0, sizeof(msg.name));
     strncpy(msg.name, name, sizeof(msg.name) - 1);
+    msg.is_autosave = isAutosave ? 1 : 0;
     gMagiLink.acquireMutex();
     bool ok = gMagiLink.send(&msg, sizeof(msg));
     gMagiLink.releaseMutex();
@@ -453,6 +565,16 @@ bool ServerPairing::sendNewSong() {
     if (_pairState != PairClientState::SUCCESS) return false;
     if (!gMagiLink.isConnected()) return false;
     MsgNewSong msg;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendSetOff() {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    if (!gMagiLink.isConnected()) return false;
+    MsgSetNoSong msg;
     gMagiLink.acquireMutex();
     bool ok = gMagiLink.send(&msg, sizeof(msg));
     gMagiLink.releaseMutex();
@@ -571,6 +693,39 @@ bool ServerPairing::sendRestoreFile(const char* name, bool isInstruments,
     gMagiLink.releaseMutex();
     Serial.printf("[SP] restore '%s' %u bytes (%s)\n",
                   hdr.name, (unsigned)dataLen, ok ? "OK" : "FAIL");
+    return ok;
+}
+
+bool ServerPairing::sendFileSave(uint8_t kind, const char* name,
+                                 const uint8_t* data, uint32_t dataLen) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    if (!gMagiLink.isConnected()) return false;
+
+    MsgFileSaveHeader hdr;
+    hdr.kind = kind;
+    memset(hdr.name, 0, sizeof(hdr.name));
+    if (name) strncpy(hdr.name, name, sizeof(hdr.name) - 1);
+    hdr.total_size = dataLen;
+
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&hdr, sizeof(hdr));
+
+    MsgFileSaveBody body;
+    const uint8_t* p = data;
+    uint32_t remaining = dataLen;
+    while (ok && remaining > 0) {
+        uint16_t chunk = remaining > 1024 ? 1024 : (uint16_t)remaining;
+        body.data_len = chunk;
+        memcpy(body.data, p, chunk);
+        ok = gMagiLink.send(&body, sizeof(body));
+        p         += chunk;
+        remaining -= chunk;
+    }
+
+    gMagiLink.releaseMutex();
+    Serial.printf("[SP] file save kind=%u '%s' %u bytes (%s)\n",
+                  (unsigned)kind, name ? name : "", (unsigned)dataLen,
+                  ok ? "OK" : "FAIL");
     return ok;
 }
 
@@ -794,11 +949,32 @@ bool ServerPairing::copySong(Song* out) const {
 // directly by MagiLink-registered callbacks.  UDP delivers loss-tolerant
 // updates from the server: row position, performer-MIDI passthrough, and the
 // column-preview playhead.
-void ServerPairing::_onReceive(const uint8_t* data, int len) {
+void ServerPairing::_onReceive(const uint8_t* data, int len, const IPAddress& src) {
     if (len < 1) return;
     MagiMsgType type = (MagiMsgType)data[0];
 
     switch (type) {
+
+        case MSG_SERVER_ANNOUNCE: {
+            if (len < (int)sizeof(MsgServerAnnounce)) return;
+            const MsgServerAnnounce* a = (const MsgServerAnnounce*)data;
+            // First beacon, or address changed → record + flag
+            bool changed = !_discoveredServerIPValid
+                        || (_discoveredServerIP   != src)
+                        || (_discoveredServerPort != a->tcpPort);
+            _discoveredServerIP     = src;
+            _discoveredServerPort   = a->tcpPort;
+            strncpy(_discoveredServerName, a->name, MAGI_ANNOUNCE_NAME_LEN - 1);
+            _discoveredServerName[MAGI_ANNOUNCE_NAME_LEN - 1] = '\0';
+            _discoveredServerIPValid = true;
+            if (changed) {
+                Serial.printf("[SP] discovered server '%s' at %s:%u\n",
+                              _discoveredServerName,
+                              _discoveredServerIP.toString().c_str(),
+                              (unsigned)_discoveredServerPort);
+            }
+            break;
+        }
 
         case MSG_SEQ_POS:
             if (_pairState != PairClientState::SUCCESS) return;
@@ -871,10 +1047,15 @@ void ServerPairing::_onPairReceive(const uint8_t* data, int len) {
             {
                 const MsgPairChallenge* c = (const MsgPairChallenge*)data;
                 memcpy(_pairCode, c->pin, 4);
+                strncpy(_pairOfferedSsid, c->apSsid, sizeof(_pairOfferedSsid) - 1);
+                _pairOfferedSsid[sizeof(_pairOfferedSsid) - 1] = '\0';
+                strncpy(_pairOfferedPsk,  c->apPsk,  sizeof(_pairOfferedPsk)  - 1);
+                _pairOfferedPsk[sizeof(_pairOfferedPsk) - 1] = '\0';
                 memcpy(_serverMac, senderMac, 6);
                 gPairTransport.addPeer(_serverMac);
-                Serial.printf("[SP] got CHALLENGE PIN=%c%c%c%c from %02X:%02X:%02X:%02X:%02X:%02X\n",
+                Serial.printf("[SP] got CHALLENGE PIN=%c%c%c%c ssid='%s' from %02X:%02X:%02X:%02X:%02X:%02X\n",
                     _pairCode[0], _pairCode[1], _pairCode[2], _pairCode[3],
+                    _pairOfferedSsid,
                     _serverMac[0], _serverMac[1], _serverMac[2],
                     _serverMac[3], _serverMac[4], _serverMac[5]);
                 _setPairState(PairClientState::PAIRING_CONFIRM);

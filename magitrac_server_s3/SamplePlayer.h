@@ -15,6 +15,6 @@
 // directions stream concurrently on the same I²S peripheral.
 
 void samplePlayerInit();                    // call once in setup() (after audioCodecInit)
-void samplePlayerPlay(const char* path);    // queue file, returns immediately
+void samplePlayerPlay(const char* path, int pitchSemitones = 0);  // 0 = native pitch (tracker C-4); ±semitones transposes
 void samplePlayerStop();                    // signal stop, returns immediately
 bool samplePlayerIsPlaying();

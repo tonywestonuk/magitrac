@@ -144,32 +144,47 @@ void WiFiSettingsPage::drawModeSection() {
 }
 
 // ── Creds section ────────────────────────────────────────────────────────────
+// In SERVER_AP mode the rows are read-only: the server owns its softAP
+// SSID + PSK (generated as Magitrac_XXXX on first pair) and the client
+// learns them via the pair-challenge.  The label flips to flag this and
+// the rows render as a single informational placeholder so the user can't
+// type into them.
 void WiFiSettingsPage::drawCredsSection() {
     _d.fillRect(0, WP_CRED_LBL_Y, WP_W, WP_LBL_H, COL_LTGREY);
     _d.setTextSize(2);
     _d.setTextColor(COL_BLACK);
     _d.setCursor(10, WP_CRED_LBL_Y + (WP_LBL_H - 16) / 2);
-    _d.print("CREDENTIALS");
+    if (_apMode == MAGI_AP_MODE_SERVER) {
+        _d.print("CREDENTIALS  (server-managed)");
+    } else {
+        _d.print("CREDENTIALS");
+    }
 
-    drawCredRow(WP_SSID_Y, "SSID",     _ssid, true);
-    drawCredRow(WP_PSK_Y,  "PASSWORD", _psk,  false);
+    bool serverAp = (_apMode == MAGI_AP_MODE_SERVER);
+    drawCredRow(WP_SSID_Y, "SSID",     _ssid, /*hasScanButton=*/true,  serverAp);
+    drawCredRow(WP_PSK_Y,  "PASSWORD", _psk,  /*hasScanButton=*/false, serverAp);
 }
 
 void WiFiSettingsPage::drawCredRow(int y, const char* label,
-                                   const char* value, bool hasScanButton) {
+                                   const char* value, bool hasScanButton,
+                                   bool disabled) {
     _d.fillRect(0, y, WP_W, WP_CRED_ROW_H, COL_WHITE);
     _d.drawFastHLine(0, y + WP_CRED_ROW_H - 1, WP_W, COL_BLACK);
 
     _d.setTextSize(3);
-    _d.setTextColor(COL_BLACK);
+    _d.setTextColor(disabled ? COL_DKGREY : COL_BLACK);
     _d.setCursor(WP_LABEL_X, y + (WP_CRED_ROW_H - 24) / 2);
     _d.print(label);
 
     int boxY = y + (WP_CRED_ROW_H - WP_VAL_H) / 2;
-    _d.drawRect(WP_VAL_X, boxY, WP_VAL_W, WP_VAL_H, COL_BLACK);
+    _d.drawRect(WP_VAL_X, boxY, WP_VAL_W, WP_VAL_H,
+                disabled ? COL_DKGREY : COL_BLACK);
     _d.setTextSize(2);
     _d.setCursor(WP_VAL_X + 8, boxY + (WP_VAL_H - 16) / 2);
-    if (value[0] == '\0') {
+    if (disabled) {
+        _d.setTextColor(COL_DKGREY);
+        _d.print("(set by server at pair)");
+    } else if (value[0] == '\0') {
         _d.setTextColor(COL_DKGREY);
         _d.print("(tap to set)");
     } else {
@@ -498,6 +513,7 @@ bool WiFiSettingsPage::poll() {
     }
 
     if (hitSsid(sx, sy)) {
+        if (_apMode == MAGI_AP_MODE_SERVER) return false;   // server-managed
         _editing = 1;
         _keyboard.open(_ssid, sizeof(_ssid));
         _keyboard.draw();
@@ -506,6 +522,7 @@ bool WiFiSettingsPage::poll() {
     }
 
     if (hitPsk(sx, sy)) {
+        if (_apMode == MAGI_AP_MODE_SERVER) return false;   // server-managed
         _editing = 2;
         _keyboard.open(_psk, sizeof(_psk));
         _keyboard.draw();

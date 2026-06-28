@@ -46,6 +46,13 @@ enum MagiMsgType : uint8_t {
     MSG_CONNECT_ACK  = 0x03,  // client → server: "ack"
     MSG_DISCONNECT   = 0x04,  // either → other:  "ending session"
 
+    // Server presence beacon — UDP broadcast on MAGI_PORT every ~2 s.
+    // Lets clients discover the server's IP without a fixed-address
+    // convention (e.g. when both devices take DHCP on an external AP).
+    // Source IP comes from the datagram itself; payload carries only TCP
+    // port + a friendly name.  See MsgServerAnnounce below.
+    MSG_SERVER_ANNOUNCE = 0x09,
+
     // Pairing ceremony (one-time setup, over ESP-NOW, always on ch1).
     // The client owns the WiFi credentials (set via the WiFi settings
     // page on the touch screen) and ships them to the server in OFFER.
@@ -77,6 +84,7 @@ enum MagiMsgType : uint8_t {
     MSG_SONG_LOAD_REQ  = 0x22,
     MSG_SONG_DELETE    = 0x26,  // client → server: delete file by name
     MSG_SONG_LOAD_NAME = 0x28,  // client → server: request song by bare name (no .mgt)
+    MSG_SET_NO_SONG    = 0x29,  // client → server: set server to OFF / No Song
 
     // MIDI passthrough — client → server
     MSG_MIDI_DATA      = 0x30,  // client → server: raw MIDI bytes to forward to MIDI out
@@ -159,20 +167,42 @@ enum MagiMsgType : uint8_t {
     // file on the server SD without needing its own dedicated message
     // type.  The `kind` byte (FileKind enum) names the directory; the
     // server holds a whitelist mapping kinds to actual SD paths.  Current
-    // users: drum-track imports (FK_DRUMTRACKS).  Future: presets,
-    // palettes, the planned Java/Swing PC tool for SD upload/download.
-    // IDs 0x93..0x96 reserved for SAVE/DELETE/ACK once an uploader needs
-    // them.
+    // users: drum-track imports (FK_DRUMTRACKS), performer setlists
+    // (FK_SETLISTS).  Future: presets, palettes, the planned Java/Swing PC
+    // tool for SD upload/download.  ID 0x96 reserved for DELETE once needed.
     MSG_FILE_LIST_REQ           = 0x8E,
     MSG_FILE_LIST_RESP          = 0x8F,
     MSG_FILE_LOAD_REQ           = 0x90,
     MSG_FILE_LOAD_HEADER        = 0x91,
     MSG_FILE_LOAD_BODY          = 0x92,
+    MSG_FILE_SAVE_HEADER        = 0x93,   // client → server: begin chunked upload
+    MSG_FILE_SAVE_BODY          = 0x94,   // client → server: one chunk
+    MSG_FILE_SAVE_ACK           = 0x95,   // server → client: save result
 
     // Client → server: fire-and-forget MIDI note-on for audition (no note-off,
     // assumes percussion-style one-shot envelope on the receiving channel).
     // Used by DrumTrackImportPage to play through a drum block before import.
     MSG_AUDITION_RAW_NOTE       = 0x97,
+
+    // Client → server: program change for audition (e.g. drum-kit select on
+    // ch10).  Emitted on the server's MIDI task so it shares the sequencer's
+    // running-status cache — a raw MIDI_DATA write would desync it.
+    MSG_AUDITION_PROGRAM        = 0x98,
+
+    // Manual PixelPost control — client → server.  The server keeps a state
+    // cache that drives the PPOST broadcast (see pixelpost_send.ino); these
+    // messages just call the matching pixelpostSetX() setter so the next
+    // change-or-heartbeat PPOST reflects the new state.
+    MSG_PIXELPOST_SET_EFFECT     = 0x99,
+    MSG_PIXELPOST_SET_SLIDER     = 0x9A,
+    MSG_PIXELPOST_SET_TOUCHPAD   = 0x9B,
+    MSG_PIXELPOST_POWER_OFF      = 0x9C,
+    MSG_PIXELPOST_SET_POST_COUNT = 0x9D,
+    MSG_PIXELPOST_FIRMWARE_UPDATE = 0x9E,
+    MSG_PIXELPOST_SET_FLASH_CTRL  = 0x9F,
+    // Perf-page live light override — grab effect control away from the PXL
+    // POST track (NEXT/PREV/POW) or hand it back (RELEASE).
+    MSG_PIXELPOST_OVERRIDE        = 0xA0,
 
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
@@ -225,13 +255,19 @@ struct MsgPairProbe {
     uint8_t     senderMac[6]; // client's own MAC (informational; wire src has it too)
 };
 
-// Server → client unicast: PIN to display on both screens.  Server
-// generates the PIN locally, sends it here, and shows it on its LCD.
-// Client displays the received PIN on its touch screen.  User taps
-// Confirm on the magitrac.
+// Server → client unicast: PIN to display on both screens + the server's
+// own softAP credentials.  Server generates a Magitrac_XXXX SSID + random
+// PSK on first pair-mode entry and stores them in NVS so the same pair of
+// strings comes back every challenge until factory-reset.  Client echoes
+// them in MsgPairOffer (so the server can write a single NVS record) AND
+// stores them in its own NVS so STA can join the softAP after reboot.
+#define MAGI_OFFER_SSID_LEN 33
+#define MAGI_OFFER_PSK_LEN  64
 struct MsgPairChallenge {
-    MagiMsgType type;    // MSG_PAIR_CHALLENGE
-    uint8_t     pin[4];  // 4 ASCII digit bytes, e.g. {'4','7','1','9'}
+    MagiMsgType type;                          // MSG_PAIR_CHALLENGE
+    uint8_t     pin[4];                        // 4 ASCII digit bytes
+    char        apSsid[MAGI_OFFER_SSID_LEN];   // server-generated, null-padded
+    char        apPsk [MAGI_OFFER_PSK_LEN];    // server-generated, null-padded
 };
 
 // Client → server unicast: WiFi credentials + apMode.  Sent after the
@@ -240,8 +276,10 @@ struct MsgPairChallenge {
 //
 // SSID/PSK fields sized to the WPA2 maxima (32/63 chars + null) so the
 // user can pick any normal home/venue network in EXTERNAL_AP mode.
-#define MAGI_OFFER_SSID_LEN 33
-#define MAGI_OFFER_PSK_LEN  64
+// In SERVER_AP mode the apSsid/apPsk fields are the server-generated
+// Magitrac_XXXX creds that the client received in MsgPairChallenge and
+// is echoing back (the server already has them; the echo is just so the
+// existing single-save NVS path covers both modes).
 struct MsgPairOffer {
     MagiMsgType type;                             // MSG_PAIR_OFFER
     uint8_t     apMode;                           // MagiApMode enum
@@ -253,6 +291,19 @@ struct MsgPairOffer {
 struct MsgDisconnect {
     uint8_t  id     = MSG_DISCONNECT;
     uint16_t length = sizeof(MsgDisconnect);
+};
+
+// UDP server presence beacon.  Broadcast by the magitrac server every ~2 s
+// to UDP MAGI_PORT.  Receivers discover the server's IP from the source
+// address of the datagram — payload carries only the TCP port + a friendly
+// name (typically the SSID or "magitrac-srv").  This is a UDP-only message;
+// it does NOT use MagiLink's {id, length} TCP framing — the UDP datagram
+// boundary is the framing.  Total wire size: 19 bytes.
+#define MAGI_ANNOUNCE_NAME_LEN 16
+struct MsgServerAnnounce {
+    MagiMsgType type;                              // MSG_SERVER_ANNOUNCE
+    uint16_t    tcpPort;                           // typically MAGI_PORT
+    char        name[MAGI_ANNOUNCE_NAME_LEN];      // null-terminated friendly name
 };
 
 // ── Fire-and-forget playback controls (MagiLink) ──────────────────────────
@@ -292,6 +343,72 @@ struct MsgSetWifiChannel {
 inline uint8_t magiWifiChannelFromIdx(uint8_t idx) {
     return (idx == 1) ? 6 : (idx == 2) ? 11 : 1;
 }
+
+// ── Manual PixelPost control structs ───────────────────────────────────────
+// Each maps 1:1 onto the matching pixelpostSetX() setter on the server.
+struct MsgPixelpostSetEffect {
+    uint8_t  id     = MSG_PIXELPOST_SET_EFFECT;
+    uint16_t length = sizeof(MsgPixelpostSetEffect);
+    uint8_t  effectIdx;
+};
+
+struct MsgPixelpostSetSlider {
+    uint8_t  id     = MSG_PIXELPOST_SET_SLIDER;
+    uint16_t length = sizeof(MsgPixelpostSetSlider);
+    uint8_t  value;     // 0..255
+};
+
+struct MsgPixelpostSetTouchpad {
+    uint8_t  id     = MSG_PIXELPOST_SET_TOUCHPAD;
+    uint16_t length = sizeof(MsgPixelpostSetTouchpad);
+    uint8_t  x;         // 0..255
+    uint8_t  y;         // 0..255
+    uint8_t  touched;   // 0 = lifted, 1 = finger down
+};
+
+struct MsgPixelpostPowerOff {
+    uint8_t  id     = MSG_PIXELPOST_POWER_OFF;
+    uint16_t length = sizeof(MsgPixelpostPowerOff);
+    uint8_t  off;       // 0 = clear, 1 = power off
+};
+
+struct MsgPixelpostSetPostCount {
+    uint8_t  id     = MSG_PIXELPOST_SET_POST_COUNT;
+    uint16_t length = sizeof(MsgPixelpostSetPostCount);
+    uint8_t  count;     // total posts in show (0 = unknown)
+};
+
+// No payload — server holds the OTA SSID / password / URL constants.
+struct MsgPixelpostFirmwareUpdate {
+    uint8_t  id     = MSG_PIXELPOST_FIRMWARE_UPDATE;
+    uint16_t length = sizeof(MsgPixelpostFirmwareUpdate);
+};
+
+// Photo-sensitivity / max-brightness control.  Single byte:
+//   upper nibble = max brightness (0..15, 15 = full)
+//   lower nibble = smoothing      (0..4 useful, higher clamped)
+//   0x00         = layer no-op (passthrough on the post side)
+struct MsgPixelpostSetFlashCtrl {
+    uint8_t  id     = MSG_PIXELPOST_SET_FLASH_CTRL;
+    uint16_t length = sizeof(MsgPixelpostSetFlashCtrl);
+    uint8_t  flashCtrl;
+};
+
+// Live light override from the performance page.  op selects the action; the
+// first NEXT/PREV/POW grabs effect control away from the PXL POST track, and
+// RELEASE hands it back so the track drives the lights again.
+enum PpOverrideOp : uint8_t {
+    PPO_RELEASE   = 0,   // return control to the PXL POST track
+    PPO_NEXT      = 1,   // grab + cycle to the next effect
+    PPO_PREV      = 2,   // grab + cycle to the previous effect
+    PPO_WHITE_ON  = 3,   // WHITE button pressed  — grab + ramp to full white
+    PPO_WHITE_OFF = 4,   // WHITE button released — fade back to black
+};
+struct MsgPixelpostOverride {
+    uint8_t  id     = MSG_PIXELPOST_OVERRIDE;
+    uint16_t length = sizeof(MsgPixelpostOverride);
+    uint8_t  op;       // PpOverrideOp
+};
 
 // Client → server: patch any bytes in the Song struct
 // Sent as 4 header bytes + length data bytes (not the full SONG_PATCH_MAX payload).
@@ -468,6 +585,16 @@ struct MsgAuditionRawNote {
     uint8_t  channel;   // 1..16
     uint8_t  note;      // 0..127
     uint8_t  velocity;  // 0..127
+};
+
+// Client → Server: program change for audition (drum-kit select etc.).
+// Emitted on the server's MIDI task so it stays coherent with the
+// sequencer's running-status cache (unlike a raw MsgMidiData write).
+struct MsgAuditionProgram {
+    uint8_t  id       = MSG_AUDITION_PROGRAM;
+    uint16_t length   = sizeof(MsgAuditionProgram);
+    uint8_t  channel;   // 1..16
+    uint8_t  program;   // 0..127
 };
 
 // Server → Client: MIDI note-on received while sequencer is stopped
@@ -648,8 +775,9 @@ struct MsgSaveActive {
     uint8_t  id     = MSG_SAVE_ACTIVE;
     uint16_t length = sizeof(MsgSaveActive);
     char     name[SRV_NAME_MAX];     // 24 — destination filename (no .mgt)
+    uint8_t  is_autosave;            // 1 = write to /autosave/, 0 = write to /songs/
 };
-// 1 + 2 + 24 = 27 bytes
+// 1 + 2 + 24 + 1 = 28 bytes
 
 // ── New song (client → server) ────────────────────────────────────────────
 // Asks the server to call initSong() on srvActiveBuf so its in-memory
@@ -658,6 +786,15 @@ struct MsgSaveActive {
 struct MsgNewSong {
     uint8_t  id     = MSG_NEW_SONG;
     uint16_t length = sizeof(MsgNewSong);
+};
+// 3 bytes
+
+// Client → server: drop to OFF / No Song (mirrors the server's local "-- OFF --"
+// selection).  Server clears srvHasActive, stops the sequencer, and replies with
+// MsgNoSong so the client clears too.
+struct MsgSetNoSong {
+    uint8_t  id     = MSG_SET_NO_SONG;
+    uint16_t length = sizeof(MsgSetNoSong);
 };
 // 3 bytes
 
@@ -670,6 +807,7 @@ struct MsgNewSong {
 
 enum FileKind : uint8_t {
     FK_DRUMTRACKS = 0,   // /drumtracks/*.txt   (drum-patterns.com format)
+    FK_SETLISTS   = 1,   // /setlists/*.set     (performer setlists, text)
     // Add future kinds here.  Server's `fileKindToPath()` must mirror.
     FK__COUNT             // sentinel for bounds checks
 };
@@ -721,5 +859,33 @@ struct MsgFileLoadBody {
     uint8_t  data[1024];
 };
 // 1029 bytes
+
+// Client → server: begin a chunked file upload.  `kind` selects the dir via
+// the server's whitelist; `name` is the destination filename (with extension).
+// BODY chunks follow; the server completes on byte count (no terminator — same
+// as the restore stream), then replies MsgFileSaveAck.
+struct MsgFileSaveHeader {
+    uint8_t  id     = MSG_FILE_SAVE_HEADER;
+    uint16_t length = sizeof(MsgFileSaveHeader);
+    uint8_t  kind;
+    char     name[FILE_NAME_LEN];   // with extension
+    uint32_t total_size;            // bytes that follow across BODY messages
+};
+
+struct MsgFileSaveBody {
+    uint8_t  id     = MSG_FILE_SAVE_BODY;
+    uint16_t length = sizeof(MsgFileSaveBody);
+    uint16_t data_len;     // 0..1024
+    uint8_t  data[1024];
+};
+// 1029 bytes
+
+// Server → client: result of a file save (kind echoed).  ok=0 on any failure.
+struct MsgFileSaveAck {
+    uint8_t  id     = MSG_FILE_SAVE_ACK;
+    uint16_t length = sizeof(MsgFileSaveAck);
+    uint8_t  kind;
+    uint8_t  ok;
+};
 
 #pragma pack(pop)

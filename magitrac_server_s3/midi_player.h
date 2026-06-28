@@ -33,6 +33,11 @@ void sequencerAuditionNote(uint8_t pattern, uint8_t row, uint8_t col);
 // fired together — this quantises the within-step jitter that WiFi adds to
 // what should be a simultaneous chord.
 void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity);
+// Queue a program change for audition (e.g. drum-kit select on ch10).  The
+// actual MIDI emit happens on the MIDI task in sequencerRawAuditionTick so it
+// shares the sequencer's running-status cache — sending the program change as
+// raw MIDI from the command task would desync that cache and silence the synth.
+void sequencerAuditionProgram(uint8_t channel, uint8_t program);
 // Call every main-loop iteration to drain the audition queue when its
 // hold timer expires.
 void sequencerRawAuditionTick();
@@ -49,9 +54,18 @@ void seqSendSlotEnable();    // send CC 115 ch16 with current performerMask
 // Pass 0 to disable.
 void sequencerSetTestMode(uint32_t intervalMs);
 
+// Bring up UART1 for MIDI (no HardwareSerial).  Configures the peripheral via
+// the IDF driver but reads/writes through the uart_ll FIFO directly, with the
+// driver's RX interrupts disabled.  Call once at boot before any MIDI I/O.
+void sequencerMidiBegin(int rxPin, int txPin);
+
+// Forward raw MIDI bytes straight to the UART FIFO (MSG_MIDI_DATA path) and
+// invalidate the output running-status cache afterwards.
+void midiSendRawBytes(const uint8_t* bytes, int n);
+
 // Configure the SAM2695 synth embedded on the M5MIDI module to respond only
 // to MIDI channel 10 (drum kit on Part 0).  Sends GS Reset + 15 "part to
-// channel = OFF" SysEx bursts.  Call once at boot after midi.begin().  Lost
+// channel = OFF" SysEx bursts.  Call once at boot after sequencerMidiBegin().  Lost
 // on SAM2695 power-cycle (no NVS in the chip) — re-send each server boot.
 // Downstream synths (e.g. Nord A1) safely ignore Roland-flavoured SysEx
 // because of the manufacturer-ID byte (0x41 = Roland).

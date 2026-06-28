@@ -28,27 +28,23 @@ enum class SongPageResult : uint8_t {
     SONG_LOADED,
 };
 
-// ── Layout constants ──────────────────────────────────────────────────────────
-
-static const char* SONGS_DIR  = "/songs";
-
 // ── SongPage ──────────────────────────────────────────────────────────────────
 
 class SongPage {
 public:
     SongPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song);
 
-    void open(bool sdAvailable);
+    void open();
     void draw();
     SongPageResult poll();
 
-    // Called on boot button short press — toggles delete mode in file browser,
-    // or forwards to the keyboard's symbol layer when keyboard is open.
+    // Boot-button short press — forwards to the keyboard's symbol layer when a
+    // name-entry keyboard is open; otherwise toggles the browser's delete mode.
     void onBootPress();
 
+    // Still used by the setlist's (legacy) local-load path; harmless server-side.
     void clearLoadedFile() { _loadedFilename[0] = '\0'; }
     void setServerLoadedName(const char* name);   // mark song as loaded from server (enables save)
-    const char* loadedFilename() const { return _loadedFilename; }   // empty if no SD file loaded
     const char* srvLoadedName() const { return _srvLoadedName; }     // empty if no server file loaded
 
 private:
@@ -60,46 +56,40 @@ private:
     FileBrowser          _browser;
 
     enum class State : uint8_t {
-        FILE_BROWSE,
-        SAVING_AS,
-        CONFIRM_OVERWRITE,
-        CONFIRM_DELETE,
         SERVER_BROWSE,         // browsing server song list
         SAVING_AS_SRV,         // keyboard open for save-as to server
         CONFIRM_DELETE_SRV,    // confirm dialog before deleting server song
+        CONFIRM_SAVE_LOAD,     // "save changes to X?" before loading another song / NEW
+        NAMING_NEW,            // keyboard: name a freshly-created (NEW) song
+        CONFIRM_NEW_EXISTS,    // NEW name clashes an existing server song — rename / cancel
+        NOT_CONNECTED,         // unpaired — client is server-only; show "pair" notice
     };
 
     State    _state;
-    bool     _sdAvailable;
-    uint32_t _sdCheckMs = 0;   // last time SD presence was probed
     bool     _wasDown;
-    int      _pendingDeleteIdx;    // absolute SD file index awaiting delete confirm
 
-    char _files[STORAGE_MAX_FILES][STORAGE_FILENAME_MAX];
-    int  _fileCount;
-    int  _filePage;   // current page index (0-based, each page = FB_PER_PAGE items)
-
-    char _loadedFilename[STORAGE_FILENAME_MAX];   // loaded SD file (with .mgt extension)
+    char _loadedFilename[STORAGE_FILENAME_MAX];   // legacy: kept for setlist clearLoadedFile()
     char _srvLoadedName[SRV_NAME_MAX];            // loaded server file (no extension)
     char _pendingSaveName[32];
-    int      _srvPage;          // current server song list page
-    bool     _srvListDrawn;     // false = browser needs repopulating on next poll
-    int      _srvPendingDeleteIdx;  // page-relative index in server list pending delete confirm
+    int      _srvPage;          // next server list page to request while accumulating
+    bool     _srvListDrawn;     // per-page latch: false = next list page not yet appended
+    char     _srvPendingDeleteName[SRV_NAME_MAX];  // server song pending delete confirm
     uint32_t _srvLoadStartMs;   // millis() when requestSongLoad was last called
+    int      _pendingLoadAbsIdx; // server-list index tapped, awaiting save-changes confirm
+    bool     _pendingNew = false; // true = the save-changes confirm precedes a NEW song
 
     // Drawing
     void drawHeader(const char* title, int h);
 
-    // Browser population helpers
-    void populateBrowserFromSD();
-    void populateBrowserFromServer();
-
-    // Helpers
-    void loadFileList();
-    void buildPath(const char* name, char* out, int outLen) const;
-    bool fileExists(const char* name) const;
-    void doSave(const char* name);
-    void doDelete(int fileIdx);
+    // Restart the server list: clear accumulated items and re-request from
+    // page 0, showing `status` until the list arrives.
+    void restartServerList(const char* status);
+    // Request the server song at absolute list index, showing "Receiving...".
+    void startServerLoad(int absIdx);
+    // Open the keyboard to name a new (blank) song before creating it.
+    void beginNewSong();
+    // True if `name` (case-insensitive) is already in the accumulated server list.
+    bool nameExistsOnServer(const char* name) const;
 
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

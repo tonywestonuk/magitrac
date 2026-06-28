@@ -40,13 +40,26 @@ bool MagiUdpLink::send(const void* data, size_t len) {
 
 void MagiUdpLink::poll() {
     if (!_isListener) return;
-    int pktSize = _udp.parsePacket();
-    if (pktSize <= 0) return;
-    uint8_t buf[MAX_UDP_PACKET];
-    int toRead = pktSize > (int)sizeof(buf) ? (int)sizeof(buf) : pktSize;
-    int n = _udp.read(buf, toRead);
-    // Drop oversized packets entirely — we never expect them and partial
-    // delivery would mis-frame the message dispatch.
-    if (n != pktSize) return;
-    if (_cb) _cb(buf, n);
+    // Drain ALL pending datagrams each call, not just one.  The high-rate
+    // message here is MSG_SEQ_POS (one per played row); the receiver coalesces
+    // to the latest via a dirty flag.  Reading a single datagram per poll —
+    // while the main loop is gated by ~20-40ms e-paper repaints — lets the
+    // socket buffer back up faster than it drains: the playhead walks a growing
+    // backlog of stale rows (lag) and overflowed datagrams are dropped (missed
+    // rows).  Draining fully restores "always show the freshest row".  The cap
+    // bounds work per loop under a pathological flood; parsePacket() returning
+    // <=0 ends the loop normally.
+    for (int guard = 0; guard < 32; guard++) {
+        int pktSize = _udp.parsePacket();
+        if (pktSize <= 0) return;
+        uint8_t buf[MAX_UDP_PACKET];
+        int toRead = pktSize > (int)sizeof(buf) ? (int)sizeof(buf) : pktSize;
+        int n = _udp.read(buf, toRead);
+        // Drop oversized packets entirely — we never expect them and partial
+        // delivery would mis-frame the message dispatch.
+        if (n != pktSize) continue;
+        // Capture source IP before the next parsePacket() rotates it out.
+        IPAddress src = _udp.remoteIP();
+        if (_cb) _cb(buf, n, src);
+    }
 }

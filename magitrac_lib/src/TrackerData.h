@@ -32,8 +32,13 @@ struct NoteNode {
 #define NOTE_OFF    0xFF // silence: sends note-off on the column, no note-on
 #define NOTE_ANY    0xFE // col-0: WAIT/SYNC triggers on any performed note
 #define NOTE_MAX    96   // B-7
+#define EFFECT_AVRG 0x0D // column-0 effect: at row-fire, set BPM to mean of last 4 WAIT-derived BPMs
 #define EFFECT_SYNC 0x0E // column-0 effect: snap to this row when performer plays matching note
-#define EFFECT_WAIT 0x0F // column-0 effect: snap AND halt until performer plays matching note
+#define EFFECT_WAIT 0x0F // column-0 effect: snap AND halt until performer plays matching note (500 ms timeout)
+#define EFFECT_WAT1 0x10 // column-0 effect: WAIT variant with 1 s timeout
+#define EFFECT_WAT2 0x11 // column-0 effect: WAIT variant with 2 s timeout
+#define IS_WAIT_EFFECT(e) ((e) == EFFECT_WAIT || (e) == EFFECT_WAT1 || (e) == EFFECT_WAT2)
+#define EFFECT_PASA 0x12 // column-0 effect: PASS-All — absorbs every matching note until playhead passes
 
 // Block-end navigation — stored in Pattern::blockEndNav as xxyyyyyy
 //   xx = mode:  00=loop, 01=forward, 10=backward, 11=absolute
@@ -174,8 +179,9 @@ struct Song {
     uint8_t    midiInNoteMin;      // lowest accepted MIDI note, 0–127
     uint8_t    midiInNoteMax;      // highest accepted MIDI note, 0–127
     uint8_t    performerMask;      // bits 0-3: MIDI channels 1-4 driven by performer keyboard
+    uint16_t   transposeChMask;    // bit n = MIDI channel (n+1) follows performer transpose; default 0xFDFF (all except ch 10)
     PerfPadConfig perfPads[PERF_PAD_COUNT];  // performance mode pad config
-    uint8_t    _songPad[3];        // reserved, write as 0
+    uint8_t    _songPad[1];        // reserved, write as 0
 };
 
 // ── Helper functions ──────────────────────────────────────────────────────────
@@ -244,7 +250,7 @@ struct SerializedNote {
 // or when MAX_COLUMNS changes (it sizes Song::columns).
 
 #define SONG_FILE_MAGIC   0x4D414754UL   // "MAGT" as uint32
-#define SONG_FILE_VERSION 18
+#define SONG_FILE_VERSION 19
 
 struct SongFileHeader {
     uint32_t magic;    // must equal SONG_FILE_MAGIC

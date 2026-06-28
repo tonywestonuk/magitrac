@@ -103,7 +103,7 @@ per-channel cache (init `0xFF` to force first send).
 | `debug_log.cpp/.h` | `debugPrintf` (server-only) |
 | `audio_codec.cpp/.h` | Thin wrapper around the shared ES8388 (Module Audio v2.2) |
 | `SamplePlayer.cpp/.h` | WAV playback via the shared codec (mono → stereo, resampled) |
-| `mic_spectrum.cpp/.h` | On-board MEMS mic → FFT bands + beat detect → pixel_post |
+| `mic_spectrum.cpp/.h` | Module Audio mic (LEFT input) → FFT bands + beat detect → pixel_post |
 
 ## Shared core: `magitrac_lib`
 

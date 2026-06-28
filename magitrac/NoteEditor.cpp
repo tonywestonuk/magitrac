@@ -15,6 +15,7 @@ uint8_t NoteEditor::_clipOctave   = 4;
 uint8_t NoteEditor::_clipVelocity = VEL_DEFAULT;
 uint8_t NoteEditor::_clipEffect   = 0;
 uint8_t NoteEditor::_clipParam    = 0;
+bool    NoteEditor::_clipPass     = false;
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -37,6 +38,10 @@ NoteEditor::NoteEditor(EPD_PainterAdafruit& display, GT911_Lite& touch)
     , _param(0)
     , _waitSet(false)
     , _syncSet(false)
+    , _passSet(false)
+    , _avrgSet(false)
+    , _waitVariant(EFFECT_WAIT)
+    , _passVariant(0)
     , _hexpad(display, touch)
     , _picker(display, touch)
     , _pendingSync(false)
@@ -97,8 +102,16 @@ void NoteEditor::loadRow() {
     }
 
     if (_col == INPUT_COLUMN) {
-        _waitSet = (n.effect == EFFECT_WAIT);
+        _waitSet = IS_WAIT_EFFECT(n.effect);
+        _waitVariant = _waitSet ? n.effect : EFFECT_WAIT;
         _syncSet = (n.effect == EFFECT_SYNC);
+        _avrgSet = (n.effect == EFFECT_AVRG);
+        // PASS / PASA = a present col-0 note (specific pitch or NOTE_ANY) with
+        // no WAIT/SYNC/AVRG cue effect.  Plain PASS has effect 0; PASA carries
+        // EFFECT_PASA so multi-note absorption can be distinguished.
+        _passSet = (!_waitSet && !_syncSet && !_avrgSet &&
+                    n.note != NOTE_EMPTY && n.note != NOTE_OFF);
+        _passVariant = (_passSet && n.effect == EFFECT_PASA) ? EFFECT_PASA : 0;
     }
 }
 
@@ -235,10 +248,20 @@ void NoteEditor::drawAttrButton() {
 
 void NoteEditor::drawInputOptions() {
     _d.fillRect(0, PE_IBTN_Y, PE_W, PE_IBTN_H, 0);
-    int btnW = PE_W / 3;  // 320px each: CLR | WAIT | SYNC
+    int btnW = PE_W / 5;  // 192px each: CLR | WAIT | SYNC | PASS | AVRG
+    const char* waitLbl = _waitSet
+                          ? (_waitVariant == EFFECT_WAT1 ? "WAT1"
+                           : _waitVariant == EFFECT_WAT2 ? "WAT2"
+                                                         : "WAIT")
+                          : "WAIT";
+    const char* passLbl = _passSet
+                          ? (_passVariant == EFFECT_PASA ? "PASA" : "PASS")
+                          : "PASS";
     popupBtn(0,          PE_IBTN_Y, btnW, PE_IBTN_H, "CLR",  false);
-    popupBtn(btnW,       PE_IBTN_Y, btnW, PE_IBTN_H, "WAIT", _waitSet);
+    popupBtn(btnW,       PE_IBTN_Y, btnW, PE_IBTN_H, waitLbl, _waitSet);
     popupBtn(btnW * 2,   PE_IBTN_Y, btnW, PE_IBTN_H, "SYNC", _syncSet);
+    popupBtn(btnW * 3,   PE_IBTN_Y, btnW, PE_IBTN_H, passLbl, _passSet);
+    popupBtn(btnW * 4,   PE_IBTN_Y, btnW, PE_IBTN_H, "AVRG", _avrgSet);
 }
 
 void NoteEditor::drawActionButtons() {
@@ -328,19 +351,21 @@ void NoteEditor::commit() {
         n.note   = NOTE_OFF;
         n.effect = _effect;
         n.param  = _param;
+    } else if (_col == INPUT_COLUMN) {
+        bool typed = _waitSet || _syncSet || _passSet || _avrgSet;
+        if (_hasNote)   n.note = makeNote(_semitone, _octave);
+        else if (typed) n.note = NOTE_ANY;   // WAIT/SYNC/PASS/AVRG with no pitch = any
+        else            n.note = NOTE_EMPTY;
+        n.effect = _waitSet ? _waitVariant
+                 : _syncSet ? EFFECT_SYNC
+                 : _avrgSet ? EFFECT_AVRG
+                 : _passSet ? _passVariant   // PASS=0, PASA=EFFECT_PASA
+                            : 0;
+        n.param  = 0;
     } else {
-        if (_col == INPUT_COLUMN && (_waitSet || _syncSet) && !_hasNote) {
-            n.note = NOTE_ANY;  // WAIT/SYNC with no specific note = trigger on any
-        } else {
-            n.note = _hasNote ? makeNote(_semitone, _octave) : NOTE_EMPTY;
-        }
-        if (_col == INPUT_COLUMN) {
-            n.effect = _waitSet ? EFFECT_WAIT : (_syncSet ? EFFECT_SYNC : 0);
-            n.param  = 0;
-        } else {
-            n.effect = _effect;
-            n.param  = _param;
-        }
+        n.note   = _hasNote ? makeNote(_semitone, _octave) : NOTE_EMPTY;
+        n.effect = _effect;
+        n.param  = _param;
     }
     NoteGrid grid(_song->notePool, &_song->noteFreeHead, &_song->patterns[_patternIdx].noteHead);
     // Always set — NoteGrid::set internally clears when *all* fields are empty,
@@ -378,25 +403,23 @@ bool NoteEditor::pollTouch() {
         return false;
     }
 
-    // If pixel-post picker is open, delegate to it
+    // If pixel-post picker is open, delegate to it.  It's a live surface now:
+    // every tap is sent to the posts and it stays open until BACK, at which
+    // point we commit whichever axes the user actually touched.
     if (_picker.isOpen()) {
         if (_picker.poll()) {
-            switch (_picker.resultKind()) {
-                case PixelPostPicker::RES_NOTE:
-                    _offNote  = false;
-                    _hasNote  = true;
-                    _semitone = _picker.resultSemitone();
-                    _octave   = _picker.resultOctave();
-                    break;
-                case PixelPostPicker::RES_VELOCITY:
-                    _velocity = _picker.resultVelocity();   // high-bit clear
-                    break;
-                case PixelPostPicker::RES_ATTR:
-                    _effect = _picker.resultEffect();
-                    _param  = _picker.resultParam();
-                    break;
-                case PixelPostPicker::RES_NONE:
-                    break;  // BACK
+            if (_picker.tookNote()) {
+                _offNote  = false;
+                _hasNote  = true;
+                _semitone = _picker.resultSemitone();
+                _octave   = _picker.resultOctave();
+            }
+            if (_picker.tookVelocity()) {
+                _velocity = _picker.resultVelocity();   // high-bit clear
+            }
+            if (_picker.tookAttr()) {
+                _effect = _picker.resultEffect();
+                _param  = _picker.resultParam();
             }
             _d.clear();
             draw();
@@ -470,6 +493,9 @@ bool NoteEditor::pollTouch() {
             } else {
                 _semitone = (uint8_t)semi;
                 _hasNote  = true;
+                // A col-0 note must have a type; default a fresh pitch to PASS.
+                if (_col == INPUT_COLUMN && !_waitSet && !_syncSet && !_passSet && !_avrgSet)
+                    _passSet = true;
                 Serial.printf("[NoteEditor] note selected: %s\n", NOTE_NAMES[semi]);
             }
             drawNoteButtons();
@@ -489,6 +515,8 @@ bool NoteEditor::pollTouch() {
             _offNote = false;
             _octave  = (uint8_t)oct;
             _hasNote = true;
+            if (_col == INPUT_COLUMN && !_waitSet && !_syncSet && !_passSet)
+                _passSet = true;
             drawOctaveButtons();
             if (_col == INPUT_COLUMN) drawInputOptions();
             else                      drawInstControl();
@@ -561,16 +589,25 @@ bool NoteEditor::pollTouch() {
         return false;
     }
 
-    // ── Input options (col 0): [CLR](320) [WAIT](320) [SYNC](320) ─────────────
+    // ── Input options (col 0): [CLR] [WAIT] [SYNC] [PASS] [AVRG] ──────────────
+    // WAIT/SYNC/PASS/AVRG are a mutually-exclusive type (radio).  WAIT/SYNC
+    // are cue effects; PASS is a played-but-inert marker; AVRG sets the live
+    // BPM to the mean of the last 4 performer-derived BPMs when the row fires.
+    // With a specific pitch the type applies to that pitch; with no pitch it
+    // becomes NOTE_ANY.
     if (_col == INPUT_COLUMN &&
         rising && ty >= PE_IBTN_Y && ty < PE_IBTN_Y + PE_IBTN_H) {
-        int btnW = PE_W / 3;
+        int btnW = PE_W / 5;
         if (tx < btnW) {
-            // [CLR] — delete note from linked list
+            // [CLR] — delete the cell entirely
             _hasNote  = false;
             _offNote  = false;
             _waitSet  = false;
             _syncSet  = false;
+            _passSet  = false;
+            _avrgSet  = false;
+            _waitVariant = EFFECT_WAIT;
+            _passVariant = 0;
             _velocity = VEL_DEFAULT;
             _effect   = 0;
             _param    = 0;
@@ -580,14 +617,32 @@ bool NoteEditor::pollTouch() {
             drawInputOptions();
             drawHeader();
         } else if (tx < btnW * 2) {
-            // WAIT: toggle on (clears SYNC), or off
-            bool on = !_waitSet;
-            _waitSet = on; _syncSet = false;
+            // WAIT — cycles WAIT → WAT1 → WAT2 → WAIT when already armed; any
+            // other state arms it as plain WAIT.
+            if (_waitSet) {
+                _waitVariant = (_waitVariant == EFFECT_WAIT) ? EFFECT_WAT1
+                             : (_waitVariant == EFFECT_WAT1) ? EFFECT_WAT2
+                                                             : EFFECT_WAIT;
+            } else {
+                _waitVariant = EFFECT_WAIT;
+            }
+            _waitSet = true;  _syncSet = false; _passSet = false; _avrgSet = false;
+            drawInputOptions();
+        } else if (tx < btnW * 3) {
+            _syncSet = true;  _waitSet = false; _passSet = false; _avrgSet = false;
+            drawInputOptions();
+        } else if (tx < btnW * 4) {
+            // PASS — cycles PASS → PASA → PASS while already armed; otherwise
+            // arms it as plain PASS.
+            if (_passSet) {
+                _passVariant = (_passVariant == 0) ? EFFECT_PASA : 0;
+            } else {
+                _passVariant = 0;
+            }
+            _passSet = true;  _waitSet = false; _syncSet = false; _avrgSet = false;
             drawInputOptions();
         } else {
-            // SYNC: toggle on (clears WAIT), or off
-            bool on = !_syncSet;
-            _syncSet = on; _waitSet = false;
+            _avrgSet = true;  _waitSet = false; _syncSet = false; _passSet = false;
             drawInputOptions();
         }
         _d.paint();
@@ -620,11 +675,17 @@ bool NoteEditor::pollTouch() {
             _clipOctave    = _octave;
             _clipVelocity  = _velocity;
             if (_col == INPUT_COLUMN) {
-                _clipEffect = _waitSet ? EFFECT_WAIT : (_syncSet ? EFFECT_SYNC : 0);
+                _clipEffect = _waitSet ? _waitVariant
+                            : _syncSet ? EFFECT_SYNC
+                            : _avrgSet ? EFFECT_AVRG
+                            : _passSet ? _passVariant
+                                       : 0;
                 _clipParam  = 0;
+                _clipPass   = _passSet;
             } else {
                 _clipEffect = _effect;
                 _clipParam  = _param;
+                _clipPass   = false;
             }
             _clipValid  = true;
             drawActionButtons();   // PASTE button lights up
@@ -642,8 +703,12 @@ bool NoteEditor::pollTouch() {
             _effect    = _clipEffect;
             _param     = _clipParam;
             if (_col == INPUT_COLUMN) {
-                _waitSet = (_clipEffect == EFFECT_WAIT);
+                _waitSet = IS_WAIT_EFFECT(_clipEffect);
+                _waitVariant = _waitSet ? _clipEffect : EFFECT_WAIT;
                 _syncSet = (_clipEffect == EFFECT_SYNC);
+                _avrgSet = (_clipEffect == EFFECT_AVRG);
+                _passSet = (!_waitSet && !_syncSet && !_avrgSet && _clipPass);
+                _passVariant = (_passSet && _clipEffect == EFFECT_PASA) ? EFFECT_PASA : 0;
             }
             drawNoteButtons();
             drawOctaveButtons();

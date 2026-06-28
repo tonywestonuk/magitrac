@@ -21,10 +21,12 @@ BlockSettingsPage::BlockSettingsPage(EPD_PainterAdafruit& display,
     , _confirmSplit(false)
     , _didDuplicate(false)
     , _didSplit(false)
+    , _didStructuralChange(false)
     , _keyChangePending(false)
     , _keyChangePat(0)
     , _navChangePending(false)
     , _navChangePat(0)
+    , _openDrum(false)
 {}
 
 // ── open() ────────────────────────────────────────────────────────────────────
@@ -36,8 +38,10 @@ void BlockSettingsPage::open(uint8_t patIdx) {
     _confirmSplit     = false;
     _didDuplicate     = false;
     _didSplit         = false;
+    _didStructuralChange = false;
     _keyChangePending = false;
     _navChangePending = false;
+    _openDrum         = false;
     _holdTrpBtn       = 0;
     _confirmSetAll    = false;
     _setAllAction     = 0;
@@ -326,6 +330,8 @@ void BlockSettingsPage::drawKeyChangeRow() {
         pat().keyChangeMode == (uint8_t)KeyChangeMode::SAME_POS);
     btn(BSP_KCH_TOP_X, btnY, BSP_KCH_TOP_W, BSP_BTN_H, "TOP",
         pat().keyChangeMode == (uint8_t)KeyChangeMode::TOP);
+
+    btn(BSP_KCH_DRUM_X, btnY, BSP_KCH_DRUM_W, BSP_BTN_H, "Drum-Editor", false);
 }
 
 void BlockSettingsPage::drawEndNavRow() {
@@ -397,6 +403,11 @@ void BlockSettingsPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
 }
 
 void BlockSettingsPage::doDelete() {
+    // Return the deleted pattern's notes to the free list before the memmove
+    // strands them — otherwise they leak pool slots permanently and a song
+    // with enough delete cycles will silently fail to accept new notes.
+    NoteGrid(_song.notePool, &_song.noteFreeHead,
+             &_song.patterns[_patIdx].noteHead).clearAll();
     for (uint8_t i = _patIdx; i < _song.numPatterns - 1; i++)
         _song.patterns[i] = _song.patterns[i + 1];
     _song.numPatterns--;
@@ -406,6 +417,7 @@ void BlockSettingsPage::doDelete() {
         _song.startPattern--;
     if (_patIdx >= _song.numPatterns) _patIdx = _song.numPatterns - 1;
     _selNote = 0;
+    _didStructuralChange = true;
     Serial.printf("[BSP] DELETE, now %d patterns\n", _song.numPatterns);
 }
 
@@ -499,6 +511,7 @@ bool BlockSettingsPage::poll() {
                 TransposeAction act = (TransposeAction)_setAllAction;
                 for (int i = 0; i < 12; i++)
                     pat().inputNotes[i].transposeAction = act;
+                _didStructuralChange = true;
                 _confirmSetAll = false;
                 drawTransposeRow(); drawNoteButtons(); _d.paint();
                 return false;
@@ -569,6 +582,7 @@ bool BlockSettingsPage::poll() {
             p.referenceNote = 0;
             _patIdx  = idx;
             _selNote = 0;
+            _didStructuralChange = true;
             Serial.printf("[BSP] NEW pattern %d\n", idx);
             draw(); _d.paint();
 
@@ -592,6 +606,7 @@ bool BlockSettingsPage::poll() {
             _patIdx       = idx;
             _selNote      = 0;
             _didDuplicate = true;
+            _didStructuralChange = true;
             Serial.printf("[BSP] DUPLICATE -> pattern %d\n", idx);
             draw(); _d.paint();
 
@@ -611,6 +626,7 @@ bool BlockSettingsPage::poll() {
     if (ty >= BSP_LEN_Y && ty < BSP_LEN_Y + BSP_LEN_H) {
         int idx = (tx - BSP_LEN_LBL_W) / BSP_LEN_BTN_W;
         if (idx >= 0 && idx < BSP_LEN_COUNT) {
+            if (pat().length != BSP_LENGTHS[idx]) _didStructuralChange = true;
             pat().length = BSP_LENGTHS[idx];
             Serial.printf("[BSP] length=%d\n", pat().length);
             drawLengthRow(); _d.paint();
@@ -637,14 +653,17 @@ bool BlockSettingsPage::poll() {
         InputNoteEntry& e = entry();
 
         if (tx >= BSP_BLK_STAY_X && tx < BSP_BLK_STAY_X + BSP_BLK_STAY_W) {
+            if (e.switchMode != BlockSwitch::STAY) _didStructuralChange = true;
             e.switchMode = BlockSwitch::STAY;
             drawBlockRow(); drawNoteButtons(); _d.paint();
 
         } else if (tx >= BSP_BLK_SPOS_X && tx < BSP_BLK_SPOS_X + BSP_BLK_SPOS_W) {
+            if (e.switchMode != BlockSwitch::SAME_POS) _didStructuralChange = true;
             e.switchMode = BlockSwitch::SAME_POS;
             drawBlockRow(); drawNoteButtons(); _d.paint();
 
         } else if (tx >= BSP_BLK_TOP_X && tx < BSP_BLK_TOP_X + BSP_BLK_TOP_W) {
+            if (e.switchMode != BlockSwitch::TOP) _didStructuralChange = true;
             e.switchMode = BlockSwitch::TOP;
             drawBlockRow(); drawNoteButtons(); _d.paint();
 
@@ -652,11 +671,13 @@ bool BlockSettingsPage::poll() {
             if (tx >= BSP_BLK_MINUS_X && tx < BSP_BLK_MINUS_X + BSP_BLK_ARROW_W) {
                 if (e.switchTarget > 0) {
                     e.switchTarget--;
+                    _didStructuralChange = true;
                     drawBlockRow(); drawNoteButtons(); _d.paint();
                 }
             } else if (tx >= BSP_BLK_PLUS_X && tx < BSP_BLK_PLUS_X + BSP_BLK_ARROW_W) {
                 if (e.switchTarget < _song.numPatterns - 1) {
                     e.switchTarget++;
+                    _didStructuralChange = true;
                     drawBlockRow(); drawNoteButtons(); _d.paint();
                 }
             }
@@ -674,6 +695,9 @@ bool BlockSettingsPage::poll() {
             pat().keyChangeMode = (uint8_t)KeyChangeMode::TOP;
             _keyChangePending = true; _keyChangePat = _patIdx;
             drawKeyChangeRow(); _d.paint();
+        } else if (tx >= BSP_KCH_DRUM_X && tx < BSP_KCH_DRUM_X + BSP_KCH_DRUM_W) {
+            _openDrum = true;
+            return true;
         }
         return false;
     }
@@ -735,16 +759,19 @@ bool BlockSettingsPage::poll() {
         InputNoteEntry& e = entry();
 
         if (tx >= BSP_TRP_KEEP_X && tx < BSP_TRP_KEEP_X + BSP_TRP_KEEP_W) {
+            if (e.transposeAction != TransposeAction::KEEP) _didStructuralChange = true;
             e.transposeAction = TransposeAction::KEEP;
             _holdTrpBtn = 1; _holdTrpStart = millis();
             drawTransposeRow(); drawNoteButtons(); _d.paint();
 
         } else if (tx >= BSP_TRP_NOTE_X && tx < BSP_TRP_NOTE_X + BSP_TRP_NOTE_W) {
+            if (e.transposeAction != TransposeAction::NOTE) _didStructuralChange = true;
             e.transposeAction = TransposeAction::NOTE;
             _holdTrpBtn = 2; _holdTrpStart = millis();
             drawTransposeRow(); drawNoteButtons(); _d.paint();
 
         } else if (tx >= BSP_TRP_CUST_X && tx < BSP_TRP_CUST_X + BSP_TRP_CUST_W) {
+            if (e.transposeAction != TransposeAction::CUSTOM) _didStructuralChange = true;
             e.transposeAction = TransposeAction::CUSTOM;
             drawTransposeRow(); drawNoteButtons(); _d.paint();
 
@@ -752,11 +779,13 @@ bool BlockSettingsPage::poll() {
             if (tx >= BSP_TRP_MINUS_X && tx < BSP_TRP_MINUS_X + BSP_BLK_ARROW_W) {
                 if (e.transposeValue > -12) {
                     e.transposeValue--;
+                    _didStructuralChange = true;
                     drawTransposeRow(); drawNoteButtons(); _d.paint();
                 }
             } else if (tx >= BSP_TRP_PLUS_X && tx < BSP_TRP_PLUS_X + BSP_BLK_ARROW_W) {
                 if (e.transposeValue < 12) {
                     e.transposeValue++;
+                    _didStructuralChange = true;
                     drawTransposeRow(); drawNoteButtons(); _d.paint();
                 }
             }

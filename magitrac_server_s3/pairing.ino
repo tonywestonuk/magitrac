@@ -25,6 +25,11 @@
 
 extern bool needsFullRedraw;   // defined in magitrac_server.ino
 
+// The bezel is one logical strip (BtnA/B/C share the capacitive zone); cancel
+// should respond to a tap anywhere on it, not just the BtnC sub-zone.
+static bool bezelDownAny()   { return BtnA.isDown()     || BtnB.isDown()     || BtnC.isDown(); }
+static bool bezelTappedAny() { return BtnA.wasPressed() || BtnB.wasPressed() || BtnC.wasPressed(); }
+
 // ── State ─────────────────────────────────────────────────────────────────────
 enum ServerMode {
     SERVER_STANDALONE,        // playing; MagiLink listening for paired client
@@ -37,11 +42,56 @@ static ServerMode  serverMode   = SERVER_STANDALONE;
        uint8_t     clientMac[6] = {};   // exposed for commands_server.ino
 
 // ── NVS-stored pairing ────────────────────────────────────────────────────────
-#define SRV_NVS_NS "magitrac_srv"
+#define SRV_NVS_NS      "magitrac_srv"
+#define SRV_SELF_NVS_NS "magitrac_srv_self"   // server-owned Magitrac_XXXX creds
 
 static bool    sHasPairing         = false;
 static uint8_t sStoredClientMac[6] = {};
 static uint8_t sStoredSecret[16]   = {};
+
+// Load (or generate-on-first-need) the server's own Magitrac_XXXX softAP
+// SSID + random PSK.  Persisted in NVS so the same pair survives reboots;
+// regenerates only after a factory-reset / NVS wipe.  SSID format
+// "Magitrac_XXXX" where XXXX is 4 random hex digits.  PSK is 12 random
+// ASCII chars from a safe alphabet (no ambiguous 0/O/l/1).
+static void srvSelfCredsLoadOrGenerate(char ssid_out[MAGI_OFFER_SSID_LEN],
+                                       char psk_out [MAGI_OFFER_PSK_LEN]) {
+    Preferences prefs;
+    prefs.begin(SRV_SELF_NVS_NS, /*readOnly=*/false);
+    bool have = (prefs.getUChar("ready", 0) == 1);
+    if (have) {
+        prefs.getString("ssid", ssid_out, MAGI_OFFER_SSID_LEN);
+        prefs.getString("psk",  psk_out,  MAGI_OFFER_PSK_LEN);
+        // Defensive: if either is empty for some reason, regenerate.
+        if (ssid_out[0] && psk_out[0]) {
+            prefs.end();
+            return;
+        }
+    }
+    const char* alpha = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+    size_t alphaN = strlen(alpha);
+    uint32_t r = esp_random();
+    snprintf(ssid_out, MAGI_OFFER_SSID_LEN, "Magitrac_%04X",
+             (unsigned)(r & 0xFFFF));
+    for (int i = 0; i < 12; i++) {
+        psk_out[i] = alpha[esp_random() % alphaN];
+    }
+    psk_out[12] = '\0';
+    prefs.putString("ssid", ssid_out);
+    prefs.putString("psk",  psk_out);
+    prefs.putUChar ("ready", 1);
+    prefs.end();
+    Serial.printf("[PAIR] generated self-creds ssid='%s' psk='%s'\n",
+                  ssid_out, psk_out);
+}
+
+// Exposed for field_flash.ino — the in-the-field OTA path serves firmware off
+// the server's OWN softAP, so it hands the posts the same self-creds the
+// pairing CHALLENGE does.
+void srvSelfCredsGet(char ssid_out[MAGI_OFFER_SSID_LEN],
+                     char psk_out [MAGI_OFFER_PSK_LEN]) {
+    srvSelfCredsLoadOrGenerate(ssid_out, psk_out);
+}
 
 // ── Pairing ceremony ──────────────────────────────────────────────────────────
 static uint8_t  sPairPendingMac[6] = {};   // MAC of the client we sent CHALLENGE to
@@ -235,8 +285,8 @@ void pairingLoop() {
             break;
 
         case SERVER_PAIRING: {
-            if (!sCancelArmed && !BtnC.isDown()) sCancelArmed = true;
-            if (sCancelArmed && BtnC.wasPressed()) {
+            if (!sCancelArmed && !bezelDownAny()) sCancelArmed = true;
+            if (sCancelArmed && bezelTappedAny()) {
                 serverMode = SERVER_STANDALONE;
                 needsFullRedraw = true;
                 return;
@@ -252,13 +302,14 @@ void pairingLoop() {
             if (sChallengePending) {
                 sChallengePending = false;
                 gTransportEspNow.addPeer(sPairPendingMac);
-                MsgPairChallenge ch;
+                MsgPairChallenge ch = {};
                 ch.type = MSG_PAIR_CHALLENGE;
                 memcpy(ch.pin, sPairCode, 4);
+                srvSelfCredsLoadOrGenerate(ch.apSsid, ch.apPsk);
                 bool ok = gTransportEspNow.sendRaw(&ch, sizeof(ch));
-                Serial.printf("[PAIR] got PROBE → PIN %c%c%c%c, CHALLENGE send=%s\n",
+                Serial.printf("[PAIR] got PROBE → PIN %c%c%c%c ssid='%s' CHALLENGE send=%s\n",
                     sPairCode[0], sPairCode[1], sPairCode[2], sPairCode[3],
-                    ok ? "OK" : "FAIL");
+                    ch.apSsid, ok ? "OK" : "FAIL");
                 char codeStr[6];
                 snprintf(codeStr, sizeof(codeStr), "%c%c%c%c",
                     sPairCode[0], sPairCode[1], sPairCode[2], sPairCode[3]);
@@ -269,8 +320,8 @@ void pairingLoop() {
         }
 
         case SERVER_PAIRING_CONFIRM: {
-            if (!sCancelArmed && !BtnC.isDown()) sCancelArmed = true;
-            if (sCancelArmed && BtnC.wasPressed()) {
+            if (!sCancelArmed && !bezelDownAny()) sCancelArmed = true;
+            if (sCancelArmed && bezelTappedAny()) {
                 serverMode = SERVER_STANDALONE;
                 needsFullRedraw = true;
                 return;
