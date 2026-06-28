@@ -25,7 +25,11 @@
 
 class MagiUdpLink {
 public:
-    using RecvCb = void (*)(const uint8_t* data, int len);
+    // Receiver callback fires once per inbound datagram.  `src` is the
+    // packet's source IP — needed for discovery (the server broadcasts
+    // MSG_SERVER_ANNOUNCE and the only way to know its IP is to inspect
+    // the datagram's source address).
+    using RecvCb = void (*)(const uint8_t* data, int len, const IPAddress& src);
 
     // Bind a UDP socket to `port` on the local AP iface.  Call after WiFi
     // is up.  Returns true on success.  Sender role calls `beginSender`

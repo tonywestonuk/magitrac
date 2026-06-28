@@ -6,134 +6,120 @@
 #include "KeyboardPopup.h"
 #include "ConfirmDialog.h"
 #include "SetlistStorage.h"
-#include "SongStorage.h"
 #include "ServerPairing.h"
+#include "ScrollViewport.h"
 
-// ── SetlistPage — performer setlists, client-only ────────────────────────────
+// ── SetlistPage — performer setlists, server-backed ──────────────────────────
 //
-// Opened from PerformancePage's SETLIST button.  Owns 4 setlists, one
-// visible at a time.  Each entry = display name + .mgt file ref + free notes.
+// Opened from PerformancePage's SETLIST button.  Two data layers, both on the
+// server SD (see SetlistStorage.h):
+//   • the MASTER catalog — every song that could be played (name/file/notes).
+//   • 4 SETLISTS — ordered lists of names that reference the catalog.
 //
-// LIST view (960×540):
-//   y=  0  [BACK 130]   "SETLIST 1"                       [ADD 130]   (50px)
-//   y= 60  [SET 1] [SET 2] [SET 3] [SET 4]                            (60px)
-//   y=130  ┌─ 7 song rows × 50px ────────────────────────────────────────┐
-//          │  1. Tainted Love                       [↑] [↓]            │
-//          │  2. Enola Gay                          [↑] [↓]            │
-//          │  ...                                                       │
-//   y=490  [PREV PAGE 130]    "Page 1 / 8"     [NEXT PAGE 130]         (50px)
+// LIST view (the current setlist):
+//   [BACK] "SETLIST n" [ADD]                            ADD → master picker
+//   [SET 1][SET 2][SET 3][SET 4]
+//   1. Tainted Love                              [Move]
+//   2. Enola Gay                                 [Move]
+//   ...                                          (drag to scroll)
 //
-// INFO popup (overlay on LIST):
-//   "Song name"
-//   Source: FILE.mgt   (or "FILE MISSING")
-//   Notes (wrapped, up to ~5 lines)
-//   [OK — LOAD]   [EDIT ENTRY]   [CANCEL]
+// MASTER_SELECT (ADD): the catalog as a drag-scroll list with inertia.  Tap a
+//   song to add it to the current setlist (in tap order) — a numbered marker
+//   shows it's in, tap again to remove.  [NEW] makes a catalog entry; [EDIT]
+//   flips taps to "open the entry editor".
 //
-// EDIT screen (full screen):
-//   "EDIT SONG ENTRY"
-//   Song Name:  <value>                          [EDIT]
-//   Song File:  <value>                          [PICK]
-//   Notes:      <wrapped value>                  [EDIT]
-//   [DELETE]                          [CANCEL]   [OK]
+// INFO popup (tap a setlist row): name / file / notes (resolved from the
+//   catalog).  [OK-LOAD] [REMOVE] [CANCEL].
 //
-// PICK_FILE screen:  list of /songs/*.mgt for the user to tap.
+// EDIT: catalog-entry editor — Name / File (server picker) / Notes, DELETE.
 
 enum class SetlistResult : uint8_t {
     NONE,
-    BACK,         // BACK pressed — return to PerformancePage
-    SONG_LOADED,  // OK pressed in INFO popup, song restored into Song&
-    TITLE_ONLY,   // OK pressed with no file attached — return to PerformancePage,
-                  //   update title only, leave Song& untouched
+    BACK,
+    SONG_LOADED,
+    TITLE_ONLY,
 };
 
-// ── Layout constants ─────────────────────────────────────────────────────────
+// ── Layout ────────────────────────────────────────────────────────────────────
+static const int SL_HDR_H   = 50;
+static const int SL_BACK_X   = 0;
+static const int SL_BACK_W   = 130;
+static const int SL_ADD_X    = 830;     // ADD / NEW (rightmost header button)
+static const int SL_ADD_W    = 130;
+static const int SL_MEDIT_X  = 690;     // EDIT-mode toggle in MASTER_SELECT
+static const int SL_MEDIT_W  = 130;
+static const int SL_BTN_Y    = 5;
+static const int SL_BTN_H    = 40;
 
-static const int SL_HDR_H        = 50;
-static const int SL_BACK_X       = 0;
-static const int SL_BACK_W       = 130;
-static const int SL_ADD_X        = 830;
-static const int SL_ADD_W        = 130;
-static const int SL_BTN_Y        = 5;
-static const int SL_BTN_H        = 40;
+static const int SL_TAB_Y      = 60;
+static const int SL_TAB_H      = 50;
+static const int SL_TAB_MARGIN = 5;
+static const int SL_TAB_GAP    = 10;
+static const int SL_TAB_W      = (960 - 2 * SL_TAB_MARGIN - 3 * SL_TAB_GAP) / 4;
 
-static const int SL_TAB_Y        = 60;
-static const int SL_TAB_H        = 50;
-static const int SL_TAB_MARGIN   = 5;
-static const int SL_TAB_GAP      = 10;
-static const int SL_TAB_W        = (960 - 2 * SL_TAB_MARGIN - 3 * SL_TAB_GAP) / 4;  // 230
-
-static const int SL_LIST_Y       = 130;
-static const int SL_ROW_H        = 50;
+static const int SL_LIST_Y        = 130;
+static const int SL_ROW_H         = 50;
 static const int SL_ROWS_PER_PAGE = 7;
 
-static const int SL_NUM_X        = 10;
-static const int SL_NUM_W        = 50;
-static const int SL_NAME_X       = 70;
-static const int SL_NAME_W       = 720;
-static const int SL_UP_X         = 800;
-static const int SL_UP_W         = 60;
-static const int SL_DOWN_X       = 870;
-static const int SL_DOWN_W       = 60;
-static const int SL_ARROW_H      = 40;
+static const int SL_NUM_X  = 10;
+static const int SL_NUM_W  = 50;
+static const int SL_NAME_X = 70;
+static const int SL_NAME_W = 720;
+static const int SL_MOVE_X = 800;
+static const int SL_MOVE_W = 130;
+static const int SL_MOVE_H = 40;
 
-static const int SL_BAR_Y        = 490;
-static const int SL_BAR_H        = 50;
-// Prev/next page buttons — only used by the PICK_FILE (SD song picker)
-// view; the main setlist LIST view scrolls by touch-drag instead.
-static const int SL_PREV_X       = 0;
-static const int SL_PREV_W       = 130;
-static const int SL_NEXT_X       = 830;
-static const int SL_NEXT_W       = 130;
+static const int SL_BAR_Y = 490;
+static const int SL_BAR_H = 50;
 
-// Drag-scroll: any vertical movement past this threshold during a touch
-// suppresses the falling-edge tap and instead pans the list.
+// LIST drag-scroll threshold (the picker lists use the ScrollViewport instead).
 static const int SL_DRAG_THRESH_PX = 12;
 
 // INFO popup
-static const int SL_INFO_X       = 80;
-static const int SL_INFO_Y       = 110;
-static const int SL_INFO_W       = 800;
-static const int SL_INFO_H       = 320;
-static const int SL_INFO_BTN_Y   = SL_INFO_Y + SL_INFO_H - 60 - 16;
-static const int SL_INFO_BTN_H   = 60;
-static const int SL_INFO_OK_X    = SL_INFO_X + 30;     // 110
-static const int SL_INFO_OK_W    = 220;
-static const int SL_INFO_EDIT_X  = SL_INFO_X + 290;    // 370
-static const int SL_INFO_EDIT_W  = 220;
-static const int SL_INFO_CAN_X   = SL_INFO_X + 550;    // 630
-static const int SL_INFO_CAN_W   = 220;
+static const int SL_INFO_X      = 80;
+static const int SL_INFO_Y      = 110;
+static const int SL_INFO_W      = 800;
+static const int SL_INFO_H      = 320;
+static const int SL_INFO_BTN_Y  = SL_INFO_Y + SL_INFO_H - 60 - 16;
+static const int SL_INFO_BTN_H  = 60;
+static const int SL_INFO_OK_X   = SL_INFO_X + 30;
+static const int SL_INFO_OK_W   = 220;
+static const int SL_INFO_REM_X  = SL_INFO_X + 290;
+static const int SL_INFO_REM_W  = 220;
+static const int SL_INFO_CAN_X  = SL_INFO_X + 550;
+static const int SL_INFO_CAN_W  = 220;
 
 // EDIT screen
-static const int SL_ED_FIELD_LBL_X   = 20;
-static const int SL_ED_FIELD_VAL_X   = 210;
-static const int SL_ED_FIELD_VAL_W   = 600;
-static const int SL_ED_FIELD_BTN_X   = 830;
-static const int SL_ED_FIELD_BTN_W   = 120;
-static const int SL_ED_FIELD_BTN_H   = 60;
+static const int SL_ED_FIELD_LBL_X = 20;
+static const int SL_ED_FIELD_VAL_X = 210;
+static const int SL_ED_FIELD_VAL_W = 600;
+static const int SL_ED_FIELD_BTN_X = 830;
+static const int SL_ED_FIELD_BTN_W = 120;
+static const int SL_ED_FIELD_BTN_H = 60;
+static const int SL_ED_FILE_VAL_W  = 500;
+static const int SL_ED_FILE_PICK_X = 720;
+static const int SL_ED_FILE_PICK_W = 110;
+static const int SL_ED_FILE_CLR_X  = 840;
+static const int SL_ED_FILE_CLR_W  = 110;
+static const int SL_ED_NAME_Y  = 70;
+static const int SL_ED_FILE_Y  = 160;
+static const int SL_ED_NOTES_Y = 250;
+static const int SL_ED_NOTES_H = 130;
+static const int SL_ED_ACT_Y = 470;
+static const int SL_ED_ACT_H = 60;
+static const int SL_ED_DEL_X = 20;
+static const int SL_ED_DEL_W = 180;
+static const int SL_ED_CAN_X = 540;
+static const int SL_ED_CAN_W = 180;
+static const int SL_ED_OK_X  = 750;
+static const int SL_ED_OK_W  = 190;
 
-// File row has two buttons (PICK + CLEAR) instead of one EDIT.
-static const int SL_ED_FILE_VAL_W    = 500;
-static const int SL_ED_FILE_PICK_X   = 720;
-static const int SL_ED_FILE_PICK_W   = 110;
-static const int SL_ED_FILE_CLR_X    = 840;
-static const int SL_ED_FILE_CLR_W    = 110;
-
-static const int SL_ED_NAME_Y   = 70;
-static const int SL_ED_FILE_Y   = 160;
-static const int SL_ED_NOTES_Y  = 250;
-static const int SL_ED_NOTES_H  = 130;
-
-static const int SL_ED_ACT_Y      = 470;
-static const int SL_ED_ACT_H      = 60;
-static const int SL_ED_DEL_X      = 20;
-static const int SL_ED_DEL_W      = 180;
-static const int SL_ED_CAN_X      = 540;
-static const int SL_ED_CAN_W      = 180;
-static const int SL_ED_OK_X       = 750;
-static const int SL_ED_OK_W       = 190;
-
-// PICK_FILE screen — reuse list layout from LIST view, with full-width rows.
-static const int SL_PICK_ROWS_PER_PAGE = 8;
+// Picker lists (MASTER_SELECT, server song picker) — share one ScrollViewport
+// geometry: a band below the header, above the bottom status bar.
+static const int SL_PICK_Y0    = SL_HDR_H + 10;     // 60
+static const int SL_PICK_ROW_H = 52;
+static const int SL_PICK_VIS   = 8;
+static const int SL_PICK_VIEW_H = SL_PICK_VIS * SL_PICK_ROW_H;   // 416
 
 class SetlistPage {
 public:
@@ -143,10 +129,6 @@ public:
     void draw();
     SetlistResult poll();
 
-    // Filled in when poll() returns SONG_LOADED — caller reads these so it
-    // knows what was loaded.  loadedFilename() matches SongPage's behaviour;
-    // loadedDisplayName() is the setlist entry's NAME (used as the
-    // PerformancePage title override).
     const char* loadedFilename()    const { return _loadedFilename; }
     const char* loadedDisplayName() const { return _loadedDisplayName; }
 
@@ -156,64 +138,67 @@ private:
     Song&                _song;
     KeyboardPopup        _keyboard;
     ConfirmDialog        _dialog;
+    ScrollViewport       _msView;     // master-select picker
+    ScrollViewport       _pickView;   // server song-file picker
 
     enum class State : uint8_t {
+        NOT_CONNECTED,
         LIST,
         INFO,
-        WAITING_SONG,      // OK pressed in INFO: waiting for server SONG_READY
+        WAITING_SONG,
+        MASTER_SELECT,
         EDIT,
         KBD_NAME,
         KBD_NOTES,
-        PICK_FILE,         // SD-card file picker
-        PICK_FILE_SRV,     // server-side song picker (paired)
+        PICK_FILE_SRV,
         CONFIRM_DELETE,
     };
 
-    State    _state;
-    bool     _wasDown;
+    State   _state;
+    bool    _wasDown;
 
-    uint8_t  _slot;          // 1..SETLIST_COUNT (currently visible)
-    Setlist  _list;          // currently loaded setlist
-    int      _scrollOffset;  // top visible row in the song list (0-based)
-    int      _selectedIdx;   // song selected in INFO / being EDITed
+    uint8_t _slot;
+    Setlist _list;
 
-    // Drag-scroll state — populated on touch-down inside the list view,
-    // cleared on touch-up.  `_dragMoved` flips to true once vertical
-    // movement exceeds SL_DRAG_THRESH_PX, which suppresses the
-    // would-be tap so panning doesn't accidentally open a row.
-    int      _dragStartY;
-    int      _dragStartScrollOffset;
-    bool     _dragMoved;
+    // LIST view scroll (manual drag — rows carry Move buttons).
+    int     _scrollOffset;
+    int     _dragStartY;
+    int     _dragStartScrollOffset;
+    bool    _dragMoved;
 
-    // Bare filename (no .mgt) of the most recently loaded setlist entry —
-    // used to draw a "currently playing" marker.  Survives close/reopen
-    // since this object is long-lived.  Stale if the user loads via
-    // SongPage in the interim; tracking that path is out of scope.
-    char     _currentLoadedFile[SETLIST_FILE_LEN];
+    int     _selectedIdx;       // setlist row in INFO / REMOVE
+    bool    _selectedMissing;   // resolved file absent on server (computed at INFO)
+    int     _moveSrcIdx;        // -1 = not reordering
+    char    _currentLoadedFile[SETLIST_FILE_LEN];
 
-    // EDIT draft (so CANCEL is non-destructive).
-    SetlistEntry _draft;
-    bool         _draftIsNew;
+    // Catalog-entry editor.
+    MasterEntry _draft;
+    bool        _draftIsNew;
+    int         _editIdx;       // index into the master catalog, or -1 for new
 
-    // Keyboard snapshot for non-destructive cancel (keyboard mutates buf in place).
-    char     _kbdSnap[SETLIST_NOTES_LEN];
-    char*    _kbdTarget;     // points into _draft
+    // Keyboard snapshot for non-destructive cancel.
+    char    _kbdSnap[SETLIST_NOTES_LEN];
+    char*   _kbdTarget;
 
-    // PICK_FILE state
-    char     _files[STORAGE_MAX_FILES][STORAGE_FILENAME_MAX];
-    int      _fileCount;
-    int      _pickPage;
+    // MASTER_SELECT.
+    bool    _msEditMode;        // taps open the editor instead of toggling
 
-    // PICK_FILE_SRV state
-    int      _srvPickPage;       // current server list page
-    bool     _srvListDrawn;      // false = browser needs repopulating on next poll
+    // Server song-file picker (streamed in, scrolled via _pickView).
+    static const int SRV_PICK_MAX = FILE_LIST_CACHE_MAX;
+    char    _srvPickNames[SRV_PICK_MAX][SETLIST_FILE_LEN];
+    int     _srvPickCount;
+    int     _srvPickReqPage;
+    bool    _srvPickLoaded;
+    bool    _srvListDrawn;
 
-    // WAITING_SONG state (OK-LOAD from server)
-    uint32_t _srvLoadStartMs;
+    uint32_t _srvLoadStartMs;   // WAITING_SONG
 
-    // Result handover
-    char     _loadedFilename[STORAGE_FILENAME_MAX];
-    char     _loadedDisplayName[SETLIST_SONG_NAME_LEN];
+    char    _loadedFilename[32];
+    char    _loadedDisplayName[SETLIST_SONG_NAME_LEN];
+
+    // ── NOT_CONNECTED ──────────────────────────────────────────────────────────
+    void drawNotConnected();
+    SetlistResult pollNotConnected();
 
     // ── LIST ─────────────────────────────────────────────────────────────────
     void drawList();
@@ -222,78 +207,76 @@ private:
     void drawListRows();
     void drawListRow(int rowOnPage);
     void drawListBottomBar();
-    SetlistResult pollList();   // can emit BACK
-
+    SetlistResult pollList();
     int  maxScrollOffset() const;
     void ensureRowVisible(int idx);
-    int  hitTab(int sx, int sy) const;          // -1 or 1..SETLIST_COUNT
-    int  hitRowName(int sx, int sy) const;      // -1 or absolute song idx
-    int  hitRowUp(int sx, int sy) const;        // -1 or absolute song idx
-    int  hitRowDown(int sx, int sy) const;      // -1 or absolute song idx
+    int  hitTab(int sx, int sy) const;
+    int  hitRowName(int sx, int sy) const;
+    int  hitRowMoveBtn(int sx, int sy) const;
     bool hitBack(int sx, int sy) const;
     bool hitAdd(int sx, int sy) const;
-
     void switchToSlot(uint8_t newSlot);
-    void moveSongUp(int idx);
-    void moveSongDown(int idx);
-    void deleteSong(int idx);
-    bool fileExistsOnSd(const char* file) const;
+
+    // Resolve a setlist row's name to its catalog entry (or nullptr if the name
+    // is no longer in the master list).
+    const MasterEntry* resolveRow(int setlistIdx) const;
 
     // ── INFO ─────────────────────────────────────────────────────────────────
     void drawInfo();
-    SetlistResult pollInfo();   // can emit SONG_LOADED
-    bool hitInfoOk    (int sx, int sy) const;
-    bool hitInfoEdit  (int sx, int sy) const;
+    SetlistResult pollInfo();
+    bool hitInfoOk(int sx, int sy) const;
+    bool hitInfoRemove(int sx, int sy) const;
     bool hitInfoCancel(int sx, int sy) const;
 
-    // ── EDIT ─────────────────────────────────────────────────────────────────
+    // ── WAITING_SONG ───────────────────────────────────────────────────────────
+    void drawWaitingSong();
+    SetlistResult pollWaitingSong();
+
+    // ── MASTER_SELECT ──────────────────────────────────────────────────────────
+    void openMasterSelect();
+    void drawMasterHeader();
+    void drawMasterHint();
+    void drawMasterChrome();                  // header + hint (no band)
+    bool paintMasterBand(int x, int y, int w, int h, int offsetY);  // ScrollViewport PaintFn
+    void tapMaster(int tx, int ty);                                 // ScrollViewport TapFn
+    void drawMasterRow(int idx, int py, int rowH);
+    SetlistResult pollMasterSelect();
+    bool hitMasterEdit(int sx, int sy) const;
+    bool hitMasterNew(int sx, int sy) const;
+
+    // ── EDIT (catalog entry) ───────────────────────────────────────────────────
     void drawEdit();
     void drawEditFieldRow(int y, const char* label, const char* value,
                           int valW, const char* btnLabel);
     void drawEditFileRow();
     void drawEditNotesRow();
     void drawEditActionBar();
-    bool pollEdit();   // returns true if state changed
+    bool pollEdit();
     bool hitEditFieldBtn(int y, int sx, int sy) const;
     bool hitEditFileClear(int sx, int sy) const;
     bool hitEditFilePick(int sx, int sy) const;
-    bool hitEditOk    (int sx, int sy) const;
+    bool hitEditOk(int sx, int sy) const;
     bool hitEditCancel(int sx, int sy) const;
     bool hitEditDelete(int sx, int sy) const;
-
-    void commitDraft();        // OK in EDIT — copy _draft into _list
+    void commitDraft();
     void openKeyboardFor(char* target, uint8_t maxLen, State afterState);
 
-    // ── PICK_FILE (SD) ───────────────────────────────────────────────────────
-    void loadFileList();
-    void drawPick();
-    void drawPickHeader(const char* title);
-    void drawPickRows();
-    void drawPickRow(int rowOnPage);
-    void drawPickBottomBar(int total);
-    bool pollPick();
-    int  numPickPages() const;
-    int  hitPickRow(int sx, int sy) const;
-    bool hitPickBack(int sx, int sy) const;
-    bool hitPickPrev(int sx, int sy) const;
-    bool hitPickNext(int sx, int sy) const;
-
-    // ── PICK_FILE_SRV (server) ───────────────────────────────────────────────
+    // ── PICK_FILE_SRV (server song picker) ─────────────────────────────────────
     void startServerPick();
-    void drawPickSrv();
-    void drawPickSrvRows();
-    void drawPickSrvRow(int rowOnPage, const char* name);
-    bool pollPickSrv();
-    int  hitPickSrvRow(int sx, int sy) const;
+    void drawPickChrome(const char* title);   // header + hint (no band)
+    bool paintPickBand(int x, int y, int w, int h, int offsetY);    // ScrollViewport PaintFn
+    void tapPick(int tx, int ty);                                   // ScrollViewport TapFn
+    void pumpServerPickPages();                // accumulate streamed pages
+    SetlistResult pollPickSrv();
+    bool hitPickBack(int sx, int sy) const;
 
-    // ── WAITING_SONG ─────────────────────────────────────────────────────────
-    void drawWaitingSong();
-    SetlistResult pollWaitingSong();
-
-    // ── helpers ──────────────────────────────────────────────────────────────
+    // ── helpers ────────────────────────────────────────────────────────────────
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
-    void save();   // persist _list to SD
+    void save();         // serialise + upload the current setlist (FK_SETLISTS)
+    void saveMaster();   // serialise + upload the master catalog (master.txt)
+    bool loadSlotFromServer(uint8_t slot, Setlist* sl);
+    bool loadMasterFromServer();
+    bool fileExistsOnServer(const char* file);
     static void wrapText(const char* in, int maxChars,
-                         char line1[], char line2[],
-                         int line1Cap, int line2Cap);
+                         char line1[], char line2[], int line1Cap, int line2Cap);
 };

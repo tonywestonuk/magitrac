@@ -60,7 +60,7 @@ private:
     void drawModeSection();
     void drawCredsSection();
     void drawCredRow(int y, const char* label, const char* value,
-                     bool hasScanButton);
+                     bool hasScanButton, bool disabled = false);
     void drawChannelSection();
     void drawActionsSection();
 

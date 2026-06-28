@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <IPAddress.h>
 #include "MagiMsg.h"
 #include "TrackerData.h"   // for Song / SongFileHeader
 
@@ -48,8 +49,10 @@ enum class FileLoadState : uint8_t {
     ERROR,
 };
 
-#define FILE_LIST_CACHE_MAX 64   // ceiling on names cached client-side
-#define FILE_LOAD_BUF_MAX   8192 // ceiling on a single fetched file
+#define FILE_LIST_CACHE_MAX 64    // ceiling on names cached client-side
+#define FILE_LOAD_BUF_MAX   24576 // ceiling on a single fetched file
+                                  //   (the master catalog master.txt, 80 songs
+                                  //    × name/file/notes, is the largest ~21 KB)
 
 // Upper bound on samples we cache client-side.  Sized for the editor picker;
 // matches PROG range (1..127) + 1 reserved slot for "no sample".
@@ -97,10 +100,17 @@ public:
     // Tell the server to write its current in-memory song to SD under `name`.
     // Cheap (one small message) — server already has the song bytes thanks
     // to the patch / note-set stream.  Used by autosave.
-    bool sendSaveActive(const char* name);
+    // isAutosave=true routes the server's write to /autosave/<name>.mgt
+    // (power-loss recovery); false writes to the canonical /songs/<name>.mgt
+    // and clears any pending /autosave/<name>.mgt.
+    bool sendSaveActive(const char* name, bool isAutosave = false);
     // Tell the server to call initSong() on its in-memory copy — keeps
     // client and server in sync after the user creates a new blank song.
     bool sendNewSong();
+
+    // Tell the server to drop to OFF / No Song (mirrors its local "-- OFF --").
+    // Server replies with MsgNoSong, which clears the client via noSongPending().
+    bool sendSetOff();
 
     // ── Live song sync ────────────────────────────────────────────────────────
     bool sendSongPatch(const Song& song, const void* fieldPtr, uint8_t length);
@@ -110,6 +120,9 @@ public:
     // Fire a raw MIDI note-on (no note-off).  Used by DrumTrackImportPage to
     // audition drum blocks before import.
     bool sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity);
+    // Select an audition program (e.g. drum kit on ch10).  Emitted on the
+    // server's MIDI task so it stays coherent with running status.
+    bool sendAuditionProgram(uint8_t channel, uint8_t program);
 
     // ── Instruments sync ─────────────────────────────────────────────────────
     void requestInstruments();
@@ -154,6 +167,13 @@ public:
     const uint8_t*  fileLoadData()  const { return _fileLoadBuf; }
     uint32_t        fileLoadLen()   const { return _fileLoadBufLen; }
 
+    // Upload a file to the server SD under `kind` (FileKind).  `name` is the
+    // destination filename with extension.  Chunked, fire-and-forget (the
+    // server ACKs but the send path doesn't block on it).  Returns the
+    // send result.  Mirrors sendRestoreFile.
+    bool sendFileSave(uint8_t kind, const char* name,
+                      const uint8_t* data, uint32_t dataLen);
+
     // ── Restore ───────────────────────────────────────────────────────────────
     bool sendRestoreFile(const char* name, bool isInstruments,
                          const uint8_t* data, uint32_t dataLen);
@@ -178,6 +198,18 @@ public:
     // Drain the latest preview-row update.  Returns false if no update pending.
     bool pollPreviewRow(uint8_t* row);
 
+    // ── Manual PixelPost control ─────────────────────────────────────────────
+    // Each call sends a single MagiLink message; the server updates its PPOST
+    // state cache and broadcasts (on-change + 2 s heartbeat coverage).
+    bool sendPixelpostEffect        (uint8_t effectIdx);
+    bool sendPixelpostSlider        (uint8_t value);
+    bool sendPixelpostTouchpad      (uint8_t x, uint8_t y, bool touched);
+    bool sendPixelpostPowerOff      (bool off);
+    bool sendPixelpostOverride      (uint8_t op);   // PpOverrideOp (perf-page light strip)
+    bool sendPixelpostPostCount     (uint8_t count);
+    bool sendPixelpostFirmwareUpdate();
+    bool sendPixelpostFlashCtrl     (uint8_t value);
+
     // ── Sequencer position (received from server) ─────────────────────────────
     bool remoteSeqPos(uint8_t* pattern, uint8_t* row);
 
@@ -197,12 +229,19 @@ public:
     const char* listName(int i)    const { return _listNames[i]; }
     bool        copySong(Song* out) const;
 
+    // ── Server discovery (MSG_SERVER_ANNOUNCE) ───────────────────────────
+    // True once we've seen at least one beacon since boot.  Used by the
+    // EXTERNAL_AP setup path to know when it can call beginConnect().
+    bool        hasDiscoveredServerIP() const { return _discoveredServerIPValid; }
+    IPAddress   discoveredServerIP()    const { return _discoveredServerIP; }
+    uint16_t    discoveredServerPort()  const { return _discoveredServerPort; }
+
     // ── Internal (called by receive callbacks) ────────────────────────────────
     // _onReceive — UDP datagrams only (row position, performer MIDI, preview
-    //              playhead).  TCP/MagiLink delivery goes via registered
-    //              MagiLink callbacks below.
+    //              playhead, server announce).  TCP/MagiLink delivery goes via
+    //              registered MagiLink callbacks below.
     // _onPairReceive — pairing ceremony, off the ESP-NOW transport.
-    void _onReceive(const uint8_t* data, int len);
+    void _onReceive(const uint8_t* data, int len, const IPAddress& src);
     void _onPairReceive(const uint8_t* data, int len);
     // MagiLink session handshake — called from the registered callback
     // (worker task, mutex held).  Sends MsgConnectAck and transitions
@@ -247,8 +286,12 @@ private:
     uint8_t _storedServerMac[6]  = {};
     uint8_t _storedSecret[16]    = {};
 
-    // Pairing ceremony — PIN received from the server in MSG_PAIR_CHALLENGE.
-    uint8_t _pairCode[4] = {};
+    // Pairing ceremony — PIN + server-supplied softAP creds received in
+    // MSG_PAIR_CHALLENGE.  For SERVER_AP mode the client uses these
+    // instead of the user-entered WiFi page creds.
+    uint8_t _pairCode[4]                     = {};
+    char    _pairOfferedSsid[MAGI_OFFER_SSID_LEN] = {};
+    char    _pairOfferedPsk [MAGI_OFFER_PSK_LEN]  = {};
 
     // PROBE broadcast pacing.  Pairing is always on ch1 — no channel hop.
     uint32_t _scanLastProbeMs  = 0;
@@ -275,6 +318,13 @@ private:
     // Latest preview-row position from server
     uint8_t  _previewRow         = 0;
     bool     _previewRowPending  = false;
+
+    // Server discovery — captured from MSG_SERVER_ANNOUNCE UDP broadcasts.
+    // Source IP comes from the datagram itself (passed by MagiUdpLink).
+    bool     _discoveredServerIPValid = false;
+    IPAddress _discoveredServerIP     = IPAddress((uint32_t)0);
+    uint16_t _discoveredServerPort    = 0;
+    char     _discoveredServerName[MAGI_ANNOUNCE_NAME_LEN] = {};
 
     // Song receive buffer
     uint8_t* _songBuf      = nullptr;

@@ -1,6 +1,7 @@
 #include "SamplePlayer.h"
 #include "sd_mutex.h"
 #include "audio_codec.h"
+#include "crash_log.h"
 #include <Arduino.h>
 #include <SD.h>
 #include <string.h>
@@ -22,6 +23,7 @@ static volatile bool             s_playing    = false;
 static SemaphoreHandle_t         s_trigger    = nullptr;
 static portMUX_TYPE              s_pathMux    = portMUX_INITIALIZER_UNLOCKED;
 static char                      s_pendingPath[64];
+static volatile int              s_pendingPitch = 0;   // semitones for the next play
 static volatile bool             s_havePending = false;
 
 static const int                 IN_SAMPLES   = 1024;
@@ -57,9 +59,17 @@ struct Resampler {
     uint32_t phase_q16 = 0;
     int16_t  lastIn    = 0;
 
-    void configure(uint32_t inRateHz) {
+    void configure(uint32_t inRateHz, int pitchSemitones = 0) {
         if (inRateHz == 0) inRateHz = AUDIO_CODEC_RATE_HZ;
-        step_q16  = (uint32_t)(((uint64_t)inRateHz << 16) / AUDIO_CODEC_RATE_HZ);
+        // Base step = file-rate → codec-rate (native pitch).  Pitch tracking
+        // scales it by 2^(semitones/12); clamp to ±4 octaves so the step can't
+        // overflow or stall.  Runs once per play, so double pow() is cheap.
+        if (pitchSemitones < -48) pitchSemitones = -48;
+        if (pitchSemitones >  48) pitchSemitones =  48;
+        double base  = ((double)inRateHz * 65536.0) / AUDIO_CODEC_RATE_HZ;
+        double ratio = exp2((double)pitchSemitones / 12.0);
+        uint32_t s   = (uint32_t)(base * ratio + 0.5);
+        step_q16  = s ? s : 1;
         phase_q16 = 0;
         lastIn    = 0;
     }
@@ -92,7 +102,9 @@ struct Resampler {
 
 static void wavTaskFn(void*) {
     char activePath[64];
+    int  activePitch = 0;
     for (;;) {
+        crashSetAudioPhase(CP_IDLE);   // breadcrumb: WAV task idle/blocked
         xSemaphoreTake(s_trigger, portMAX_DELAY);
 
         bool havePath;
@@ -100,6 +112,7 @@ static void wavTaskFn(void*) {
         havePath = s_havePending;
         if (havePath) {
             memcpy(activePath, s_pendingPath, sizeof(activePath));
+            activePitch = s_pendingPitch;
             s_havePending = false;
         }
         portEXIT_CRITICAL(&s_pathMux);
@@ -107,6 +120,7 @@ static void wavTaskFn(void*) {
 
         s_stop    = false;
         s_playing = true;
+        crashSetAudioPhase(CP_SAMPLE_READ);   // breadcrumb: audio active
 
         File f;
         { SdLock _; f = SD.open(activePath); }
@@ -152,7 +166,7 @@ static void wavTaskFn(void*) {
         }
 
         Resampler rs;
-        rs.configure(sampleRate);
+        rs.configure(sampleRate, activePitch);
         s_fadeInRemaining = FADE_IN_SAMPLES;
 
         int curBytes;
@@ -168,10 +182,21 @@ static void wavTaskFn(void*) {
                 applyFadeOut(inBuf, samples);
             }
 
-            int consumed = 0;
-            int outFrames = rs.process(inBuf, samples, outBuf, OUT_FRAMES_MAX, consumed);
-            if (outFrames > 0) {
-                audioCodecPlay((const uint8_t*)outBuf, outFrames * 4);
+            // Drain the whole input chunk.  With downward pitch one process()
+            // call can want to emit more than OUT_FRAMES_MAX frames, so loop
+            // until the chunk is consumed instead of dropping the remainder.
+            // Phase + lastIn carry correctly across calls via the advanced
+            // pointer, so this keeps outBuf small (memory stays flat).
+            int done = 0;
+            while (done < samples && !s_stop) {
+                int consumed = 0;
+                int outFrames = rs.process(inBuf + done, samples - done,
+                                           outBuf, OUT_FRAMES_MAX, consumed);
+                if (outFrames > 0) {
+                    audioCodecPlay((const uint8_t*)outBuf, outFrames * 4);
+                }
+                if (consumed <= 0) break;   // safety: never spin
+                done += consumed;
             }
 
             // Swap buffers
@@ -198,10 +223,11 @@ void samplePlayerInit() {
     xTaskCreatePinnedToCore(wavTaskFn, "WAV", 4096, nullptr, 5, nullptr, 0);  // Core 0
 }
 
-void samplePlayerPlay(const char* path) {
+void samplePlayerPlay(const char* path, int pitchSemitones) {
     portENTER_CRITICAL(&s_pathMux);
     strncpy(s_pendingPath, path, sizeof(s_pendingPath) - 1);
     s_pendingPath[sizeof(s_pendingPath) - 1] = '\0';
+    s_pendingPitch = pitchSemitones;
     s_havePending = true;
     portEXIT_CRITICAL(&s_pathMux);
     s_stop = true;

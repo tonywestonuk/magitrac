@@ -14,13 +14,17 @@
 //   y=440  ├─ [1] [2] [3] [4] [5] [6] [7] [BACK]  (8 × 100w / 115step) ─────┤
 //   y=540  └──────────────────────────────────────────────────────────────────┘
 //
-// Effect button touch:   sets _resultKind=NOTE, note = effect_idx + 1
-//                        (effect_idx = button + page*6)
-// Slider touch:          sets _resultKind=VELOCITY, scaled 0..127 (top = 127)
-// Touchpad touch:        sets _resultKind=ATTR, _resultEffect=X, _resultParam=Y
-//                        (top-left origin, both 0..255)
-// Page button (1-7):     swaps effect-label set, stays open
-// BACK:                  closes with _resultKind=NONE
+// LIVE control surface — every touch is sent to the pixel posts immediately so
+// the user can audition, and the screen STAYS OPEN.  The last value touched in
+// each of the three axes is remembered and committed to the note-editor cell
+// only when BACK is pressed:
+//
+//   Effect button → sendPixelpostEffect(idx) live; remembers note (took*Note)
+//                   (effect_idx = button + page*6; "--" slots ignored)
+//   Slider drag   → sendPixelpostSlider live; remembers velocity 0..127 (top=127)
+//   Touchpad drag → sendPixelpostTouchpad live; remembers x,y attr (0..255)
+//   Page (1-7)    → swaps effect-label set, stays open
+//   BACK          → closes; caller commits whichever axes were touched
 
 static const int PPK_W           = 960;
 static const int PPK_H           = 540;
@@ -55,13 +59,6 @@ static const int PPK_NUM_PAGES   = 7;
 
 class PixelPostPicker {
 public:
-    enum ResultKind {
-        RES_NONE     = 0,   // back pressed or no commit yet
-        RES_NOTE     = 1,   // effect tapped → use resultSemitone/Octave
-        RES_VELOCITY = 2,   // slider tapped → use resultVelocity
-        RES_ATTR     = 3    // touchpad tapped → use resultEffect/Param
-    };
-
     PixelPostPicker(EPD_PainterAdafruit& display, GT911_Lite& touch);
 
     // Open the picker.  fingerDown=true if a finger is still pressing
@@ -72,10 +69,15 @@ public:
     bool isOpen() const { return _open; }
     void draw();
 
-    // Returns true when picker closes (effect/slider/pad commit, or BACK).
+    // Returns true once when the user taps BACK — caller commits the touched
+    // axes (see took*() below) and closes us out.
     bool poll();
 
-    ResultKind resultKind()      const { return _resultKind; }
+    // Which axes were touched this session (commit only these on BACK).
+    bool       tookNote()        const { return _haveNote; }
+    bool       tookVelocity()    const { return _haveVel; }
+    bool       tookAttr()        const { return _haveAttr; }
+
     uint8_t    resultSemitone()  const { return _resultSemitone; }
     uint8_t    resultOctave()    const { return _resultOctave; }
     uint8_t    resultVelocity()  const { return _resultVelocity; }
@@ -90,13 +92,25 @@ private:
     bool       _wasDown;
     bool       _swallowDown;   // ignore touches until finger lifts after open
     uint8_t    _page;          // 0..PPK_NUM_PAGES-1
+    uint8_t    _selectedEffect; // last effect sent (0xFF = none); highlights grid
 
-    ResultKind _resultKind;
+    // Active-widget tracking — set on rising edge so a slider/pad drag streams
+    // even if the finger crosses into another region.
+    enum class ActiveWidget : uint8_t { NONE, SLIDER, TOUCHPAD };
+    ActiveWidget _active;
+
+    // Which axes the user touched (commit only these on BACK).
+    bool       _haveNote;
+    bool       _haveVel;
+    bool       _haveAttr;
+
     uint8_t    _resultSemitone;
     uint8_t    _resultOctave;
     uint8_t    _resultVelocity;
     uint8_t    _resultEffect;
     uint8_t    _resultParam;
+    uint8_t    _lastPadX;       // last touchpad x/y sent (for release send)
+    uint8_t    _lastPadY;
 
     void drawTitle();
     void drawEffectButtons();
@@ -105,4 +119,9 @@ private:
     void drawPageRow();
     void drawWrappedLabel(const char* text, int cx, int cy);
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
+
+    bool hitSlider(int sx, int sy) const;
+    bool hitTouchpad(int sx, int sy) const;
+    void sliderUpdateFromY(int sy);
+    void touchpadUpdateFromXY(int sx, int sy, bool touched);
 };

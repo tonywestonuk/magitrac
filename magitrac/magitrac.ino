@@ -17,6 +17,7 @@
 #include "NoteEditor.h"
 #include "PageManager.h"
 #include "BlockSettingsPage.h"
+#include "DrumEditorPage.h"
 #include "ColumnNoteEditorPage.h"
 #include "SongStorage.h"
 #include "SongPage.h"
@@ -30,6 +31,7 @@
 #include "SettingsPage.h"
 #include "BackupRestorePage.h"
 #include "PerformancePage.h"
+#include "PixelPostManualPage.h"
 #include "SetlistPage.h"
 #include "WiFiSettingsPage.h"
 #include "Battery.h"
@@ -40,9 +42,11 @@
 
 
 // ── Backlight + boot button ───────────────────────────────────────────────────
-#define BOARD_BL_EN   11   // PWM backlight enable — LilyGo T5 S3
+#define BOARD_BL_EN   11   // PWM frontlight enable — LilyGo T5 S3
+#define BL_ON_LEVEL   128  // half brightness when on (e-paper holds its image
+                           // with no light; the frontlight is battery-costly)
 #define BOOT_BTN_PIN   0   // GPIO 0 = BOOT button (active LOW, internal pull-up)
-static bool gBacklightOn    = true;
+static bool gBacklightOn    = false;   // off by default — boot button turns it on
 static bool gBootBtnWasDown = false;
 
 // ── SD card pins ──────────────────────────────────────────────────────────────
@@ -74,6 +78,7 @@ TouchHandler  handler(touch, ui, engine, song);
 NoteEditor         noteEditor(display, touch);
 PageManager        pageManager(display, touch, song);
 BlockSettingsPage  blockSettings(display, touch, song);
+DrumEditorPage     drumEditor   (display, touch, song);
 ColumnNoteEditorPage noteEditorPage(display, touch, song);
 SongPage           songPage(display, touch, song);
 BootMenu           bootMenu(display, touch);
@@ -82,6 +87,7 @@ SongConfigPage     songConfigPage(display, touch, song);
 ColumnEditor       columnEditor(display, touch, song, gInstruments);
 DrumTrackImportPage drumTrackImportPage(display, touch, song);
 PerformancePage    performancePage(display, touch, song);
+PixelPostManualPage pixelpostManualPage(display, touch);
 SetlistPage        setlistPage(display, touch, song);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
@@ -223,10 +229,12 @@ static bool     songConfigPageOpen  = false;
 static bool     columnEditorOpen    = false;
 static bool     drumTrackImportOpen = false;
 static bool     noteEditorPageOpen  = false;
+static bool     drumEditorOpen      = false;
 static bool     settingsPageOpen     = false;
 static bool     wifiSettingsPageOpen = false;
 static bool     backupRestorePageOpen = false;
 static bool     performancePageOpen   = false;
+static bool     pixelpostManualPageOpen = false;
 static bool     setlistPageOpen       = false;
 
 // ── Autosave state ───────────────────────────────────────────────────────
@@ -249,6 +257,10 @@ void markSongDirty() {
 
 void markSongClean() {
     gSongDirty = false;
+}
+
+bool songIsDirty() {
+    return gSongDirty;
 }
 
 // ── Grid pause state ─────────────────────────────────────────────────────
@@ -277,6 +289,13 @@ void setup() {
     // persistent(false) suppresses WiFi's own NVS writes of SSID/PSK.
     WiFi.persistent(false);
     WiFi.mode(WIFI_AP_STA);
+    // Disable STA modem-sleep.  The server's AP runs a 400ms beacon (RF-hum
+    // mitigation for its audio path); with default power-save the client only
+    // wakes at DTIM beacons, so the AP buffers our downlink UDP playhead
+    // packets and flushes them in ~400ms lumps → the row cursor feels laggy.
+    // Keeping the radio awake delivers them immediately.  Costs some current,
+    // worth it for a live-performance client.
+    WiFi.setSleep(false);
 
     Serial.printf("[MEM] Before display.begin() — internal: %u  PSRAM: %u\n",
         heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -298,9 +317,17 @@ void setup() {
     gServerPairing.begin();
 
     // ── MagiLink (reliable TCP transport) ───────────────────────────────────
-    // Client is always a STA at MAGI_CLIENT_IP regardless of apMode —
-    // the mode only tells the server what to do.  No creds → no
-    // MagiLink (user must pair first).
+    //
+    // Two paths depending on apMode:
+    //   SERVER_AP   — server hosts its own AP at fixed MAGI_SERVER_IP and
+    //                 stops softAP DHCP.  Client must assign itself a
+    //                 static IP via WiFi.config, and the server's address
+    //                 is known up-front, so beginConnect can fire here.
+    //   EXTERNAL_AP — both devices join a third-party AP and take DHCP.
+    //                 Server's address is no longer predictable; we defer
+    //                 beginConnect until the first MSG_SERVER_ANNOUNCE
+    //                 beacon arrives (handled by tickDiscoveryConnect()
+    //                 in loop()).
     {
         char    creds_ssid[33] = {};
         char    creds_psk[64]  = {};
@@ -308,15 +335,22 @@ void setup() {
         if (pairNvsLoadCreds("magitrac_cli", creds_ssid, creds_psk, &apMode)) {
             Serial.printf("[SETUP] WiFi creds present — STA→%s (apMode=%u)\n",
                 creds_ssid, (unsigned)apMode);
-            WiFi.config(IPAddress(MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1,
-                                  MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3),
-                        IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
-                                  MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
-                        IPAddress(255, 255, 255, 0));
-            WiFi.begin(creds_ssid, creds_psk);
-            gMagiLink.beginConnect(MAGI_PORT,
-                IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
-                          MAGI_SERVER_IP_2, MAGI_SERVER_IP_3));
+            if (apMode == MAGI_AP_MODE_SERVER) {
+                WiFi.config(IPAddress(MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1,
+                                      MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3),
+                            IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                      MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                            IPAddress(255, 255, 255, 0));
+                WiFi.begin(creds_ssid, creds_psk);
+                gMagiLink.beginConnect(MAGI_PORT,
+                    IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                              MAGI_SERVER_IP_2, MAGI_SERVER_IP_3));
+            } else {
+                // EXTERNAL_AP — DHCP everywhere; server IP comes via
+                // MSG_SERVER_ANNOUNCE discovery beacon.
+                WiFi.begin(creds_ssid, creds_psk);
+                Serial.println("[SETUP] EXTERNAL_AP — waiting for server discovery beacon");
+            }
         } else {
             Serial.println("[SETUP] no WiFi creds — open WiFi page + pair to connect");
         }
@@ -326,7 +360,9 @@ void setup() {
     // with display pins on M5PaperS3)
     if (display.getPreset() != &EPD_M5PAPER_S3_PRESET) {
         pinMode(BOARD_BL_EN,  OUTPUT);
-        analogWrite(BOARD_BL_EN, 255);   // backlight on at full brightness
+        // Off by default (gBacklightOn=false); boot button toggles it on at
+        // half brightness.  Respect the flag rather than forcing it on.
+        analogWrite(BOARD_BL_EN, gBacklightOn ? BL_ON_LEVEL : 0);
     }
 
     TwoWire* wire = display.getConfig().i2c.wire;
@@ -369,6 +405,7 @@ void setup() {
     // under m5stack:esp32 if it runs first).  See the note next to its
     // current call site at the top of setup().
     loadMidiLimits();
+    loadPixelPostFlashCtrl();
     // loadWifiChannel() moved up — now runs before gServerPairing.begin()
     // so the SoftAP starts on the right channel.  Don't call WiFi.setChannel()
     // here: with the AP already up, changing channel from STA would either
@@ -384,10 +421,9 @@ void setup() {
 
     initSong(&song);
 
+    // Instruments are server-owned: start from defaults, then the server pushes
+    // the real bank on connect (requestInstruments / copyInstruments in loop()).
     initInstruments(gInstruments);
-    if (gSdAvailable && !loadInstruments(gInstruments)) {
-        saveInstruments(gInstruments);
-    }
 
     ui.drawAll();
     display.paintLater();
@@ -400,12 +436,60 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
+    // ── Debug tick (2 s) — paired/link/STA snapshot, drop when connection is fine
+    {
+        static uint32_t sDbgMs = 0;
+        if (now - sDbgMs >= 2000) {
+            sDbgMs = now;
+            const char* st;
+            switch (WiFi.status()) {
+                case WL_IDLE_STATUS:     st = "IDLE";       break;
+                case WL_NO_SSID_AVAIL:   st = "NO_SSID";    break;
+                case WL_SCAN_COMPLETED:  st = "SCAN_DONE";  break;
+                case WL_CONNECTED:       st = "CONNECTED";  break;
+                case WL_CONNECT_FAILED:  st = "FAILED";     break;
+                case WL_CONNECTION_LOST: st = "LOST";       break;
+                case WL_DISCONNECTED:    st = "DISCONNECT"; break;
+                default:                 st = "?";          break;
+            }
+            Serial.printf("[DBG] STA=%s SSID='%s' RSSI=%ld IP=%s GW=%s | paired=%d link=%d\n",
+                          st,
+                          WiFi.SSID().c_str(),
+                          WiFi.RSSI(),
+                          WiFi.localIP().toString().c_str(),
+                          WiFi.gatewayIP().toString().c_str(),
+                          (int)gServerPairing.isPaired(),
+                          (int)gMagiLink.isConnected());
+        }
+    }
+
+    // ── Discovery-driven late connect (EXTERNAL_AP only) ──────────────────────
+    //
+    // In SERVER_AP mode beginConnect was fired at setup().  In EXTERNAL_AP
+    // mode we defer until ServerPairing has seen a MSG_SERVER_ANNOUNCE
+    // beacon; this kicks gMagiLink the moment that lands.  One-shot per
+    // address — guarded by sIssuedForIp so we don't repeatedly call
+    // beginConnect against the same target.
+    {
+        static IPAddress sIssuedForIp((uint32_t)0);
+        if (gServerPairing.hasDiscoveredServerIP()) {
+            IPAddress disc = gServerPairing.discoveredServerIP();
+            uint16_t  port = gServerPairing.discoveredServerPort();
+            if (disc != sIssuedForIp) {
+                Serial.printf("[MAGI] discovery → beginConnect %s:%u\n",
+                              disc.toString().c_str(), (unsigned)port);
+                gMagiLink.beginConnect(port ? port : (uint16_t)MAGI_PORT, disc);
+                sIssuedForIp = disc;
+            }
+        }
+    }
+
     // ── Boot button — toggle backlight ────────────────────────────────────────
     {
         bool down = (digitalRead(BOOT_BTN_PIN) == LOW);
         if (down && !gBootBtnWasDown) {
             gBacklightOn = !gBacklightOn;
-            analogWrite(BOARD_BL_EN, gBacklightOn ? 255 : 0);
+            analogWrite(BOARD_BL_EN, gBacklightOn ? BL_ON_LEVEL : 0);
         }
         gBootBtnWasDown = down;
     }
@@ -514,8 +598,8 @@ void loop() {
         !songPageOpen && !instrumentsPageOpen && !songConfigPageOpen &&
         !columnEditorOpen && !noteEditorPageOpen && !settingsPageOpen &&
         !wifiSettingsPageOpen && !backupRestorePageOpen &&
-        !drumTrackImportOpen &&
-        !performancePageOpen && !setlistPageOpen &&
+        !drumTrackImportOpen && !drumEditorOpen &&
+        !performancePageOpen && !pixelpostManualPageOpen && !setlistPageOpen &&
         !noteEditor.isOpen() &&
         pageManager.currentPage() == Page::TRACKER) {
         const char* srvName = songPage.srvLoadedName();
@@ -532,8 +616,10 @@ void loop() {
 
             // Tiny "save your in-memory song to SD under this name" — the
             // server already has every edit via the patch / note-set stream,
-            // so we don't need to ship the song bytes again.
-            bool ok = gServerPairing.sendSaveActive(srvName);
+            // so we don't need to ship the song bytes again.  isAutosave=true
+            // routes the server write to /autosave/<name>.mgt — the canonical
+            // /songs/<name>.mgt is only touched by explicit Save.
+            bool ok = gServerPairing.sendSaveActive(srvName, /*isAutosave=*/true);
             if (ok) gSongDirty = false;
             // If !ok (link dropped between the isConnected() gate and here)
             // push the retry out a full AUTOSAVE_DELAY_MS instead of leaving
@@ -599,6 +685,13 @@ void loop() {
                 performancePage.draw();
                 display.paint();
                 break;
+            case BootMenuResult::PIXELPOST:
+                pixelpostManualPageOpen = true;
+                pixelpostManualPage.open(touch.isTouched);
+                display.clear();
+                pixelpostManualPage.draw();
+                display.paint();
+                break;
             case BootMenuResult::PAIR:
                 gPairingUiOpen    = true;
                 gPairingUiWasDown = touch.isTouched;
@@ -632,12 +725,26 @@ void loop() {
     // ── Server set to OFF — clear song and show message ──────────────────────
     if (gServerPairing.noSongPending()) {
         gServerPairing.clearNoSong();
+        bool wasOff = (gSongSource == SongSource::NONE);
         engine.stop();
         initSong(&song);
+        song.numPatterns = 0;            // OFF = no blocks → perform pads all grey
         ui.setSelected(0, 0);
         ui.setNoSong(true);
         gSongSource = SongSource::NONE;
-        needsFullRedraw = true;
+        // If the server went OFF on its own (its own "-- OFF --"), reflect it
+        // now.  When we already drove OFF locally (setlist no-file entry), this
+        // is the echo and we skip the redundant redraw.
+        if (!wasOff) {
+            if (performancePageOpen) {
+                performancePage.open(engine.currentPattern(), /*stopped=*/true);
+                display.clear();
+                performancePage.draw();
+                display.paint();
+            } else {
+                needsFullRedraw = true;
+            }
+        }
     }
 
     // ── Unsolicited song push (server pushed song on connect or song change) ──
@@ -683,27 +790,52 @@ void loop() {
             ui.setNoSong(false);
             if (gServerPairing.isPaired()) {
                 gSongSource = SongSource::SERVER;
-                songPage.setServerLoadedName(song.name);
+                // Identify the loaded song by the setlist's FILENAME — it's the
+                // exact server file we loaded, so it always matches the Songs
+                // browser list and the autosave target.  (Relying on the song's
+                // internal name field fails when it's blank or out of sync.)
+                char bare[STORAGE_FILENAME_MAX];
+                strncpy(bare, setlistPage.loadedFilename(), sizeof(bare) - 1);
+                bare[sizeof(bare) - 1] = '\0';
+                int bl = (int)strlen(bare);
+                if (bl > 4 && bare[bl - 4] == '.' &&
+                    (bare[bl - 3] == 'm' || bare[bl - 3] == 'M')) {
+                    bare[bl - 4] = '\0';
+                }
+                songPage.setServerLoadedName(bare);
+                // Make the tracker status bar (which shows song.name) reflect
+                // the setlist filename.  App convention keeps name == filename
+                // on save, so this is a no-op for well-formed songs and a fix
+                // for any whose internal name is blank or out of sync.
+                strncpy(song.name, bare, sizeof(song.name) - 1);
+                song.name[sizeof(song.name) - 1] = '\0';
             } else {
                 gSongSource = SongSource::SD;
                 songPage.clearLoadedFile();
             }
-            // Stay on PerformancePage with the freshly-loaded song,
-            // and start the server playing — the user picked a song to
-            // perform, not to inspect.  Server-side song load stops the
-            // sequencer, so serverPlaying() will be false here.
-            performancePage.open(engine.currentPattern());
+            // Stay on PerformancePage with the freshly-loaded song.  Server-
+            // side song load stops the sequencer; we leave it stopped with no
+            // pad lit — the performer chooses which pad starts playback.
+            performancePage.open(engine.currentPattern(), /*stopped=*/true);
             performancePage.setTitleOverride(setlistPage.loadedDisplayName());
-            if (gServerPairing.isPaired()) {
-                gServerPairing.sendControl(MSG_PLAY);
-            }
             display.clear();
             performancePage.draw();
             display.paint();
         } else if (sres == SetlistResult::TITLE_ONLY) {
-            // OK with no file attached — keep current song, just update the
-            // PerformancePage title to the setlist entry's display name.
+            // No song file attached → drop to OFF / No Song.  Command the server
+            // to OFF (it stops the sequencer + clears its active song) and clear
+            // locally so the PerformancePage shows no blocks — all pads grey.
+            // The server's MsgNoSong reply re-runs noSongPending() but no-ops
+            // since we're already OFF.
             setlistPageOpen = false;
+            gServerPairing.sendSetOff();
+            engine.stop();
+            initSong(&song);
+            song.numPatterns = 0;            // no blocks → all perform pads grey
+            ui.setSelected(0, 0);
+            ui.setNoSong(true);
+            gSongSource = SongSource::NONE;
+            performancePage.open(engine.currentPattern(), /*stopped=*/true);
             performancePage.setTitleOverride(setlistPage.loadedDisplayName());
             display.clear();
             performancePage.draw();
@@ -712,13 +844,29 @@ void loop() {
         return;
     }
 
+    // ── PixelPost manual control page ─────────────────────────────────────────
+    if (pixelpostManualPageOpen) {
+        if (pixelpostManualPage.poll()) {
+            pixelpostManualPageOpen = false;
+            display.clear();
+            ui.drawAll();
+            display.paintLater();
+        }
+        return;
+    }
+
     // ── Performance page ──────────────────────────────────────────────────────
     if (performancePageOpen) {
-        // Forward server position updates to the performance page
+        // Forward server position updates to the performance page.  Only
+        // light a pad when the server is actually playing — sequencerReset()
+        // on the server fires a (pat=0,row=0) notify after song load, and
+        // we don't want that to light pad 1 on a freshly-loaded setlist.
         {
             uint8_t rPat, rRow;
             if (gServerPairing.remoteSeqPos(&rPat, &rRow)) {
-                performancePage.setPlayingPattern(rPat);
+                if (gServerPairing.serverPlaying()) {
+                    performancePage.setPlayingPattern(rPat);
+                }
                 engine.setPosition(rPat, rRow);
             }
         }
@@ -753,9 +901,9 @@ void loop() {
     // ── Song config page ──────────────────────────────────────────────────────
     if (songConfigPageOpen) {
         if (gServerPairing.isPaired() && songConfigPage.patchPending()) {
-            // Send all editable song-level fields in one patch (bpm..performerMask = 59 bytes)
+            // Send all editable song-level fields in one patch (bpm..transposeChMask)
             const uint8_t* start = (const uint8_t*)&song.bpm;
-            const uint8_t* end   = (const uint8_t*)&song.performerMask + 1;
+            const uint8_t* end   = (const uint8_t*)&song.transposeChMask + sizeof(song.transposeChMask);
             gServerPairing.sendSongPatch(song, start, (uint8_t)(end - start));
             songConfigPage.clearPatch();
         }
@@ -773,18 +921,17 @@ void loop() {
         if (instrumentsPage.poll()) {
             instrumentsPageOpen = false;
             if (instrumentsPage.saveOnExit()) {
+                // Instruments are server-owned — push edits up.  When unpaired
+                // there's nowhere to persist; edits stay in memory and the
+                // server bank reloads on the next connect.
                 if (gServerPairing.isPaired()) {
                     for (int i = 0; i < MAX_INSTRUMENTS; i++)
                         gServerPairing.sendInstrumentPatch(gInstruments, i);
-                } else if (gSdAvailable) {
-                    saveInstruments(gInstruments);
                 }
             } else {
-                // User chose NO — discard in-memory edits
+                // User chose NO — discard edits by reloading the server bank.
                 if (gServerPairing.isPaired()) {
                     gServerPairing.requestInstruments();  // async reload from server
-                } else if (gSdAvailable) {
-                    loadInstruments(gInstruments);
                 }
             }
             display.clear();
@@ -888,8 +1035,29 @@ void loop() {
     // ── Drum-track import page ─────────────────────────────────────────────
     if (drumTrackImportOpen) {
         if (drumTrackImportPage.poll()) {
-            // On successful import, push every changed column's settings
-            // (midiChannel + name) AND notes (this pattern only) to the server.
+            const bool drumEditorMode =
+                drumTrackImportPage.mode() == DrumTrackImportPage::Mode::DRUM_EDITOR;
+
+            if (drumEditorMode) {
+                // Drum-editor mode: hand the picked block to the drum editor.
+                // importBlock() sends per-note and per-column patches itself.
+                if (drumTrackImportPage.importDidComplete()) {
+                    drumEditor.importBlock(drumTrackImportPage.pickedFile(),
+                                           drumTrackImportPage.pickedBlock(),
+                                           drumTrackImportPage.pickedKit());
+                    markSongDirty();
+                }
+                drumTrackImportPage.clearResync();
+                drumEditor.clearResync();
+                drumTrackImportOpen = false;
+                drumEditor.resumeTouch();
+                drumEditor.draw();
+                display.clear();
+                display.paint();
+                return;
+            }
+
+            // Column-editor mode (original behaviour).
             if (gServerPairing.isPaired() && drumTrackImportPage.importDidComplete()) {
                 uint32_t mask = drumTrackImportPage.resyncMask();
                 uint8_t pat = columnEditor.editPattern();
@@ -964,6 +1132,28 @@ void loop() {
         return;
     }
 
+    // ── Drum editor page ──────────────────────────────────────────────────────
+    if (drumEditorOpen) {
+        if (drumEditor.poll()) {
+            // IMPORT button tapped — hand off to the drum-track import overlay
+            // in drum-editor mode.  Drum editor stays open underneath.
+            if (drumEditor.importRequested()) {
+                drumEditor.clearImportRequest();
+                drumTrackImportOpen = true;
+                drumTrackImportPage.openForDrumEditor(drumEditor.patIdx());
+                return;
+            }
+            // BACK tapped — return to Block Settings on the same pattern
+            drumEditorOpen = false;
+            blockSettings.open(drumEditor.patIdx());
+            blockSettings.draw();
+            display.clear();
+            display.paint();
+            lastPage = Page::BLOCKS;
+        }
+        return;
+    }
+
     // ── Block settings page ───────────────────────────────────────────────────
     if (pageManager.currentPage() == Page::BLOCKS) {
         // First frame on this page — open and draw
@@ -993,11 +1183,30 @@ void loop() {
             blockSettings.clearSplit();
         }
         if (blockSettings.poll()) {
-            if (gServerPairing.isPaired()) {
-                // Structural changes (new, delete, duplicate, split, length)
-                // affect noteHead links and note pool topology — send full song
-                // so the server has a consistent copy.
+            // Drum-Editor button: hand off to that page, don't go HOME.
+            if (blockSettings.drumEditorRequested()) {
+                blockSettings.clearDrumEditor();
+                drumEditor.open(blockSettings.patIdx());
+                drumEditor.draw();
+                display.clear();
+                display.paint();
+                drumEditorOpen = true;
+                return;
+            }
+            if (gServerPairing.isPaired() && blockSettings.didStructuralChange()) {
+                // Structural changes (new, delete, duplicate, length,
+                // inputNote edits) affect noteHead links / note pool topology /
+                // playback — send full song so the server has a consistent copy.
+                // GATE: browse-and-exit must not push, because the push routes
+                // through MSG_SAVE_SONG_HEADER and stops the server's sequencer
+                // mid-song.
                 gServerPairing.sendSongToServer("", &song);
+                blockSettings.clearStructuralChange();
+            }
+            // A delete may have removed the pattern the engine was sitting on.
+            // Clamp before any TrackerPage code touches song.patterns[idx].
+            if (engine.currentPattern() >= song.numPatterns) {
+                engine.setPattern(song.numPatterns - 1);
             }
             // HOME tapped — return to tracker
             lastPage = Page::TRACKER;
@@ -1165,7 +1374,7 @@ void loop() {
 
         case TouchAction::SONG_NAME_TAP:
             songPageOpen = true;
-            songPage.open(gSdAvailable);
+            songPage.open();
             display.clear();
             display.fillScreen(COL_WHITE);
             songPage.draw();
@@ -1295,8 +1504,12 @@ void loop() {
                         n.effect    = existing.effect;
                         n.param     = existing.param;
                         grid.set(row, col, n);
-                        if (gServerPairing.isPaired())
+                        if (gServerPairing.isPaired()) {
                             gServerPairing.sendNoteSet(song, pat, row, col);
+                            // Sound the entered note on the column's channel so
+                            // the person stepping it in can hear what they typed.
+                            gServerPairing.sendAuditionNote(pat, row, col);
+                        }
                         handled = true;
                     }
                 }
@@ -1354,4 +1567,9 @@ void loop() {
     if (painted) {
         { uint32_t t0=millis(); display.paintLater(); DBG("[TIMING] paintLater   %lums\n", millis()-t0); }
     }
+
+    // Yield so the idle task runs and the core drops into low-power WAITI
+    // between passes instead of busy-spinning at 240 MHz.  Nothing time-critical
+    // lives at the tail of loop(); UDP/playhead draining is event-driven above.
+    vTaskDelay(1);
 }

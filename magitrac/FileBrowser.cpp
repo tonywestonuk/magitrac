@@ -9,6 +9,8 @@ FileBrowser::FileBrowser(EPD_PainterAdafruit& d, GT911_Lite& touch)
     , _hasPrev(false), _hasNext(false)
     , _altMode(false), _wasDown(false)
     , _itemCount(0)
+    , _listMode(false), _scroll(0)
+    , _dragStartY(0), _dragStartScroll(0), _dragMoved(false)
 {
     _title[0]      = '\0';
     _loadedName[0] = '\0';
@@ -18,8 +20,15 @@ FileBrowser::FileBrowser(EPD_PainterAdafruit& d, GT911_Lite& touch)
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 void FileBrowser::open() {
-    _altMode = false;
-    _wasDown = _touch.isTouched;
+    _altMode   = false;
+    _wasDown   = _touch.isTouched;
+    _scroll    = 0;
+    _dragMoved = false;
+}
+
+void FileBrowser::setListMode(bool v) {
+    _listMode = v;
+    _scroll   = 0;
 }
 
 void FileBrowser::setTitle(const char* title) {
@@ -45,7 +54,7 @@ void FileBrowser::clearItems() {
 }
 
 void FileBrowser::addItem(const char* name) {
-    if (_itemCount >= FB_PER_PAGE) return;
+    if (_itemCount >= FB_MAX_ITEMS) return;
     strncpy(_items[_itemCount], name, STORAGE_FILENAME_MAX - 1);
     _items[_itemCount][STORAGE_FILENAME_MAX - 1] = '\0';
     _itemCount++;
@@ -157,14 +166,145 @@ void FileBrowser::drawFooter() {
 
 void FileBrowser::draw() {
     drawHeader();
-    drawToolbar();
-    drawGrid();
+    if (_listMode) {
+        drawListToolbar();
+        drawList();
+    } else {
+        drawToolbar();
+        drawGrid();
+    }
     drawFooter();
+}
+
+// ── List mode (drag-scroll, single column) ──────────────────────────────────
+
+int FileBrowser::maxScroll() const {
+    int m = _itemCount - FB_LIST_ROWS;
+    return m > 0 ? m : 0;
+}
+
+void FileBrowser::drawListToolbar() {
+    _d.fillRect(0, FB_HDR_H, 960, FB_TOOL_H, COL_WHITE);
+    _d.drawFastHLine(0, FB_HDR_H + FB_TOOL_H - 1, 960, COL_BLACK);
+    if (_itemCount == 0) return;   // body shows the status / empty message
+    int first = _scroll + 1;
+    int last  = _scroll + FB_LIST_ROWS;
+    if (last > _itemCount) last = _itemCount;
+    char hint[48];
+    snprintf(hint, sizeof(hint), "%d-%d of %d  (drag to scroll)",
+             first, last, _itemCount);
+    _d.setTextSize(2);
+    _d.setTextColor(COL_BLACK);
+    int tw = (int)strlen(hint) * 12;
+    _d.setCursor((960 - tw) / 2, FB_HDR_H + (FB_TOOL_H - 16) / 2);
+    _d.print(hint);
+}
+
+void FileBrowser::drawList() {
+    _d.fillRect(0, FB_LIST_Y, 960, FB_FOOT_Y - FB_LIST_Y, COL_WHITE);
+
+    if (_itemCount == 0) {
+        const char* msg = _statusText[0] ? _statusText : "No songs";
+        int y = FB_LIST_Y + (FB_LIST_ROWS / 2) * FB_LROW_H;
+        _d.setTextSize(3);
+        _d.setTextColor(COL_BLACK);
+        _d.setCursor(20, y + (FB_LROW_H - 24) / 2);
+        _d.print(msg);
+        return;
+    }
+
+    for (int vi = 0; vi < FB_LIST_ROWS; vi++) {
+        int idx = _scroll + vi;
+        if (idx >= _itemCount) break;
+        int y = FB_LIST_Y + vi * FB_LROW_H;
+
+        bool isLoaded = (_loadedName[0] != '\0' &&
+                         strcmp(_items[idx], _loadedName) == 0);
+        uint8_t bg = _altMode ? COL_BLACK : COL_WHITE;
+        uint8_t fg = _altMode ? COL_WHITE : COL_BLACK;
+
+        _d.fillRect(8, y + 2, 944, FB_LROW_H - 4, bg);
+        _d.drawRect(8, y + 2, 944, FB_LROW_H - 4, _altMode ? COL_WHITE : COL_BLACK);
+
+        _d.setTextSize(3);
+        _d.setTextColor(fg);
+        _d.setCursor(24, y + (FB_LROW_H - 24) / 2);
+        _d.print(_items[idx]);
+        if (isLoaded) {  // bold simulation
+            _d.setCursor(25, y + (FB_LROW_H - 24) / 2);
+            _d.print(_items[idx]);
+        }
+    }
+}
+
+int FileBrowser::hitListItem(int sx, int sy) const {
+    if (sx < 8 || sx >= 952) return -1;
+    if (sy < FB_LIST_Y || sy >= FB_FOOT_Y) return -1;
+    int vi  = (sy - FB_LIST_Y) / FB_LROW_H;
+    int idx = _scroll + vi;
+    return (idx >= 0 && idx < _itemCount) ? idx : -1;
 }
 
 // ── Poll ──────────────────────────────────────────────────────────────────────
 
+FileBrowserResult FileBrowser::pollList() {
+    FileBrowserResult r { FileBrowserEvent::NONE, -1 };
+
+    if (!_touch.read()) return r;
+    bool down = _touch.isTouched;
+    int sx, sy;
+    rawToScreen(_touch.x, _touch.y, sx, sy);
+
+    if (down && !_wasDown) {
+        _wasDown         = true;
+        _dragStartY      = sy;
+        _dragStartScroll = _scroll;
+        _dragMoved       = false;
+    } else if (down && _wasDown) {
+        int dy = sy - _dragStartY;
+        if (!_dragMoved && (dy >= FB_LIST_DRAG_THRESH || dy <= -FB_LIST_DRAG_THRESH))
+            _dragMoved = true;
+        if (_dragMoved) {
+            int rowDelta  = -dy / FB_LROW_H;
+            int newScroll = _dragStartScroll + rowDelta;
+            if (newScroll < 0)            newScroll = 0;
+            if (newScroll > maxScroll())  newScroll = maxScroll();
+            if (newScroll != _scroll) {
+                _scroll = newScroll;
+                drawListToolbar();
+                drawList();
+                _d.paintLater();
+            }
+        }
+    } else if (!down && _wasDown) {
+        _wasDown = false;
+        if (_dragMoved) { _dragMoved = false; return r; }  // swallow tap after a drag
+
+        if (hitHome(sx, sy)) {
+            r.event = FileBrowserEvent::HOME;
+        } else if (hitDel(sx, sy)) {
+            onBootPress();                       // toggle delete mode
+        } else if (hitNew(sx, sy)) {
+            r.event = FileBrowserEvent::NEW;
+        } else if (hitSave(sx, sy)) {
+            r.event = FileBrowserEvent::SAVE;
+        } else if (hitSaveAs(sx, sy)) {
+            r.event = FileBrowserEvent::SAVE_AS;
+        } else {
+            int idx = hitListItem(sx, sy);
+            if (idx >= 0) {
+                r.event  = _altMode ? FileBrowserEvent::ITEM_DELETE
+                                    : FileBrowserEvent::ITEM_TAP;
+                r.index  = idx;                  // absolute index into the list
+            }
+        }
+    }
+    return r;
+}
+
 FileBrowserResult FileBrowser::poll() {
+    if (_listMode) return pollList();
+
     FileBrowserResult r { FileBrowserEvent::NONE, -1 };
 
     if (!_touch.read()) return r;

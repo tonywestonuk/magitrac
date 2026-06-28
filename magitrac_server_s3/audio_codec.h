@@ -12,6 +12,17 @@
 bool audioCodecInit();           // returns true on success
 bool audioCodecReady();          // safe to call from anywhere
 
+// Switch the module's input bias (STM32 PB7 / LIN_MIC_PU_EN, via reg 0x00):
+// true  → bias pull-up ON  → MIC mode (electret biased)
+// false → bias pull-up OFF → LINE mode
+// Global (affects every reader of the codec) — restore to true after use.
+void audioCodecSetMicBias(bool micMode);
+
+// Headphone MODE line (STM32 PA.2 → MUX, register 0x10): false = National
+// (OMTP), true = American (CTIA).  Swaps the TRRS jack mic/ground routing —
+// a diagnostic for the output→input feedback coupling.  Default is National.
+void audioCodecSetHPMode(bool american);
+
 // Blocking write — call from a task only.  `bytes` should be a multiple
 // of 4 (16-bit stereo frames).  Returns false on failure.
 bool audioCodecPlay(const uint8_t* buf, size_t bytes);

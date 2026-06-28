@@ -29,10 +29,11 @@ void BootMenu::draw() {
     uiButton(_d, BM_INST_X, BM_BTN_Y, BM_BTN_W, BM_BTN_H, "INSTRUMENTS", COL_WHITE, COL_BLACK, 3);
     uiButton(_d, BM_SETT_X, BM_BTN_Y, BM_BTN_W, BM_BTN_H, "SETTINGS",    COL_WHITE, COL_BLACK, 3);
 
-    // Row 2: backup + perform + pairing
-    uiButton(_d, BM_BACKUP_X,  BM_BTN2_Y, BM_BTN2_W, BM_BTN2_H, "BACKUP",  COL_WHITE, COL_BLACK, 3);
-    uiButton(_d, BM_PERFORM_X, BM_BTN2_Y, BM_BTN2_W, BM_BTN2_H, "PERFORM", COL_WHITE, COL_BLACK, 3);
-    uiButton(_d, BM_PAIR_X,    BM_BTN2_Y, BM_PAIR_W, BM_BTN2_H, "PAIR",    COL_WHITE, COL_BLACK, 3);
+    // Row 2: backup + perform + pixelpost + pairing
+    uiButton(_d, BM_BACKUP_X,    BM_BTN2_Y, BM_BTN2_W, BM_BTN2_H, "BACKUP",  COL_WHITE, COL_BLACK, 3);
+    uiButton(_d, BM_PERFORM_X,   BM_BTN2_Y, BM_BTN2_W, BM_BTN2_H, "PERFORM", COL_WHITE, COL_BLACK, 3);
+    uiButton(_d, BM_PIXELPOST_X, BM_BTN2_Y, BM_BTN2_W, BM_BTN2_H, "POSTS",   COL_WHITE, COL_BLACK, 3);
+    uiButton(_d, BM_PAIR_X,      BM_BTN2_Y, BM_PAIR_W, BM_BTN2_H, "PAIR",    COL_WHITE, COL_BLACK, 3);
 }
 
 BootMenuResult BootMenu::poll() {
@@ -51,6 +52,7 @@ BootMenuResult BootMenu::poll() {
         if (hitSettings   (sx, sy)) return BootMenuResult::SETTINGS;
         if (hitBackup     (sx, sy)) return BootMenuResult::BACKUP;
         if (hitPerform    (sx, sy)) return BootMenuResult::PERFORM;
+        if (hitPixelpost  (sx, sy)) return BootMenuResult::PIXELPOST;
         if (hitPair       (sx, sy)) return BootMenuResult::PAIR;
         return BootMenuResult::DISMISSED;
     }
@@ -82,6 +84,11 @@ bool BootMenu::hitBackup(int sx, int sy) const {
 bool BootMenu::hitPerform(int sx, int sy) const {
     return (sx >= BM_PERFORM_X && sx < BM_PERFORM_X + BM_BTN2_W &&
             sy >= BM_BTN2_Y   && sy < BM_BTN2_Y   + BM_BTN2_H);
+}
+
+bool BootMenu::hitPixelpost(int sx, int sy) const {
+    return (sx >= BM_PIXELPOST_X && sx < BM_PIXELPOST_X + BM_BTN2_W &&
+            sy >= BM_BTN2_Y      && sy < BM_BTN2_Y      + BM_BTN2_H);
 }
 
 bool BootMenu::hitPair(int sx, int sy) const {

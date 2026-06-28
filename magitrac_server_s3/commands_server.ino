@@ -35,30 +35,28 @@ static void wifiChannelApply(uint8_t idx) {
     prefs.begin(WIFI_NVS_NS, false);
     prefs.putUChar("idx", idx);
     prefs.end();
-    // Only meaningful in SERVER_AP mode (we own the AP).  Re-bring-up
-    // softAP on the new channel using the persisted creds.  In
-    // EXTERNAL_AP mode this is a no-op — the channel is the external
-    // AP's choice.
-    char    ssid[33] = {};
-    char    psk[64]  = {};
-    uint8_t apMode   = 0;
-    if (pairNvsLoadCreds("magitrac_srv", ssid, psk, &apMode) &&
-        apMode == MAGI_AP_MODE_SERVER) {
-        uint8_t ch = magiWifiChannelFromIdx(idx);
-        WiFi.softAP(ssid, psk, ch);
-        Serial.printf("[WIFI] AP moved to channel %u\n", (unsigned)ch);
-    } else {
-        Serial.println("[WIFI] channel change ignored — not in SERVER_AP mode");
-    }
+    // Live channel-switch via WiFi.softAP(ssid, psk, ch) is unreliable on
+    // Arduino-ESP32 — the call can silently fail when the AP is already
+    // running, leaving the radio in a default fallback state (the AP
+    // disappears or comes back as "ESP_xxxxxx" with no SSID/PSK).  Persist
+    // the new index and reboot so setup() runs its full softAP +
+    // softAPConfig + dhcps_stop sequence cleanly on the new channel.
+    Serial.printf("[WIFI] channel idx=%u saved — rebooting to apply\n",
+                  (unsigned)idx);
+    delay(200);   // serial flush
+    ESP.restart();
 }
-
-extern HardwareSerial midi;
 
 // CoreS3 SD: SCLK=G36, MISO=G35, MOSI=G37, CS=G4.  SPI.begin() with those
 // pins runs in setup() before commandsInit(); SD.begin(cs) then picks up
 // the default SPI bus we just configured.
 #define SRV_SD_CS      4
 #define SRV_SONGS_DIR  "/songs"
+// Power-loss recovery: autosave writes land here, NOT /songs/.  On boot any
+// file in this dir is promoted to /songs/<same name>.mgt (overwriting), then
+// the directory is empty until the next autosave.  Explicit Save also writes
+// to /songs/ and clears the matching /autosave/ file.
+#define SRV_AUTOSAVE_DIR "/autosave"
 
 // Song layout constants
 #define SRV_HDR_SIZE      8      // sizeof(SongFileHeader)
@@ -170,14 +168,36 @@ static File    srvRestoreFile;
 // client can enumerate / fetch.  Currently just /drumtracks/; add a row
 // here and a FileKind entry to expose another directory.
 #define SRV_DRUMTRACKS_DIR  "/drumtracks"
+#define SRV_SETLISTS_DIR    "/setlists"
 #define SRV_GM_MAP_NAME     "gm_map.txt"
 
 // Returns nullptr for an unknown / out-of-range kind.
 static const char* fileKindToPath(uint8_t kind) {
     switch (kind) {
         case FK_DRUMTRACKS: return SRV_DRUMTRACKS_DIR;
+        case FK_SETLISTS:   return SRV_SETLISTS_DIR;
         default:            return nullptr;
     }
+}
+
+// Maps a plain backup filename to its SD directory by extension.  Keeps the
+// backup (read) and restore (write) sides in lockstep so each file round-trips
+// to the directory it came from.  instruments.mgt is handled separately (it
+// lives at the root path, not under a directory).
+//   .txt → /drumtracks   .set → /setlists   everything else → /songs
+static const char* backupDirForName(const char* name) {
+    int n = (int)strlen(name);
+    // The setlist master catalog is a .txt but belongs with the setlists, not
+    // the drumtracks — route it by name before the extension rules below.
+    if (strcasecmp(name, "master.txt") == 0) return SRV_SETLISTS_DIR;
+    if (n >= 4 && name[n - 4] == '.') {
+        char c3 = name[n - 3], c2 = name[n - 2], c1 = name[n - 1];
+        if ((c3 == 't' || c3 == 'T') && (c2 == 'x' || c2 == 'X') && (c1 == 't' || c1 == 'T'))
+            return SRV_DRUMTRACKS_DIR;
+        if ((c3 == 's' || c3 == 'S') && (c2 == 'e' || c2 == 'E') && (c1 == 't' || c1 == 'T'))
+            return SRV_SETLISTS_DIR;
+    }
+    return SRV_SONGS_DIR;
 }
 
 // True when this filename should be excluded from the user-facing list
@@ -221,14 +241,28 @@ static void writeDefaultGmMap() {
     Serial.println("[CMD] wrote default gm_map.txt");
 }
 
+// Autosave policy: the 30 s autosave tick drops a draft in /autosave/<name>.mgt
+// for every song being worked on.  These are crash / power-cut survivors ONLY —
+// the server NEVER auto-promotes or reloads them on boot.  A draft sits
+// untouched until the next autosave of the same name overwrites it, or an
+// explicit Save / Delete of that song clears it (see finaliseSaveActive +
+// the delete handler).  Recovering a draft, if ever wanted, must be a
+// deliberate user action — never a silent boot step.
+
 void commandsInit() {
     srvSdOk = SD.begin(SRV_SD_CS);
     Serial.printf("[CMD] SD: %s\n", srvSdOk ? "OK" : "not found");
     if (srvSdOk && !SD.exists(SRV_SONGS_DIR))
         SD.mkdir(SRV_SONGS_DIR);
+    if (srvSdOk && !SD.exists(SRV_AUTOSAVE_DIR))
+        SD.mkdir(SRV_AUTOSAVE_DIR);
     if (srvSdOk && !SD.exists(SRV_DRUMTRACKS_DIR)) {
         SD.mkdir(SRV_DRUMTRACKS_DIR);
         Serial.println("[CMD] created /drumtracks/");
+    }
+    if (srvSdOk && !SD.exists(SRV_SETLISTS_DIR)) {
+        SD.mkdir(SRV_SETLISTS_DIR);
+        Serial.println("[CMD] created /setlists/");
     }
     if (srvSdOk) writeDefaultGmMap();
 
@@ -239,7 +273,14 @@ void commandsInit() {
     }
 }
 
+// Case-insensitive name compare for qsort over the fixed-width name rows.
+static int srvNameCmp(const void* a, const void* b) {
+    return strcasecmp((const char*)a, (const char*)b);
+}
+
 // ── List .mgt files in /songs ──────────────────────────────────────────────────
+// Returns names sorted alphabetically (case-insensitive) so every paginated
+// list the client assembles is in a stable, sorted order.
 int srvListSongs(char names[][SRV_FNAME_MAX], int maxFiles) {
     if (!srvSdOk) return 0;
     SdLock _;
@@ -267,6 +308,7 @@ int srvListSongs(char names[][SRV_FNAME_MAX], int maxFiles) {
         e.close();
     }
     d.close();
+    qsort(names, count, SRV_FNAME_MAX, srvNameCmp);
     return count;
 }
 
@@ -463,6 +505,31 @@ static void sendSampleList(uint8_t page) {
 // This handles legacy v7..v16 files transparently — the client always
 // receives a current-version payload regardless of the on-disk format.
 static void sendSongDataFromPath(const char* path, const char* displayName) {
+    // Explicit load is the user's "discard draft" path.
+    // Clear the autosave draft for:
+    //   (a) the song being loaded — they asked for the canonical /songs/
+    //       version, so any session draft is abandoned;
+    //   (b) the song we're moving away from — they didn't hit Save, so the
+    //       draft would otherwise resurrect at next boot recovery.
+    {
+        SdLock _;
+        char autopath[48];
+        if (srvActiveName[0] != '\0') {
+            snprintf(autopath, sizeof(autopath), "%s/%s",
+                     SRV_AUTOSAVE_DIR, srvActiveName);    // already carries .mgt
+            if (SD.exists(autopath)) {
+                SD.remove(autopath);
+                Serial.printf("[CMD] abandoned autosave '%s'\n", autopath);
+            }
+        }
+        snprintf(autopath, sizeof(autopath), "%s/%s",
+                 SRV_AUTOSAVE_DIR, displayName);          // also has .mgt
+        if (SD.exists(autopath)) {
+            SD.remove(autopath);
+            Serial.printf("[CMD] discarded draft on reload '%s'\n", autopath);
+        }
+    }
+
     srvHasActive    = false;
     srvActiveBufLen = 0;
     bool loaded = false;
@@ -481,6 +548,9 @@ static void sendSongDataFromPath(const char* path, const char* displayName) {
 
             if (hdr.version == SONG_FILE_VERSION) {
                 loaded = songReadCompact(f, song);
+            } else if (hdr.version == 18) {
+                loaded = songMigrateV18FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v18->v%d '%s'\n", SONG_FILE_VERSION, path);
             } else if (hdr.version == 17) {
                 loaded = songMigrateV17FromFile(f, song);
                 if (loaded) Serial.printf("[CMD] migrated v17->v%d '%s'\n", SONG_FILE_VERSION, path);
@@ -595,6 +665,9 @@ bool srvLoadSongLocal(int listIdx) {
 
             if (hdr.version == SONG_FILE_VERSION) {
                 loaded = songReadCompact(f, song);
+            } else if (hdr.version == 18) {
+                loaded = songMigrateV18FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v18->v%d '%s'\n", SONG_FILE_VERSION, path);
             } else if (hdr.version == 17) {
                 loaded = songMigrateV17FromFile(f, song);
                 if (loaded) Serial.printf("[CMD] migrated v17->v%d '%s'\n", SONG_FILE_VERSION, path);
@@ -634,20 +707,80 @@ bool srvLoadSongLocal(int listIdx) {
     return loaded;
 }
 
+// ── Verified song write ───────────────────────────────────────────────────────
+// Writes `song` to `path`, then reads the bytes straight back off the card and
+// CRC-checks them against the in-memory song before committing.  The write goes
+// to a sibling _save.tmp first; only a byte-verified temp is atomically renamed
+// over `path`, so a bad write (dying card, truncation, power glitch) can never
+// clobber the previous good file.  Retries once.  Returns true only when the
+// committed file is verified.
+//
+// Caller MUST already hold SdLock — sSdMutex is non-recursive, do not re-lock.
+static bool writeSongVerified(const char* path, const Song* song) {
+    const uint32_t crcMem = songCrc32(song);
+
+    // Temp file in the same directory as the target so the rename stays intra-FS.
+    char tmp[64];
+    const char* sl = strrchr(path, '/');
+    if (sl) snprintf(tmp, sizeof(tmp), "%.*s/_save.tmp", (int)(sl - path), path);
+    else    snprintf(tmp, sizeof(tmp), "/_save.tmp");
+
+    for (int attempt = 1; attempt <= 2; attempt++) {
+        SD.remove(tmp);
+        File f = SD.open(tmp, FILE_WRITE);
+        if (!f) { Serial.printf("[CMD] save-verify: tmp open failed '%s'\n", tmp); continue; }
+        bool ok = songWriteCompact(f, song);
+        uint32_t sz = (uint32_t)f.size();
+        f.close();
+        if (!ok) {
+            Serial.printf("[CMD] save-verify: write failed (try %d)\n", attempt);
+            SD.remove(tmp);
+            continue;
+        }
+
+        // Read it straight back and CRC the bytes that actually landed.
+        uint32_t crcDisk = 0;
+        bool readOk = false;
+        File rf = SD.open(tmp, FILE_READ);
+        if (rf) {
+            readOk = true;
+            uint8_t buf[256];
+            int r;
+            while ((r = rf.read(buf, sizeof(buf))) > 0)
+                crcDisk = magiCrc32(crcDisk, buf, (size_t)r);
+            rf.close();
+        }
+        if (!readOk || crcDisk != crcMem) {
+            Serial.printf("[CMD] save-verify: VERIFY FAIL (try %d) crcMem=%08X crcDisk=%08X sz=%u\n",
+                          attempt, (unsigned)crcMem, (unsigned)crcDisk, (unsigned)sz);
+            SD.remove(tmp);
+            continue;
+        }
+
+        // Verified — atomically swap the temp in for the canonical file.
+        SD.remove(path);
+        if (!SD.rename(tmp, path)) {
+            Serial.printf("[CMD] save-verify: rename '%s' -> '%s' FAILED (try %d)\n", tmp, path, attempt);
+            SD.remove(tmp);
+            continue;
+        }
+        Serial.printf("[CMD] save-verify: '%s' %u bytes OK (crc=%08X)\n",
+                      path, (unsigned)sz, (unsigned)crcDisk);
+        return true;
+    }
+    Serial.printf("[CMD] save-verify: GAVE UP on '%s' — existing file left intact\n", path);
+    return false;
+}
+
 // ── Flush active song buffer back to SD ───────────────────────────────────────
 static void flushActiveSong() {
     if (!srvHasActive || srvActiveName[0] == '\0') return;
     char path[48];
     snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, srvActiveName);
-    SdLock _;
-    SD.remove(path);
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) { Serial.printf("[CMD] flush: open failed '%s'\n", path); return; }
     const Song* song = (const Song*)(srvActiveBuf + sizeof(SongFileHeader));
-    bool ok = songWriteCompact(f, song);
-    uint32_t sz = (uint32_t)f.size();
-    f.close();
-    Serial.printf("[CMD] flushed '%s' %u bytes %s\n", path, sz, ok ? "OK" : "FAIL");
+    SdLock _;
+    if (!writeSongVerified(path, song))
+        Serial.printf("[CMD] flush: verify failed '%s' — kept previous file\n", path);
 }
 
 // ── Write uploaded song chunks to SD ──────────────────────────────────────────
@@ -682,13 +815,11 @@ static void finaliseSongSave() {
     if (srvSaveName[0] != '\0') {
         char path[48];
         snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, srvSaveName);
-        SD.remove(path);
-        File f = SD.open(path, FILE_WRITE);
-        if (!f) { Serial.printf("[CMD] save: open failed '%s'\n", path); srvSaveActive = false; return; }
-        bool ok = songWriteCompact(f, song);
-        uint32_t sz = (uint32_t)f.size();
-        f.close();
-        Serial.printf("[CMD] saved '%s' %u bytes %s\n", path, sz, ok ? "OK" : "FAIL");
+        if (!writeSongVerified(path, song)) {
+            Serial.printf("[CMD] save: verify failed '%s' — kept previous file\n", path);
+            srvSaveActive = false;
+            return;
+        }
         snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", srvSaveName);
     } else {
         Serial.println("[CMD] song pushed (no SD save)");
@@ -816,11 +947,15 @@ void onMagiLinkRestoreBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
 // temp file to its destination, reloads instruments if relevant, and
 // reloads the active song if the restored file matches.
 static void finaliseMagiLinkRestore() {
-    char path[48];
+    char path[64];
     if (sMagiRestoreIsInstruments) {
         strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
     } else {
-        snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, sMagiRestoreName);
+        // Route by extension so setlists/drumtracks go back to their own dirs,
+        // not into /songs.  (Cross-dir rename from the /songs temp is fine —
+        // same volume.)
+        snprintf(path, sizeof(path), "%s/%s",
+                 backupDirForName(sMagiRestoreName), sMagiRestoreName);
     }
     path[sizeof(path) - 1] = '\0';
 
@@ -842,6 +977,98 @@ static void finaliseMagiLinkRestore() {
         Serial.printf("[CMD] restored file is the active song — reloading\n");
         reloadActiveSongFromSD();
     }
+}
+
+// ── MagiLink generic file save (client → server) state ─────────────────────
+// Streams an uploaded {kind}/{name} file to a temp file in the target dir on
+// the worker task (SdLock-serialised, like restore); the main loop then
+// renames it into place and ACKs.  Completion is detected by byte count — the
+// stream has no terminator.  Used by setlists; the planned PC uploader shares
+// it.  Only one upload in flight at a time (mutex-serialised send side).
+static File     sMagiFileSaveFile;
+static uint8_t  sMagiFileSaveKind              = 0;
+static char     sMagiFileSaveName[FILE_NAME_LEN] = {};
+static char     sMagiFileSaveTmp[96]           = {};
+static uint32_t sMagiFileSaveExpectedBytes     = 0;
+static uint32_t sMagiFileSaveReceivedBytes     = 0;
+static bool     sMagiFileSavePending           = false;
+
+void onMagiLinkFileSaveHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (len < sizeof(MsgFileSaveHeader)) return;
+    const MsgFileSaveHeader* h = (const MsgFileSaveHeader*)msg;
+    const char* dir = fileKindToPath(h->kind);
+    if (!dir) {
+        Serial.printf("[CMD] file save: unknown kind=%u\n", (unsigned)h->kind);
+        sMagiFileSaveExpectedBytes = 0;
+        return;
+    }
+    sMagiFileSaveKind = h->kind;
+    strncpy(sMagiFileSaveName, h->name, sizeof(sMagiFileSaveName) - 1);
+    sMagiFileSaveName[sizeof(sMagiFileSaveName) - 1] = '\0';
+    sMagiFileSaveExpectedBytes = h->total_size;
+    sMagiFileSaveReceivedBytes = 0;
+    snprintf(sMagiFileSaveTmp, sizeof(sMagiFileSaveTmp), "%s/_save.tmp", dir);
+    {
+        SdLock _;
+        if (!SD.exists(dir)) SD.mkdir(dir);
+        if (sMagiFileSaveFile) sMagiFileSaveFile.close();
+        SD.remove(sMagiFileSaveTmp);
+        sMagiFileSaveFile = SD.open(sMagiFileSaveTmp, FILE_WRITE);
+    }
+    if (!sMagiFileSaveFile) {
+        Serial.println("[CMD] file save: tmp open failed");
+        sMagiFileSaveExpectedBytes = 0;
+        return;
+    }
+    Serial.printf("[CMD] file save start: kind=%u name='%s' bytes=%u\n",
+                  (unsigned)sMagiFileSaveKind, sMagiFileSaveName,
+                  (unsigned)sMagiFileSaveExpectedBytes);
+}
+
+void onMagiLinkFileSaveBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (sMagiFileSaveExpectedBytes == 0) return;
+    if (len < sizeof(MsgFileSaveBody)) return;
+    if (!sMagiFileSaveFile) return;
+    const MsgFileSaveBody* b = (const MsgFileSaveBody*)msg;
+    if (b->data_len > 1024) return;
+    if (sMagiFileSaveReceivedBytes + b->data_len > sMagiFileSaveExpectedBytes) {
+        Serial.println("[CMD] file save body overshoot — dropping");
+        { SdLock _; sMagiFileSaveFile.close(); }
+        sMagiFileSaveExpectedBytes = 0;
+        return;
+    }
+    { SdLock _; sMagiFileSaveFile.write(b->data, b->data_len); }
+    sMagiFileSaveReceivedBytes += b->data_len;
+    if (sMagiFileSaveReceivedBytes >= sMagiFileSaveExpectedBytes) {
+        { SdLock _; sMagiFileSaveFile.close(); }
+        sMagiFileSaveExpectedBytes = 0;
+        sMagiFileSavePending       = true;
+    }
+}
+
+// Called from commandsTick when sMagiFileSavePending fires.  Renames the temp
+// into place (same dir, so atomic) and ACKs the client.
+static void finaliseMagiLinkFileSave() {
+    const char* dir = fileKindToPath(sMagiFileSaveKind);
+    bool ok = false;
+    if (dir) {
+        char path[96];
+        snprintf(path, sizeof(path), "%s/%s", dir, sMagiFileSaveName);
+        SdLock _;
+        if (SD.exists(path)) SD.remove(path);
+        ok = SD.rename(sMagiFileSaveTmp, path);
+        if (!ok) SD.remove(sMagiFileSaveTmp);
+    }
+    Serial.printf("[CMD] file saved kind=%u '%s' (%u bytes) %s\n",
+                  (unsigned)sMagiFileSaveKind, sMagiFileSaveName,
+                  (unsigned)sMagiFileSaveReceivedBytes, ok ? "OK" : "FAIL");
+
+    MsgFileSaveAck ack;
+    ack.kind = sMagiFileSaveKind;
+    ack.ok   = ok ? 1 : 0;
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&ack, sizeof(ack));
+    gMagiLink.releaseMutex();
 }
 
 // ── MagiLink song save (client → server) state ─────────────────────────────
@@ -867,7 +1094,14 @@ void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
     // Stop the sequencer up-front: the receive writes incrementally into
     // srvActiveBuf over many ms.  If the sequencer keeps reading it could
     // follow a half-overwritten NoteNode pointer into garbage.
+    Serial.printf("[STOPSRC] save-header (full song push) name='%s' t=%lu\n",
+                  h->name, millis());
+    crashSetPhase(CP_SONG_PUSH);   // breadcrumb until finalise re-arms to idle
     sequencerStop();
+    // Also drop srvHasActive so sequencerTick's early-return guards the
+    // buffer even if a tick was already past the seqRunning check when this
+    // header arrived.  Restored in finaliseMagiLinkSongSave().
+    srvHasActive = false;
     // Stamp SongFileHeader at the front of srvActiveBuf.
     memcpy(srvActiveBuf, &h->song_file_header, sizeof(SongFileHeader));
     strncpy(sMagiSaveName, h->name, sizeof(sMagiSaveName) - 1);
@@ -903,12 +1137,14 @@ void onMagiLinkSaveBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
 // in sync with the client's memory.  SD work deferred to commandsTick.
 static char sSaveActiveName[SRV_NAME_MAX] = {};
 static bool sSaveActivePending            = false;
+static bool sSaveActiveIsAutosave         = false;
 
 void onMagiLinkSaveActive(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (len < sizeof(MsgSaveActive)) return;
     const MsgSaveActive* m = (const MsgSaveActive*)msg;
     strncpy(sSaveActiveName, m->name, sizeof(sSaveActiveName) - 1);
     sSaveActiveName[sizeof(sSaveActiveName) - 1] = '\0';
+    sSaveActiveIsAutosave = (m->is_autosave != 0);
     sSaveActivePending = true;
 }
 
@@ -922,22 +1158,32 @@ static void finaliseSaveActive() {
         Serial.println("[CMD] save-active: empty name — ignoring");
         return;
     }
+    crashSetPhase(CP_AUTOSAVE);
+    // Autosave goes to /autosave/; explicit Save goes to /songs/ AND wipes the
+    // matching /autosave/ draft (it's now superseded by the committed file).
+    // Drafts are never auto-recovered on boot — see the autosave-policy note.
+    const char* dir = sSaveActiveIsAutosave ? SRV_AUTOSAVE_DIR : SRV_SONGS_DIR;
     char path[48];
-    snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, sSaveActiveName);
+    snprintf(path, sizeof(path), "%s/%s.mgt", dir, sSaveActiveName);
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
     SdLock _;
-    SD.remove(path);
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) {
-        Serial.printf("[CMD] save-active: open failed '%s'\n", path);
+    if (!writeSongVerified(path, song)) {
+        Serial.printf("[CMD] save-active: verify failed '%s' — kept previous file\n", path);
+        crashSetPhase(CP_IDLE);
         return;
     }
-    bool ok = songWriteCompact(f, song);
-    uint32_t sz = (uint32_t)f.size();
-    f.close();
-    Serial.printf("[CMD] save-active: wrote '%s' %u bytes %s\n",
-                  path, sz, ok ? "OK" : "FAIL");
-    snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", sSaveActiveName);
+    if (!sSaveActiveIsAutosave) {
+        // Explicit save committed — any pending autosave draft is now redundant.
+        char autopath[48];
+        snprintf(autopath, sizeof(autopath), "%s/%s.mgt",
+                 SRV_AUTOSAVE_DIR, sSaveActiveName);
+        if (SD.exists(autopath)) {
+            SD.remove(autopath);
+            Serial.printf("[CMD] cleared autosave '%s'\n", autopath);
+        }
+        snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", sSaveActiveName);
+    }
+    crashSetPhase(CP_IDLE);   // autosave/save complete
 }
 
 // ── New-song: client → server ────────────────────────────────────────────
@@ -950,7 +1196,16 @@ void onMagiLinkNewSong(const uint8_t* msg, size_t len, void* /*ctx*/) {
     sNewSongPending = true;
 }
 
+// ── Set-OFF: client → server "-- OFF -- / No Song" ────────────────────────────
+static bool sSetOffPending = false;
+
+void onMagiLinkSetNoSong(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (len < sizeof(MsgSetNoSong)) return;
+    sSetOffPending = true;   // deferred to commandsTick — same as loadSong(0)
+}
+
 static void finaliseNewSong() {
+    Serial.printf("[STOPSRC] finaliseNewSong t=%lu\n", millis());
     sequencerStop();
     // Stamp a fresh SongFileHeader at the front of srvActiveBuf, then
     // initSong() the Song body that follows.
@@ -980,23 +1235,18 @@ static void finaliseMagiLinkSongSave() {
         char path[48];
         snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, sMagiSaveName);
         SdLock _;
-        SD.remove(path);
-        File f = SD.open(path, FILE_WRITE);
-        if (!f) {
-            Serial.printf("[CMD] save: open failed '%s'\n", path);
-            return;
-        }
-        bool ok = songWriteCompact(f, song);
-        uint32_t sz = (uint32_t)f.size();
-        f.close();
-        Serial.printf("[CMD] save: wrote '%s' %u bytes %s\n",
-                      path, sz, ok ? "OK" : "FAIL");
-        snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", sMagiSaveName);
+        if (writeSongVerified(path, song))
+            snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", sMagiSaveName);
+        else
+            Serial.printf("[CMD] save: verify failed '%s' — kept previous file\n", path);
     } else {
         Serial.println("[CMD] save: in-memory push (no SD write)");
     }
+    Serial.printf("[STOPSRC] finaliseMagiLinkSongSave name='%s' t=%lu\n",
+                  sMagiSaveName, millis());
     sequencerStop();
     sequencerReset();
+    crashSetPhase(CP_IDLE);   // song-push complete
 }
 
 // ── MagiLink backup — streams every /songs/*.mgt + instruments.mgt ─────────
@@ -1082,6 +1332,35 @@ void sendBackupToClient() {
             }
             dt.close();
         }
+        // Append every /setlists/*.set plus the master.txt catalog so the
+        // performer's setlists travel with the backup.  Restore routes .set →
+        // /setlists by extension, and master.txt → /setlists by name.
+        File sld = SD.open(SRV_SETLISTS_DIR);
+        if (sld && sld.isDirectory()) {
+            while (count < SRV_MAX_FILES) {
+                File entry = sld.openNextFile();
+                if (!entry) break;
+                if (!entry.isDirectory()) {
+                    const char* nm = entry.name();
+                    const char* sl = nm ? strrchr(nm, '/') : nullptr;
+                    if (sl) nm = sl + 1;
+                    int nlen = nm ? (int)strlen(nm) : 0;
+                    bool isSet = (nlen >= 4 && (nm[nlen-4] == '.')
+                        && (nm[nlen-3] == 's' || nm[nlen-3] == 'S')
+                        && (nm[nlen-2] == 'e' || nm[nlen-2] == 'E')
+                        && (nm[nlen-1] == 't' || nm[nlen-1] == 'T'));
+                    bool isMaster = (nm && strcasecmp(nm, "master.txt") == 0);
+                    if (isSet || isMaster) {
+                        strncpy(names[count], nm, SRV_FNAME_MAX - 1);
+                        names[count][SRV_FNAME_MAX - 1] = '\0';
+                        sizes[count] = (uint32_t)entry.size();
+                        count++;
+                    }
+                }
+                entry.close();
+            }
+            sld.close();
+        }
     }
     Serial.printf("[BK-SRV] sending %u files\n", (unsigned)count);
 
@@ -1104,20 +1383,15 @@ void sendBackupToClient() {
             break;
         }
 
-        // Open the file.  Path depends on extension: .mgt → /songs/ (except
-        // instruments.mgt → /instruments.mgt), .txt → /drumtracks/.
+        // Open the file.  Path depends on extension (same mapping as restore):
+        // instruments.mgt → root, .txt → /drumtracks, .set → /setlists,
+        // everything else → /songs.
         char path[80];
         if (strcmp(names[i], "instruments.mgt") == 0) {
             strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
         } else {
-            int nlen = (int)strlen(names[i]);
-            bool isTxt = (nlen >= 4
-                          && names[i][nlen-4] == '.'
-                          && (names[i][nlen-3] == 't' || names[i][nlen-3] == 'T')
-                          && (names[i][nlen-2] == 'x' || names[i][nlen-2] == 'X')
-                          && (names[i][nlen-1] == 't' || names[i][nlen-1] == 'T'));
             snprintf(path, sizeof(path), "%s/%s",
-                     isTxt ? SRV_DRUMTRACKS_DIR : SRV_SONGS_DIR, names[i]);
+                     backupDirForName(names[i]), names[i]);
         }
         path[sizeof(path) - 1] = '\0';
 
@@ -1179,6 +1453,9 @@ static void reloadActiveSongFromSD() {
 
             if (hdr.version == SONG_FILE_VERSION) {
                 loaded = songReadCompact(f, song);
+            } else if (hdr.version == 18) {
+                loaded = songMigrateV18FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v18->v%d '%s'\n", SONG_FILE_VERSION, path);
             } else if (hdr.version == 17) {
                 loaded = songMigrateV17FromFile(f, song);
                 if (loaded) Serial.printf("[CMD] migrated v17->v%d '%s'\n", SONG_FILE_VERSION, path);
@@ -1318,6 +1595,8 @@ void commandsTick() {
         // sync the on-screen cursor so the row highlight tracks the
         // song the client just pushed to us via the setlist.
         if (srvHasActive) {
+            Serial.printf("[STOPSRC] load-by-name '%s' t=%lu\n",
+                          srvLoadByNameStr, millis());
             sequencerStop();
             sequencerReset();
             int matchIdx = -1;
@@ -1342,6 +1621,8 @@ void commandsTick() {
         int fileIdx = (int)srvLoadPendingPage * SL_PER_PKT + (int)srvLoadPendingIdx;
         sendSongData(srvLoadPendingPage, srvLoadPendingIdx);
         if (srvHasActive) {
+            Serial.printf("[STOPSRC] load-by-index fileIdx=%d t=%lu\n",
+                          fileIdx, millis());
             sequencerStop();
             sequencerReset();
             // Sync the server display cursor to the song the client just loaded
@@ -1360,7 +1641,11 @@ void commandsTick() {
     if (srvFinaliseNeeded) {
         srvFinaliseNeeded = false;
         finaliseSongSave();  // loads into srvActiveBuf, writes compact to SD
-        if (srvHasActive) { sequencerStop(); sequencerReset(); }
+        if (srvHasActive) {
+            Serial.printf("[STOPSRC] finaliseSongSave t=%lu\n", millis());
+            sequencerStop();
+            sequencerReset();
+        }
     }
     if (sMagiSavePending) {
         sMagiSavePending = false;
@@ -1374,9 +1659,29 @@ void commandsTick() {
         sNewSongPending = false;
         finaliseNewSong();
     }
+    if (sSetOffPending) {
+        sSetOffPending = false;
+        // Same as the server's local "-- OFF --" selection: stop, drop the
+        // active song, tell the client, and sync the on-screen cursor to OFF.
+        sequencerStop();
+        srvHasActive    = false;
+        srvActiveName[0] = '\0';
+        if (pairingIsConnected()) {
+            MsgNoSong msg;
+            gMagiLink.acquireMutex();
+            gMagiLink.send(&msg, sizeof(msg));
+            gMagiLink.releaseMutex();
+        }
+        cursor          = 0;   // 0 = OFF (SONG_IDX_OFFSET)
+        needsFullRedraw = true;
+    }
     if (sMagiRestorePending) {
         sMagiRestorePending = false;
         finaliseMagiLinkRestore();
+    }
+    if (sMagiFileSavePending) {
+        sMagiFileSavePending = false;
+        finaliseMagiLinkFileSave();
     }
     if (srvInstLoadPending) {
         srvInstLoadPending = false;
@@ -1409,6 +1714,15 @@ void commandsTick() {
                     SD.remove(path);
                     Serial.printf("[CMD] deleted '%s'\n", path);
                 }
+            }
+            // Also wipe any matching autosave draft so a recovered file
+            // can't resurrect the song we just deleted.
+            char autopath[48];
+            snprintf(autopath, sizeof(autopath), "%s/%s.mgt",
+                     SRV_AUTOSAVE_DIR, srvDeleteName);
+            if (SD.exists(autopath)) {
+                SD.remove(autopath);
+                Serial.printf("[CMD] deleted autosave '%s'\n", autopath);
             }
         }
         char expectedActive[SRV_FNAME_MAX];
@@ -1547,8 +1861,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             if (len < (int)sizeof(MsgMidiData)) return;
             {
                 const MsgMidiData* m = (const MsgMidiData*)data;
-                for (uint8_t i = 0; i < m->midiLen && i < 3; i++)
-                    midi.write(m->data[i]);
+                midiSendRawBytes(m->data, m->midiLen < 3 ? m->midiLen : 3);
             }
             break;
 
@@ -1557,11 +1870,89 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             break;
 
         case MSG_STOP:
+            Serial.printf("[STOPSRC] MSG_STOP from client running=%d t=%lu\n",
+                          (int)sequencerIsRunning(), millis());
             if (sequencerIsRunning()) {
                 sequencerStop();    // stop in place
             } else {
                 sequencerPanic();   // all notes off on all channels
                 sequencerReset();   // snap to top of block
+            }
+            break;
+
+        case MSG_PIXELPOST_SET_EFFECT:
+            if (len < (int)sizeof(MsgPixelpostSetEffect)) return;
+            {
+                extern void pixelpostSetEffect(uint8_t idx);
+                pixelpostSetEffect(((const MsgPixelpostSetEffect*)data)->effectIdx);
+            }
+            break;
+
+        case MSG_PIXELPOST_SET_SLIDER:
+            if (len < (int)sizeof(MsgPixelpostSetSlider)) return;
+            {
+                extern void pixelpostSetSlider(uint8_t value);
+                pixelpostSetSlider(((const MsgPixelpostSetSlider*)data)->value);
+            }
+            break;
+
+        case MSG_PIXELPOST_SET_TOUCHPAD:
+            if (len < (int)sizeof(MsgPixelpostSetTouchpad)) return;
+            {
+                extern void pixelpostSetTouchpad(uint8_t x, uint8_t y, bool touched);
+                const MsgPixelpostSetTouchpad* m = (const MsgPixelpostSetTouchpad*)data;
+                pixelpostSetTouchpad(m->x, m->y, m->touched != 0);
+            }
+            break;
+
+        case MSG_PIXELPOST_POWER_OFF:
+            if (len < (int)sizeof(MsgPixelpostPowerOff)) return;
+            {
+                extern void pixelpostSetPowerOff(bool off);
+                pixelpostSetPowerOff(((const MsgPixelpostPowerOff*)data)->off != 0);
+            }
+            break;
+
+        case MSG_PIXELPOST_SET_POST_COUNT:
+            if (len < (int)sizeof(MsgPixelpostSetPostCount)) return;
+            {
+                extern void pixelpostSetPostCount(uint8_t count);
+                pixelpostSetPostCount(((const MsgPixelpostSetPostCount*)data)->count);
+            }
+            break;
+
+        case MSG_PIXELPOST_FIRMWARE_UPDATE:
+            {
+                // PixelPost OTA is now driven from the server's FLASH screen
+                // (copy the bin to SD via USB-MSC, reboot, tap FLASH) so the
+                // HTTP server never runs during the music.  The old client-side
+                // trigger is a no-op.
+                Serial.println("[FLD] client OTA trigger ignored - use server FLASH screen");
+            }
+            break;
+
+        case MSG_PIXELPOST_SET_FLASH_CTRL:
+            if (len < (int)sizeof(MsgPixelpostSetFlashCtrl)) return;
+            {
+                extern void pixelpostSetFlashCtrl(uint8_t value);
+                pixelpostSetFlashCtrl(((const MsgPixelpostSetFlashCtrl*)data)->flashCtrl);
+            }
+            break;
+
+        case MSG_PIXELPOST_OVERRIDE:
+            if (len < (int)sizeof(MsgPixelpostOverride)) return;
+            {
+                extern void pixelpostManualCycle(int8_t delta);
+                extern void pixelpostManualWhite(bool on);
+                extern void pixelpostManualRelease();
+                switch (((const MsgPixelpostOverride*)data)->op) {
+                    case PPO_NEXT:      pixelpostManualCycle(+1);    break;
+                    case PPO_PREV:      pixelpostManualCycle(-1);    break;
+                    case PPO_WHITE_ON:  pixelpostManualWhite(true);  break;
+                    case PPO_WHITE_OFF: pixelpostManualWhite(false); break;
+                    case PPO_RELEASE:   pixelpostManualRelease();    break;
+                    default: break;
+                }
             }
             break;
 
@@ -1628,6 +2019,14 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             {
                 const MsgAuditionRawNote* a = (const MsgAuditionRawNote*)data;
                 sequencerAuditionRawNote(a->channel, a->note, a->velocity);
+            }
+            break;
+
+        case MSG_AUDITION_PROGRAM:
+            if (len < (int)sizeof(MsgAuditionProgram)) return;
+            {
+                const MsgAuditionProgram* a = (const MsgAuditionProgram*)data;
+                sequencerAuditionProgram(a->channel, a->program);
             }
             break;
 

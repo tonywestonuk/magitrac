@@ -56,6 +56,7 @@ void SongConfigPage::drawPage0() {
     drawBpmSection();
     drawMidiInSection();
     drawSlotSection();
+    drawTransposeSection();
 }
 
 void SongConfigPage::drawBpmSection() {
@@ -158,6 +159,31 @@ void SongConfigPage::drawSlotSection() {
             uiButton(_d, x, btnY, SC_SL_BTN_W, SC_SL_BTN_H, SLOT_NAMES[i], COL_BLACK, COL_WHITE, 3);
         } else {
             uiButton(_d, x, btnY, SC_SL_BTN_W, SC_SL_BTN_H, SLOT_NAMES[i], COL_WHITE, COL_BLACK, 3);
+        }
+    }
+}
+
+// ── Transpose Channels section ───────────────────────────────────────────────
+
+void SongConfigPage::drawTransposeSection() {
+    _d.fillRect(0, SC_TR_LBL_Y, 960, SC_TR_LBL_H, COL_LTGREY);
+    _d.setTextSize(1);
+    _d.setTextColor(COL_BLACK);
+    _d.setCursor(10, SC_TR_LBL_Y + (SC_TR_LBL_H - 8) / 2);
+    _d.print("TRANSPOSE CH");
+
+    _d.fillRect(0, SC_TR_Y, 960, SC_TR_H, COL_WHITE);
+
+    int btnY = SC_TR_Y + (SC_TR_H - SC_TR_BTN_H) / 2;
+    char lbl[4];
+    for (int i = 0; i < SC_TR_COUNT; i++) {
+        int x = SC_TR_X0 + i * (SC_TR_BTN_W + SC_TR_GAP);
+        snprintf(lbl, sizeof(lbl), "%d", i + 1);
+        bool on = (_song.transposeChMask >> i) & 1;
+        if (on) {
+            uiButton(_d, x, btnY, SC_TR_BTN_W, SC_TR_BTN_H, lbl, COL_BLACK, COL_WHITE, 2);
+        } else {
+            uiButton(_d, x, btnY, SC_TR_BTN_W, SC_TR_BTN_H, lbl, COL_WHITE, COL_BLACK, 2);
         }
     }
 }
@@ -312,6 +338,16 @@ bool SongConfigPage::poll() {
             return false;
         }
 
+        // Transpose-channel toggle (falling edge only)
+        int trCh = hitTranspose(sx, sy);
+        if (trCh >= 0) {
+            _song.transposeChMask ^= (uint16_t)(1 << trCh);
+            drawTransposeSection();
+            _patchPending = true;
+            _d.paintLater();
+            return false;
+        }
+
         // Only fire a quick-tap if the rising edge actually hit a +/- button
         // (savedField >= 0 means start() was called this press).
         if (!_hold.wasFired() && _hold.savedType() > 0 && _hold.savedField() >= 0) {
@@ -350,6 +386,16 @@ int SongConfigPage::hitSlot(int sx, int sy) const {
     for (int i = 0; i < SC_SL_COUNT; i++) {
         int x = SC_SL_X0 + i * (SC_SL_BTN_W + SC_SL_GAP);
         if (sx >= x && sx < x + SC_SL_BTN_W) return i;
+    }
+    return -1;
+}
+
+int SongConfigPage::hitTranspose(int sx, int sy) const {
+    int btnY = SC_TR_Y + (SC_TR_H - SC_TR_BTN_H) / 2;
+    if (sy < btnY || sy >= btnY + SC_TR_BTN_H) return -1;
+    for (int i = 0; i < SC_TR_COUNT; i++) {
+        int x = SC_TR_X0 + i * (SC_TR_BTN_W + SC_TR_GAP);
+        if (sx >= x && sx < x + SC_TR_BTN_W) return i;
     }
     return -1;
 }

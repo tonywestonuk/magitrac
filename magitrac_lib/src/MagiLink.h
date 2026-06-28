@@ -32,6 +32,12 @@ public:
     // Updated from the worker task; safe to read from any task.
     bool isConnected() const { return _connected; }
 
+    // Peer IP of the currently-connected session, or 0.0.0.0 if not
+    // connected.  Accept role: the connecting client's IP.  Connect role:
+    // the configured peer.  Useful for the server to learn its client's
+    // address (e.g. for UDP unicasts) without a hardcoded convention.
+    IPAddress peerIP() const;
+
     // Monotonic counter, bumped every time a new connection is established —
     // including a preempt-swap to a fresh peer.  A session task can compare
     // this against the value it last handled to detect "this is a new

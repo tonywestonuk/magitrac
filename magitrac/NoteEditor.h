@@ -122,9 +122,17 @@ private:
     uint8_t _velocity;   // 0–127 explicit, or VEL_DEFAULT
     uint8_t _effect;     // 0x00–0xFF
     uint8_t _param;      // 0x00–0xFF
-    // col-0 working state (mutually exclusive: at most one of these is set)
-    bool    _waitSet;    // col0: effect == EFFECT_WAIT
+    // col-0 input-note type — at most one of these is set (radio).  WAIT/SYNC
+    // are cue effects; PASS is a played-but-inert marker (effect 0, note present)
+    // that absorbs an expected note so the playhead doesn't snap to the next
+    // cue.  With a specific pitch (_hasNote) the type applies to that pitch;
+    // with no pitch the note is NOTE_ANY (matches any played note).
+    bool    _waitSet;    // col0: effect is a WAIT variant (WAIT / WAT1 / WAT2)
     bool    _syncSet;    // col0: effect == EFFECT_SYNC
+    bool    _passSet;    // col0: no WAIT/SYNC/AVRG, but a note is present (PASS marker)
+    bool    _avrgSet;    // col0: effect == EFFECT_AVRG (running-mean tempo on row-fire)
+    uint8_t _waitVariant; // exact WAIT byte to write back (EFFECT_WAIT / WAT1 / WAT2); only meaningful when _waitSet
+    uint8_t _passVariant; // 0 = plain PASS, EFFECT_PASA = Pass-All; only meaningful when _passSet
 
     // Hex editor for attributes
     HexpadPopup _hexpad;
@@ -164,5 +172,7 @@ private:
     static uint8_t _clipVelocity;
     static uint8_t _clipEffect;
     static uint8_t _clipParam;
+    static bool    _clipPass;   // col0: copied note was a PASS marker (effect 0,
+                                // note present) — distinguishes ANY-PASS from empty
     static bool    _clipValid;  // true once something has been copied
 };

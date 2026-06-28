@@ -26,9 +26,19 @@ class ServerPairing;
 
 class DrumTrackImportPage {
 public:
+    // Caller-mode flag.  COLUMN_EDITOR (default): applyImport() writes notes
+    // straight into cols startCol..startCol+activeN-1.  DRUM_EDITOR: the
+    // IMPORT button just records the user's choice (block + kit) and closes;
+    // the caller reads pickedBlock() / pickedKit() and performs the import
+    // using its own column-allocation rules.
+    enum class Mode : uint8_t { COLUMN_EDITOR, DRUM_EDITOR };
+
     DrumTrackImportPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song);
 
     void open(uint8_t patternIdx, uint8_t startCol);
+    // Drum-editor entry point — no startCol because the drum editor allocates
+    // columns itself via its same-drum-first allocation rules.
+    void openForDrumEditor(uint8_t patternIdx);
     void draw();
     // Returns true when the page wants to close (user tapped HOME, CANCEL,
     // or import completed).
@@ -41,6 +51,11 @@ public:
     void     clearResync()      { _resyncMask = 0; }
 
     bool importDidComplete() const { return _imported; }
+
+    Mode                    mode()        const { return _mode; }
+    const DrumPatternFile&  pickedFile()  const { return _file; }
+    int                     pickedBlock() const { return _selectedBlock; }
+    int                     pickedKit()   const { return _kitIdx; }
 
 private:
     enum class State : uint8_t {
@@ -59,6 +74,7 @@ private:
     Song&                _song;
 
     State    _state          = State::DONE;
+    Mode     _mode           = Mode::COLUMN_EDITOR;
     uint8_t  _patIdx         = 0;
     uint8_t  _startCol       = 1;
     uint32_t _resyncMask     = 0;
@@ -76,6 +92,11 @@ private:
     DrumPatternFile _file;
     int      _selectedBlock  = 0;     // 0-based block index
 
+    // Chosen drum kit — index into DRUM_KITS (DrumKits.h, the SAM2695's
+    // populated GS kit slots).  Drives the program change sent on ch10 for
+    // audition + applied to the imported columns so playback matches.
+    int      _kitIdx         = 0;
+
     // Audition (drum block playback through server MIDI) — only active on
     // the BLOCK_CHOOSE screen.  Stopped on tap STOP, block change, or any
     // state transition out of BLOCK_CHOOSE.
@@ -86,6 +107,7 @@ private:
     void auditionStart();
     void auditionStop();
     void auditionTick();              // call every poll; fires due steps
+    void sendDrumProgram();           // program-change ch10 → selected kit
 
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
     // Returns true on any touch state change (press OR release).  `down`

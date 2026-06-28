@@ -1,124 +1,177 @@
 #include "SetlistStorage.h"
-#include <SD.h>
 #include <string.h>
 #include <stdio.h>
 
-const char* SETLISTS_DIR = "/setlists";
+// ── helpers ──────────────────────────────────────────────────────────────────
 
-static const char* MAGIC_HEADER = "MAGITRAC_SETLIST v1";
-
-void buildSetlistPath(uint8_t slot, char* out, size_t outLen) {
-    snprintf(out, outLen, "%s/setlist%u.set", SETLISTS_DIR, (unsigned)slot);
+static void copyField(const char* val, size_t valLen, char* dst, size_t dstCap) {
+    size_t n = valLen;
+    if (n > dstCap - 1) n = dstCap - 1;
+    memcpy(dst, val, n);
+    dst[n] = '\0';
 }
 
-void initSetlist(Setlist* sl, uint8_t slot) {
-    memset(sl, 0, sizeof(Setlist));
-    snprintf(sl->name, SETLIST_NAME_LEN, "Setlist %u", (unsigned)slot);
-    sl->count = 0;
-}
-
-// Strip trailing CR/LF/whitespace from an Arduino String in place by truncating.
-static void rtrim(String& s) {
-    int n = s.length();
-    while (n > 0) {
-        char c = s.charAt(n - 1);
-        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') n--;
+// Length of the line starting at p (up to nl/end), trailing CR/space trimmed.
+static size_t lineLen(const char* p, const char* end) {
+    const char* nl = (const char*)memchr(p, '\n', end - p);
+    size_t llen = nl ? (size_t)(nl - p) : (size_t)(end - p);
+    while (llen > 0) {
+        char c = p[llen - 1];
+        if (c == '\r' || c == ' ' || c == '\t') llen--;
         else break;
     }
-    if (n != (int)s.length()) s.remove(n);
+    return llen;
 }
 
-static void copyField(const String& src, int startIdx, char* dst, size_t dstLen) {
-    int srcLen = src.length() - startIdx;
-    if (srcLen < 0) srcLen = 0;
-    if (srcLen > (int)dstLen - 1) srcLen = dstLen - 1;
-    for (int i = 0; i < srcLen; i++) dst[i] = src.charAt(startIdx + i);
-    dst[srcLen] = '\0';
+// ── Master catalog ────────────────────────────────────────────────────────────
+
+const char* masterListFilename() { return "master.txt"; }
+
+void initMasterList(MasterList* ml) {
+    ml->count = 0;
 }
 
-bool loadSetlist(uint8_t slot, Setlist* sl) {
-    char path[40];
-    buildSetlistPath(slot, path, sizeof(path));
-    if (!SD.exists(path)) return false;
-
-    File f = SD.open(path, FILE_READ);
-    if (!f) return false;
-
-    String line = f.readStringUntil('\n');
-    rtrim(line);
-    if (line != MAGIC_HEADER) { f.close(); return false; }
-
-    // Header is valid — commit by parsing directly into *sl (no stack temp:
-    // a Setlist is ~13 KB, which would blow the loop-task stack).
-    initSetlist(sl, slot);
-    sl->count = 0;
-
-    int curIdx = -1;
-    while (f.available()) {
-        line = f.readStringUntil('\n');
-        rtrim(line);
-        if (line.length() == 0) continue;
-
-        if (line == "SONG") {
-            if (sl->count >= SETLIST_MAX_SONGS) { curIdx = -1; continue; }
-            curIdx = sl->count;
-            sl->count++;
-            sl->songs[curIdx].name[0]  = '\0';
-            sl->songs[curIdx].file[0]  = '\0';
-            sl->songs[curIdx].notes[0] = '\0';
-            continue;
-        }
-        if (line == "END") { curIdx = -1; continue; }
-
-        int eq = line.indexOf('=');
-        if (eq < 0) continue;
-        String key = line.substring(0, eq);
-
-        if (curIdx < 0) {
-            if (key == "NAME") {
-                copyField(line, eq + 1, sl->name, SETLIST_NAME_LEN);
-            }
-        } else {
-            if (key == "NAME") {
-                copyField(line, eq + 1, sl->songs[curIdx].name, SETLIST_SONG_NAME_LEN);
-            } else if (key == "FILE") {
-                copyField(line, eq + 1, sl->songs[curIdx].file, SETLIST_FILE_LEN);
-            } else if (key == "NOTES") {
-                copyField(line, eq + 1, sl->songs[curIdx].notes, SETLIST_NOTES_LEN);
-            }
-        }
+int masterFindByName(const MasterList* ml, const char* name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < (int)ml->count; i++) {
+        if (strcasecmp(ml->entries[i].name, name) == 0) return i;
     }
-    f.close();
+    return -1;
+}
+
+size_t serializeMasterList(const MasterList* ml, char* buf, size_t cap) {
+    size_t off = 0;
+    auto append = [&](const char* s, size_t n) {
+        if (off + n <= cap) { memcpy(buf + off, s, n); off += n; }
+    };
+    auto appendStr = [&](const char* s) { append(s, strlen(s)); };
+
+    int n = ml->count > MASTER_MAX_ENTRIES ? MASTER_MAX_ENTRIES : ml->count;
+    for (int i = 0; i < n; i++) {
+        const MasterEntry& e = ml->entries[i];
+        if (e.name[0] == '\0') continue;        // skip blanks defensively
+        appendStr(e.name); append(":", 1);
+        appendStr(e.file); append(":", 1);
+        appendStr(e.notes);
+        append("\n", 1);
+    }
+    return off;
+}
+
+bool parseMasterList(const char* text, size_t len, MasterList* ml) {
+    initMasterList(ml);
+    const char* p   = text;
+    const char* end = text + len;
+
+    while (p < end && ml->count < MASTER_MAX_ENTRIES) {
+        size_t llen = lineLen(p, end);
+        const char* line = p;
+        const char* nl = (const char*)memchr(p, '\n', end - p);
+        p = nl ? nl + 1 : end;
+        if (llen == 0) continue;
+
+        // Split on the first two colons: name : file : notes(remainder).
+        const char* c1 = (const char*)memchr(line, ':', llen);
+        if (!c1) continue;                       // no colon — not a catalog line
+        size_t rem = llen - (c1 + 1 - line);
+        const char* c2 = (const char*)memchr(c1 + 1, ':', rem);
+
+        MasterEntry& e = ml->entries[ml->count];
+        copyField(line, c1 - line, e.name, SETLIST_SONG_NAME_LEN);
+        if (e.name[0] == '\0') continue;
+        if (c2) {
+            copyField(c1 + 1, c2 - (c1 + 1), e.file, SETLIST_FILE_LEN);
+            copyField(c2 + 1, (line + llen) - (c2 + 1), e.notes, SETLIST_NOTES_LEN);
+        } else {
+            copyField(c1 + 1, (line + llen) - (c1 + 1), e.file, SETLIST_FILE_LEN);
+            e.notes[0] = '\0';
+        }
+        ml->count++;
+    }
     return true;
 }
 
-bool saveSetlist(uint8_t slot, const Setlist* sl) {
-    if (!SD.exists(SETLISTS_DIR)) SD.mkdir(SETLISTS_DIR);
+// ── Setlists ──────────────────────────────────────────────────────────────────
 
-    char path[40];
-    buildSetlistPath(slot, path, sizeof(path));
+void buildSetlistFilename(uint8_t slot, char* out, size_t outLen) {
+    snprintf(out, outLen, "setlist%u.set", (unsigned)slot);
+}
 
-    File f = SD.open(path, FILE_WRITE);
-    if (!f) return false;
+void initSetlist(Setlist* sl) {
+    sl->count = 0;
+}
 
-    f.println(MAGIC_HEADER);
-    f.print("NAME=");
-    f.println(sl->name);
-
-    uint8_t n = sl->count;
-    if (n > SETLIST_MAX_SONGS) n = SETLIST_MAX_SONGS;
-    for (uint8_t i = 0; i < n; i++) {
-        const SetlistEntry& e = sl->songs[i];
-        f.println("SONG");
-        f.print("NAME=");
-        f.println(e.name);
-        f.print("FILE=");
-        f.println(e.file);
-        f.print("NOTES=");
-        f.println(e.notes);
-        f.println("END");
+int setlistFind(const Setlist* sl, const char* name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < (int)sl->count; i++) {
+        if (strcasecmp(sl->names[i], name) == 0) return i;
     }
+    return -1;
+}
 
-    f.close();
+bool setlistAppend(Setlist* sl, const char* name) {
+    if (sl->count >= SETLIST_MAX_SONGS) return false;
+    strncpy(sl->names[sl->count], name, SETLIST_SONG_NAME_LEN - 1);
+    sl->names[sl->count][SETLIST_SONG_NAME_LEN - 1] = '\0';
+    sl->count++;
+    return true;
+}
+
+void setlistRemoveAt(Setlist* sl, int idx) {
+    if (idx < 0 || idx >= (int)sl->count) return;
+    for (int i = idx; i + 1 < (int)sl->count; i++)
+        memcpy(sl->names[i], sl->names[i + 1], SETLIST_SONG_NAME_LEN);
+    sl->count--;
+    sl->names[sl->count][0] = '\0';
+}
+
+void setlistMoveAfter(Setlist* sl, int srcIdx, int afterIdx) {
+    int n = (int)sl->count;
+    if (srcIdx < 0 || srcIdx >= n) return;
+    if (afterIdx < 0 || afterIdx >= n) return;
+    if (srcIdx == afterIdx) return;
+
+    char tmp[SETLIST_SONG_NAME_LEN];
+    memcpy(tmp, sl->names[srcIdx], SETLIST_SONG_NAME_LEN);
+    if (srcIdx < afterIdx) {
+        // Moving down: close the gap, drop into afterIdx (now right after target).
+        for (int i = srcIdx; i < afterIdx; i++)
+            memcpy(sl->names[i], sl->names[i + 1], SETLIST_SONG_NAME_LEN);
+        memcpy(sl->names[afterIdx], tmp, SETLIST_SONG_NAME_LEN);
+    } else {
+        // Moving up: open a gap just after the target and drop in.
+        for (int i = srcIdx; i > afterIdx + 1; i--)
+            memcpy(sl->names[i], sl->names[i - 1], SETLIST_SONG_NAME_LEN);
+        memcpy(sl->names[afterIdx + 1], tmp, SETLIST_SONG_NAME_LEN);
+    }
+}
+
+size_t serializeSetlist(const Setlist* sl, char* buf, size_t cap) {
+    size_t off = 0;
+    auto append = [&](const char* s, size_t n) {
+        if (off + n <= cap) { memcpy(buf + off, s, n); off += n; }
+    };
+    int n = sl->count > SETLIST_MAX_SONGS ? SETLIST_MAX_SONGS : sl->count;
+    for (int i = 0; i < n; i++) {
+        if (sl->names[i][0] == '\0') continue;
+        append(sl->names[i], strlen(sl->names[i]));
+        append("\n", 1);
+    }
+    return off;
+}
+
+bool parseSetlist(const char* text, size_t len, Setlist* sl) {
+    initSetlist(sl);
+    const char* p   = text;
+    const char* end = text + len;
+    while (p < end && sl->count < SETLIST_MAX_SONGS) {
+        size_t llen = lineLen(p, end);
+        const char* line = p;
+        const char* nl = (const char*)memchr(p, '\n', end - p);
+        p = nl ? nl + 1 : end;
+        if (llen == 0) continue;
+        copyField(line, llen, sl->names[sl->count], SETLIST_SONG_NAME_LEN);
+        if (sl->names[sl->count][0] != '\0') sl->count++;
+    }
     return true;
 }

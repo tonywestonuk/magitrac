@@ -8,3 +8,6 @@ void markSongDirty();
 
 // Called by SongPage::doSave to suppress an immediate redundant autosave.
 void markSongClean();
+
+// True if the loaded song has unsaved edits since the last save / load.
+bool songIsDirty();
