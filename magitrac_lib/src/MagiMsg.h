@@ -85,6 +85,7 @@ enum MagiMsgType : uint8_t {
     MSG_SONG_DELETE    = 0x26,  // client → server: delete file by name
     MSG_SONG_LOAD_NAME = 0x28,  // client → server: request song by bare name (no .mgt)
     MSG_SET_NO_SONG    = 0x29,  // client → server: set server to OFF / No Song
+    MSG_ORGAN          = 0x2A,  // client → server: drawbar organ control (enter/exit/set bar)
 
     // MIDI passthrough — client → server
     MSG_MIDI_DATA      = 0x30,  // client → server: raw MIDI bytes to forward to MIDI out
@@ -336,6 +337,28 @@ struct MsgSetWifiChannel {
     uint8_t  id     = MSG_SET_WIFI_CHANNEL;
     uint16_t length = sizeof(MsgSetWifiChannel);
     uint8_t  idx;   // 0, 1, 2 → channels 1, 6, 11
+};
+
+// Drawbar organ control — client → server.  One message type, three ops, so it
+// costs a single MagiLink callback slot (the table is nearly full).
+//  ORGAN_OP_ENTER → server switches to the organ screen + starts the synth
+//  ORGAN_OP_EXIT  → server leaves the organ screen + stops the synth
+//  ORGAN_OP_SET   → set drawbar `index` (0..8) to `value` (0..8)
+//  ORGAN_OP_TYPE      → select voice model: `value` = organ type index
+//  ORGAN_OP_VIBCHORUS → scanner: `value` 0=off,1-3=V1-3,4-6=C1-3
+//  ORGAN_OP_LESLIE    → rotor: `value` 0=stop,1=slow,2=fast
+//  ORGAN_OP_DRIVE     → tube drive: `value` 0=off,1=on
+//  ORGAN_OP_PARAM     → per-type knob: `index` = knob 0..2, `value` 0..8
+enum OrganOp : uint8_t {
+    ORGAN_OP_EXIT = 0, ORGAN_OP_ENTER = 1, ORGAN_OP_SET = 2, ORGAN_OP_TYPE = 3,
+    ORGAN_OP_VIBCHORUS = 4, ORGAN_OP_LESLIE = 5, ORGAN_OP_DRIVE = 6, ORGAN_OP_PARAM = 7
+};
+struct MsgOrgan {
+    uint8_t  id     = MSG_ORGAN;
+    uint16_t length = sizeof(MsgOrgan);
+    uint8_t  op;      // OrganOp
+    uint8_t  index;   // drawbar 0..8 (ORGAN_OP_SET only)
+    uint8_t  value;   // 0..8        (ORGAN_OP_SET only)
 };
 
 // Map a channel index (0..2) to the WiFi channel number (1, 6, or 11).

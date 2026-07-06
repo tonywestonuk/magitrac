@@ -408,6 +408,50 @@ void BlockSettingsPage::doDelete() {
     // with enough delete cycles will silently fail to accept new notes.
     NoteGrid(_song.notePool, &_song.noteFreeHead,
              &_song.patterns[_patIdx].noteHead).clearAll();
+
+    // Renumber block references before the shift, while every pattern still
+    // has its original index.  A target past the deleted block slides down by
+    // one; a target ON the deleted block falls through to its successor (which
+    // inherits the slot), clamped if the deleted block was last.  FWD/BACK are
+    // stored as distances, so both endpoints are mapped and the distance
+    // re-derived; a distance that collapses to zero degrades to LOOP.
+    // Deliberately untouched: NAV_RNT (dynamic), and FWD/BACK jumps that
+    // already pointed out of range (they wrap at runtime).
+    {
+        const uint8_t D = _patIdx;
+        const uint8_t n = _song.numPatterns;
+        auto mapT = [D, n](uint8_t t) -> uint8_t {
+            uint8_t m = (t > D) ? (uint8_t)(t - 1) : t;
+            return (m > (uint8_t)(n - 2)) ? (uint8_t)(n - 2) : m;
+        };
+        for (uint8_t i = 0; i < n; i++) {
+            if (i == D) continue;
+            Pattern& p    = _song.patterns[i];
+            uint8_t  newI = (i > D) ? (uint8_t)(i - 1) : i;
+            uint8_t  nav  = p.blockEndNav;
+            uint8_t  mode = nav & NAV_MODE_MASK;
+            uint8_t  tgt  = nav & NAV_TARGET_MASK;
+            if (nav != NAV_RNT) {
+                if (mode == NAV_ABS) {
+                    p.blockEndNav = (uint8_t)(NAV_ABS | mapT(tgt));
+                } else if (mode == NAV_FWD && tgt > 0 && i + tgt < n) {
+                    int nd = (int)mapT((uint8_t)(i + tgt)) - (int)newI;
+                    p.blockEndNav = (nd >= 1) ? (uint8_t)(NAV_FWD | nd)
+                                              : (uint8_t)NAV_LOOP;
+                } else if (mode == NAV_BACK && tgt > 0 && tgt <= i) {
+                    int nd = (int)newI - (int)mapT((uint8_t)(i - tgt));
+                    p.blockEndNav = (nd >= 1) ? (uint8_t)(NAV_BACK | nd)
+                                              : (uint8_t)NAV_LOOP;
+                }
+            }
+            for (int k = 0; k < 12; k++) {
+                InputNoteEntry& e = p.inputNotes[k];
+                if (e.switchMode != BlockSwitch::STAY && e.switchTarget < n)
+                    e.switchTarget = mapT(e.switchTarget);
+            }
+        }
+    }
+
     for (uint8_t i = _patIdx; i < _song.numPatterns - 1; i++)
         _song.patterns[i] = _song.patterns[i + 1];
     _song.numPatterns--;

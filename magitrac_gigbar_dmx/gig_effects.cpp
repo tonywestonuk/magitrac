@@ -48,6 +48,7 @@ GigFrame gigRenderEffect(const EffectCtx &c) {
     case 19:                    return effLightning(c);  // Lightning (random white strikes)
     case 13:                    return effSpectrum(c);   // Sound Spectrum (simple green)
     case 26:                    return effUv(c);         // UV (UV channels full on)
+    case 27:                    return effWhite(c);      // WHITE (press-hold white swell)
     case 5:                     return effColorSel(c);   // Color Wheel (uniform colour)
     case 11:                    return effCircles(c);    // Circles 1 (2D circle, per-slice)
     case 7:                     return effSparkle(c);    // Sparkle (strobe-panel twinkle)

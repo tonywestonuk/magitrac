@@ -34,6 +34,9 @@ void BootMenu::draw() {
     uiButton(_d, BM_PERFORM_X,   BM_BTN2_Y, BM_BTN2_W, BM_BTN2_H, "PERFORM", COL_WHITE, COL_BLACK, 3);
     uiButton(_d, BM_PIXELPOST_X, BM_BTN2_Y, BM_BTN2_W, BM_BTN2_H, "POSTS",   COL_WHITE, COL_BLACK, 3);
     uiButton(_d, BM_PAIR_X,      BM_BTN2_Y, BM_PAIR_W, BM_BTN2_H, "PAIR",    COL_WHITE, COL_BLACK, 3);
+
+    // Row 3: drawbar organ
+    uiButton(_d, BM_ORGAN_X, BM_BTN3_Y, BM_ORGAN_W, BM_BTN3_H, "ORGAN", COL_WHITE, COL_BLACK, 3);
 }
 
 BootMenuResult BootMenu::poll() {
@@ -54,6 +57,7 @@ BootMenuResult BootMenu::poll() {
         if (hitPerform    (sx, sy)) return BootMenuResult::PERFORM;
         if (hitPixelpost  (sx, sy)) return BootMenuResult::PIXELPOST;
         if (hitPair       (sx, sy)) return BootMenuResult::PAIR;
+        if (hitOrgan      (sx, sy)) return BootMenuResult::DRAWBAR_ORGAN;
         return BootMenuResult::DISMISSED;
     }
 
@@ -94,6 +98,11 @@ bool BootMenu::hitPixelpost(int sx, int sy) const {
 bool BootMenu::hitPair(int sx, int sy) const {
     return (sx >= BM_PAIR_X && sx < BM_PAIR_X + BM_PAIR_W &&
             sy >= BM_BTN2_Y && sy < BM_BTN2_Y + BM_BTN2_H);
+}
+
+bool BootMenu::hitOrgan(int sx, int sy) const {
+    return (sx >= BM_ORGAN_X && sx < BM_ORGAN_X + BM_ORGAN_W &&
+            sy >= BM_BTN3_Y  && sy < BM_BTN3_Y  + BM_BTN3_H);
 }
 
 bool BootMenu::hitInsideBox(int sx, int sy) const {

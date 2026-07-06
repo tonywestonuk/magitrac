@@ -24,9 +24,37 @@ enum CrashPhase : uint8_t {
     CP_COUNT
 };
 
+// Boot-step breadcrumb — finer-grained than CrashPhase, scoped to setup().
+// Set before each init call so that if a boot panics (common after the
+// USB-MSC reboot, when the USB-CDC console is dead and the backtrace is lost),
+// the NEXT boot can name the exact init that was running.  Kept in its own RTC
+// byte so it never fights the main/audio runtime phases.
+enum CrashBootStep : uint8_t {
+    BS_START = 0,     // re-armed value: panicked before the first marker below
+    BS_AUDIO,         // audioCodecInit (ES8388 over I²C)
+    BS_MIDI,          // sequencerMidiBegin (UART1 FIFO)
+    BS_SAM2695,       // sam2695MuteAllExcept10
+    BS_SPI,           // sdMutexInit + SPI.begin
+    BS_WIFI,          // WiFi mode/softAP/softAPConfig/protocol
+    BS_NET,           // UDP sender + MagiLink accept + ESP-NOW begin
+    BS_PIXELPOST,     // pixelpostInit
+    BS_PAIRING,       // pairingInit
+    BS_COMMANDS,      // commandsInit (SD mount + recovery)
+    BS_SAMPLE,        // samplePlayerInit + manifest sync
+    BS_SPECTRUM,      // spectrumInit
+    BS_SONGLIST,      // loadSongList
+    BS_TASKS,         // xTaskCreate (MIDI / link session)
+    BS_UI,            // fieldFlashScreen + drawScreen + loadSong
+    BS_DONE,          // reached the main loop
+    BS_STEP_COUNT
+};
+
 // Call once, early in setup(), after Serial is up.  Reads the reset reason +
 // breadcrumb, logs to NVS + Serial, then re-arms the breadcrumb for this run.
 void crashLogInit();
+
+// Boot-step breadcrumb setter — one byte to RTC RAM, call before each init.
+void crashSetBootStep(uint8_t step);
 
 // Breadcrumbs — set the current phase so a fault leaves a trail.  Cheap
 // (one byte to RTC RAM); safe to call from any task/core.
@@ -45,3 +73,11 @@ bool crashLogLastWasFault();
 // One-line human-readable summary of the last reset, e.g.
 //   "last reset: BROWNOUT  main=idle audio=sample-read  alive=41m  boot#7"
 const char* crashLogLastSummary();
+
+// Core-dump backtrace from the last panic (decoded from the `coredump` flash
+// partition at boot, then erased).  crashLogHasCoreDump() is true when a dump
+// was found; crashLogCoreSummary() is a compact "task pc=… cz=… va=… bt: …"
+// string of PCs.  Decode the PCs with xtensa-esp32s3-elf-addr2line against the
+// matching .ino.elf.  Full per-frame backtrace is also printed to Serial.
+bool        crashLogHasCoreDump();
+const char* crashLogCoreSummary();

@@ -47,6 +47,7 @@ uint16_t sequencerCurrentBPM();  // live BPM — updated each performer snap
 void     sequencerSetBPM(uint16_t bpm);  // set live BPM immediately (e.g. from config edit)
 void sequencerTick();
 void sequencerPollMidiIn();  // call every loop() — reads performer MIDI in
+bool sequencerSongReaderBusy();  // true while a loop-task walk of srvActiveBuf is in flight
 void seqSendSlotEnable();    // send CC 115 ch16 with current performerMask
 
 // Test mode — emulates a perfectly timed performer sending C-4 at a fixed interval.
@@ -81,6 +82,13 @@ void seqSetStateCallback(void (*cb)(bool playing));
 // Optional callback — called when a MIDI note-on is received while the sequencer is stopped.
 // Use this to forward the note to the client for step-entry editing.
 void seqSetMidiNoteInCallback(void (*cb)(uint8_t midiNote, uint8_t velocity));
+
+// Optional raw note monitor — fires for EVERY live MIDI note-on and note-off
+// on any channel, regardless of sequencer run/stop state, before the normal
+// performer/step-input dispatch.  `on` is false for note-off (and for note-on
+// with velocity 0).  Used by the drawbar organ to play notes live without
+// disturbing the sequencer.  Runs on the MIDI task — keep it short.
+void seqSetMidiRawNoteCallback(void (*cb)(bool on, uint8_t midiNote, uint8_t velocity));
 
 // Optional callback — fires once per row tick while preview is active.
 // `row` is the row that was just played.

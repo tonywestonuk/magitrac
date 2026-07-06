@@ -67,6 +67,32 @@ static bool mscOnStartStop(uint8_t /*power*/, bool start, bool eject) {
     return true;
 }
 
+// Leave the SD bus in a sane state before the reboot.  ESP.restart() is only a
+// CPU reset — the card keeps whatever SPI state SdFat left it in — so deselect
+// CS and let the next boot's sdRecoverBus() do the real flush.
+//
+// Do NOT call sSd.end() here: SdFat's end() runs a final SD sync (syncDevice →
+// writeStop) over SPI, and SPI.endTransaction() asserts→panics in this
+// post-eject context (the TinyUSB task left the bus lock state inconsistent).
+// That assert was the "PANIC step=start" crash on the first post-MSC boot —
+// the coredump backtrace pointed straight here (usb_msc.ino:76).  A plain CS
+// deselect carries no transaction and is safe.
+static void mscSdTeardown() {
+    pinMode(MSC_SD_CS, OUTPUT);
+    digitalWrite(MSC_SD_CS, HIGH);
+}
+
+// Reboot out of MSC mode.  Plain ESP.restart() is all that's needed: the SD card
+// is unwedged by sdPowerCycle() (ALDO4 rail toggle) on the next boot, so the
+// reboot itself carries no SD responsibility.  (Earlier builds used a full
+// digital-core reset here on the mistaken theory that the reset cleared the SD —
+// it doesn't; only cutting the card's Vdd does.  Reverted — simpler, and friendlier
+// to the USB-OTG → USB-Serial-JTAG console handoff.)
+static void mscHardReboot() {
+    Serial.flush();
+    ESP.restart();
+}
+
 static void banner(const char* line1, const char* line2) {
     lcd.fillScreen(COL_BG);
     lcd.fillRect(0, 0, 240, 40, COL_HDR);
@@ -124,11 +150,13 @@ void runUsbMsc() {
     // Exit USB-storage mode on either of:
     //   • the host ejecting the disk (preferred — clean unmount), or
     //   • a screen tap (fallback — wait for the boot-held touch to release first).
-    // Plain ESP.restart() ONLY.  usb_persist_restart(RESTART_NO_PERSIST) was tried
-    // and is worse: it does NOT bring the Serial-JTAG console back on first boot,
-    // and it leaves the SD/SPI un-reinitialisable (server boots with no files
-    // until a power cycle).  Cost of ESP.restart(): serial returns on the *second*
-    // boot.  Reliable SD + reboot beats clean serial.
+    // The reboot uses mscHardReboot() (esp_restart_noos_dig — full digital
+    // peripheral reset), NOT ESP.restart(): a plain soft reset leaves the SPI/SD
+    // controller in the state SdFat left it, so the next boot's SD.begin() fails
+    // to mount until a power cycle.  The digital reset clears it — same effect as
+    // a power cycle, no crash.  sdRecoverBus()/retry in commandsInit() stays as a
+    // belt-and-braces card-level flush.  (usb_persist_restart(RESTART_NO_PERSIST)
+    // was also tried and was worse — see git history.)
     bool released = false;
     for (;;) {
         if (sEjectReq) {
@@ -136,7 +164,8 @@ void runUsbMsc() {
             // hitting the SD on the shared SPI bus, and a concurrent LCD write
             // hangs the bus — wedging this loop before it can reboot.  Just go.
             delay(800);          // let macOS finalise the unmount before USB drops
-            ESP.restart();
+            mscSdTeardown();     // deselect CS before the reset
+            mscHardReboot();
         }
 
         // Do NOT draw to the LCD here — it shares the SPI bus with the SD card,
@@ -149,7 +178,8 @@ void runUsbMsc() {
         if (released && touched) {
             banner("Restarting...", nullptr);
             delay(400);
-            ESP.restart();
+            mscSdTeardown();
+            mscHardReboot();
         }
         delay(10);
     }
