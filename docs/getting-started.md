@@ -57,8 +57,9 @@ Symlink (or copy) these into `~/Documents/Arduino/libraries/`:
 - **`magitrac_lib`** — in this repo; shared song model + transport used by
   both client and server:
   `ln -s /path/to/magitrac/magitrac_lib ~/Documents/Arduino/libraries/`
-- **`EPD_Painter`** and **`gt911-arduino`** — the client's e-paper painter
-  and touch driver (companion libraries, distributed separately).
+- **[EPD_Painter](https://github.com/tonywestonuk/EPD_Painter)** and
+  **[gt911-arduino](https://github.com/tonywestonuk/gt911-arduino)** — the
+  client's e-paper painter and touch driver.
 - **`pixelpost_proto`** — the light-broadcast protocol header, needed by
   the server and the light nodes (companion library, distributed
   separately).
