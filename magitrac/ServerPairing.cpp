@@ -393,6 +393,18 @@ bool ServerPairing::sendPixelpostOverride(uint8_t op) {
     return ok;
 }
 
+bool ServerPairing::sendOrgan(uint8_t op, uint8_t index, uint8_t value) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgOrgan msg;
+    msg.op    = op;
+    msg.index = index;
+    msg.value = value;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
 bool ServerPairing::sendPixelpostPostCount(uint8_t count) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPixelpostSetPostCount msg;

@@ -100,6 +100,7 @@ GigFrame effBeat     (const EffectCtx &c);
 GigFrame effHeartbeat(const EffectCtx &c);
 GigFrame effSpectrum (const EffectCtx &c);
 GigFrame effUv       (const EffectCtx &c);
+GigFrame effWhite    (const EffectCtx &c);
 
 // effectId -> renderer (the taste-map).  gig_effects.cpp.
 GigFrame gigRenderEffect(const EffectCtx &c);

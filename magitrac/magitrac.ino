@@ -33,6 +33,7 @@
 #include "PerformancePage.h"
 #include "PixelPostManualPage.h"
 #include "SetlistPage.h"
+#include "OrganPage.h"
 #include "WiFiSettingsPage.h"
 #include "Battery.h"
 #include "Autosave.h"
@@ -63,7 +64,9 @@ static bool gBootBtnWasDown = false;
 
 // ── Hardware objects ──────────────────────────────────────────────────────────
 
-EPD_PainterAdafruit display(EPD_PAINTER_PRESET);   // AUTO board detection
+// 180° flip (panel mounted upside down).  Set rotation back to ROTATION_0 and
+// drop the touch.setRotate180() call below to revert.
+EPD_PainterAdafruit display(EPD_PAINTER_PRESET.withRotation(EPD_Painter::Rotation::ROTATION_180));
 GT911_Lite          touch;
 
 // ── Application objects ───────────────────────────────────────────────────────
@@ -89,6 +92,7 @@ DrumTrackImportPage drumTrackImportPage(display, touch, song);
 PerformancePage    performancePage(display, touch, song);
 PixelPostManualPage pixelpostManualPage(display, touch);
 SetlistPage        setlistPage(display, touch, song);
+OrganPage          organPage(display, touch);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
 WiFiSettingsPage   wifiSettingsPage(display, touch);
@@ -236,6 +240,7 @@ static bool     backupRestorePageOpen = false;
 static bool     performancePageOpen   = false;
 static bool     pixelpostManualPageOpen = false;
 static bool     setlistPageOpen       = false;
+static bool     organPageOpen         = false;
 
 // ── Autosave state ───────────────────────────────────────────────────────
 // markSongDirty() is called from ServerPairing::sendSongPatch / sendNoteSet,
@@ -367,6 +372,7 @@ void setup() {
 
     TwoWire* wire = display.getConfig().i2c.wire;
     touch.begin(wire, 20);
+    touch.setRotate180(true, 540, 960);   // match the 180° display flip (touch res 540×960)
 
     // RTC — BM8563 shares the display's I2C bus
     if (wire) {
@@ -600,6 +606,7 @@ void loop() {
         !wifiSettingsPageOpen && !backupRestorePageOpen &&
         !drumTrackImportOpen && !drumEditorOpen &&
         !performancePageOpen && !pixelpostManualPageOpen && !setlistPageOpen &&
+        !organPageOpen &&
         !noteEditor.isOpen() &&
         pageManager.currentPage() == Page::TRACKER) {
         const char* srvName = songPage.srvLoadedName();
@@ -699,6 +706,10 @@ void loop() {
                 gServerPairing.startPairCeremony();
                 display.clear();
                 drawPairingScreen();
+                break;
+            case BootMenuResult::DRAWBAR_ORGAN:
+                organPageOpen = true;
+                organPage.open();   // draws + tells the server to enter organ mode
                 break;
             case BootMenuResult::DISMISSED:
                 display.clear();
@@ -848,6 +859,17 @@ void loop() {
     if (pixelpostManualPageOpen) {
         if (pixelpostManualPage.poll()) {
             pixelpostManualPageOpen = false;
+            display.clear();
+            ui.drawAll();
+            display.paintLater();
+        }
+        return;
+    }
+
+    // ── Drawbar organ page ────────────────────────────────────────────────────
+    if (organPageOpen) {
+        if (organPage.poll() == OrganPage::Result::HOME) {
+            organPageOpen = false;   // page already sent ORGAN_OP_EXIT to the server
             display.clear();
             ui.drawAll();
             display.paintLater();

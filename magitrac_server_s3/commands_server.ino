@@ -11,6 +11,16 @@
 #include "midi_player.h"
 #include "SampleManifest.h"
 
+// ── Direct-from-Mac PixelPost OTA (client FW button) ──────────────────────────
+// The client's FW button triggers MSG_PIXELPOST_FIRMWARE_UPDATE; the server then
+// tells the posts to join the home WiFi and OTA from the Mac's nginx box.  This
+// is the bench/home route — the gig route is the server's own FLASH screen +
+// field_flash.ino (self-served off the server softAP, no external router).
+// Creds live here because the trigger message is a bare button-press.
+#define PP_MAC_OTA_SSID  "TonyWireless"
+#define PP_MAC_OTA_PSK   "Jackyourbody321"
+#define PP_MAC_OTA_URL   "http://192.168.178.31/upd/pixel_post.ino.bin"
+
 // ── WiFi channel persistence ──────────────────────────────────────────────────
 // Shared namespace name with the client side ("magitrac_wifi") so the channel
 // setting is conceptually one thing across both devices, just stored locally.
@@ -143,6 +153,20 @@ static File     srvSaveFile;               // kept open during chunk reception t
 static char     srvDeleteName[SRV_FNAME_MAX] = {};  // name pending delete (deferred to main loop)
 static bool     srvDeletePending  = false;
 
+// MSG_NOTE_SET queue — produced on the MagiLink worker task, consumed by
+// commandsTick on the loop task, so note-pool relinks never race a playing
+// sequencer walk.  SPSC ring: head written only by the worker, tail only by
+// the loop; uint8_t indices wrap at 256, a multiple of the queue length, so
+// the masks stay consistent across wrap.
+#define NOTE_SET_Q_LEN 64
+static MsgNoteSet       sNoteSetQ[NOTE_SET_Q_LEN];
+static volatile uint8_t sNoteSetQHead = 0;
+static volatile uint8_t sNoteSetQTail = 0;
+
+// Cell-tap audition, deferred behind the note-set queue (see MSG_NOTE_AUDITION).
+static volatile bool sAuditionPending = false;
+static uint8_t       sAuditionPat = 0, sAuditionRow = 0, sAuditionCol = 0;
+
 // ── Deferred song-load request ─────────────────────────────────────────────────
 // sendSongData is blocking (~750ms); calling it from the ESP-NOW receive callback
 // stalls the WiFi task. Set a flag here and do the send from the main loop instead.
@@ -249,8 +273,59 @@ static void writeDefaultGmMap() {
 // the delete handler).  Recovering a draft, if ever wanted, must be a
 // deliberate user action — never a silent boot step.
 
+// After a USB-MSC session the SD card is left in SPI mode by SdFat (25 MHz,
+// DEDICATED_SPI) and an ESP.restart() does NOT power-cycle it.  If the host
+// ejected while the card was mid (multi-)block read it keeps streaming data and
+// swallows the next CMD0 as payload, so a single cold SD.begin() can never get
+// the card to idle — mounting then fails until a full power cycle.  Recover the
+// way the SD spec prescribes: deassert CS and clock a long 0xFF burst (>1 block)
+// at a slow rate to flush any pending stream and return the card to idle.
+static void sdRecoverBus() {
+    pinMode(SRV_SD_CS, OUTPUT);
+    digitalWrite(SRV_SD_CS, HIGH);                 // deselect the card
+    SPI.beginTransaction(SPISettings(400000, MSBFIRST, SPI_MODE0));
+    for (int i = 0; i < 1024; i++) SPI.transfer(0xFF);   // >1 block of clocks
+    SPI.endTransaction();
+}
+
+// Hard power-cycle the SD card.  On CoreS3 the TF-card slot Vdd is on AXP2101
+// ALDO4 (reg 0x90 bit 3) — confirmed in M5Unified Power_Class.  After a USB-MSC
+// session SdFat can leave the card's own state machine wedged mid-operation, and
+// NOTHING short of removing Vcc resets it: not sdRecoverBus()'s clock burst, not
+// even a full digital-core reset (esp_rom_software_reset_system).  Only pulling
+// the rail works — which is exactly the manual unplug the card used to need.
+//
+// Drive the shared SPI lines (SCK/MOSI/CS) low first so the card can't stay
+// alive on phantom power through its protection diodes while the rail is down,
+// then cut ALDO4, drain, restore, and re-init the bus.  (SCK/MOSI are shared
+// with the LCD but driving them static-low just means no LCD update meanwhile —
+// no clock edges, no harm.)
+#define AXP2101_I2C_ADDR  0x34
+#define AXP2101_LDO_EN0   0x90
+#define AXP2101_ALDO4_BIT 0x08
+static void sdPowerCycle() {
+    // Toggle ONLY the AXP2101 ALDO4 rail (TF-card Vdd) — touch nothing else.
+    // The AXP holds ALDO4 up across any ESP32 reset, so cutting it here is the
+    // only thing that resets a card SdFat left wedged after a USB-MSC session.
+    // Do NOT hand-drive the SD SPI pins: SCK(36)/MOSI(37) are shared with the LCD
+    // bus and driving them here hangs boot — the rail toggle alone is enough.
+    M5.In_I2C.bitOff(AXP2101_I2C_ADDR, AXP2101_LDO_EN0, AXP2101_ALDO4_BIT, 400000);
+    delay(400);           // let the slot caps discharge
+    M5.In_I2C.bitOn (AXP2101_I2C_ADDR, AXP2101_LDO_EN0, AXP2101_ALDO4_BIT, 400000);
+    delay(100);           // Vdd ramp + card internal power-up
+}
+
 void commandsInit() {
-    srvSdOk = SD.begin(SRV_SD_CS);
+    sdPowerCycle();                                // real Vcc cycle: unwedge the card
+    srvSdOk = false;
+    for (int attempt = 0; attempt < 4 && !srvSdOk; ++attempt) {
+        sdRecoverBus();                            // idle the card before each try
+        srvSdOk = SD.begin(SRV_SD_CS);
+        if (!srvSdOk) {
+            Serial.printf("[CMD] SD.begin attempt %d failed\n", attempt + 1);
+            delay(100);
+        }
+    }
     Serial.printf("[CMD] SD: %s\n", srvSdOk ? "OK" : "not found");
     if (srvSdOk && !SD.exists(SRV_SONGS_DIR))
         SD.mkdir(SRV_SONGS_DIR);
@@ -1102,6 +1177,14 @@ void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
     // buffer even if a tick was already past the seqRunning check when this
     // header arrived.  Restored in finaliseMagiLinkSongSave().
     srvHasActive = false;
+    // Those guards only stop NEW walks.  A tick/MIDI-poll already in flight on
+    // the loop task can be parked mid-walk in a midiTx FIFO wait for several
+    // ms; the body chunks that follow overwrite the note pool it is walking,
+    // and a torn `next` index reads far out of bounds (LoadProhibited) or
+    // breaks list circularity (watchdog).  Wait the in-flight walk out —
+    // dispatch is sequential on this task, so once we return no walker can
+    // race the body writes.  Bounded: a walk is µs–ms, never near 100 ms.
+    for (int i = 0; i < 100 && sequencerSongReaderBusy(); i++) delay(1);
     // Stamp SongFileHeader at the front of srvActiveBuf.
     memcpy(srvActiveBuf, &h->song_file_header, sizeof(SongFileHeader));
     strncpy(sMagiSaveName, h->name, sizeof(sMagiSaveName) - 1);
@@ -1573,6 +1656,30 @@ static void sendActiveSongToClient() {
 
 // ── Tick — call from main loop() to run deferred operations ──────────────────
 void commandsTick() {
+    // Apply queued note edits first, so anything below that reads or saves the
+    // song (save-active, autosave) sees them.  Skipped-but-consumed while a
+    // full push is in flight (srvHasActive false) — the push supersedes them.
+    while (sNoteSetQTail != sNoteSetQHead) {
+        const MsgNoteSet& m = sNoteSetQ[sNoteSetQTail & (NOTE_SET_Q_LEN - 1)];
+        if (srvHasActive) {
+            Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
+            if (m.pattern < song->numPatterns) {
+                NoteGrid grid(song->notePool, &song->noteFreeHead,
+                              &song->patterns[m.pattern].noteHead);
+                // Always set — NoteGrid::set clears internally when *all*
+                // fields are empty, but persists attr-only / vel-only rows.
+                grid.set(m.row, m.col, m.note);
+            }
+        }
+        sNoteSetQTail++;
+    }
+
+    // Audition fires after the drain so it plays the just-set cell value.
+    if (sAuditionPending) {
+        sAuditionPending = false;
+        sequencerAuditionNote(sAuditionPat, sAuditionRow, sAuditionCol);
+    }
+
     // Push active song to client on connect or song change (deferred from pairing/main)
     extern bool sSongPushPending;
     if (sSongPushPending) {
@@ -1813,15 +1920,17 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
         case MSG_NOTE_SET:
             if (len < (int)sizeof(MsgNoteSet)) return;
             if (srvHasActive) {
-                const MsgNoteSet* m = (const MsgNoteSet*)data;
-                Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
-                if (m->pattern < song->numPatterns) {
-                    NoteGrid grid(song->notePool, &song->noteFreeHead,
-                                  &song->patterns[m->pattern].noteHead);
-                    // Always set — NoteGrid::set clears internally when *all*
-                    // fields are empty, but persists attr-only / vel-only rows.
-                    grid.set(m->row, m->col, m->note);
-                }
+                // NoteGrid::set relinks the live note pool the sequencer walks
+                // on the loop task — applying it here (MagiLink worker task)
+                // races a playing walker.  Queue it; commandsTick applies it
+                // on the loop task, serialised with sequencerTick.
+                // Queue full is effectively impossible (client paces edits at
+                // touch speed), but never drop silently — wait for a slot.
+                while ((uint8_t)(sNoteSetQHead - sNoteSetQTail) >= NOTE_SET_Q_LEN)
+                    delay(1);
+                sNoteSetQ[sNoteSetQHead & (NOTE_SET_Q_LEN - 1)] =
+                    *(const MsgNoteSet*)data;
+                sNoteSetQHead++;
             }
             break;
 
@@ -1888,6 +1997,26 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             }
             break;
 
+        case MSG_ORGAN:
+            if (len < (int)sizeof(MsgOrgan)) return;
+            {
+                extern volatile int      gOrganScreenReq;
+                extern volatile uint16_t gOrganBarDirty;
+                const MsgOrgan* m = (const MsgOrgan*)data;
+                if (m->op == ORGAN_OP_ENTER)      gOrganScreenReq = 1;
+                else if (m->op == ORGAN_OP_EXIT)  gOrganScreenReq = 2;
+                else if (m->op == ORGAN_OP_SET) {
+                    organSetDrawbar(m->index, m->value);   // task-safe (volatile write)
+                    if (m->index < 16) gOrganBarDirty |= (uint16_t)(1u << m->index);
+                }
+                else if (m->op == ORGAN_OP_TYPE)      organSetType(m->value);
+                else if (m->op == ORGAN_OP_VIBCHORUS) organSetVibChorus(m->value);
+                else if (m->op == ORGAN_OP_LESLIE)    organSetLeslie(m->value);
+                else if (m->op == ORGAN_OP_DRIVE)     organSetDrive(m->value);
+                else if (m->op == ORGAN_OP_PARAM)     organSetParam(m->index, m->value);
+            }
+            break;
+
         case MSG_PIXELPOST_SET_SLIDER:
             if (len < (int)sizeof(MsgPixelpostSetSlider)) return;
             {
@@ -1923,11 +2052,14 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
 
         case MSG_PIXELPOST_FIRMWARE_UPDATE:
             {
-                // PixelPost OTA is now driven from the server's FLASH screen
-                // (copy the bin to SD via USB-MSC, reboot, tap FLASH) so the
-                // HTTP server never runs during the music.  The old client-side
-                // trigger is a no-op.
-                Serial.println("[FLD] client OTA trigger ignored - use server FLASH screen");
+                // Client FW button → tell the posts to OTA directly from the
+                // Mac's nginx box over the home WiFi (bench/home route).  The gig
+                // route is the server's own FLASH screen (field_flash.ino); the
+                // two don't collide — this one points the posts at an external
+                // network, not the server softAP.
+                extern void pixelpostSendFirmwareUpdate(const char* ssid, const char* pwd, const char* url);
+                pixelpostSendFirmwareUpdate(PP_MAC_OTA_SSID, PP_MAC_OTA_PSK, PP_MAC_OTA_URL);
+                Serial.println("[PP-TX] client FW trigger → posts OTA from Mac nginx");
             }
             break;
 
@@ -2009,8 +2141,15 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
         case MSG_NOTE_AUDITION:
             if (len < (int)sizeof(MsgNoteAudition)) return;
             {
+                // Deferred behind the note-set queue: the client sends
+                // NOTE_SET then NOTE_AUDITION for a cell tap, and the set is
+                // now applied from commandsTick — auditioning inline here
+                // would play the cell's OLD value.  Latest-wins single slot.
                 const MsgNoteAudition* a = (const MsgNoteAudition*)data;
-                sequencerAuditionNote(a->pattern, a->row, a->col);
+                sAuditionPat     = a->pattern;
+                sAuditionRow     = a->row;
+                sAuditionCol     = a->col;
+                sAuditionPending = true;
             }
             break;
 

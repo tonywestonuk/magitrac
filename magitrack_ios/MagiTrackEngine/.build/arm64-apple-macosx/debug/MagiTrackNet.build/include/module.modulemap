@@ -1,3 +1,0 @@
-module MagiTrackNet {
-    header "/Users/tonyweston/magitrac/magitrack_ios/MagiTrackEngine/.build/arm64-apple-macosx/debug/MagiTrackNet.build/include/MagiTrackNet-Swift.h"
-}

@@ -15,6 +15,8 @@
 #include "SampleManifest.h"
 #include "mic_spectrum.h"
 #include "audio_codec.h"
+#include "drawbar_organ.h"
+#include "sample_organ.h"
 #include "sd_mutex.h"
 #include "Battery.h"
 #include "crash_log.h"
@@ -94,8 +96,16 @@ uint16_t gLastBPM        = 0;
 // The bezel strip cycles through these (short tap); a 2 s hold enters pairing
 // (drawn separately by pairing.ino as a serverMode overlay).  Within a screen,
 // the glass area is a drag-scroll list — see pollListTouch().
-enum Screen { SCR_SONGS = 0, SCR_SAMPLES = 1, SCR_CHORD = 2, SCR_SCOPE = 3, SCR_USB = 4, SCR_COUNT = 5 };
+enum Screen { SCR_SONGS = 0, SCR_SAMPLES = 1, SCR_CHORD = 2, SCR_SCOPE = 3, SCR_USB = 4, SCR_ORGAN = 5, SCR_COUNT = 6 };
 static Screen gScreen = SCR_SONGS;
+
+// Remote drawbar-organ control (MSG_ORGAN, from the client over MagiLink).  The
+// MagiLink callback runs on the link worker task, so it only sets these; the
+// LCD work (setScreen / drawOrganBar) is applied on the loop task.  Drawbar
+// values themselves are written straight through organSetDrawbar (volatile,
+// task-safe).  Non-static so commands_server.ino's handler can reach them.
+volatile int      gOrganScreenReq = 0;   // 0 none, 1 enter, 2 exit
+volatile uint16_t gOrganBarDirty  = 0;   // bit i → repaint drawbar i
 
 // Live softAP creds, captured when the AP is brought up in setup().  The
 // field-flash OTA hands these to the posts so they ALWAYS match the running AP
@@ -732,6 +742,117 @@ static void pollScopeTouch() {
     }
 }
 
+// ── Drawbar organ screen ──────────────────────────────────────────────────────
+// Nine vertical draggable drawbars (0..8) in Hammond colours; live MIDI plays
+// the additive synth in drawbar_organ.cpp.  Bars only repaint on touch.
+static const int ORG_BAR_N  = ORGAN_DRAWBARS;                  // 9
+static const int ORG_BAR_W  = 26;
+static const int ORG_X0     = (240 - ORG_BAR_W * ORG_BAR_N) / 2;
+static const int ORG_TOP    = UI_HEADER_H + 22;
+static const int ORG_BOT    = UI_SCR_H - UI_FOOTER_H - 18;
+static const int ORG_KNOB_H = 20;
+static int       _organCol  = -1;
+
+static uint16_t organBarColor(int i) {
+    switch (i) {
+        case 0: case 1:         return lgfx::color565(150, 45, 35);   // 16',5 1/3' brown
+        case 4: case 6: case 7: return lgfx::color565(40, 40, 48);    // mutations  black
+        default:                return lgfx::color565(235, 235, 235); // foundation white
+    }
+}
+
+static void drawOrganBar(int i) {
+    int x  = ORG_X0 + i * ORG_BAR_W;
+    int cx = x + ORG_BAR_W / 2;
+    int v  = organGetDrawbar(i);
+    uint16_t col = organBarColor(i);
+
+    lcd.fillRect(x, UI_HEADER_H, ORG_BAR_W, (UI_SCR_H - UI_FOOTER_H) - UI_HEADER_H, COL_BG);
+
+    lcd.setTextSize(2);
+    lcd.setTextColor(col, COL_BG);
+    char buf[4]; snprintf(buf, sizeof(buf), "%d", v);
+    lcd.setCursor(cx - 6, UI_HEADER_H + 2);
+    lcd.print(buf);
+
+    lcd.drawFastVLine(cx, ORG_TOP, ORG_BOT - ORG_TOP, lgfx::color565(0, 0, 90));
+    int tabY = ORG_TOP + v * (ORG_BOT - ORG_TOP) / 8;
+    if (tabY > ORG_TOP) lcd.fillRect(cx - 1, ORG_TOP, 3, tabY - ORG_TOP, col);
+
+    int ky = tabY - ORG_KNOB_H / 2;
+    if (ky < ORG_TOP) ky = ORG_TOP;
+    if (ky + ORG_KNOB_H > ORG_BOT) ky = ORG_BOT - ORG_KNOB_H;
+    lcd.fillRoundRect(x + 3, ky, ORG_BAR_W - 6, ORG_KNOB_H, 3, col);
+    lcd.drawRoundRect(x + 3, ky, ORG_BAR_W - 6, ORG_KNOB_H, 3, lgfx::color565(0, 0, 40));
+
+    lcd.setTextSize(1);
+    lcd.setTextColor(TFT_WHITE, COL_BG);
+    const char* lab = ORGAN_FOOTAGE[i];
+    int lw = (int)strlen(lab) * 6;
+    lcd.setCursor(cx - lw / 2, ORG_BOT + 4);
+    lcd.print(lab);
+}
+
+static void drawOrganHeader() {
+    lcd.fillRect(0, 0, 240, UI_HEADER_H, COL_HDR);
+    lcd.setTextColor(TFT_WHITE, COL_HDR);
+    lcd.setTextSize(2);
+    lcd.setCursor(8, (UI_HEADER_H - 16) / 2);
+    lcd.print("Organ");
+    int nv = organVoiceCount();
+    if (nv > 0) {
+        lcd.setTextColor(lgfx::color565(144, 238, 144), COL_HDR);
+        char b[8]; snprintf(b, sizeof(b), "%d", nv);
+        lcd.setCursor(150, (UI_HEADER_H - 16) / 2);
+        lcd.print(b);
+    }
+    batteryDrawIcon(240 - BATT_ICON_W - 4, (UI_HEADER_H - BATT_ICON_H) / 2, COL_HDR);
+}
+
+static void drawOrganFooter() {
+    int y = UI_SCR_H - UI_FOOTER_H;
+    lcd.fillRect(0, y, 240, UI_FOOTER_H, COL_FOOTER);
+    lcd.setTextColor(TFT_WHITE, COL_FOOTER);
+    lcd.setTextSize(1);
+    lcd.setCursor(8, y + (UI_FOOTER_H - 8) / 2);
+    lcd.print("Drag drawbars   Bezel: next");
+}
+
+static void drawOrganScreen() {
+    lcd.fillScreen(COL_BG);
+    drawOrganHeader();
+    for (int i = 0; i < ORG_BAR_N; i++) drawOrganBar(i);
+    drawOrganFooter();
+}
+
+// Lock to the column the press started in, then slide vertically to set 0..8.
+static void pollOrganTouch() {
+    auto& t   = M5.Touch.getDetail();
+    bool down = t.isPressed();
+    if (down) {
+        if (!_touchDown) {
+            _touchDown = true;
+            int x = t.x, y = t.y;
+            _organCol = (y >= UI_HEADER_H && y < UI_SCR_H - UI_FOOTER_H &&
+                         x >= ORG_X0 && x < ORG_X0 + ORG_BAR_W * ORG_BAR_N)
+                        ? (x - ORG_X0) / ORG_BAR_W : -1;
+        }
+        if (_organCol >= 0 && _organCol < ORG_BAR_N) {
+            int span = ORG_BOT - ORG_TOP;
+            int v = ((t.y - ORG_TOP) * 8 + span / 2) / span;
+            if (v < 0) v = 0;
+            if (v > 8) v = 8;
+            if (v != organGetDrawbar(_organCol)) {
+                organSetDrawbar(_organCol, v);
+                drawOrganBar(_organCol);
+            }
+        }
+    } else if (_touchDown) {
+        _touchDown = false;
+        _organCol  = -1;
+    }
+}
+
 // ── Screen dispatch ───────────────────────────────────────────────────────────
 void drawScreen() {
     switch (gScreen) {
@@ -739,6 +860,7 @@ void drawScreen() {
         case SCR_CHORD:   drawChordScreen();  break;
         case SCR_SCOPE:   drawScopeScreen();  break;
         case SCR_USB:     drawUsbScreen();    break;
+        case SCR_ORGAN:   drawOrganScreen();  break;
         case SCR_SONGS:
         default:          drawSongScreen();   break;
     }
@@ -749,6 +871,7 @@ static void setScreen(Screen s) {
     if (gScreen == SCR_SAMPLES && s != SCR_SAMPLES) samplePlayerStop();
     if (gScreen == SCR_CHORD   && s != SCR_CHORD)   chordSetActive(false);
     if (gScreen == SCR_SCOPE   && s != SCR_SCOPE) scopeSetActive(false);
+    if (gScreen == SCR_ORGAN   && s != SCR_ORGAN) organSetActive(false);
     gScreen     = s;
     _touchDown  = false;
     _dragMoved  = false;
@@ -763,6 +886,10 @@ static void setScreen(Screen s) {
         gScopeLastSeq  = 0xFFFFFFFF;
         gScopeHavePrev = false;
         scopeSetActive(true);
+    }
+    if (s == SCR_ORGAN) {
+        samplePlayerStop();      // free the codec before the organ task writes
+        organSetActive(true);
     }
     drawScreen();
 }
@@ -1115,7 +1242,22 @@ void setup() {
             lcd.println(line);
             y += 12;
         }
-        delay(5000);
+        // If the panic left a core dump, paint the decoded backtrace below the
+        // summary — readable headless at a gig; serial has the full per-frame list.
+        if (crashLogHasCoreDump()) {
+            y += 8;
+            lcd.setCursor(6, y); lcd.println("coredump:"); y += 12;
+            const char* b = crashLogCoreSummary();
+            for (size_t i = 0; b[i]; ) {
+                size_t n = 0;
+                while (b[i] && n < sizeof(line) - 1) line[n++] = b[i++];
+                line[n] = '\0';
+                lcd.setCursor(6, y);
+                lcd.println(line);
+                y += 12;
+            }
+        }
+        delay(crashLogHasCoreDump() ? 9000 : 5000);
         lcd.fillScreen(COL_BG);
     }
 
@@ -1130,6 +1272,7 @@ void setup() {
     // Must come before samplePlayerInit / spectrumInit so the codec is ready
     // when those tasks start.  Wire is initialised by M5.begin (internal I²C
     // on G12/G11 shared with AXP, AW9523, touch).
+    crashSetBootStep(BS_AUDIO);
     if (!audioCodecInit()) {
         Serial.println("[SETUP] WARNING: Module Audio not detected — audio disabled");
     }
@@ -1140,6 +1283,7 @@ void setup() {
 #endif
 
     // ── MIDI ─────────────────────────────────────────────────────────────────
+    crashSetBootStep(BS_MIDI);
     sequencerMidiBegin(MIDI_RX_PIN, MIDI_TX_PIN);
     Serial.println("[SETUP] MIDI serial ready (direct FIFO) on G1/G2 (Port A, UART1)");
 
@@ -1147,16 +1291,19 @@ void setup() {
     // every power cycle.  Reconfigure on each boot to suppress its synthesis
     // on every channel except 10 (drums) — keeps the chip from doubling up
     // melodic instruments with the downstream keyboard.
+    crashSetBootStep(BS_SAM2695);
     sam2695MuteAllExcept10();
 
     // ── SD on the CoreS3 base ───────────────────────────────────────────────
     // CoreS3 SD is on SPI: SCK=G36, MISO=G35, MOSI=G37, CS=G4 (shared with
     // the LCD on a different CS).  Must call SPI.begin with those explicit
     // pins because the default constructor would pick the wrong bus.
+    crashSetBootStep(BS_SPI);
     sdMutexInit();
     SPI.begin(GPIO_NUM_36, GPIO_NUM_35, GPIO_NUM_37, GPIO_NUM_4);
 
     // ── WiFi ─────────────────────────────────────────────────────────────────
+    crashSetBootStep(BS_WIFI);
     Serial.println("[SETUP] comms init");
     extern void pairingHandleMessage(const uint8_t* data, int len);
     extern uint8_t wifiChannelLoad();
@@ -1242,6 +1389,7 @@ void setup() {
     }
     Serial.printf("[UDP] broadcast destination: %s\n",
                   gBroadcastIp.toString().c_str());
+    crashSetBootStep(BS_NET);
     {
         uint8_t octets[4] = { gBroadcastIp[0], gBroadcastIp[1],
                               gBroadcastIp[2], gBroadcastIp[3] };
@@ -1302,6 +1450,7 @@ void setup() {
     gMagiLink.registerCallback(MSG_PIXELPOST_FIRMWARE_UPDATE, controlCb, nullptr);
     gMagiLink.registerCallback(MSG_PIXELPOST_SET_FLASH_CTRL,  controlCb, nullptr);
     gMagiLink.registerCallback(MSG_PIXELPOST_OVERRIDE,        controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_ORGAN,                     controlCb, nullptr);
 
     extern void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* ctx);
     extern void onMagiLinkSaveBody  (const uint8_t* msg, size_t len, void* ctx);
@@ -1389,15 +1538,24 @@ void setup() {
         esp_wifi_get_channel(&prim, &sec);
         Serial.printf("[SETUP-DBG] WiFi channel after setup = %u\n", (unsigned)prim);
     }
+    crashSetBootStep(BS_PIXELPOST);
     extern void pixelpostInit();
     pixelpostInit();
+    crashSetBootStep(BS_PAIRING);
     pairingInit();
+    crashSetBootStep(BS_COMMANDS);
     Serial.println("[SETUP] commandsInit");
     commandsInit();
+    crashSetBootStep(BS_SAMPLE);
     samplePlayerInit();
     sampleManifestSync();
+    crashSetBootStep(BS_SPECTRUM);
     spectrumInit();
+    organInit();
+    sampleOrganInit();
+    crashSetBootStep(BS_SONGLIST);
     loadSongList();
+    loadSampleList();   // so the SAMPLE organ can pick samples without visiting the Samples screen
 
     seqSetRowCallback([](uint8_t pattern, uint8_t row) {
         sPosNotify.pattern = pattern;
@@ -1416,11 +1574,19 @@ void setup() {
         sMidiNoteInNotify.dirty     = true;
     });
 
+    // Live MIDI → drawbar organ (only while the organ screen owns the codec).
+    seqSetMidiRawNoteCallback([](bool on, uint8_t note, uint8_t vel) {
+        if (!organActive()) return;
+        if (on) organNoteOn(note, vel);
+        else    organNoteOff(note);
+    });
+
     seqSetPreviewRowCallback([](uint8_t row) {
         sPreviewRowNotify.row   = row;
         sPreviewRowNotify.dirty = true;
     });
 
+    crashSetBootStep(BS_TASKS);
     xTaskCreatePinnedToCore(
         midiTaskFn,
         "MIDI",
@@ -1432,10 +1598,12 @@ void setup() {
     );
 
     Serial.println("[SETUP] done");
+    crashSetBootStep(BS_UI);
     gLastInputMs = millis();
     fieldFlashScreen();   // dedicated FLASH screen if /firmware/ has a fresh bin
     drawScreen();
     loadSong(cursor);
+    crashSetBootStep(BS_DONE);
 }
 
 void loop() {
@@ -1581,6 +1749,7 @@ void loop() {
     }
 
     if (!pairingIsActive() && gScreen != SCR_CHORD && gScreen != SCR_SCOPE &&
+        gScreen != SCR_ORGAN &&   // organ is driven remotely → never idle-timeout it
         (millis() - gLastInputMs >= TEMPO_IDLE_MS)) {
         enterTempoMode();
         return;
@@ -1631,6 +1800,7 @@ void loop() {
             if      (gScreen == SCR_USB)   pollUsbTouch();
             else if (gScreen == SCR_CHORD) pollChordTouch();
             else if (gScreen == SCR_SCOPE) pollScopeTouch();
+            else if (gScreen == SCR_ORGAN) pollOrganTouch();
             else                           pollListTouch();
         }
     }
@@ -1662,6 +1832,42 @@ void loop() {
             lastFootMs = now;
             drawScopeFooter();
         }
+    }
+
+    // SAMPLE organ: a sample was selected → load + analyse it here (SD-safe,
+    // ~0.2-0.4 s).  The synth plays silence until the frames are ready.
+    {
+        extern volatile int gSampleLoadReq;
+        if (gSampleLoadReq >= 0) {
+            int idx = gSampleLoadReq;
+            gSampleLoadReq = -1;
+            if (numSamples == 0) loadSampleList();   // lazy scan if not done yet
+            Serial.printf("[SAMPORG] select idx=%d of %d samples\n", idx, numSamples);
+            if (idx >= 0 && idx < numSamples) {
+                char path[80];
+                snprintf(path, sizeof(path), "%s/%s", SRV_SAMPLES_DIR, sampleNames[idx]);
+                sampleOrganLoad(path);
+            }
+        }
+    }
+
+    // Remote organ control from the client (applied here, on the loop task).
+    if (gOrganScreenReq) {
+        int req = gOrganScreenReq; gOrganScreenReq = 0;
+        if (req == 1 && gScreen != SCR_ORGAN)      setScreen(SCR_ORGAN);
+        else if (req == 2 && gScreen == SCR_ORGAN) setScreen(SCR_SONGS);
+    }
+    if (gScreen == SCR_ORGAN && gOrganBarDirty) {
+        uint16_t d = gOrganBarDirty; gOrganBarDirty = 0;
+        for (int i = 0; i < ORG_BAR_N; i++) if (d & (1u << i)) drawOrganBar(i);
+    }
+
+    // Organ screen: refresh the header voice-count readout when it changes.
+    if (gScreen == SCR_ORGAN) {
+        static uint32_t lastMs = 0; static int lastV = -1;
+        uint32_t now = millis();
+        int v = organVoiceCount();
+        if (v != lastV && now - lastMs >= 60) { lastV = v; lastMs = now; drawOrganHeader(); }
     }
 
     // Keep the samples row/footer in sync when playback ends on its own.

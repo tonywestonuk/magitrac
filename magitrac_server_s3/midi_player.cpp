@@ -132,6 +132,17 @@ static bool     seqPpPressed[MAX_COLUMNS] = {};
 static uint8_t  seqPpLastEffect[MAX_COLUMNS];   // initialised at sequencerStart
 // MIDI channel (0-based) for each column's active note — needed for correct note-off
 static uint8_t  seqActiveChan[MAX_COLUMNS] = {};
+// Retrigger (ratchet) state per output column.  A note with EFFECT_RTRG fires
+// its first hit at row time (the normal note-on) and then `left` more hits at
+// `intervalMs` spacing, subdividing the row — so "play twice" is two evenly
+// spaced hits across the row.  Cleared by seqNoteOff (the next note/OFF cancels
+// any roll still in flight).
+static uint8_t  seqRetrigLeft[MAX_COLUMNS]       = {};   // hits remaining after the first
+static uint32_t seqRetrigNextMs[MAX_COLUMNS]     = {};
+static uint32_t seqRetrigIntervalMs[MAX_COLUMNS] = {};
+static uint8_t  seqRetrigNote[MAX_COLUMNS]       = {};
+static uint8_t  seqRetrigVel[MAX_COLUMNS]        = {};
+static uint8_t  seqRetrigCh[MAX_COLUMNS]         = {};
 // Per-channel bank/program/volume state — 0xFF = not set (force send on next note)
 static uint8_t  seqChanBank[16];
 static uint8_t  seqChanProg[16];
@@ -148,6 +159,10 @@ static void (*seqStateCallback)(bool playing) = nullptr;
 
 // Optional MIDI-note-in callback — fires when note-on arrives while stopped
 static void (*seqMidiNoteInCallback)(uint8_t midiNote, uint8_t velocity) = nullptr;
+
+// Optional raw note monitor — fires for every live note-on/off on any channel,
+// independent of run state (drawbar organ).  See header.
+static void (*seqRawNoteCallback)(bool on, uint8_t midiNote, uint8_t velocity) = nullptr;
 
 // ── Preview state ─────────────────────────────────────────────────────────────
 // Single-column looping audition for the column-note editor.  Mutually
@@ -266,6 +281,7 @@ static inline const Song* seqSong() {
 #define SAMPLE_ROOT_NOTE 49
 
 static void seqNoteOff(int col) {
+    seqRetrigLeft[col] = 0;            // cancel any ratchet still rolling on this column
     if (seqActiveNote[col] == 0) return;
     if (seqActiveChan[col] == SEQ_CHAN_SFX) {
         samplePlayerStop();
@@ -279,6 +295,38 @@ static void seqNoteOff(int col) {
     seqActiveChan[col] = 0;
 }
 
+// Fire any retrigger hits that have come due.  Each hit is a note-off of the
+// current sounding note immediately followed by a fresh note-on at the same
+// pitch/velocity — a re-articulation, so the column "plays the note again"
+// inside its row.  Runs straight to MIDI (not via seqNoteOff, which would
+// cancel the roll).  Only MIDI output columns arm this (see seqPlayRow).
+static void seqProcessRetrigs(uint32_t now) {
+    for (int col = 1; col < MAX_COLUMNS; col++) {
+        if (seqRetrigLeft[col] == 0) continue;
+        if ((int32_t)(now - seqRetrigNextMs[col]) < 0) continue;
+        // Overdue by more than one interval means the main loop stalled past
+        // this roll's row — drop the remaining hits rather than burst stale
+        // re-articulations after the row is already gone.
+        if ((int32_t)(now - seqRetrigNextMs[col]) > (int32_t)seqRetrigIntervalMs[col]) {
+            seqRetrigLeft[col] = 0;
+            continue;
+        }
+        uint8_t ch   = seqRetrigCh[col];
+        uint8_t note = seqRetrigNote[col];
+        uint8_t vel  = seqRetrigVel[col];
+        seqWriteStatus((uint8_t)(0x80 | ch));
+        midiTx(note);
+        midiTx((uint8_t)0);
+        seqWriteStatus((uint8_t)(0x90 | ch));
+        midiTx(note);
+        midiTx(vel);
+        seqActiveNote[col] = note;
+        seqActiveChan[col] = ch;
+        seqRetrigLeft[col]--;
+        seqRetrigNextMs[col] += seqRetrigIntervalMs[col];
+    }
+}
+
 // Scan the active pattern's circular list from its head and position
 // seqNextNoteIdx at the first node with row >= targetRow.
 // Call whenever seqRow or seqPattern changes discontinuously.
@@ -286,8 +334,15 @@ static void seqReposition(uint8_t targetRow) {
     const Song*    s    = seqSong();
     uint16_t       head = s->patterns[seqPattern].noteHead;
     if (head == NOTE_NULL) { seqNextNoteIdx = NOTE_NULL; return; }
-    uint16_t idx = head;
+    uint16_t idx   = head;
+    uint16_t steps = 0;
     do {
+        // Hardening: a link damaged by a concurrent song write must degrade
+        // to "no notes", never an out-of-pool read or an unbounded walk.
+        if (idx >= MAX_SONG_NOTES || ++steps > MAX_SONG_NOTES) {
+            seqNextNoteIdx = NOTE_NULL;
+            return;
+        }
         if (s->notePool[idx].row >= targetRow) {
             seqNextNoteIdx = idx;
             return;
@@ -305,7 +360,13 @@ static void seqPlayRow() {
 
     // Walk nodes at seqRow in list order (col 0 first, then col 1+).
     // seqNextNoteIdx is already positioned at the first node for this row.
+    uint16_t steps = 0;
     while (seqNextNoteIdx != NOTE_NULL) {
+        // Same hardening as seqReposition: bail on out-of-pool or cyclic links.
+        if (seqNextNoteIdx >= MAX_SONG_NOTES || ++steps > MAX_SONG_NOTES) {
+            seqNextNoteIdx = NOTE_NULL;
+            break;
+        }
         const NoteNode& nn = s->notePool[seqNextNoteIdx];
         if (nn.row != seqRow) break;                    // past this row — stop
 
@@ -474,6 +535,25 @@ static void seqPlayRow() {
             midiTx(noteVel);
             seqActiveNote[col] = midiNote;
             seqActiveChan[col] = midiCh;
+
+            // Retrigger: subdivide the row into `hits` evenly spaced
+            // re-articulations.  Interval is anchored to the current row
+            // duration at trigger time; later tempo changes don't reshape an
+            // in-flight roll.  seqNoteOff (next note/OFF) cancels it.
+            if (nn.effect == EFFECT_RTRG) {
+                uint8_t  hits  = retrigHits(nn.param);
+                uint8_t  speed = s->speed > 0 ? s->speed : 6;
+                uint16_t bpm   = seqCurrentBPM > 0 ? seqCurrentBPM : 100;
+                uint32_t rowMs = (uint32_t)speed * 2500UL / bpm;
+                uint32_t interval = rowMs / hits;
+                if (interval < 5) interval = 5;   // floor: never machine-gun
+                seqRetrigLeft[col]       = (uint8_t)(hits - 1);
+                seqRetrigIntervalMs[col] = interval;
+                seqRetrigNextMs[col]     = millis() + interval;
+                seqRetrigNote[col]       = midiNote;
+                seqRetrigVel[col]        = noteVel;
+                seqRetrigCh[col]         = midiCh;
+            }
         } else {
             // NOTE_EMPTY — only meaningful on PIXELPOST columns: velocity-only
             // rows fire MSG_SLIDER, attribute-only rows fire MSG_MOVE.  Both
@@ -785,7 +865,7 @@ static void seqOnPerformerNote(uint8_t midiNote) {
 }
 
 // ── MIDI input polling ────────────────────────────────────────────────────────
-void sequencerPollMidiIn() {
+static void sequencerPollMidiInBody() {
     // Test mode — inject perfectly timed C-4 notes
     if (seqTestMode && seqRunning) {
         uint32_t now = millis();
@@ -820,6 +900,8 @@ void sequencerPollMidiIn() {
             } else {
                 uint8_t velocity = b;
                 midiCount = 0;
+                // Raw monitor first — sees every note on any channel (organ).
+                if (seqRawNoteCallback) seqRawNoteCallback(velocity > 0, midiByte1, velocity);
                 if (velocity >= 20) {
                     const Song* s = seqSong();
                     uint8_t ch = midiStatus & 0x0F;  // 0-based channel
@@ -840,7 +922,13 @@ void sequencerPollMidiIn() {
                 }
             }
         } else if ((midiStatus & 0xF0) == 0x80) {
-            midiCount = (midiCount == 0) ? 1 : 0;
+            if (midiCount == 0) {
+                midiByte1 = b;       // note number
+                midiCount = 1;
+            } else {
+                midiCount = 0;       // velocity byte — message complete
+                if (seqRawNoteCallback) seqRawNoteCallback(false, midiByte1, 0);
+            }
         }
     }
 }
@@ -1368,7 +1456,7 @@ void sequencerUnpause() {
     debugPrintf("[SEQ] unpause t=%lu\n", millis());
 }
 
-void sequencerTick() {
+static void sequencerTickBody() {
     // Audition timeout — fires regardless of play / preview state, so a
     // stranded audition note never sits on indefinitely.
     if (seqAuditionCol != 0xFF && (int32_t)(millis() - seqAuditionEndMs) >= 0) {
@@ -1376,6 +1464,10 @@ void sequencerTick() {
         seqAuditionCol = 0xFF;
         seqOutStatus = 0;
     }
+
+    // Retrigger rolls run off the row clock — service them every loop while the
+    // sequencer is live so a roll finishes even between row boundaries.
+    if (seqRunning && !seqPaused && srvHasActive) seqProcessRetrigs(millis());
 
     if (seqPreview) {
         if (!srvHasActive) return;
@@ -1506,6 +1598,30 @@ void sequencerTick() {
     if ((int32_t)(after - seqNextRowMs) > (int32_t)rowMs) seqNextRowMs = after;
 }
 
+// Both loop-task song walkers run under a busy flag.  The srvHasActive /
+// seqRunning guards only protect walks that haven't started; a walk already
+// in flight can be parked in a midiTx FIFO wait for several ms.  Cross-task
+// writers (the MagiLink song-push receive) must wait for this flag to clear
+// after dropping the guards, BEFORE overwriting srvActiveBuf — see
+// onMagiLinkSaveHeader in commands_server.ino.
+static volatile bool seqLoopWalkerBusy = false;
+
+void sequencerTick() {
+    seqLoopWalkerBusy = true;
+    sequencerTickBody();
+    seqLoopWalkerBusy = false;
+}
+
+void sequencerPollMidiIn() {
+    seqLoopWalkerBusy = true;
+    sequencerPollMidiInBody();
+    seqLoopWalkerBusy = false;
+}
+
+bool sequencerSongReaderBusy() {
+    return seqLoopWalkerBusy;
+}
+
 void seqSetRowCallback(void (*cb)(uint8_t pattern, uint8_t row)) {
     seqRowCallback = cb;
 }
@@ -1516,6 +1632,10 @@ void seqSetStateCallback(void (*cb)(bool playing)) {
 
 void seqSetMidiNoteInCallback(void (*cb)(uint8_t midiNote, uint8_t velocity)) {
     seqMidiNoteInCallback = cb;
+}
+
+void seqSetMidiRawNoteCallback(void (*cb)(bool on, uint8_t midiNote, uint8_t velocity)) {
+    seqRawNoteCallback = cb;
 }
 
 void seqSetPreviewRowCallback(void (*cb)(uint8_t row)) {

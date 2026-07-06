@@ -39,6 +39,15 @@ struct NoteNode {
 #define EFFECT_WAT2 0x11 // column-0 effect: WAIT variant with 2 s timeout
 #define IS_WAIT_EFFECT(e) ((e) == EFFECT_WAIT || (e) == EFFECT_WAT1 || (e) == EFFECT_WAT2)
 #define EFFECT_PASA 0x12 // column-0 effect: PASS-All — absorbs every matching note until playhead passes
+#define EFFECT_RTRG 0x1B // MIDI output-col effect: retrigger — replay the note within its own row.
+                         // param = total hit count (0/1 → 2 = "play twice"); clamped to 2..8.
+                         // SFX / pixel_post columns ignore it.
+
+// How many times a retrigger note fires across its row (default 2 = play twice).
+inline uint8_t retrigHits(uint8_t param) {
+    uint8_t h = (param < 2) ? 2 : param;
+    return (h > 8) ? 8 : h;
+}
 
 // Block-end navigation — stored in Pattern::blockEndNav as xxyyyyyy
 //   xx = mode:  00=loop, 01=forward, 10=backward, 11=absolute

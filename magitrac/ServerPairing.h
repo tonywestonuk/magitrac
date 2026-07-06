@@ -210,6 +210,10 @@ public:
     bool sendPixelpostFirmwareUpdate();
     bool sendPixelpostFlashCtrl     (uint8_t value);
 
+    // ── Drawbar organ ─────────────────────────────────────────────────────────
+    // op = OrganOp (ENTER / EXIT / SET).  index/value only used for SET.
+    bool sendOrgan(uint8_t op, uint8_t index = 0, uint8_t value = 0);
+
     // ── Sequencer position (received from server) ─────────────────────────────
     bool remoteSeqPos(uint8_t* pattern, uint8_t* row);
 
