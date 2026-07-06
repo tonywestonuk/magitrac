@@ -9,6 +9,14 @@
 
 class MagiCommsEspNow : public MagiCommsTransport {
 public:
+    // Coexist mode: when true, begin() does not touch WiFi mode, channel,
+    // or protocol — it assumes the WiFi stack is already up (typically
+    // because the magitrac client's softAP is running).  Only
+    // esp_now_init() and the recv/send callbacks are wired up.  Used on
+    // the client where ESP-NOW serves only the pairing ceremony while
+    // MagiLink runs the data path.  Call before begin().
+    void setCoexistMode(bool yes) { _coexist = yes; }
+
     bool   begin() override;
     bool   sendRaw(const void* data, size_t len) override;
     bool   sendBroadcast(const void* data, size_t len) override;
@@ -26,4 +34,5 @@ public:
 private:
     uint8_t _peerMac[6] = {};
     bool    _hasPeer   = false;
+    bool    _coexist   = false;
 };

@@ -2,10 +2,12 @@
 #include "SettingsPage.h"   // for gMaxBank, gMaxProgram
 #include "NoteGrid.h"
 #include "ServerPairing.h"  // for gServerPairing — sample list fetch
+#include "DrumKits.h"       // for the channel-10 KIT selector
 #include <string.h>
 
 static inline bool isSfx(uint8_t ch) { return ch == SFX_CHANNEL; }
 static inline bool isPxl(uint8_t ch) { return ch == PIXELPOST_CHANNEL; }
+static inline bool isDrums(uint8_t ch) { return ch == DRUM_MIDI_CHANNEL; }
 
 // Strip ".wav" suffix and truncate to fit the column NAME field.
 static void copySampleNameToCol(const char* fname, char* nameField) {
@@ -56,6 +58,7 @@ void ColumnEditor::open(uint8_t patternIdx, uint8_t col) {
     _actionDst     = 0;
     _resyncMask    = 0;
     _pressedOnName = false;
+    _importRequested = false;
     // If the column is on SFX, trigger a sample-list refresh now so the
     // picker / PROG +/- has fresh data by the time the user reaches them.
     // Spec: refresh every time the editor sees an SFX column.
@@ -90,6 +93,8 @@ void ColumnEditor::drawHeader() {
 
 void ColumnEditor::fieldLabel(int field, char* out) const {
     static const char* labels[] = { "MIDI CH", "BANK", "PROGRAM", "VOLUME", "TRANSPOSE", "NAME" };
+    // On the drum channel the program field is a kit picker.
+    if (field == 2 && isDrums(_song.columns[_col].midiChannel)) { strcpy(out, "KIT"); return; }
     strcpy(out, labels[field]);
 }
 
@@ -106,12 +111,15 @@ void ColumnEditor::fieldValue(int field, char* out) const {
             if (isSfx(c.midiChannel) || isPxl(c.midiChannel)) strcpy(out, "--");
             else                                              snprintf(out, 16, "%d", c.bankMSB + 1);
             break;
-        case 2:  // PROGRAM — on SFX shows sample id (0 = none); PXL has none
+        case 2:  // PROGRAM — SFX shows sample id (0 = none); PXL none; drums show kit
             if (isSfx(c.midiChannel)) {
                 if (c.program == 0) strcpy(out, "--");
                 else                snprintf(out, 16, "%d", c.program);
             } else if (isPxl(c.midiChannel)) {
                 strcpy(out, "--");
+            } else if (isDrums(c.midiChannel)) {
+                int k = drumKitIndexForProgram(c.program);
+                strcpy(out, DRUM_KITS[k < 0 ? 0 : k].name);
             } else {
                 snprintf(out, 16, "%d", c.program + 1);
             }
@@ -162,8 +170,9 @@ void ColumnEditor::drawFieldRow(int field) {
             uiButton(_d, CE_MINUS_X, btnY, CE_BTN_W, CE_BTN_H, "-", COL_WHITE, COL_BLACK, 3);
             uiButton(_d, CE_PLUS_X,  btnY, CE_BTN_W, CE_BTN_H, "+", COL_WHITE, COL_BLACK, 3);
         }
-    } else if (!pxl) {
-        // PXL has no instrument/sample picker — name is fixed to "PIXEL POST".
+    } else if (!pxl && !isDrums(_song.columns[_col].midiChannel)) {
+        // PXL has no picker (name fixed to "PIXEL POST"); drums pick a kit via
+        // the KIT field, not the melodic instrument library.
         const char* pickLabel = sfx ? "PICK SAMPLE" : "PICK INSTR";
         uiButton(_d, CE_PICK_X, btnY, CE_PICK_W, CE_BTN_H,
                  pickLabel, COL_WHITE, COL_BLACK, 2);
@@ -322,16 +331,18 @@ void ColumnEditor::drawActionBar() {
     _d.drawFastHLine(0, CE_ACT_Y, CE_W, COL_LTGREY);
 
     char clearLabel[20], copyLabel[20], swapLabel[20];
-    snprintf(clearLabel, sizeof(clearLabel), "CLEAR COL %d",   _col + 1);
-    snprintf(copyLabel,  sizeof(copyLabel),  "COPY COL %d TO...", _col + 1);
-    snprintf(swapLabel,  sizeof(swapLabel),  "SWAP COL %d WITH...", _col + 1);
+    snprintf(clearLabel, sizeof(clearLabel), "CLEAR %d", _col + 1);
+    snprintf(copyLabel,  sizeof(copyLabel),  "COPY %d TO...", _col + 1);
+    snprintf(swapLabel,  sizeof(swapLabel),  "SWAP %d WITH...", _col + 1);
 
-    uiButton(_d, CE_CLEAR_X, btnY, CE_CLEAR_W, CE_ACT_BTN_H,
-             clearLabel, COL_WHITE, COL_BLACK, 2);
-    uiButton(_d, CE_COPY_X,  btnY, CE_COPY_W,  CE_ACT_BTN_H,
-             copyLabel,  COL_WHITE, COL_BLACK, 2);
-    uiButton(_d, CE_SWAP_X,  btnY, CE_SWAP_W,  CE_ACT_BTN_H,
-             swapLabel,  COL_WHITE, COL_BLACK, 2);
+    uiButton(_d, CE_CLEAR_X,  btnY, CE_CLEAR_W,  CE_ACT_BTN_H,
+             clearLabel,    COL_WHITE, COL_BLACK, 2);
+    uiButton(_d, CE_COPY_X,   btnY, CE_COPY_W,   CE_ACT_BTN_H,
+             copyLabel,     COL_WHITE, COL_BLACK, 2);
+    uiButton(_d, CE_SWAP_X,   btnY, CE_SWAP_W,   CE_ACT_BTN_H,
+             swapLabel,     COL_WHITE, COL_BLACK, 2);
+    uiButton(_d, CE_IMPORT_X, btnY, CE_IMPORT_W, CE_ACT_BTN_H,
+             "IMPORT DRUMS", COL_WHITE, COL_BLACK, 2);
 }
 
 // ── Column-picker overlay (COPY/SWAP destination) ────────────────────────────
@@ -490,7 +501,7 @@ void ColumnEditor::doCopyColumn(uint8_t srcCol, uint8_t dstCol) {
         }
     }
 
-    _resyncMask |= (uint16_t)(1u << dstCol);
+    _resyncMask |= (1u << dstCol);
 }
 
 void ColumnEditor::doSwapColumn(uint8_t a, uint8_t b) {
@@ -514,7 +525,7 @@ void ColumnEditor::doSwapColumn(uint8_t a, uint8_t b) {
         }
     }
 
-    _resyncMask |= (uint8_t)((1u << a) | (1u << b));
+    _resyncMask |= ((1u << a) | (1u << b));
 }
 
 void ColumnEditor::doClearColumn(uint8_t col) {
@@ -533,7 +544,7 @@ void ColumnEditor::doClearColumn(uint8_t col) {
         }
     }
 
-    _resyncMask |= (uint8_t)(1u << col);
+    _resyncMask |= (1u << col);
 }
 
 // ── Field adjustment ─────────────────────────────────────────────────────────
@@ -547,7 +558,13 @@ void ColumnEditor::adjustField(int field, int delta) {
             if (v > PIXELPOST_CHANNEL) v = PIXELPOST_CHANNEL;
             bool enteredSfx = (v == SFX_CHANNEL       && c.midiChannel != SFX_CHANNEL);
             bool enteredPxl = (v == PIXELPOST_CHANNEL && c.midiChannel != PIXELPOST_CHANNEL);
+            bool enteredDrums = (v == DRUM_MIDI_CHANNEL && c.midiChannel != DRUM_MIDI_CHANNEL);
             c.midiChannel = (uint8_t)v;
+            // Entering the drum channel — snap PROGRAM onto a real kit slot so
+            // the KIT field shows a valid kit instead of an arbitrary patch.
+            if (enteredDrums && drumKitIndexForProgram(c.program) < 0) {
+                c.program = DRUM_KITS[drumKitNearestIndex(c.program)].program;
+            }
             // First entry into SFX — start fetching the sample list so the
             // picker has something to show.
             if (enteredSfx && gServerPairing.isPaired()) {
@@ -567,8 +584,18 @@ void ColumnEditor::adjustField(int field, int delta) {
             c.bankMSB = (uint8_t)constrain(v, 0, (int)gMaxBank);
             break;
         }
-        case 2: {  // PROGRAM — locked on PXL
+        case 2: {  // PROGRAM — locked on PXL; KIT picker on drums; sample on SFX
             if (isPxl(c.midiChannel)) return;
+            if (isDrums(c.midiChannel)) {
+                // Cycle the SAM2695's populated kit slots.  The gMaxProgram
+                // limit is a melodic-patch guard and doesn't apply here.
+                int idx = drumKitIndexForProgram(c.program);
+                if (idx < 0) idx = drumKitNearestIndex(c.program);
+                idx += (delta > 0) ? 1 : -1;
+                idx = constrain(idx, 0, DRUM_KIT_COUNT - 1);
+                c.program = DRUM_KITS[idx].program;
+                break;
+            }
             if (isSfx(c.midiChannel)) {
                 // Walk through the cached sample list by index.  PROG holds
                 // the manifest id; PROG=0 = "no sample".  Map current id to
@@ -906,8 +933,8 @@ bool ColumnEditor::poll() {
         return false;
     }
 
-    // PICK INSTRUMENT / SAMPLE button — no picker on PXL.
-    if (!isPxl(cs().midiChannel) &&
+    // PICK INSTRUMENT / SAMPLE button — no picker on PXL or drums (kit picker).
+    if (!isPxl(cs().midiChannel) && !isDrums(cs().midiChannel) &&
         ty >= CE_PICK_Y && ty < CE_PICK_Y + CE_PICK_H) {
         if (tx >= CE_PICK_X && tx < CE_PICK_X + CE_PICK_W) {
             _pickPage = 0;
@@ -946,6 +973,13 @@ bool ColumnEditor::poll() {
             drawColumnPicker();
             _d.paint();
             return false;
+        }
+        if (tx >= CE_IMPORT_X && tx < CE_IMPORT_X + CE_IMPORT_W) {
+            // Signal to the outer page loop that the user wants to leave
+            // this editor and open the drum-track import flow.  The .ino
+            // observes _importRequested after poll() returns true.
+            _importRequested = true;
+            return true;
         }
     }
 

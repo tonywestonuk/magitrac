@@ -60,30 +60,33 @@ static const int CE_LIST_PREV_X = 0;
 static const int CE_LIST_NEXT_X = CE_W - 130;
 static const int CE_LIST_NAV_W  = 130;
 
-// Action bar (bottom): CLEAR / COPY / SWAP buttons
+// Action bar (bottom): CLEAR / COPY / SWAP / IMPORT buttons (4 across)
 static const int CE_ACT_Y       = 428;
 static const int CE_ACT_H       = 60;
 static const int CE_ACT_BTN_H   = 50;
 static const int CE_CLEAR_X     = 10;
-static const int CE_CLEAR_W     = 290;
-static const int CE_COPY_X      = 320;
-static const int CE_COPY_W      = 300;
-static const int CE_SWAP_X      = 640;
-static const int CE_SWAP_W      = 310;
+static const int CE_CLEAR_W     = 220;
+static const int CE_COPY_X      = 240;
+static const int CE_COPY_W      = 220;
+static const int CE_SWAP_X      = 470;
+static const int CE_SWAP_W      = 220;
+static const int CE_IMPORT_X    = 700;
+static const int CE_IMPORT_W    = 250;
 
 // Column-picker overlay (for COPY/SWAP destination)
-// Buttons for cols 1..MAX_COLUMNS-1 in a 4×N grid (col 0 is INPUT, excluded)
-static const int CE_PICKCOL_TITLE_Y  = 80;
-static const int CE_PICKCOL_TITLE_H  = 50;
-static const int CE_PICKCOL_GRID_Y   = 150;
-static const int CE_PICKCOL_BTN_W    = 220;
-static const int CE_PICKCOL_BTN_H    = 100;
+// Buttons for cols 1..MAX_COLUMNS-1 in a 5-wide grid (col 0 is INPUT, excluded).
+// With MAX_COLUMNS=21, that's 20 buttons in 4 rows.
+static const int CE_PICKCOL_TITLE_Y  = 60;
+static const int CE_PICKCOL_TITLE_H  = 40;
+static const int CE_PICKCOL_GRID_Y   = 115;
+static const int CE_PICKCOL_BTN_W    = 180;
+static const int CE_PICKCOL_BTN_H    = 70;
 static const int CE_PICKCOL_GAP      = 10;
-static const int CE_PICKCOL_COLS     = 4;     // buttons per row in grid
-static const int CE_PICKCOL_X0       = 25;    // left margin: 25 + 4*(220+10) = 945
-static const int CE_PICKCOL_CANCEL_Y = 410;
+static const int CE_PICKCOL_COLS     = 5;     // buttons per row in grid
+static const int CE_PICKCOL_X0       = 10;    // left margin: 10 + 5*(180+10) - 10 = 950
+static const int CE_PICKCOL_CANCEL_Y = 460;
 static const int CE_PICKCOL_CANCEL_W = 240;
-static const int CE_PICKCOL_CANCEL_H = 70;
+static const int CE_PICKCOL_CANCEL_H = 60;
 
 // Copy confirm dialog
 static const int CE_CONF_TITLE_Y = 120;
@@ -112,8 +115,14 @@ public:
     // After COPY/SWAP, returns a bitmask of column indices that need full
     // (settings + notes across all patterns) resync to the server.  Caller
     // dispatches the syncing and then calls clearResync().
-    uint16_t resyncMask() const { return _resyncMask; }
+    uint32_t resyncMask() const { return _resyncMask; }
     void     clearResync()      { _resyncMask = 0; }
+
+    // Set when the user taps IMPORT DRUMS in the action bar.  The page
+    // closes (poll() returns true); the caller checks this flag and opens
+    // DrumTrackImportPage with the current pattern + cursor column.
+    bool importRequested() const { return _importRequested; }
+    void clearImportRequest()    { _importRequested = false; }
 
 private:
     EPD_PainterAdafruit& _d;
@@ -142,7 +151,8 @@ private:
     };
     Action   _action;
     uint8_t  _actionDst;    // remembered destination column for CONFIRM_COPY
-    uint16_t _resyncMask;   // bits of columns whose settings + notes need resync
+    uint32_t _resyncMask;   // bits of columns whose settings + notes need resync
+    bool     _importRequested = false;
     bool     _pressedOnName; // true if last touch-down landed in the NAME row
                              // (gates the falling-edge keyboard popup so other
                              //  overlays' YES/NO buttons don't trigger it)

@@ -97,14 +97,17 @@ static const int BSP_KCH_Y       = 420;
 static const int BSP_KCH_H       = 52;
 static const int BSP_KCH_SPOS_X  = 160; static const int BSP_KCH_SPOS_W  = 170;
 static const int BSP_KCH_TOP_X   = 340; static const int BSP_KCH_TOP_W   = 100;
+// Drum-Editor button sits on the same row, well separated from KEY-CHG.
+static const int BSP_KCH_DRUM_X  = 600; static const int BSP_KCH_DRUM_W  = 320;
 
-// End-navigation row (block-end behaviour: loop/fwd/back/abs)
+// End-navigation row (block-end behaviour: loop/fwd/back/abs/rnt)
 static const int BSP_END_Y       = 472;
 static const int BSP_END_H       = 68;
-static const int BSP_END_LOOP_X  = 160; static const int BSP_END_LOOP_W  = 100;
-static const int BSP_END_FWD_X   = 260; static const int BSP_END_FWD_W   = 100;
-static const int BSP_END_BACK_X  = 360; static const int BSP_END_BACK_W  = 100;
-static const int BSP_END_ABS_X   = 460; static const int BSP_END_ABS_W   = 100;
+static const int BSP_END_LOOP_X  = 160; static const int BSP_END_LOOP_W  = 80;
+static const int BSP_END_FWD_X   = 240; static const int BSP_END_FWD_W   = 80;
+static const int BSP_END_BACK_X  = 320; static const int BSP_END_BACK_W  = 80;
+static const int BSP_END_ABS_X   = 400; static const int BSP_END_ABS_W   = 80;
+static const int BSP_END_RNT_X   = 480; static const int BSP_END_RNT_W   = 80;
 static const int BSP_END_MINUS_X = 600; static const int BSP_END_ARROW_W = 70;
 static const int BSP_END_VAL_X   = 670; static const int BSP_END_VAL_W   = 90;
 static const int BSP_END_PLUS_X  = 760;
@@ -131,10 +134,17 @@ private:
     bool    _confirmSplit;     // true while waiting for split confirmation
     bool    _didDuplicate;    // set when a duplicate was performed this session
     bool    _didSplit;        // set when a split was performed this session
+    // Set by any structural mutation (delete / new / duplicate / length /
+    // inputNote edits) that isn't covered by an inline patch path.  Browse-and-
+    // exit must NOT fire a full song push — the push routes through
+    // MSG_SAVE_SONG_HEADER which calls sequencerStop() on the server, killing
+    // playback mid-song.
+    bool    _didStructuralChange;
     bool    _keyChangePending; // set when keyChangeMode is changed — caller should patch server
     uint8_t _keyChangePat;    // pattern index that was changed
     bool    _navChangePending; // set when blockEndNav is changed
     uint8_t _navChangePat;     // pattern index that was changed
+    bool    _openDrum;         // Drum-Editor button tapped — caller routes
 
     // Hold-to-set-all state for transpose buttons
     uint8_t  _holdTrpBtn;     // 0=none, 1=KEEP held, 2=NOTE held
@@ -171,6 +181,13 @@ public:
     bool didSplit()     const { return _didSplit; }
     void clearSplit()         { _didSplit = false; }
 
+    // True if any structural mutation has occurred (delete / new / duplicate /
+    // length / inputNote edits) — caller pushes full song on HOME exit, which
+    // unavoidably stops the server's sequencer.  Without this guard, every
+    // browse-and-exit kills playback.
+    bool didStructuralChange() const { return _didStructuralChange; }
+    void clearStructuralChange()     { _didStructuralChange = false; }
+
     // True if keyChangeMode was changed — caller should patch server immediately
     bool    keyChangePending() const { return _keyChangePending; }
     uint8_t keyChangePat()     const { return _keyChangePat; }
@@ -180,4 +197,10 @@ public:
     bool    navChangePending() const { return _navChangePending; }
     uint8_t navChangePat()     const { return _navChangePat; }
     void    clearNavChange()         { _navChangePending = false; }
+
+    // True if the Drum-Editor button was tapped — caller routes to that page
+    // instead of returning to the tracker after poll() returns true.
+    bool    drumEditorRequested() const { return _openDrum; }
+    void    clearDrumEditor()           { _openDrum = false; }
+    uint8_t patIdx()              const { return _patIdx; }
 };

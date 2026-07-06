@@ -5,7 +5,7 @@
 
 #define MAX_PATTERNS      50
 #define MAX_ROWS          64
-#define MAX_COLUMNS        9   // 1 input (col 0) + 8 outputs (cols 1..8)
+#define MAX_COLUMNS       21   // 1 input (col 0) + 20 outputs (cols 1..20)
 #define MAX_SONG_NOTES  4000   // sparse pool shared across all patterns
 #define MAX_INSTRUMENTS  256
 #define INSTRUMENT_NAME_LEN 12  // 11 chars + null
@@ -32,18 +32,37 @@ struct NoteNode {
 #define NOTE_OFF    0xFF // silence: sends note-off on the column, no note-on
 #define NOTE_ANY    0xFE // col-0: WAIT/SYNC triggers on any performed note
 #define NOTE_MAX    96   // B-7
+#define EFFECT_AVRG 0x0D // column-0 effect: at row-fire, set BPM to mean of last 4 WAIT-derived BPMs
 #define EFFECT_SYNC 0x0E // column-0 effect: snap to this row when performer plays matching note
-#define EFFECT_WAIT 0x0F // column-0 effect: snap AND halt until performer plays matching note
+#define EFFECT_WAIT 0x0F // column-0 effect: snap AND halt until performer plays matching note (500 ms timeout)
+#define EFFECT_WAT1 0x10 // column-0 effect: WAIT variant with 1 s timeout
+#define EFFECT_WAT2 0x11 // column-0 effect: WAIT variant with 2 s timeout
+#define IS_WAIT_EFFECT(e) ((e) == EFFECT_WAIT || (e) == EFFECT_WAT1 || (e) == EFFECT_WAT2)
+#define EFFECT_PASA 0x12 // column-0 effect: PASS-All — absorbs every matching note until playhead passes
+#define EFFECT_RTRG 0x1B // MIDI output-col effect: retrigger — replay the note within its own row.
+                         // param = total hit count (0/1 → 2 = "play twice"); clamped to 2..8.
+                         // SFX / pixel_post columns ignore it.
+
+// How many times a retrigger note fires across its row (default 2 = play twice).
+inline uint8_t retrigHits(uint8_t param) {
+    uint8_t h = (param < 2) ? 2 : param;
+    return (h > 8) ? 8 : h;
+}
 
 // Block-end navigation — stored in Pattern::blockEndNav as xxyyyyyy
 //   xx = mode:  00=loop, 01=forward, 10=backward, 11=absolute
 //   yyyyyy = target (0–63), meaning depends on mode
+// Special whole-byte sentinel NAV_RNT means "return to whichever block last
+// passed control to this one" (subroutine-style).  Encoded as 0x3F so it
+// occupies an otherwise unused combination (LOOP ignores its target field,
+// so a non-zero target with mode==LOOP can only happen via NAV_RNT).
 #define NAV_MODE_MASK   0xC0
 #define NAV_TARGET_MASK 0x3F
 #define NAV_LOOP        0x00  // 00: loop current pattern
 #define NAV_FWD         0x40  // 01: jump forward by y patterns
 #define NAV_BACK        0x80  // 10: jump backward by y patterns
 #define NAV_ABS         0xC0  // 11: absolute jump to pattern y
+#define NAV_RNT         0x3F  // sentinel: return to the calling block
 
 // ── Structs ──────────────────────────────────────────────────────────────────
 
@@ -169,8 +188,9 @@ struct Song {
     uint8_t    midiInNoteMin;      // lowest accepted MIDI note, 0–127
     uint8_t    midiInNoteMax;      // highest accepted MIDI note, 0–127
     uint8_t    performerMask;      // bits 0-3: MIDI channels 1-4 driven by performer keyboard
+    uint16_t   transposeChMask;    // bit n = MIDI channel (n+1) follows performer transpose; default 0xFDFF (all except ch 10)
     PerfPadConfig perfPads[PERF_PAD_COUNT];  // performance mode pad config
-    uint8_t    _songPad[3];        // reserved, write as 0
+    uint8_t    _songPad[1];        // reserved, write as 0
 };
 
 // ── Helper functions ──────────────────────────────────────────────────────────
@@ -225,10 +245,10 @@ struct SerializedNote {
     uint8_t param;
 };
 
-// .mgt file layout (v17 compact):
+// .mgt file layout (v18 compact):
 //   [ SongFileHeader              ]  (8 bytes)
 //   [ Pattern x MAX_PATTERNS      ]  (72 x 50 = 3600 bytes; noteHead ignored on load)
-//   [ ColumnSettings x MAX_COLUMNS ] (20 x 9 = 180 bytes; per-song column config)
+//   [ ColumnSettings x MAX_COLUMNS ] (20 x 21 = 420 bytes; per-song column config)
 //   [ Song tail                   ]  (numPatterns ... _songPad)
 //   [ uint16_t noteCount          ]  (2 bytes)
 //   [ SerializedNote x noteCount  ]  (7 bytes each)
@@ -239,7 +259,7 @@ struct SerializedNote {
 // or when MAX_COLUMNS changes (it sizes Song::columns).
 
 #define SONG_FILE_MAGIC   0x4D414754UL   // "MAGT" as uint32
-#define SONG_FILE_VERSION 17
+#define SONG_FILE_VERSION 19
 
 struct SongFileHeader {
     uint32_t magic;    // must equal SONG_FILE_MAGIC

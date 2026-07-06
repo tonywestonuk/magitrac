@@ -1,8 +1,8 @@
 #include "SongPage.h"
 #include "ServerPairing.h"
 #include "SongSource.h"
+#include "Autosave.h"
 #include <Arduino.h>
-#include <SD.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -17,53 +17,41 @@ SongPage::SongPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song)
     , _keyboard(display, touch)
     , _dialog(display, touch)
     , _browser(display, touch)
-    , _state(State::FILE_BROWSE)
-    , _sdAvailable(false)
+    , _state(State::NOT_CONNECTED)
     , _wasDown(false)
-    , _pendingDeleteIdx(-1)
-    , _fileCount(0)
-    , _filePage(0)
     , _srvPage(0)
     , _srvListDrawn(false)
-    , _srvPendingDeleteIdx(-1)
 {
-    _loadedFilename[0]  = '\0';
-    _srvLoadedName[0]   = '\0';
-    _pendingSaveName[0] = '\0';
+    _loadedFilename[0]       = '\0';
+    _srvLoadedName[0]        = '\0';
+    _pendingSaveName[0]      = '\0';
+    _srvPendingDeleteName[0] = '\0';
 }
 
 // ── open() ────────────────────────────────────────────────────────────────────
 
-void SongPage::open(bool sdAvailable) {
-    _sdAvailable = sdAvailable;
-    _filePage    = 0;
-    _wasDown     = _touch.isTouched;
+void SongPage::open() {
+    _wasDown = _touch.isTouched;
     // Do NOT clear _loadedFilename — preserves current file across opens.
 
-    if (sdAvailable && !SD.exists(SONGS_DIR)) {
-        SD.mkdir(SONGS_DIR);
-    }
-
     if (gServerPairing.isPaired()) {
-        // Connected to server — open server browser directly
+        // Connected to server — open server browser directly.  The server list
+        // is a drag-scroll list that accumulates every page into one list.
         gServerPairing.resetBrowse();
         gServerPairing.requestSongList(0);
         _srvPage      = 0;
         _srvListDrawn = false;
         _state = State::SERVER_BROWSE;
         _browser.open();
+        _browser.setListMode(true);
         _browser.setTitle("SERVER");
         _browser.setLoadedName(_srvLoadedName);
-        _browser.setHasPrev(false);
-        _browser.setHasNext(false);
         _browser.clearItems();
         _browser.setStatusText("Loading...");
     } else {
-        // Not connected — open SD card browser directly
-        loadFileList();
-        populateBrowserFromSD();
-        _state = State::FILE_BROWSE;
-        _browser.open();
+        // Not connected — the client is server-only, so there's nothing to
+        // browse locally.  Show a notice prompting the user to pair.
+        _state = State::NOT_CONNECTED;
     }
 }
 
@@ -71,21 +59,33 @@ void SongPage::open(bool sdAvailable) {
 
 void SongPage::draw() {
     switch (_state) {
-        case State::FILE_BROWSE:
         case State::SERVER_BROWSE:
             _browser.draw();
             break;
-        case State::SAVING_AS:
         case State::SAVING_AS_SRV:
+        case State::NAMING_NEW:
             _browser.draw();
             _keyboard.draw();
             break;
-        case State::CONFIRM_OVERWRITE:
-        case State::CONFIRM_DELETE:
         case State::CONFIRM_DELETE_SRV:
+        case State::CONFIRM_SAVE_LOAD:
+        case State::CONFIRM_NEW_EXISTS:
             _browser.draw();
             _dialog.draw();
             break;
+        case State::NOT_CONNECTED: {
+            drawHeader("SONGS", 50);
+            _d.setTextSize(3);
+            _d.setTextColor(COL_BLACK);
+            const char* l1 = "Not connected.";
+            const char* l2 = "Pair to a server to load songs.";
+            _d.setCursor((960 - (int)strlen(l1) * 18) / 2, 210);
+            _d.print(l1);
+            _d.setCursor((960 - (int)strlen(l2) * 18) / 2, 260);
+            _d.print(l2);
+            uiButton(_d, 0, 483, 160, 57, "BACK", COL_BLACK, COL_WHITE, 3);
+            break;
+        }
     }
 }
 
@@ -93,18 +93,18 @@ void SongPage::draw() {
 
 SongPageResult SongPage::poll() {
 
-    // ── CONFIRM_DELETE ────────────────────────────────────────────────────────
-    if (_state == State::CONFIRM_DELETE) {
-        if (_dialog.poll()) {
-            if (_dialog.confirmed() && _pendingDeleteIdx >= 0) {
-                doDelete(_pendingDeleteIdx);
-                _pendingDeleteIdx = -1;
-                populateBrowserFromSD();
+    // ── NOT_CONNECTED — server-only notice; the BACK button returns home ──────
+    if (_state == State::NOT_CONNECTED) {
+        if (_touch.read()) {
+            bool down = _touch.isTouched;
+            int sx, sy;
+            rawToScreen(_touch.x, _touch.y, sx, sy);
+            if (!down && _wasDown) {
+                _wasDown = false;
+                if (sx >= 0 && sx < 160 && sy >= 483) return SongPageResult::HOME;
+            } else if (down && !_wasDown) {
+                _wasDown = true;
             }
-            _state = State::FILE_BROWSE;
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _d.paintLater();
         }
         return SongPageResult::NONE;
     }
@@ -112,19 +112,15 @@ SongPageResult SongPage::poll() {
     // ── CONFIRM_DELETE_SRV ────────────────────────────────────────────────────
     if (_state == State::CONFIRM_DELETE_SRV) {
         if (_dialog.poll()) {
-            if (_dialog.confirmed() && _srvPendingDeleteIdx >= 0) {
-                const char* name = gServerPairing.listName(_srvPendingDeleteIdx);
-                if (name && name[0] != '\0') {
-                    gServerPairing.deleteSongOnServer(name);
-                    if (_srvLoadedName[0] != '\0' &&
-                        strcmp(name, _srvLoadedName) == 0) {
-                        _srvLoadedName[0] = '\0';
-                        gSongSource = SongSource::NONE;
-                    }
+            if (_dialog.confirmed() && _srvPendingDeleteName[0] != '\0') {
+                const char* name = _srvPendingDeleteName;
+                gServerPairing.deleteSongOnServer(name);
+                if (_srvLoadedName[0] != '\0' && strcmp(name, _srvLoadedName) == 0) {
+                    _srvLoadedName[0] = '\0';
+                    gSongSource = SongSource::NONE;
                 }
-                _srvPendingDeleteIdx = -1;
-                _srvListDrawn = false;
-                gServerPairing.requestSongList(_srvPage);
+                _srvPendingDeleteName[0] = '\0';
+                restartServerList("Loading...");
             }
             _state = State::SERVER_BROWSE;
             _d.fillScreen(COL_WHITE);
@@ -134,47 +130,24 @@ SongPageResult SongPage::poll() {
         return SongPageResult::NONE;
     }
 
-    // ── CONFIRM_OVERWRITE ─────────────────────────────────────────────────────
-    if (_state == State::CONFIRM_OVERWRITE) {
+    // ── CONFIRM_SAVE_LOAD ─────────────────────────────────────────────────────
+    // "Save changes to X?" before loading a different server song or starting a
+    // NEW one.
+    //   YES → save the current song to the server first.
+    //   NO  → discard edits.
+    // Then proceed with the pending action (load the tapped song, or name+create
+    // a new one).
+    if (_state == State::CONFIRM_SAVE_LOAD) {
         if (_dialog.poll()) {
-            if (_dialog.confirmed()) {
-                doSave(_pendingSaveName);
-                loadFileList();
-                populateBrowserFromSD();
-            }
-            _state = State::FILE_BROWSE;
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _d.paintLater();
-        }
-        return SongPageResult::NONE;
-    }
-
-    // ── SAVING_AS — keyboard ──────────────────────────────────────────────────
-    if (_state == State::SAVING_AS) {
-        if (_keyboard.poll()) {
-            if (_keyboard.isDone() && _pendingSaveName[0] != '\0') {
-                if (fileExists(_pendingSaveName)) {
-                    _dialog.open("OVERWRITE EXISTING FILE?");
-                    _state = State::CONFIRM_OVERWRITE;
-                    _d.fillScreen(COL_WHITE);
-                    _browser.draw();
-                    _dialog.draw();
-                    _d.paintLater();
-                } else {
-                    doSave(_pendingSaveName);
-                    loadFileList();
-                    populateBrowserFromSD();
-                    _state = State::FILE_BROWSE;
-                    _d.fillScreen(COL_WHITE);
-                    _browser.draw();
-                    _d.paintLater();
-                }
+            if (_dialog.confirmed())
+                gServerPairing.sendSaveActive(_srvLoadedName);
+            markSongClean();                 // saved, or edits discarded
+            if (_pendingNew) {
+                _pendingNew = false;
+                beginNewSong();
             } else {
-                _state = State::FILE_BROWSE;
-                _d.fillScreen(COL_WHITE);
-                _browser.draw();
-                _d.paintLater();
+                _state = State::SERVER_BROWSE;
+                startServerLoad(_pendingLoadAbsIdx);
             }
         }
         return SongPageResult::NONE;
@@ -186,21 +159,76 @@ SongPageResult SongPage::poll() {
             if (_keyboard.isDone() && _pendingSaveName[0] != '\0') {
                 strncpy(_song.name, _pendingSaveName, sizeof(_song.name) - 1);
                 _song.name[sizeof(_song.name) - 1] = '\0';
-                gServerPairing.sendSongToServer(_pendingSaveName, &_song);
+                // Patch the server's in-memory song.name to match (so the
+                // saved file carries the new display name), then ask it to
+                // write to SD.  No full-song stream needed — server already
+                // has every edit via the patch / note-set stream.
+                gServerPairing.sendSongPatch(_song, _song.name, sizeof(_song.name));
+                gServerPairing.sendSaveActive(_pendingSaveName);
+                markSongClean();
                 strncpy(_srvLoadedName, _pendingSaveName, sizeof(_srvLoadedName) - 1);
                 _srvLoadedName[sizeof(_srvLoadedName) - 1] = '\0';
                 // Refresh list so the newly saved file appears
-                gServerPairing.requestSongList(_srvPage);
-                _srvListDrawn = false;
-                _browser.setHasPrev(false);
-                _browser.setHasNext(false);
-                _browser.clearItems();
-                _browser.setStatusText("Saving...");
+                restartServerList("Saving...");
             }
             _state = State::SERVER_BROWSE;
             _d.fillScreen(COL_WHITE);
             _browser.draw();
             _d.paintLater();
+        }
+        return SongPageResult::NONE;
+    }
+
+    // ── NAMING_NEW — keyboard for a freshly-created song's name ────────────────
+    if (_state == State::NAMING_NEW) {
+        if (_keyboard.poll()) {
+            if (_keyboard.isDone() && _pendingSaveName[0] != '\0') {
+                // Reject a name that already exists on the server — the user
+                // must pick a different one (or cancel).
+                if (nameExistsOnServer(_pendingSaveName)) {
+                    _dialog.open("NAME EXISTS - RENAME?");
+                    _state = State::CONFIRM_NEW_EXISTS;
+                    _d.fillScreen(COL_WHITE);
+                    _browser.draw();
+                    _dialog.draw();
+                    _d.paintLater();
+                    return SongPageResult::NONE;
+                }
+                // Create a blank song with the entered name on both client and
+                // server, and persist it immediately so it appears in the list.
+                initSong(&_song);
+                strncpy(_song.name, _pendingSaveName, sizeof(_song.name) - 1);
+                _song.name[sizeof(_song.name) - 1] = '\0';
+                gServerPairing.sendNewSong();   // wipe server's in-memory copy
+                gServerPairing.sendSongPatch(_song, _song.name, sizeof(_song.name));
+                gServerPairing.sendSaveActive(_pendingSaveName);
+                markSongClean();
+                strncpy(_srvLoadedName, _pendingSaveName, sizeof(_srvLoadedName) - 1);
+                _srvLoadedName[sizeof(_srvLoadedName) - 1] = '\0';
+                gSongSource = SongSource::SERVER;
+                return SongPageResult::SONG_LOADED;
+            }
+            // Cancelled / empty name — abandon NEW, back to the server list.
+            _state = State::SERVER_BROWSE;
+            _d.fillScreen(COL_WHITE);
+            _browser.draw();
+            _d.paintLater();
+        }
+        return SongPageResult::NONE;
+    }
+
+    // ── CONFIRM_NEW_EXISTS — NEW name clashed an existing server song ──────────
+    //   YES → re-enter a name.   NO → abandon NEW, back to the list.
+    if (_state == State::CONFIRM_NEW_EXISTS) {
+        if (_dialog.poll()) {
+            if (_dialog.confirmed()) {
+                beginNewSong();
+            } else {
+                _state = State::SERVER_BROWSE;
+                _d.fillScreen(COL_WHITE);
+                _browser.draw();
+                _d.paintLater();
+            }
         }
         return SongPageResult::NONE;
     }
@@ -219,25 +247,34 @@ SongPageResult SongPage::poll() {
                 gServerPairing.resetBrowse();
                 return SongPageResult::SONG_LOADED;
             }
-            // Corrupt data — request list again
-            gServerPairing.requestSongList(_srvPage);
-            _srvListDrawn = false;
+            // Corrupt data — show the list again
+            restartServerList("Loading...");
         }
 
-        // List arrived — repopulate browser
+        // A list page arrived — append its entries, then request the next page
+        // until the whole (server-sorted) list is accumulated, then draw.
         if (bs == BrowseState::LIST_READY && !_srvListDrawn) {
-            _srvListDrawn = true;
-            populateBrowserFromServer();
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _d.paintLater();
+            _srvListDrawn = true;   // this page consumed
+            int c = gServerPairing.listCount();
+            for (int i = 0; i < c; i++) _browser.addItem(gServerPairing.listName(i));
+
+            if (_srvPage + 1 < gServerPairing.listTotalPages()) {
+                _srvPage++;
+                _srvListDrawn = false;            // expect the next page
+                gServerPairing.requestSongList(_srvPage);
+            } else {
+                _browser.setLoadedName(_srvLoadedName);
+                _browser.setStatusText("");
+                _d.fillScreen(COL_WHITE);
+                _browser.draw();
+                _d.paintLater();
+            }
         }
 
         // Song load timeout — give up after 8 s and show list again
         if (bs == BrowseState::WAITING_SONG && millis() - _srvLoadStartMs > 8000) {
             gServerPairing.resetBrowse();
-            gServerPairing.requestSongList(_srvPage);
-            _srvListDrawn = false;
+            restartServerList("Loading...");
         }
 
         FileBrowserResult r = _browser.poll();
@@ -247,47 +284,31 @@ SongPageResult SongPage::poll() {
             gServerPairing.resetBrowse();
             return SongPageResult::HOME;
 
-        case FileBrowserEvent::PREV_PAGE:
-            _srvPage--;
-            _srvListDrawn = false;
-            gServerPairing.requestSongList(_srvPage);
-            _browser.clearItems();
-            _browser.setHasPrev(false);
-            _browser.setHasNext(false);
-            _browser.setStatusText("Loading...");
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _d.paintLater();
-            break;
-
-        case FileBrowserEvent::NEXT_PAGE:
-            _srvPage++;
-            _srvListDrawn = false;
-            gServerPairing.requestSongList(_srvPage);
-            _browser.clearItems();
-            _browser.setHasPrev(false);
-            _browser.setHasNext(false);
-            _browser.setStatusText("Loading...");
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _d.paintLater();
-            break;
+        // PREV_PAGE / NEXT_PAGE are never emitted in list mode (drag-scroll).
 
         case FileBrowserEvent::NEW:
-            initSong(&_song);
-            _srvLoadedName[0] = '\0';
-            gSongSource = SongSource::NONE;
-            gServerPairing.sendSongToServer("", &_song);  // push blank song to server (no SD save)
-            return SongPageResult::SONG_LOADED;
+            // Same guard as loading a different song: offer to save edits first.
+            if (songIsDirty() && _srvLoadedName[0] != '\0') {
+                _pendingNew = true;
+                char msg[48];
+                snprintf(msg, sizeof(msg), "SAVE CHANGES TO %s?", _srvLoadedName);
+                _dialog.open(msg);
+                _state = State::CONFIRM_SAVE_LOAD;
+                _d.fillScreen(COL_WHITE);
+                _browser.draw();
+                _dialog.draw();
+                _d.paintLater();
+            } else {
+                beginNewSong();
+            }
+            break;
 
         case FileBrowserEvent::SAVE:
-            gServerPairing.sendSongToServer(_srvLoadedName, &_song);
-            gServerPairing.requestSongList(_srvPage);
-            _srvListDrawn = false;
-            _browser.setHasPrev(false);
-            _browser.setHasNext(false);
-            _browser.clearItems();
-            _browser.setStatusText("Saving...");
+            // Server already has every edit via the patch / note-set stream;
+            // ask it to write its own in-memory copy to SD under this name.
+            gServerPairing.sendSaveActive(_srvLoadedName);
+            markSongClean();
+            restartServerList("Saving...");
             _d.fillScreen(COL_WHITE);
             _browser.draw();
             _d.paintLater();
@@ -305,20 +326,28 @@ SongPageResult SongPage::poll() {
             break;
 
         case FileBrowserEvent::ITEM_TAP:
-            gServerPairing.requestSongLoad(_srvPage, (uint8_t)r.index);
-            _srvLoadStartMs = millis();
-            _srvListDrawn = false;
-            _browser.clearItems();
-            _browser.setHasPrev(false);
-            _browser.setHasNext(false);
-            _browser.setStatusText("Receiving song...");
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _d.paintLater();
+            // If the current song has unsaved edits, offer to save it before
+            // replacing it with the tapped one.
+            if (songIsDirty() && _srvLoadedName[0] != '\0') {
+                _pendingNew        = false;
+                _pendingLoadAbsIdx = r.index;
+                char msg[48];
+                snprintf(msg, sizeof(msg), "SAVE CHANGES TO %s?", _srvLoadedName);
+                _dialog.open(msg);
+                _state = State::CONFIRM_SAVE_LOAD;
+                _d.fillScreen(COL_WHITE);
+                _browser.draw();
+                _dialog.draw();
+                _d.paintLater();
+            } else {
+                startServerLoad(r.index);
+            }
             break;
 
         case FileBrowserEvent::ITEM_DELETE:
-            _srvPendingDeleteIdx = r.index;
+            strncpy(_srvPendingDeleteName, _browser.itemName(r.index),
+                    sizeof(_srvPendingDeleteName) - 1);
+            _srvPendingDeleteName[sizeof(_srvPendingDeleteName) - 1] = '\0';
             _dialog.open("DELETE SERVER FILE?");
             _state = State::CONFIRM_DELETE_SRV;
             _d.fillScreen(COL_WHITE);
@@ -326,93 +355,6 @@ SongPageResult SongPage::poll() {
             _dialog.draw();
             _d.paintLater();
             break;
-
-        default:
-            break;
-        }
-        return SongPageResult::NONE;
-    }
-
-    // ── FILE_BROWSE ───────────────────────────────────────────────────────────
-    if (_state == State::FILE_BROWSE) {
-        FileBrowserResult r = _browser.poll();
-        switch (r.event) {
-
-        case FileBrowserEvent::HOME:
-            return SongPageResult::HOME;
-
-        case FileBrowserEvent::PREV_PAGE:
-            _filePage--;
-            populateBrowserFromSD();
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _d.paintLater();
-            break;
-
-        case FileBrowserEvent::NEXT_PAGE:
-            _filePage++;
-            populateBrowserFromSD();
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _d.paintLater();
-            break;
-
-        case FileBrowserEvent::NEW:
-            initSong(&_song);
-            _loadedFilename[0] = '\0';
-            gSongSource = SongSource::NONE;
-            return SongPageResult::SONG_LOADED;
-
-        case FileBrowserEvent::SAVE:
-            doSave(_loadedFilename);
-            loadFileList();
-            populateBrowserFromSD();
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _d.paintLater();
-            break;
-
-        case FileBrowserEvent::SAVE_AS:
-            strncpy(_pendingSaveName, _song.name, sizeof(_pendingSaveName) - 1);
-            _pendingSaveName[sizeof(_pendingSaveName) - 1] = '\0';
-            _keyboard.open(_pendingSaveName, 9);
-            _state = State::SAVING_AS;
-            _d.fillScreen(COL_WHITE);
-            _browser.draw();
-            _keyboard.draw();
-            _d.paintLater();
-            break;
-
-        case FileBrowserEvent::ITEM_TAP: {
-            int absIdx = _filePage * FB_PER_PAGE + r.index;
-            if (absIdx >= 0 && absIdx < _fileCount) {
-                char path[64];
-                buildPath(_files[absIdx], path, sizeof(path));
-                if (loadSong(path, &_song)) {
-                    strncpy(_loadedFilename, _files[absIdx],
-                            sizeof(_loadedFilename) - 1);
-                    _loadedFilename[sizeof(_loadedFilename) - 1] = '\0';
-                    gSongSource = SongSource::SD;
-                    return SongPageResult::SONG_LOADED;
-                }
-                Serial.printf("[SongPage] load failed: %s\n", path);
-            }
-            break;
-        }
-
-        case FileBrowserEvent::ITEM_DELETE: {
-            int absIdx = _filePage * FB_PER_PAGE + r.index;
-            if (absIdx >= 0 && absIdx < _fileCount) {
-                _pendingDeleteIdx = absIdx;
-                _dialog.open("DELETE FILE?");
-                _state = State::CONFIRM_DELETE;
-                _d.fillScreen(COL_WHITE);
-                _browser.draw();
-                _dialog.draw();
-                _d.paintLater();
-            }
-            break;
-        }
 
         default:
             break;
@@ -434,101 +376,51 @@ void SongPage::drawHeader(const char* title, int h) {
     _d.print(title);
 }
 
-// ── Browser population helpers ────────────────────────────────────────────────
-
-void SongPage::populateBrowserFromSD() {
-    // Build display name from loaded filename (strip .mgt)
-    char loadedDisplay[STORAGE_FILENAME_MAX] = {};
-    if (_loadedFilename[0]) {
-        strncpy(loadedDisplay, _loadedFilename, sizeof(loadedDisplay) - 1);
-        int len = (int)strlen(loadedDisplay);
-        if (len > 4 && loadedDisplay[len - 4] == '.' &&
-            (loadedDisplay[len - 3] == 'm' || loadedDisplay[len - 3] == 'M')) {
-            loadedDisplay[len - 4] = '\0';
-        }
-    }
-
-    _browser.setTitle("SD CARD");
-    _browser.setLoadedName(loadedDisplay);
-    _browser.setHasPrev(_filePage > 0);
-    _browser.setHasNext((_filePage + 1) * FB_PER_PAGE < _fileCount);
+// Restart the server list: clear accumulated items and re-request from page 0.
+void SongPage::restartServerList(const char* status) {
+    _srvPage      = 0;
+    _srvListDrawn = false;
     _browser.clearItems();
-    _browser.setStatusText("");
-
-    int first = _filePage * FB_PER_PAGE;
-    for (int i = first; i < _fileCount && (i - first) < FB_PER_PAGE; i++) {
-        char label[STORAGE_FILENAME_MAX];
-        strncpy(label, _files[i], sizeof(label) - 1);
-        label[sizeof(label) - 1] = '\0';
-        int len = (int)strlen(label);
-        if (len > 4 && label[len - 4] == '.' &&
-            (label[len - 3] == 'm' || label[len - 3] == 'M')) {
-            label[len - 4] = '\0';
-        }
-        _browser.addItem(label);
-    }
+    _browser.setStatusText(status);
+    gServerPairing.requestSongList(0);
 }
 
-void SongPage::populateBrowserFromServer() {
-    _browser.setTitle("SERVER");
-    _browser.setLoadedName(_srvLoadedName);
-    _browser.setHasPrev(_srvPage > 0);
-    _browser.setHasNext(_srvPage + 1 < gServerPairing.listTotalPages());
+// Request the server song at absolute list index and show "Receiving...".
+// The flat list index maps to the server's page/index (same sorted order).
+void SongPage::startServerLoad(int absIdx) {
+    gServerPairing.requestSongLoad((uint8_t)(absIdx / SL_PER_PKT),
+                                   (uint8_t)(absIdx % SL_PER_PKT));
+    _srvLoadStartMs = millis();
+    _srvListDrawn   = false;
     _browser.clearItems();
-    _browser.setStatusText("");
+    _browser.setStatusText("Receiving song...");
+    _d.fillScreen(COL_WHITE);
+    _browser.draw();
+    _d.paintLater();
+}
 
-    int count = gServerPairing.listCount();
-    for (int i = 0; i < count; i++) {
-        _browser.addItem(gServerPairing.listName(i));
-    }
+// Open the keyboard to name a new song.  The blank song isn't created until a
+// non-empty name is confirmed (see the NAMING_NEW poll branch).
+void SongPage::beginNewSong() {
+    _pendingSaveName[0] = '\0';
+    _keyboard.open(_pendingSaveName, 9);
+    _state = State::NAMING_NEW;
+    _d.fillScreen(COL_WHITE);
+    _browser.draw();
+    _keyboard.draw();
+    _d.paintLater();
+}
+
+// True if `name` already exists in the accumulated server song list (the
+// browser holds every page fetched in SERVER_BROWSE).  Case-insensitive to
+// match the server's own filename comparison.
+bool SongPage::nameExistsOnServer(const char* name) const {
+    for (int i = 0; i < _browser.itemCount(); i++)
+        if (strcasecmp(_browser.itemName(i), name) == 0) return true;
+    return false;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-void SongPage::loadFileList() {
-    _fileCount = listSongs(SONGS_DIR, _files, STORAGE_MAX_FILES);
-    _filePage  = 0;
-}
-
-void SongPage::buildPath(const char* name, char* out, int outLen) const {
-    snprintf(out, outLen, "%s/%s", SONGS_DIR, name);
-    int len = (int)strlen(out);
-    if (len >= 4) {
-        const char* ext = out + len - 4;
-        if (!(ext[0] == '.' &&
-              (ext[1] == 'm' || ext[1] == 'M') &&
-              (ext[2] == 'g' || ext[2] == 'G') &&
-              (ext[3] == 't' || ext[3] == 'T'))) {
-            if (len + 4 < outLen) strcat(out, ".mgt");
-        }
-    }
-}
-
-bool SongPage::fileExists(const char* name) const {
-    char path[64];
-    buildPath(name, path, sizeof(path));
-    return SD.exists(path);
-}
-
-void SongPage::doSave(const char* name) {
-    strncpy(_song.name, name, sizeof(_song.name) - 1);
-    _song.name[sizeof(_song.name) - 1] = '\0';
-
-    char path[64];
-    buildPath(name, path, sizeof(path));
-    if (saveSong(path, &_song)) {
-        char fname[STORAGE_FILENAME_MAX];
-        snprintf(fname, sizeof(fname), "%s", name);
-        int len = (int)strlen(fname);
-        if (len < 4 || fname[len - 4] != '.') {
-            if (len + 4 < (int)sizeof(fname)) strcat(fname, ".mgt");
-        }
-        strncpy(_loadedFilename, fname, sizeof(_loadedFilename) - 1);
-        _loadedFilename[sizeof(_loadedFilename) - 1] = '\0';
-    } else {
-        Serial.printf("[SongPage] save failed: %s\n", path);
-    }
-}
 
 void SongPage::setServerLoadedName(const char* name) {
     if (name && name[0]) {
@@ -539,17 +431,6 @@ void SongPage::setServerLoadedName(const char* name) {
     }
 }
 
-void SongPage::doDelete(int fileIdx) {
-    char path[64];
-    buildPath(_files[fileIdx], path, sizeof(path));
-    SD.remove(path);
-    if (_loadedFilename[0] != '\0' &&
-        strcmp(_files[fileIdx], _loadedFilename) == 0) {
-        _loadedFilename[0] = '\0';
-    }
-    loadFileList();
-}
-
 void SongPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
     sx = ry;
     sy = 540 - rx;
@@ -558,10 +439,10 @@ void SongPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
 // ── Boot button alt mode ───────────────────────────────────────────────────────
 
 void SongPage::onBootPress() {
-    if (_state == State::SAVING_AS || _state == State::SAVING_AS_SRV) {
+    if (_state == State::SAVING_AS_SRV || _state == State::NAMING_NEW) {
         _keyboard.toggleSymbolLayer();
-    } else if (_state == State::FILE_BROWSE || _state == State::SERVER_BROWSE) {
+    } else if (_state == State::SERVER_BROWSE) {
         _browser.onBootPress();
     }
-    // Ignore on CONFIRM_* states
+    // Ignore on CONFIRM_* / NOT_CONNECTED states
 }

@@ -1,7 +1,11 @@
 #include "PixelPostPicker.h"
+#include "ServerPairing.h"
+#include "PixelPostSettingsPage.h"   // gPixelPostFlashCtrl
 #include <pixelpost_proto.h>
 #include <string.h>
 #include <stdio.h>
+
+extern ServerPairing gServerPairing;
 
 // Effect labels are pulled from the shared pixelpost_proto catalogue per
 // page/slot — single source of truth shared with pixel_post,
@@ -24,19 +28,32 @@ PixelPostPicker::PixelPostPicker(EPD_PainterAdafruit& display, GT911_Lite& touch
     , _wasDown(false)
     , _swallowDown(false)
     , _page(0)
-    , _resultKind(RES_NONE)
+    , _selectedEffect(0xFF)
+    , _active(ActiveWidget::NONE)
+    , _haveNote(false)
+    , _haveVel(false)
+    , _haveAttr(false)
     , _resultSemitone(0)
     , _resultOctave(0)
     , _resultVelocity(0)
     , _resultEffect(0)
     , _resultParam(0)
+    , _lastPadX(0)
+    , _lastPadY(0)
 {}
 
 void PixelPostPicker::open(bool fingerDown) {
-    _open        = true;
-    _wasDown     = fingerDown;
-    _swallowDown = fingerDown;
-    _resultKind  = RES_NONE;
+    _open           = true;
+    _wasDown        = fingerDown;
+    _swallowDown    = fingerDown;
+    _page           = 0;
+    _selectedEffect = 0xFF;
+    _active         = ActiveWidget::NONE;
+    _haveNote = _haveVel = _haveAttr = false;
+    _lastPadX = _lastPadY = 0;
+    // Refresh the server's flash-ctrl cache so live preview actually flashes
+    // (covers a server reboot since last visit).
+    gServerPairing.sendPixelpostFlashCtrl(gPixelPostFlashCtrl);
 }
 
 // ── Draw ─────────────────────────────────────────────────────────────────────
@@ -71,17 +88,22 @@ void PixelPostPicker::drawEffectButtons() {
     for (int i = 0; i < 6; i++) {
         int x = effectButtonX(i);
         int y = effectButtonY(i);
-        _d.fillRect(x, y, PPK_BTN_W, PPK_BTN_H, COL_WHITE);
-        _d.drawRect(x, y, PPK_BTN_W, PPK_BTN_H, COL_BLACK);
         uint8_t effectIdx = (uint8_t)((int)_page * 6 + i);
+        bool valid = (effectIdx < (uint8_t)PIXELPOST_EFFECT_COUNT);
+        bool hl    = valid && (effectIdx == _selectedEffect);
+        uint8_t bg = hl ? COL_BLACK : COL_WHITE;
+        uint8_t fg = hl ? COL_WHITE : (valid ? COL_BLACK : COL_DKGREY);
+        _d.fillRect(x, y, PPK_BTN_W, PPK_BTN_H, bg);
+        _d.drawRect(x, y, PPK_BTN_W, PPK_BTN_H, valid ? COL_BLACK : COL_DKGREY);
+        _d.setTextColor(fg);
         drawWrappedLabel(pixelPostEffectName(effectIdx),
                          x + PPK_BTN_W / 2, y + PPK_BTN_H / 2);
     }
 }
 
 void PixelPostPicker::drawWrappedLabel(const char* text, int cx, int cy) {
+    // Text colour is set by the caller (highlight-aware).
     _d.setTextSize(3);
-    _d.setTextColor(COL_BLACK);
 
     const char* space = strchr(text, ' ');
     if (!space) {
@@ -173,6 +195,47 @@ void PixelPostPicker::rawToScreen(int rx, int ry, int& sx, int& sy) const {
 
 // ── Poll ─────────────────────────────────────────────────────────────────────
 
+bool PixelPostPicker::hitSlider(int sx, int sy) const {
+    return sx >= PPK_SLIDER_X && sx < PPK_SLIDER_X + PPK_SLIDER_W &&
+           sy >= PPK_SLIDER_Y && sy < PPK_SLIDER_Y + PPK_SLIDER_H;
+}
+
+bool PixelPostPicker::hitTouchpad(int sx, int sy) const {
+    return sx >= PPK_PAD_X && sx < PPK_PAD_X + PPK_PAD_W &&
+           sy >= PPK_PAD_Y && sy < PPK_PAD_Y + PPK_PAD_H;
+}
+
+void PixelPostPicker::sliderUpdateFromY(int sy) {
+    // Top of slider = max velocity (127); bottom = 0.
+    int fromBottom = (PPK_SLIDER_Y + PPK_SLIDER_H) - sy;
+    int v = (fromBottom * 127) / PPK_SLIDER_H;
+    if (v < 0)   v = 0;
+    if (v > 127) v = 127;
+    uint8_t vel = (uint8_t)v;
+    if (_haveVel && vel == _resultVelocity) return;
+    _resultVelocity = vel;
+    _haveVel = true;
+    // Live preview: the post's slider is 0..255 brightness; scale up from 0..127.
+    gServerPairing.sendPixelpostSlider((uint8_t)((v * 255) / 127));
+}
+
+void PixelPostPicker::touchpadUpdateFromXY(int sx, int sy, bool touched) {
+    int px = ((sx - PPK_PAD_X) * 255) / PPK_PAD_W;
+    int py = ((sy - PPK_PAD_Y) * 255) / PPK_PAD_H;
+    if (px < 0)   px = 0;
+    if (px > 255) px = 255;
+    if (py < 0)   py = 0;
+    if (py > 255) py = 255;
+    uint8_t bx = (uint8_t)px, by = (uint8_t)py;
+    if (_haveAttr && touched && bx == _lastPadX && by == _lastPadY) return;
+    _lastPadX = bx;
+    _lastPadY = by;
+    _resultEffect = bx;
+    _resultParam  = by;
+    _haveAttr = true;
+    gServerPairing.sendPixelpostTouchpad(bx, by, touched);
+}
+
 bool PixelPostPicker::poll() {
     if (!_open || !_touch.read()) return false;
 
@@ -180,19 +243,50 @@ bool PixelPostPicker::poll() {
     int  sx, sy;
     rawToScreen(_touch.x, _touch.y, sx, sy);
 
-    bool rising  = (down  && !_wasDown);
-    bool falling = (!down && _wasDown);
-    _wasDown = down;
-
-    // Wait for the opening finger to lift before accepting any input.
+    // Swallow the lingering touch that opened the page until the user lifts.
     if (_swallowDown) {
-        if (falling) _swallowDown = false;
+        if (!down) _swallowDown = false;
+        _wasDown = down;
         return false;
     }
 
-    if (!rising) return false;
+    bool rising  = ( down && !_wasDown);
+    bool falling = (!down &&  _wasDown);
+    _wasDown = down;
 
-    // ── Bottom row: page selectors + BACK ────────────────────────────────────
+    // ── Rising: pick an active widget for drag streaming ──────────────────────
+    if (rising) {
+        if (hitSlider(sx, sy)) {
+            _active = ActiveWidget::SLIDER;
+            sliderUpdateFromY(sy);
+        } else if (hitTouchpad(sx, sy)) {
+            _active = ActiveWidget::TOUCHPAD;
+            touchpadUpdateFromXY(sx, sy, /*touched=*/true);
+        } else {
+            _active = ActiveWidget::NONE;   // tap-style — decided on falling edge
+        }
+    }
+
+    // ── Move: stream the active widget ────────────────────────────────────────
+    if (down && !rising) {
+        if (_active == ActiveWidget::SLIDER)        sliderUpdateFromY(sy);
+        else if (_active == ActiveWidget::TOUCHPAD) touchpadUpdateFromXY(sx, sy, true);
+    }
+
+    if (!falling) return false;
+
+    // ── Falling: release the touchpad, or commit a tap ────────────────────────
+    ActiveWidget was = _active;
+    _active = ActiveWidget::NONE;
+
+    if (was == ActiveWidget::TOUCHPAD) {
+        // Release with last (x,y) so the post drops its finger but holds position.
+        gServerPairing.sendPixelpostTouchpad(_lastPadX, _lastPadY, false);
+        return false;
+    }
+    if (was == ActiveWidget::SLIDER) return false;  // latest value already sent
+
+    // Bottom row: page selectors + BACK.
     if (sy >= PPK_PAGE_Y && sy < PPK_PAGE_Y + PPK_PAGE_H) {
         for (int i = 0; i < 8; i++) {
             int x = PPK_PAGE_X0 + i * PPK_PAGE_STEP;
@@ -207,8 +301,7 @@ bool PixelPostPicker::poll() {
                     }
                     return false;
                 }
-                // BACK
-                _resultKind = RES_NONE;
+                // BACK — caller commits the touched axes.
                 _open = false;
                 return true;
             }
@@ -216,51 +309,23 @@ bool PixelPostPicker::poll() {
         return false;
     }
 
-    // ── Effect grid ──────────────────────────────────────────────────────────
+    // Effect grid — send live, remember, stay open.
     for (int i = 0; i < 6; i++) {
         int bx = effectButtonX(i);
         int by = effectButtonY(i);
         if (sx >= bx && sx < bx + PPK_BTN_W &&
             sy >= by && sy < by + PPK_BTN_H) {
-            int effectIdx = i + (int)_page * 6;
-            if (effectIdx < 0) effectIdx = 0;
-            if (effectIdx > 95) effectIdx = 95;     // NOTE_MAX = 96 (B-7)
+            uint8_t effectIdx = (uint8_t)((int)_page * 6 + i);
+            if (effectIdx >= (uint8_t)PIXELPOST_EFFECT_COUNT) return false;  // "--"
+            gServerPairing.sendPixelpostEffect(effectIdx);
             _resultSemitone = (uint8_t)(effectIdx % 12);
             _resultOctave   = (uint8_t)(effectIdx / 12);
-            _resultKind     = RES_NOTE;
-            _open = false;
-            return true;
+            _haveNote       = true;
+            _selectedEffect = effectIdx;
+            drawEffectButtons();          // flip the highlight
+            _d.paintLater();
+            return false;
         }
-    }
-
-    // ── Slider ───────────────────────────────────────────────────────────────
-    if (sx >= PPK_SLIDER_X && sx < PPK_SLIDER_X + PPK_SLIDER_W &&
-        sy >= PPK_SLIDER_Y && sy < PPK_SLIDER_Y + PPK_SLIDER_H) {
-        // Top of slider = max velocity (127); bottom = 0.
-        int fromBottom = (PPK_SLIDER_Y + PPK_SLIDER_H) - sy;
-        int v = (fromBottom * 127) / PPK_SLIDER_H;
-        if (v < 0)   v = 0;
-        if (v > 127) v = 127;
-        _resultVelocity = (uint8_t)v;
-        _resultKind     = RES_VELOCITY;
-        _open = false;
-        return true;
-    }
-
-    // ── Touchpad ─────────────────────────────────────────────────────────────
-    if (sx >= PPK_PAD_X && sx < PPK_PAD_X + PPK_PAD_W &&
-        sy >= PPK_PAD_Y && sy < PPK_PAD_Y + PPK_PAD_H) {
-        int px = ((sx - PPK_PAD_X) * 255) / PPK_PAD_W;
-        int py = ((sy - PPK_PAD_Y) * 255) / PPK_PAD_H;
-        if (px < 0)   px = 0;
-        if (px > 255) px = 255;
-        if (py < 0)   py = 0;
-        if (py > 255) py = 255;
-        _resultEffect = (uint8_t)px;
-        _resultParam  = (uint8_t)py;
-        _resultKind   = RES_ATTR;
-        _open = false;
-        return true;
     }
 
     return false;

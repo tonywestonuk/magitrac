@@ -10,6 +10,13 @@
 // pixelpost_send.ino — when effect 13 (SoundSpectrum) is selected, mic on;
 // any other effect, mic off.
 #pragma once
+#include <stdint.h>
 
 void spectrumInit();
 void spectrumSetActive(bool active);
+
+// State queries used by SamplePlayer to coordinate I²S0 (mic PDM RX
+// and DAC output are mutually exclusive on the hardware).
+bool spectrumIsActive();                          // user intent (sActive)
+bool spectrumIsRunning();                         // I²S actually claimed
+void spectrumWaitStopped(uint32_t timeout_ms);    // block until !sI2sUp

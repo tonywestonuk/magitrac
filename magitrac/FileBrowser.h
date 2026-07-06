@@ -44,6 +44,17 @@ static const int FB_SAVE_W   = 316;
 static const int FB_SAVEAS_X = 640;
 static const int FB_SAVEAS_W = 320;
 
+// Max items the browser can hold at once.  Grid mode (SD) only shows one page
+// (≤ FB_PER_PAGE); list mode (server) accumulates the whole list, so this caps
+// it — sized above the server's SRV_MAX_FILES (32) with headroom.
+static const int FB_MAX_ITEMS = 64;
+
+// Drag-scroll list mode (used for the server browser): single full-width rows
+// between the toolbar and footer.
+static const int FB_LROW_H           = FB_ROW_H;                        // 54
+static const int FB_LIST_ROWS        = (FB_FOOT_Y - FB_LIST_Y) / FB_LROW_H; // 7
+static const int FB_LIST_DRAG_THRESH = 12;
+
 // ── Events ────────────────────────────────────────────────────────────────────
 
 enum class FileBrowserEvent : uint8_t {
@@ -92,10 +103,18 @@ public:
     void setHasNext   (bool v);
     void setStatusText(const char* text);    // shown centred in grid when no items
 
-    // ── Item list for current page ───────────────────────────────────────────
+    // ── Item list ────────────────────────────────────────────────────────────
     void clearItems();
-    void addItem(const char* name);          // display name (no extension), up to FB_PER_PAGE
+    void addItem(const char* name);          // display name (no extension)
     int  itemCount() const { return _itemCount; }
+    const char* itemName(int i) const {      // valid 0..itemCount()-1
+        return (i >= 0 && i < _itemCount) ? _items[i] : "";
+    }
+
+    // Drag-scroll single-column list mode (server browser).  Off = paginated
+    // 4×7 grid (SD card).  Toggle before populating; resets scroll.
+    void setListMode(bool v);
+    bool listMode() const { return _listMode; }
 
     // ── Header tap (or legacy boot button call) toggles delete mode ──────────
     void onBootPress();
@@ -116,14 +135,26 @@ private:
     bool  _altMode;
     bool  _wasDown;
 
-    char  _items[FB_PER_PAGE][STORAGE_FILENAME_MAX];
+    char  _items[FB_MAX_ITEMS][STORAGE_FILENAME_MAX];
     int   _itemCount;
+
+    // List-mode (drag-scroll) state.
+    bool  _listMode;
+    int   _scroll;            // index of the first visible row
+    int   _dragStartY;
+    int   _dragStartScroll;
+    bool  _dragMoved;
 
     void drawHeader ();
     void drawToolbar();
     void drawGrid   ();
     void drawItem   (int col, int rowY, const char* name, bool isLoaded);
     void drawFooter ();
+    void drawList     ();                 // list-mode body
+    void drawListToolbar();               // scroll hint instead of PREV/NEXT
+    int  hitListItem(int sx, int sy) const;  // absolute item index or -1
+    int  maxScroll() const;
+    FileBrowserResult pollList();         // list-mode poll (drag + tap)
 
     bool hitHome  (int sx, int sy) const;
     bool hitDel   (int sx, int sy) const;   // left-side DELETE-mode toggle

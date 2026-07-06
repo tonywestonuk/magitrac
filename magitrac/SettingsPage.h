@@ -52,13 +52,15 @@ static const int SP_MIDI_BTN_W   = 75;
 static const int SP_MIDI_BTN_H   = 38;
 
 // ── WIFI section ──────────────────────────────────────────────────────────────
+// Single button — opens the dedicated WiFiSettingsPage which owns the
+// SSID/PSK/mode/channel controls.
 static const int SP_WIFI_LBL_Y = SP_MIDI_Y + SP_NUM_MIDI * SP_MIDI_ROW_H;  // 430
 static const int SP_WIFI_LBL_H = 20;
 static const int SP_WIFI_Y     = SP_WIFI_LBL_Y + SP_WIFI_LBL_H;            // 450
 static const int SP_WIFI_ROW_H = 50;
-static const int SP_WIFI_BTN_W = 100;
 static const int SP_WIFI_BTN_H = 38;
-static const int SP_WIFI_BTN_X[3] = { 590, 720, 850 };
+static const int SP_WIFI_PAGE_X = 590;
+static const int SP_WIFI_PAGE_W = 360;
 
 // ── Global MIDI limits (persisted via NVS) ────────────────────────────────────
 // Loaded on boot, saved when changed on SettingsPage.
@@ -85,7 +87,8 @@ public:
 
     void open();
     void draw();
-    bool poll();      // returns true when HOME tapped
+    // Returns:  0 = stay open,  1 = HOME tapped,  2 = WiFi page requested.
+    int  poll();
 
 private:
     EPD_PainterAdafruit& _d;
@@ -109,23 +112,16 @@ private:
     void drawMidiSection();
     void drawMidiRow(int field);
     void drawWifiSection();
-    void drawWifiRow();
     void adjustMidi(int field, int delta);
     void fireMidiHeld();
     void readRTC();
     void applyNumpadResult();
-
-    // Send MSG_SET_WIFI_CHANNEL three times (once per channel) so a
-    // server on the wrong channel still gets the message, then settle
-    // on the requested channel locally.  Blocks for ~350ms.
-    void changeWifiChannel(uint8_t idx);
 
     bool hitHome(int sx, int sy) const;
     bool hitTime(int sx, int sy) const;
     bool hitDate(int sx, int sy) const;
     int  hitMidiMinus(int sx, int sy) const;
     int  hitMidiPlus(int sx, int sy) const;
-    // Returns 0/1/2 if a WIFI channel button was hit, else -1.
-    int  hitWifiBtn(int sx, int sy) const;
+    bool hitWifiPageBtn(int sx, int sy) const;
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

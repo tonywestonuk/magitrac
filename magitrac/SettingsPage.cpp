@@ -1,7 +1,5 @@
 #include "SettingsPage.h"
-#include "ServerPairing.h"     // for gComms
 #include "MagiMsg.h"
-#include <WiFi.h>
 #include <Preferences.h>
 #include <string.h>
 #include <stdio.h>
@@ -262,59 +260,24 @@ void SettingsPage::drawWifiSection() {
     _d.setTextColor(COL_BLACK);
     _d.setCursor(10, SP_WIFI_LBL_Y + (SP_WIFI_LBL_H - 16) / 2);
     _d.print("WIFI");
-    drawWifiRow();
-}
 
-void SettingsPage::drawWifiRow() {
     int btnY = SP_WIFI_Y + (SP_WIFI_ROW_H - SP_WIFI_BTN_H) / 2;
-
     _d.fillRect(0, SP_WIFI_Y, SP_W, SP_WIFI_ROW_H, COL_WHITE);
     _d.drawFastHLine(0, SP_WIFI_Y + SP_WIFI_ROW_H - 1, SP_W, COL_BLACK);
 
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
     _d.setCursor(SP_LABEL_X, SP_WIFI_Y + (SP_WIFI_ROW_H - 24) / 2);
-    _d.print("CHANNEL");
+    _d.print("NETWORK");
 
-    static const char* LBL[3] = { "1", "6", "11" };
-    for (int i = 0; i < 3; i++) {
-        bool sel = (gWifiChannelIdx == (uint8_t)i);
-        uint16_t bg   = sel ? COL_BLACK : COL_WHITE;
-        uint16_t text = sel ? COL_WHITE : COL_BLACK;
-        uiButton(_d, SP_WIFI_BTN_X[i], btnY, SP_WIFI_BTN_W, SP_WIFI_BTN_H,
-                 LBL[i], bg, text, 3);
-    }
+    uiButton(_d, SP_WIFI_PAGE_X, btnY, SP_WIFI_PAGE_W, SP_WIFI_BTN_H,
+             "WIFI SETTINGS...", COL_BLACK, COL_WHITE, 2);
 }
 
-int SettingsPage::hitWifiBtn(int sx, int sy) const {
+bool SettingsPage::hitWifiPageBtn(int sx, int sy) const {
     int btnY = SP_WIFI_Y + (SP_WIFI_ROW_H - SP_WIFI_BTN_H) / 2;
-    if (sy < btnY || sy >= btnY + SP_WIFI_BTN_H) return -1;
-    for (int i = 0; i < 3; i++) {
-        if (sx >= SP_WIFI_BTN_X[i] && sx < SP_WIFI_BTN_X[i] + SP_WIFI_BTN_W) return i;
-    }
-    return -1;
-}
-
-void SettingsPage::changeWifiChannel(uint8_t idx) {
-    if (idx > 2) return;
-    gWifiChannelIdx = idx;
-    saveWifiChannel();
-
-    MsgSetWifiChannel msg;
-    msg.type = MSG_SET_WIFI_CHANNEL;
-    msg.idx  = idx;
-
-    // Sweep across all 3 channels so a mismatched server still gets it.
-    static const uint8_t SWEEP[3] = { 1, 6, 11 };
-    for (int i = 0; i < 3; i++) {
-        WiFi.setChannel(SWEEP[i]);
-        delay(50);
-        gComms.send(&msg, sizeof(msg));
-        delay(50);
-    }
-    // Settle on the requested channel.
-    WiFi.setChannel(magiWifiChannelFromIdx(idx));
-    Serial.printf("[WIFI] channel → %u\n", (unsigned)magiWifiChannelFromIdx(idx));
+    if (sy < btnY || sy >= btnY + SP_WIFI_BTN_H) return false;
+    return sx >= SP_WIFI_PAGE_X && sx < SP_WIFI_PAGE_X + SP_WIFI_PAGE_W;
 }
 
 // ── Hit tests — MIDI rows ─────────────────────────────────────────────────
@@ -357,7 +320,7 @@ void SettingsPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
 
 // ── poll ──────────────────────────────────────────────────────────────────────
 
-bool SettingsPage::poll() {
+int SettingsPage::poll() {
     // Numpad is open — delegate to it
     if (_editing > 0) {
         if (_numpad.poll()) {
@@ -367,13 +330,13 @@ bool SettingsPage::poll() {
             draw();
             _d.paintLater();
         }
-        return false;
+        return 0;
     }
 
     // Hold-repeat for MIDI rows
     if (_wasDown && _hold.active() && _hold.tickFast()) fireMidiHeld();
 
-    if (!_touch.read()) return false;
+    if (!_touch.read()) return 0;
 
     bool down = _touch.isTouched;
     int sx, sy;
@@ -392,14 +355,15 @@ bool SettingsPage::poll() {
         } else if ((fi = hitMidiPlus(sx, sy)) >= 0) {
             _hold.start(fi, +1);
         }
-        return false;
+        return 0;
     }
 
     if (falling) {
         _wasDown = false;
         _hold.release();
 
-        if (hitHome(sx, sy)) return true;
+        if (hitHome(sx, sy)) return 1;
+        if (hitWifiPageBtn(sx, sy)) return 2;
 
         if (hitTime(sx, sy)) {
             _editing = 1;
@@ -409,7 +373,7 @@ bool SettingsPage::poll() {
             _d.fillScreen(COL_WHITE);
             _numpad.draw();
             _d.paint();
-            return false;
+            return 0;
         }
 
         if (hitDate(sx, sy)) {
@@ -420,15 +384,7 @@ bool SettingsPage::poll() {
             _d.fillScreen(COL_WHITE);
             _numpad.draw();
             _d.paint();
-            return false;
-        }
-
-        int wifiBtn = hitWifiBtn(sx, sy);
-        if (wifiBtn >= 0 && (uint8_t)wifiBtn != gWifiChannelIdx) {
-            changeWifiChannel((uint8_t)wifiBtn);
-            drawWifiRow();
-            _d.paintLater();
-            return false;
+            return 0;
         }
 
         // Single-tap MIDI +/- (no hold fired)
@@ -437,5 +393,5 @@ bool SettingsPage::poll() {
         }
     }
 
-    return false;
+    return 0;
 }

@@ -11,11 +11,27 @@
 #include "SamplePlayer.h"
 #include "SampleManifest.h"
 #include "mic_spectrum.h"
+#include "sd_mutex.h"
 #include "hal/uart_ll.h"
+#include "esp_wifi.h"
 
 // ── Communications ───────────────────────────────────────────────────────────
-static MagiCommsEspNow gTransport;
-MagiComms gComms(gTransport);
+// Server is the WiFi AP at 192.168.0.1 and owns the AP credentials
+// (generated once on first boot, persisted forever).  Both transports
+// come up unconditionally at boot:
+//
+//   • MagiLink AP    → reliable TCP listener on MAGI_PORT for the paired
+//                      magitrac client.
+//   • MagiUdpLink    → sender to the paired client (192.168.0.2) for
+//                      loss-tolerant updates (sequencer pos, preview row,
+//                      MIDI note-in).
+//   • ESP-NOW        → pairing ceremony only.  Coexists on the STA
+//                      interface (WIFI_AP_STA mode).
+//
+// No restart on pair — the AP stays up; the client reboots into STA mode
+// after receiving the OFFER and joins the existing AP.
+MagiCommsEspNow gTransportEspNow;   // exposed so pairing.ino can use it
+static MagiUdpLink gUdpLink;
 
 bool needsFullRedraw = false;   // set by pairing.ino to trigger song list redraw
 extern bool srvHasActive;       // defined in commands_server.ino
@@ -98,8 +114,16 @@ struct Button {
     bool wasPressed() {
         if (!_isrFlag) return false;
         _isrFlag = false;
+        // GPIO 36/39 errata: WiFi TX activity generates spurious
+        // falling-edge glitches that trip the ISR.  Re-sample after a
+        // short delay — a real press stays LOW (finger is still down),
+        // an errata glitch has returned HIGH within microseconds.  With
+        // TCP traffic constantly flowing the radio is rarely idle, so
+        // without this every keepalive ping would phantom-press buttons.
+        delayMicroseconds(200);
+        if (digitalRead(pin) != LOW) return false;
         uint32_t now = millis();
-        if (now - _lastAccept < 30) return false;  // bounce filter
+        if (now - _lastAccept < 30) return false;
         _lastAccept = now;
         _pressedMs  = now;
         return true;
@@ -195,6 +219,7 @@ static bool nextWavFile(File& dir, char* buf, int bufLen) {
 
 // Count .wav files in samples dir and update numSamples
 static void loadSampleList() {
+    SdLock _;
     numSamples = 0;
     File dir = SD.open(SRV_SAMPLES_DIR);
     if (!dir || !dir.isDirectory()) { dir.close(); return; }
@@ -231,6 +256,7 @@ static void drawSampleFooter() {
 
 // Open dir, skip to sampleScrollOff, then stream filenames directly to screen
 static void drawSampleList() {
+    SdLock _;
     File dir = SD.open(SRV_SAMPLES_DIR);
     bool dirOk = dir && dir.isDirectory();
 
@@ -372,8 +398,10 @@ void loadSong(int idx) {
         // OFF — deactivate song and notify connected client
         srvHasActive = false;
         if (pairingIsConnected()) {
-            uint8_t msg = (uint8_t)MSG_NO_SONG;
-            gComms.send(&msg, 1);
+            MsgNoSong msg;
+            gMagiLink.acquireMutex();
+            gMagiLink.send(&msg, sizeof(msg));
+            gMagiLink.releaseMutex();
         }
         return;
     }
@@ -480,6 +508,7 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     debugLogInit();
+    sdMutexInit();   // BEFORE any SD-touching task spawns (sample player, MIDI, TCP reader)
     Serial.println("[SETUP] start");
 
     midi.begin(31250, SERIAL_8N1, MIDI_RX_PIN, MIDI_TX_PIN);
@@ -501,20 +530,210 @@ void setup() {
     lcd.setBrightness(200);
 
     Serial.println("[SETUP] comms init");
-    // Forward declarations (defined in pairing.ino)
     extern void pairingHandleMessage(const uint8_t* data, int len);
-    gComms.setOnReceive([](const uint8_t* data, int len) {
+    extern uint8_t wifiChannelLoad();   // defined in commands_server.ino
+
+    // Dispatch on apMode from NVS.  Three boot paths:
+    //   • SERVER_AP   → host softAP at MAGI_SERVER_IP, MagiLink accepts.
+    //   • EXTERNAL_AP → STA-join the external AP at MAGI_SERVER_IP.
+    //   • unset       → no WiFi config; ESP-NOW only, awaiting pairing.
+    //
+    // In all three cases MagiLink + UDP + ESP-NOW come up; MagiLink's
+    // worker task waits for any local IP before listening, so it's safe
+    // to call unconditionally.
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_AP_STA);
+
+    char    creds_ssid[33] = {};
+    char    creds_psk[64]  = {};
+    uint8_t apMode         = 0;
+    bool hasCreds = pairNvsLoadCreds("magitrac_srv", creds_ssid, creds_psk, &apMode);
+
+    if (hasCreds && apMode == MAGI_AP_MODE_SERVER) {
+        const uint8_t apChannel = magiWifiChannelFromIdx(wifiChannelLoad());
+        Serial.printf("[SETUP] branch=SERVER_AP ch=%u ssid='%s'\n",
+                      (unsigned)apChannel, creds_ssid);
+        bool apOk = WiFi.softAP(creds_ssid, creds_psk, apChannel);
+        if (!apOk) {
+            Serial.println("[SETUP] softAP FAILED — common causes: PSK < 8 chars, SSID empty, channel out of range");
+        }
+        WiFi.softAPConfig(IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                          IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                          IPAddress(255, 255, 255, 0));
+        if (esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
+            esp_netif_dhcps_stop(ap_netif);
+        }
+        Serial.printf("[SETUP] AP IP: %s  SSID broadcast: %s\n",
+                      WiFi.softAPIP().toString().c_str(),
+                      WiFi.softAPSSID().c_str());
+    } else if (hasCreds && apMode == MAGI_AP_MODE_EXTERNAL) {
+        Serial.printf("[SETUP] branch=EXTERNAL_AP ssid='%s' — STA join\n", creds_ssid);
+        WiFi.config(IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                              MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                    IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                              MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                    IPAddress(255, 255, 255, 0));
+        WiFi.begin(creds_ssid, creds_psk);
+        // WIFI_AP_STA above brings up a stray default softAP at 192.168.4.1
+        // that MagiLink's firstLocalIp() would prefer over the eventual
+        // STA-assigned MAGI_SERVER_IP.  Drop AP mode — ESP-NOW still
+        // works in STA-only, and pair mode doesn't need AP either.
+        WiFi.mode(WIFI_STA);
+    } else {
+        Serial.printf("[SETUP] branch=NONE (hasCreds=%d apMode=%u) — pair via BtnC long-press\n",
+                      hasCreds ? 1 : 0, (unsigned)apMode);
+    }
+
+    // UDP companion — send-only; destination is the paired client at
+    // the reserved static IP.
+    static const uint8_t kClientIp[4] = {
+        MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1, MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3 };
+    gUdpLink.beginSender(kClientIp, MAGI_PORT);
+
+    // MagiLink listener — waits for any local IP before accepting.
+    gMagiLink.beginAccept(MAGI_PORT);
+
+    // ESP-NOW for pairing.  Coexist mode keeps it from clobbering the
+    // WiFi setup (whether softAP or STA).
+    gTransportEspNow.setCoexistMode(true);
+    gTransportEspNow.setOnReceive([](const uint8_t* data, int len) {
         pairingHandleMessage(data, len);
     });
-    gComms.begin();
+    gTransportEspNow.begin();
+
+    // ── Backup handler ─────────────────────────────────────────────────────
+    // Client sends MSG_START_BACKUP → server streams every /songs/*.mgt
+    // plus instruments.mgt as (header + N bodies), terminated by
+    // MsgEndOfData.  Runs on the MagiLink worker task with the transaction
+    // mutex already held; sendBackupToClient lives in commands_server.ino.
+    extern void sendBackupToClient();
+    gMagiLink.registerCallback(MSG_START_BACKUP,
+        [](const uint8_t* /*msg*/, size_t /*len*/, void* /*ctx*/) {
+            Serial.println("[BK-SRV] MSG_START_BACKUP received");
+            sendBackupToClient();
+        },
+        nullptr);
+
+    // ── Playback controls (Phase 1 #3) ─────────────────────────────────────
+    // All client→server fire-and-forget.  Worker task dispatches to
+    // handleCommand which routes to the appropriate sequencer call.
+    // Safe to run on the worker task — none of these touch SD.
+    extern void handleCommand(MagiMsgType type, const uint8_t* data, int len);
+    auto controlCb = [](const uint8_t* msg, size_t len, void* /*ctx*/) {
+        handleCommand((MagiMsgType)msg[0], msg, (int)len);
+    };
+    gMagiLink.registerCallback(MSG_PLAY,            controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_STOP,            controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_PAUSE,           controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_UNPAUSE,         controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SEEK,            controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_GOTO,            controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_NOTE_SET,        controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_NOTE_AUDITION,   controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SONG_LOAD_NAME,  controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SONG_LIST_REQ,    controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SONG_LOAD_REQ,    controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SONG_DELETE,      controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SET_SONG_DATA,    controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_INSTRUMENTS_REQ,  controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_INSTRUMENTS_PATCH, controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_QUEUE_BLOCK,      controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_CANCEL_QUEUE,     controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_PREVIEW_START,    controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_PREVIEW_STOP,     controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SET_WIFI_CHANNEL, controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SAMPLE_LIST_REQ,  controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_MIDI_DATA,        controlCb, nullptr);
+
+    // ── Song save (Phase 2 #6) — client streams Song bytes to us ───────────
+    // Handlers live in commands_server.ino; they accumulate into srvActiveBuf
+    // and set sMagiSavePending so commandsTick can do the SD write off the
+    // worker task (SD-on-worker would race with SamplePlayer).
+    extern void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* ctx);
+    extern void onMagiLinkSaveBody  (const uint8_t* msg, size_t len, void* ctx);
+    extern void onMagiLinkSaveActive(const uint8_t* msg, size_t len, void* ctx);
+    extern void onMagiLinkNewSong   (const uint8_t* msg, size_t len, void* ctx);
+    gMagiLink.registerCallback(MSG_SAVE_SONG_HEADER, onMagiLinkSaveHeader, nullptr);
+    gMagiLink.registerCallback(MSG_SAVE_SONG_BODY,   onMagiLinkSaveBody,   nullptr);
+    gMagiLink.registerCallback(MSG_SAVE_ACTIVE,      onMagiLinkSaveActive, nullptr);
+    gMagiLink.registerCallback(MSG_NEW_SONG,         onMagiLinkNewSong,    nullptr);
+
+    // ── Restore (Phase: symmetric to song save, for any backup file) ──────
+    extern void onMagiLinkRestoreHeader(const uint8_t* msg, size_t len, void* ctx);
+    extern void onMagiLinkRestoreBody  (const uint8_t* msg, size_t len, void* ctx);
+    gMagiLink.registerCallback(MSG_RESTORE_HEADER, onMagiLinkRestoreHeader, nullptr);
+    gMagiLink.registerCallback(MSG_RESTORE_BODY,   onMagiLinkRestoreBody,   nullptr);
+
+    // ── MSG_DISCONNECT (Phase 1 #2) ────────────────────────────────────────
+    // Either side may send.  Server-side: tear down the session.  No ACK
+    // needed — fire-and-forget.  TCP socket stays up; re-establishment
+    // requires the link to drop (which sets the session task's wasConnected
+    // back to false).
+    gMagiLink.registerCallback(MSG_DISCONNECT,
+        [](const uint8_t* /*msg*/, size_t /*len*/, void* /*ctx*/) {
+            Serial.println("[LINK] MSG_DISCONNECT from client");
+            pairingOnMagiLinkDisconnected();
+        },
+        nullptr);
+
+    // ── MagiLink session task ─────────────────────────────────────────────
+    // Polls gMagiLink.isConnected() and drives the SERVER_STANDALONE ↔
+    // SERVER_CONNECTED transition.  On rising edge: does the synchronous
+    // MSG_CONNECT/ACK handshake then calls pairingOnMagiLinkConnected().
+    // On falling edge: calls pairingOnMagiLinkDisconnected().
+    extern void pairingOnMagiLinkConnected();
+    extern void pairingOnMagiLinkDisconnected();
+    xTaskCreate(
+        [](void* /*pv*/) {
+            bool wasConnected = false;
+            for (;;) {
+                bool nowConnected = gMagiLink.isConnected();
+                if (nowConnected && !wasConnected) {
+                    // Rising edge — do the handshake.
+                    MsgConnect req;
+                    gMagiLink.acquireMutex();
+                    bool sentOk = gMagiLink.send(&req, sizeof(req));
+                    Serial.printf("[LINK-SES] sent MSG_CONNECT (%s)\n",
+                                  sentOk ? "OK" : "FAIL");
+                    const uint8_t* resp = sentOk ? gMagiLink.read() : nullptr;
+                    if (resp && resp[0] == MSG_CONNECT_ACK) {
+                        Serial.println("[LINK-SES] got MSG_CONNECT_ACK");
+                        pairingOnMagiLinkConnected();
+                        wasConnected = true;
+                    } else {
+                        Serial.println("[LINK-SES] handshake failed");
+                    }
+                    gMagiLink.releaseMutex();
+                } else if (!nowConnected && wasConnected) {
+                    // Falling edge — tear the session down.
+                    pairingOnMagiLinkDisconnected();
+                    wasConnected = false;
+                }
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+        },
+        "link_ses",
+        4096,
+        nullptr,
+        3,        // low-ish priority — not on the critical path
+        nullptr);
+
     {
         uint8_t mac[6];
         WiFi.macAddress(mac);
         Serial.printf("[SETUP] my MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
-    extern void wifiChannelInit();   // defined in commands_server.ino
-    wifiChannelInit();               // load + apply persisted WiFi channel
+    // Diagnostic — log the actual channel the WiFi driver thinks it's on
+    // (was already set by the softAP call above).
+    {
+        uint8_t prim = 0;
+        wifi_second_chan_t sec;
+        esp_wifi_get_channel(&prim, &sec);
+        Serial.printf("[SETUP-DBG] WiFi channel after setup = %u\n", (unsigned)prim);
+    }
     extern void pixelpostInit();     // defined in pixelpost_send.ino
     pixelpostInit();                 // queue + worker for outgoing pixel_post traffic
     pairingInit();   // load stored pairing from NVS
@@ -575,21 +794,32 @@ void loop() {
     commandsTick();
     // sequencerPollMidiIn() and sequencerTick() now run in midiTaskFn()
 
-    // Forward row-position notifications queued by the MIDI task
-    if (sPosNotify.dirty) {
+    // Forward row-position notifications queued by the MIDI task.  UDP
+    // best-effort — these fire 5+ Hz and a stale one is just superseded
+    // by the next.  Avoids head-of-line blocking that TCP would impose.
+    if (sPosNotify.dirty && pairingIsConnected()) {
         sPosNotify.dirty = false;
         MsgSeqPos msg;
         msg.type    = MSG_SEQ_POS;
         msg.pattern = sPosNotify.pattern;
         msg.row     = sPosNotify.row;
-        pairingSendToClient(&msg, sizeof(msg));
+        gUdpLink.send(&msg, sizeof(msg));
     }
 
-    // Forward play/stop notifications queued by the MIDI task
+    // Forward play/stop notifications queued by the MIDI task.  MagiLink
+    // direction: server → client.  Same id as the inbound client→server
+    // "please play/stop" — receiver knows by context (client has its own
+    // request callbacks for these).  MsgPlay's 3-byte layout is shared
+    // for both, override `id` per send.
     if (sStateNotify.dirty) {
         sStateNotify.dirty = false;
-        uint8_t msg = sStateNotify.playing ? (uint8_t)MSG_PLAY : (uint8_t)MSG_STOP;
-        pairingSendToClient(&msg, 1);
+        if (pairingIsConnected()) {
+            MsgPlay msg;
+            msg.id = sStateNotify.playing ? MSG_PLAY : MSG_STOP;
+            gMagiLink.acquireMutex();
+            gMagiLink.send(&msg, sizeof(msg));
+            gMagiLink.releaseMutex();
+        }
         // Redraw selected row so selector bar colour reflects play/stop state
         if (!sampleBrowserOpen && cursor >= scrollOffset &&
             cursor < scrollOffset + UI_VISIBLE_ROWS) {
@@ -597,23 +827,25 @@ void loop() {
         }
     }
 
-    // Forward MIDI note-on (received while stopped) to client for step-entry
-    if (sMidiNoteInNotify.dirty) {
+    // Forward MIDI note-on (received while stopped) to client for step-entry.
+    // UDP best-effort — loss of one step-entry note is recoverable by replay.
+    if (sMidiNoteInNotify.dirty && pairingIsConnected()) {
         sMidiNoteInNotify.dirty = false;
         MsgMidiNoteIn msg;
         msg.type     = MSG_MIDI_NOTE_IN;
         msg.midiNote = sMidiNoteInNotify.midiNote;
         msg.velocity = sMidiNoteInNotify.velocity;
-        pairingSendToClient(&msg, sizeof(msg));
+        gUdpLink.send(&msg, sizeof(msg));
     }
 
-    // Forward column-preview row position to the client
-    if (sPreviewRowNotify.dirty) {
+    // Forward column-preview row position to the client.  UDP best-effort
+    // — coalescing is fine, missed rows just mean the highlight lags briefly.
+    if (sPreviewRowNotify.dirty && pairingIsConnected()) {
         sPreviewRowNotify.dirty = false;
         MsgPreviewRow msg;
         msg.type = MSG_PREVIEW_ROW;
         msg.row  = sPreviewRowNotify.row;
-        pairingSendToClient(&msg, sizeof(msg));
+        gUdpLink.send(&msg, sizeof(msg));
     }
 
     if (needsFullRedraw) {
@@ -636,52 +868,58 @@ void loop() {
 
     // Allow navigation in STANDALONE and CONNECTED; only block during active pairing ceremony
     if (!pairingIsActive() || pairingIsConnected()) {
-        uint32_t now = millis();
+        // No cached `now` — each long-press check calls millis() fresh.
+        // A stale cached value was the source of a uint32_t underflow when
+        // millis() ticked between sampling and the elif: see the long-press
+        // checks below for the explanation.
 
         // ── BTN_B: short press = navigate up, long press = toggle test mode ─
+        //
+        // Release check before long-press check: if the main loop was blocked
+        // for ≥ LONG_PRESS_MS (e.g. a synchronous song push over WiFi), the
+        // button may have been pressed AND released within that gap.  Without
+        // re-sampling isDown(), the long-press timer would fire after the
+        // fact even though the user only tapped briefly.
         static bool sBtnBTestActive = false;
         if (BtnB.wasPressed()) {
             BtnB._held      = true;
             BtnB._longFired = false;
         }
         if (BtnB._held) {
-            if (!BtnB._longFired && (now - BtnB._pressedMs >= LONG_PRESS_MS)) {
+            if (!BtnB.isDown()) {
+                BtnB._held = false;
+                if (!BtnB._longFired) {
+                    if (sampleBrowserOpen) sampleMoveCursor(-1);
+                    else                  moveCursor(-1);
+                }
+            } else if (!BtnB._longFired && (millis() - BtnB._pressedMs >= LONG_PRESS_MS)) {
                 BtnB._longFired = true;
                 sBtnBTestActive = !sBtnBTestActive;
                 sequencerSetTestMode(sBtnBTestActive ? 500 : 0);
             }
-            if (!BtnB.isDown()) {
-                BtnB._held = false;
-                if (!BtnB._longFired) {
-                    // Short press released — navigate up
-                    if (sampleBrowserOpen) sampleMoveCursor(-1);
-                    else                  moveCursor(-1);
-                }
-            }
         }
 
         // ── BTN_A: short press = activate, long press = switch screen ────────
+        // Same release-before-long-press ordering as BtnB; see comment there.
         if (BtnA.wasPressed()) {
             BtnA._held      = true;
             BtnA._longFired = false;
         }
         if (BtnA._held) {
-            if (!BtnA._longFired && (now - BtnA._pressedMs >= LONG_PRESS_MS)) {
-                BtnA._longFired = true;
-                if (sampleBrowserOpen) switchToSongs();
-                else                   switchToSamples();
-            }
             if (!BtnA.isDown()) {
                 BtnA._held = false;
                 if (!BtnA._longFired) {
                     // Short press released — activate current item
                     if (sampleBrowserOpen && numSamples > 0) {
                         char fname[32] = {};
-                        File dir = SD.open(SRV_SAMPLES_DIR);
-                        if (dir && dir.isDirectory()) {
-                            for (int i = 0; i <= sampleCursor; i++)
-                                if (!nextWavFile(dir, fname, sizeof(fname))) { fname[0] = '\0'; break; }
-                            dir.close();
+                        {
+                            SdLock _;
+                            File dir = SD.open(SRV_SAMPLES_DIR);
+                            if (dir && dir.isDirectory()) {
+                                for (int i = 0; i <= sampleCursor; i++)
+                                    if (!nextWavFile(dir, fname, sizeof(fname))) { fname[0] = '\0'; break; }
+                                dir.close();
+                            }
                         }
                         if (fname[0]) {
                             // BTN-A toggles: stop if currently playing, else start.
@@ -702,19 +940,22 @@ void loop() {
                         else                      sequencerStart();
                     }
                 }
+            } else if (!BtnA._longFired && (millis() - BtnA._pressedMs >= LONG_PRESS_MS)) {
+                BtnA._longFired = true;
+                if (sampleBrowserOpen) switchToSongs();
+                else                   switchToSamples();
             }
         }
 
-        // ── BTN_C: short press = navigate down, long press = pairing mode ────
+        // ── BTN_C: short press = navigate down, long press = pair / re-pair ──
+        // Long-press always enters pair mode.  The AP stays up across
+        // pairings — a successful pair just overwrites the stored client
+        // MAC, no restart needed.
         if (BtnC.wasPressed()) {
             BtnC._held      = true;
             BtnC._longFired = false;
         }
         if (BtnC._held) {
-            if (!BtnC._longFired && (now - BtnC._pressedMs >= 2000)) {
-                BtnC._longFired = true;
-                enterPairingMode();
-            }
             if (!BtnC.isDown()) {
                 BtnC._held = false;
                 if (!BtnC._longFired) {
@@ -722,6 +963,9 @@ void loop() {
                     if (sampleBrowserOpen) sampleMoveCursor(+1);
                     else                  moveCursor(+1);
                 }
+            } else if (!BtnC._longFired && (millis() - BtnC._pressedMs >= 2000)) {
+                BtnC._longFired = true;
+                enterPairingMode();
             }
         }
 

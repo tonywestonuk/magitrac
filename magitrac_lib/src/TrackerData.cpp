@@ -70,8 +70,22 @@ void effectToString5(uint8_t effect, uint8_t param, char* buf) {
 void col0MetaToString(const Note& n, char* buf) {
     if (n.effect == EFFECT_WAIT) {
         buf[0]='W'; buf[1]='A'; buf[2]='I'; buf[3]='T'; buf[4]='\0';
+    } else if (n.effect == EFFECT_WAT1) {
+        buf[0]='W'; buf[1]='A'; buf[2]='T'; buf[3]='1'; buf[4]='\0';
+    } else if (n.effect == EFFECT_WAT2) {
+        buf[0]='W'; buf[1]='A'; buf[2]='T'; buf[3]='2'; buf[4]='\0';
     } else if (n.effect == EFFECT_SYNC) {
         buf[0]='S'; buf[1]='Y'; buf[2]='N'; buf[3]='C'; buf[4]='\0';
+    } else if (n.effect == EFFECT_AVRG) {
+        buf[0]='A'; buf[1]='V'; buf[2]='R'; buf[3]='G'; buf[4]='\0';
+    } else if (n.note != NOTE_EMPTY && n.note != NOTE_OFF) {
+        // A present col-0 note with no cue effect is a PASS marker (plain
+        // PASS = effect 0; PASA = effect 0x12).
+        if (n.effect == EFFECT_PASA) {
+            buf[0]='P'; buf[1]='A'; buf[2]='S'; buf[3]='A'; buf[4]='\0';
+        } else {
+            buf[0]='P'; buf[1]='A'; buf[2]='S'; buf[3]='S'; buf[4]='\0';
+        }
     } else {
         buf[0]=' '; buf[1]=' '; buf[2]=' '; buf[3]=' '; buf[4]='\0';
     }
@@ -105,9 +119,10 @@ void initSong(Song* song) {
     song->speed        = 6;
     song->numPatterns  = 1;
     song->startPattern = 0;
-    song->midiInChannel  = 0;  // ANY
-    song->midiInNoteMin  = 0;
-    song->midiInNoteMax  = 127;
+    song->midiInChannel   = 0;  // ANY
+    song->midiInNoteMin   = 0;
+    song->midiInNoteMax   = 127;
+    song->transposeChMask = 0xFDFF;  // all 16 channels except ch 10 (drums)
 
     song->patterns[0].length = 16;
 

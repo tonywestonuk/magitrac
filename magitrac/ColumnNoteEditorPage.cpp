@@ -202,7 +202,9 @@ void ColumnNoteEditorPage::drawGrid() {
             if (!match) continue;
 
             bool hasIcon = isInput &&
-                           (n.effect == EFFECT_WAIT || n.effect == EFFECT_SYNC);
+                           (IS_WAIT_EFFECT(n.effect) ||
+                            n.effect == EFFECT_SYNC ||
+                            n.effect == EFFECT_AVRG);
 
             // Highlight body — dark-grey filled square (skipped when an icon
             // will overlay, so the black icon keeps contrast on white).
@@ -210,15 +212,30 @@ void ColumnNoteEditorPage::drawGrid() {
                 _d.fillRect(cx + 5, rowY + 5, CNE_CELL - 10, CNE_CELL - 10, COL_DKGREY);
             }
 
-            // WAIT / SYNC icons — input col only.
-            if (isInput && n.effect == EFFECT_WAIT) {
+            // WAIT / SYNC / AVRG icons — input col only.
+            if (isInput && IS_WAIT_EFFECT(n.effect)) {
                 _d.fillCircle(cxC, cyC, 12, COL_BLACK);
                 _d.fillRect(cxC - 11, cyC - 2, 22, 4, COL_WHITE);
+                // WAT1/WAT2: small "1"/"2" badge to the right so the variant
+                // is legible at a glance without losing the WAIT shape.
+                if (n.effect == EFFECT_WAT1 || n.effect == EFFECT_WAT2) {
+                    char d[2] = { (n.effect == EFFECT_WAT1) ? '1' : '2', '\0' };
+                    _d.setTextSize(2);
+                    _d.setTextColor(COL_BLACK);
+                    _d.setCursor(cxC + 14, cyC - 7);
+                    _d.print(d);
+                }
             } else if (isInput && n.effect == EFFECT_SYNC) {
                 _d.drawCircle(cxC, cyC, 10, COL_BLACK);
                 _d.drawCircle(cxC, cyC, 11, COL_BLACK);
                 _d.fillTriangle(cxC + 10, cyC - 3, cxC + 10, cyC + 3, cxC + 14, cyC, COL_BLACK);
                 _d.fillTriangle(cxC - 10, cyC - 3, cxC - 10, cyC + 3, cxC - 14, cyC, COL_BLACK);
+            } else if (isInput && n.effect == EFFECT_AVRG) {
+                // Three horizontal bars (top short, middle long, bottom medium)
+                // with a centerline — reads as "averaging" / mean indicator.
+                _d.fillRect(cxC - 5,  cyC - 9, 10, 3, COL_BLACK);
+                _d.fillRect(cxC - 10, cyC - 1, 20, 3, COL_BLACK);
+                _d.fillRect(cxC - 7,  cyC + 7, 14, 3, COL_BLACK);
             }
         }
     }
@@ -484,9 +501,18 @@ void ColumnNoteEditorPage::applyAction(uint8_t which) {
             n.note = NOTE_ANY;
             if (n.velocity == 0 && !(n.velocity & 0x80)) n.velocity = VEL_DEFAULT;
         } else if (which == 1) {
-            // WAIT: set effect, param=0; if no note yet, default to NOTE_ANY.
+            // WAIT: cycles WAIT → WAT1 → WAT2 → WAIT on repeat presses while a
+            // WAIT-variant is already set.  Any other effect (or no effect)
+            // defaults to plain WAIT.  Param stays 0.
             if (n.note == NOTE_EMPTY) n.note = NOTE_ANY;
-            n.effect = EFFECT_WAIT;
+            uint8_t next;
+            switch (n.effect) {
+                case EFFECT_WAIT: next = EFFECT_WAT1; break;
+                case EFFECT_WAT1: next = EFFECT_WAT2; break;
+                case EFFECT_WAT2: next = EFFECT_WAIT; break;
+                default:          next = EFFECT_WAIT; break;
+            }
+            n.effect = next;
             n.param  = 0;
         } else {
             // SYNC: same shape as WAIT.

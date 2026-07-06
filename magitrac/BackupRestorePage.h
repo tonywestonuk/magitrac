@@ -17,18 +17,13 @@
 #define BR_FOLDER_MAX   32  // max folder name length
 #define BR_BACKUPS_DIR  "/backups"
 
-// List display
-#define BR_LIST_COLS    2
-#define BR_LIST_ROWS    7
-#define BR_LIST_PER_PAGE (BR_LIST_COLS * BR_LIST_ROWS)
-
 enum class BRState : uint8_t {
     MENU,
-    BACKUP_WAITING_LIST,
     BACKUP_PROGRESS,
     BACKUP_DONE,
     FOLDER_LIST,
     FILE_LIST,
+    RESTORE_CONFIRM,
     RESTORE_PROGRESS,
     RESTORE_DONE,
     ERROR_SCREEN,
@@ -55,13 +50,22 @@ private:
     char     _bkFileNames[BR_MAX_FILES][SRV_FNAME_MAX];
     int      _bkFileTotal;
     int      _bkFileCurrent;
-    int      _bkListPage;    // for multi-page backup list from server
-    bool     _bkCancelled;
+    // Set from UI task on Cancel tap, read from the v2 backup worker
+    // task — must be volatile for visibility across cores/tasks.
+    volatile bool _bkCancelled;
+
+    // Number of files fully written to SD this backup run.  Used by
+    // drawBackupDone to show "N of M saved" (especially after a cancel).
+    int _bkFilesSaved = 0;
 
     // Restore state
     char     _rsFolders[BR_MAX_FOLDERS][BR_FOLDER_MAX];
+    int      _rsFolderSongCount[BR_MAX_FOLDERS];   // .mgt count minus instruments.mgt
     int      _rsFolderCount;
-    int      _rsFolderPage;
+    int      _rsFolderScroll;                      // row offset for drag-scroll
+    int      _rsDragStartY;
+    int      _rsDragStartScroll;
+    bool     _rsDragMoved;
     char     _rsSelectedFolder[48];
     char     _rsFileNames[BR_MAX_FILES][SRV_FNAME_MAX];
     int      _rsFileTotal;
@@ -69,17 +73,32 @@ private:
     int      _rsRestoreCount;
     int      _rsRestoreList[BR_MAX_FILES];  // indices of files to restore
     bool     _rsCancelled;
+    int      _rsConfirmIdx;                 // -1 = restore all; else file index
+
+    // FILE_LIST drag-scroll state — mirrors the folder list.
+    int      _rsFileScroll;
+    int      _rsFileDragStartY;
+    int      _rsFileDragStartScroll;
+    bool     _rsFileDragMoved;
+
+    // Deferred song-counting for the folder list.  scanBackupFolders only
+    // collects names; song counts are filled in over subsequent poll()
+    // ticks so the list appears immediately.  -1 in the count means "not
+    // yet scanned".
+    int      _rsFolderScanIdx;
+    bool     _rsFolderListDirty;
 
     // Error message
     char     _errMsg[48];
 
     // Drawing
-    void drawHeader(const char* title);
+    void drawHeader(const char* title, bool withBack = false);
     void drawMenu();
     void drawBackupProgress();
     void drawBackupDone();
     void drawFolderList();
     void drawFileList();
+    void drawRestoreConfirm();
     void drawRestoreProgress();
     void drawRestoreDone();
     void drawError();
@@ -88,13 +107,14 @@ private:
     // Touch
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
     bool hitHome(int sx, int sy) const;
+    bool hitHeaderBack(int sx, int sy) const;
 
     // Backup logic
     void startBackup();
-    void backupTick();
 
     // Restore logic
     void scanBackupFolders();
+    void scanFolderSongsTick();      // counts songs for one folder per call
     void scanFolderFiles(const char* folder);
     void startRestore(int fileIdx);  // -1 = all
     void restoreTick();

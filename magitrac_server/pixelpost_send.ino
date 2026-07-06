@@ -1,211 +1,161 @@
-// pixelpost_send.ino — outgoing messages to pixel_post devices.
+// pixelpost_send.ino — outgoing ESP-NOW messages to pixel_post devices.
 //
-// Pixel_post expects every frame as [32B HMAC-SHA256][4B uint32 timestamp LE][payload].
-// The HMAC key is the same 32 bytes that pixel_post stores in its C3 eFuse
-// (HMAC_KEY4) and that the M5Paper pixel_post_controller hardcodes; we use it
-// here verbatim so any paired pixel_post will accept our frames.
+// Wire format (post-2026-05-28 redesign — see pixelpost_proto.h):
+//   [4B uint32 LE timestamp = millis()][payload]
+// No HMAC, no replay protection.  Posts lock their effect clock to the
+// timestamp on every received packet.
 //
-// Sends are broadcast (FF:FF:FF:FF:FF:FF), since pixel_post's model is one-to-many.
-//
-// HMAC compute is ~430 us on this classic ESP32, too long to run on the MIDI
-// task.  All outbound pixel_post traffic is routed through a FreeRTOS queue +
-// low-priority worker task pinned to core 0, so the MIDI task on core 1 is
-// never blocked.  Producers (sequencer, pairing loop, UI) just enqueue.
+// Coexists with MagiLink: gTransportEspNow.begin() in setup() initialises
+// ESP-NOW; we just register a broadcast peer and use raw esp_now_send.
+// All callers (mic_spectrum, midi_player) enqueue rather than send inline
+// so time-critical tasks don't block on the ESP-NOW driver.
 
+#include <Arduino.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <mbedtls/md.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
 #include <pixelpost_proto.h>
-#include "mic_spectrum.h"
+#include <string.h>
+#include "mic_spectrum.h"        // spectrumSetActive
+#include "MagiCommsEspNow.h"     // gTransportEspNow
 
-// ── Queue + worker ──────────────────────────────────────────────────────────
+extern MagiCommsEspNow gTransportEspNow;
 
-// One discriminated struct on the queue — SEND carries an outgoing payload,
-// RECV carries a full received frame (HMAC+ts+payload) to be HMAC-verified
-// and used for Lamport-clock sync.  Both paths run on the worker task so
-// no HMAC compute touches either the WiFi task or the MIDI task.
-enum PpCmdKind : uint8_t { PPCMD_SEND = 0, PPCMD_RECV = 1 };
+// ── Queue ───────────────────────────────────────────────────────────────────
+// Payload-only — the worker stamps the timestamp at send time so it's the
+// true millis() at TX rather than at enqueue.  32 bytes covers every
+// magitrac_server pixelpost message type with headroom (largest is
+// SPECTRUM at 6 bytes; biggest plausible future is ~10).
+#define PP_TX_PAYLOAD_MAX  32
+#define PP_TX_QUEUE_DEPTH  16
 
-struct PixelPostCmd {
-    PpCmdKind kind;
-    uint8_t   len;          // payload bytes (SEND) or frame bytes (RECV)
-    uint8_t   data[64];     // SEND: <=4; RECV: 37..~50 (HMAC+ts+payload)
+struct PpTxFrame {
+    uint8_t len;
+    uint8_t data[PP_TX_PAYLOAD_MAX];
 };
 
-static QueueHandle_t        sPixelPostQueue = NULL;
-// Persistent mbedtls HMAC context, owned by the pixelpost worker task.
-// Initialised once at pixelpostInit() — avoids per-send heap churn that
-// would slowly fragment the heap on busy sequences.
-static mbedtls_md_context_t sHmacCtx;
-static bool                 sHmacCtxReady = false;
+static QueueHandle_t sTxQueue = nullptr;
 
-// Logical (Lamport) clock — bumped on every send, and bumped from any
-// HMAC-verified received broadcast.  Survives across send/recv, only reset
-// on full reboot.  See pixel_post.ino for the matching protocol.
-static volatile uint32_t    sMyClock      = 0;
+// ── Worker ──────────────────────────────────────────────────────────────────
+static void pixelpostTaskFn(void*) {
+    const uint8_t bcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    PpTxFrame frame;
+    uint8_t wire[4 + PP_TX_PAYLOAD_MAX];
+    uint32_t lastErrMs = 0;
+    for (;;) {
+        if (xQueueReceive(sTxQueue, &frame, portMAX_DELAY) != pdTRUE) continue;
+        if (frame.len == 0 || frame.len > PP_TX_PAYLOAD_MAX) continue;
 
-static void ensureBroadcastPeer() {
-    static const uint8_t BCAST[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-    if (esp_now_is_peer_exist(BCAST)) return;
-    esp_now_peer_info_t p = {};
-    memcpy(p.peer_addr, BCAST, 6);
-    p.channel = 0;        // follow current WiFi channel
-    p.ifidx   = WIFI_IF_STA;
-    p.encrypt = false;
-    esp_err_t r = esp_now_add_peer(&p);
-    if (r != ESP_OK) {
-        Serial.printf("[PP] add broadcast peer err=%d\n", (int)r);
-    }
-}
-
-// Build [32B HMAC][4B ts LE][payload] and broadcast it.
-// Only called from the worker task — direct callers should use enqueue.
-static void pixelpostSendNow(const uint8_t* payload, size_t payloadLen) {
-    if (payloadLen == 0 || payloadLen > 200) return;
-    if (!sHmacCtxReady) return;
-    ensureBroadcastPeer();
-
-    uint32_t ts = ++sMyClock;
-
-    uint8_t buf[256];
-    memcpy(buf + 32, &ts, 4);
-    memcpy(buf + 36, payload, payloadLen);
-
-    // Reuse the persistent context — hmac_starts() resets state; no heap
-    // alloc per call.
-    mbedtls_md_hmac_starts(&sHmacCtx, PIXELPOST_HMAC_KEY, sizeof(PIXELPOST_HMAC_KEY));
-    mbedtls_md_hmac_update(&sHmacCtx, buf + 32, 4 + payloadLen);
-    mbedtls_md_hmac_finish(&sHmacCtx, buf);   // HMAC into first 32 bytes
-
-    static const uint8_t BCAST[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-    esp_err_t r = esp_now_send(BCAST, buf, 36 + payloadLen);
-    if (r != ESP_OK) {
-        Serial.printf("[PP] esp_now_send err=%d\n", (int)r);
-    }
-}
-
-// Verify HMAC on an incoming broadcast and, if valid, sync sMyClock from
-// the embedded timestamp.  Runs on the worker task — never on WiFi or MIDI.
-static void pixelpostHandleRecv(const uint8_t* frame, size_t frameLen) {
-    if (!sHmacCtxReady) return;
-    if (frameLen < 37) return;   // [32 HMAC][4 ts][>=1 payload]
-
-    uint8_t expected[32];
-    mbedtls_md_hmac_starts(&sHmacCtx, PIXELPOST_HMAC_KEY, sizeof(PIXELPOST_HMAC_KEY));
-    mbedtls_md_hmac_update(&sHmacCtx, frame + 32, frameLen - 32);
-    mbedtls_md_hmac_finish(&sHmacCtx, expected);
-    if (memcmp(expected, frame, 32) != 0) return;  // not a pixel_post frame
-
-    // Quiet log: only print verified frames for non-routine traffic.  Skips
-    // MSG_SPECTRUM (0xCF, 30 Hz from controller) and MSG_TICK_SYNC (0xC8,
-    // a few Hz from each pixel_post) which would otherwise dominate.
-    if (frameLen >= 37 && frame[36] != 0xCF && frame[36] != 0xC8) {
-        Serial.printf("[PP] verified type=0x%02X len=%d\n",
-                      frame[36], (int)frameLen);
-    }
-
-    uint32_t ts;
-    memcpy(&ts, frame + 32, 4);
-    if (ts > sMyClock) sMyClock = ts;   // no log — bumps every few frames
-
-    // Mirror the magitrac-side gating: if the M5Paper controller just
-    // broadcast SELECT_EFFECT, track its choice so the mic follows whoever
-    // last set the effect.  Payload is at offset 36 onward.
-    size_t payloadLen = frameLen - 36;
-    const uint8_t* payload = frame + 36;
-    if (payloadLen >= 2 && payload[0] == PP_MSG_SELECT_EFFECT) {
-        spectrumSetActive(pixelPostEffectNeedsMic(payload[1]));
-    }
-}
-
-static void pixelpostWorker(void*) {
-    PixelPostCmd cmd;
-    while (true) {
-        if (xQueueReceive(sPixelPostQueue, &cmd, portMAX_DELAY) == pdTRUE) {
-            if (cmd.kind == PPCMD_SEND)      pixelpostSendNow(cmd.data, cmd.len);
-            else if (cmd.kind == PPCMD_RECV) pixelpostHandleRecv(cmd.data, cmd.len);
+        uint32_t ts = millis();
+        memcpy(wire,     &ts,        sizeof(ts));
+        memcpy(wire + 4, frame.data, frame.len);
+        esp_err_t err = esp_now_send(bcast, wire, 4 + frame.len);
+        if (err != ESP_OK) {
+            uint32_t now = millis();
+            if (now - lastErrMs > 1000) {
+                lastErrMs = now;
+                Serial.printf("[PP-TX] esp_now_send err=%d\n", (int)err);
+            }
         }
     }
 }
 
-// Spy hook — fires on the WiFi task for every raw broadcast.  Keep this
-// tiny: copy and queue.  HMAC verification happens on the worker.
-static void pixelpostBroadcastSpy(const uint8_t* data, int len) {
-    if (!sPixelPostQueue) return;
-    if (len < 37 || len > (int)sizeof(((PixelPostCmd*)0)->data)) return;
-    PixelPostCmd cmd;
-    cmd.kind = PPCMD_RECV;
-    cmd.len  = (uint8_t)len;
-    memcpy(cmd.data, data, len);
-    xQueueSend(sPixelPostQueue, &cmd, 0);   // drop if full
+// ── RX hook (via MagiCommsEspNow's pre-filter spy) ──────────────────────────
+// Frame: [4B timestamp][payload].  We only act on PP_MSG_SELECT_EFFECT so
+// the mic stays off unless a needsMic effect is selected.  Driven by the
+// pixel_post_controller's broadcasts.  Runs from the ESP-NOW recv-task
+// context; spectrumSetActive is semaphore-driven so it's safe here.
+static void pixelpostRecvCb(const uint8_t* data, int len) {
+    if (len < 5) return;
+    uint8_t type = data[4];
+    if (type != PP_MSG_SELECT_EFFECT) return;
+    if (len < 6) return;
+    uint8_t idx = data[5];
+    bool needsMic = pixelPostEffectNeedsMic(idx);
+    Serial.printf("[PP-RX] SELECT_EFFECT idx=%u needsMic=%d\n",
+                  (unsigned)idx, (int)needsMic);
+    spectrumSetActive(needsMic);
 }
 
+// ── Init ────────────────────────────────────────────────────────────────────
+// Called from magitrac_server.ino setup() after gTransportEspNow.begin().
+// ESP-NOW is already initialised at that point; we just add the broadcast
+// peer (if not already added by MagiCommsEspNow) and spawn the worker.
 void pixelpostInit() {
-    if (sPixelPostQueue) return;
-
-    // One-time HMAC context setup — internal allocations happen here, not
-    // per-send, so the worker doesn't churn the heap.
-    mbedtls_md_init(&sHmacCtx);
-    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (mbedtls_md_setup(&sHmacCtx, info, /*hmac=*/1) == 0) {
-        sHmacCtxReady = true;
-    } else {
-        Serial.println("[PP] mbedtls_md_setup FAILED — pixel_post disabled");
+    const uint8_t bcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    if (!esp_now_is_peer_exist(bcast)) {
+        // WIFI_IF_STA exists in both SERVER_AP (WIFI_AP_STA) and
+        // EXTERNAL_AP (WIFI_STA) modes, and ifidx is just the source-MAC
+        // selector — radio TX still uses the current channel either way,
+        // which is what posts listen on.  Mirrors MagiCommsEspNow.cpp so
+        // a single registered broadcast peer serves both paths.
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, bcast, 6);
+        peer.channel = 0;            // 0 = current channel
+        peer.ifidx   = WIFI_IF_STA;
+        peer.encrypt = false;
+        esp_err_t err = esp_now_add_peer(&peer);
+        if (err != ESP_OK) {
+            Serial.printf("[PP-TX] add broadcast peer err=%d\n", (int)err);
+        }
     }
 
-    sPixelPostQueue = xQueueCreate(32, sizeof(PixelPostCmd));
-    // Core 0 = WiFi/system core (MIDI sequencer runs on core 1 via midiTaskFn,
-    // so this worker never preempts MIDI).  Low priority (1) — sequencer and
-    // WiFi outrank it.
-    xTaskCreatePinnedToCore(pixelpostWorker, "ppw", 4096, NULL, 1, NULL, 0);
+    sTxQueue = xQueueCreate(PP_TX_QUEUE_DEPTH, sizeof(PpTxFrame));
+    if (!sTxQueue) {
+        Serial.println("[PP-TX] xQueueCreate FAILED");
+        return;
+    }
+    xTaskCreatePinnedToCore(pixelpostTaskFn, "pp-tx",
+        /*stack=*/2048, nullptr, /*prio=*/1, nullptr, /*core=*/0);
 
-    // Register the broadcast spy so we sync sMyClock from pixel_post's
-    // HMAC'd MSG_TICK_SYNC broadcasts.  Without this, every magitrac
-    // reboot would drop the first N sends until our counter caught up
-    // to whatever pixel_post had cached for our MAC.
-    extern MagiCommsEspNow gTransport;
-    gTransport.setOnBroadcastSpy(pixelpostBroadcastSpy);
+    // Hook the per-frame spy on the ESP-NOW transport so we see
+    // PP_MSG_SELECT_EFFECT from the controller and can activate the
+    // mic for needsMic effects.
+    gTransportEspNow.setOnBroadcastSpy(pixelpostRecvCb);
+
+    Serial.println("[PP-TX] init OK");
 }
 
-// Non-blocking enqueue.  Drops silently if the queue is full (best-effort).
+// ── Enqueue helpers ─────────────────────────────────────────────────────────
+// Drop on full queue rather than block — callers are on the mic / MIDI
+// tasks and must not stall.
+static void enqueue(const uint8_t* data, size_t len) {
+    if (!sTxQueue) return;
+    if (len == 0 || len > PP_TX_PAYLOAD_MAX) return;
+    PpTxFrame frame;
+    frame.len = (uint8_t)len;
+    memcpy(frame.data, data, len);
+    xQueueSend(sTxQueue, &frame, 0);
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
 void pixelpostEnqueue(const uint8_t* payload, size_t len) {
-    if (!sPixelPostQueue) return;
-    if (len == 0 || len > sizeof(((PixelPostCmd*)0)->data)) return;
-    PixelPostCmd cmd;
-    cmd.kind = PPCMD_SEND;
-    cmd.len  = (uint8_t)len;
-    memcpy(cmd.data, payload, len);
-    xQueueSend(sPixelPostQueue, &cmd, 0);
+    enqueue(payload, len);
 }
-
-// ── Public message helpers (all go through the queue) ───────────────────────
 
 void pixelpostSendPairingBeacon() {
-    uint8_t msg = PP_MSG_MAGITRAC;
-    pixelpostEnqueue(&msg, 1);
+    uint8_t buf[1] = { PP_MSG_MAGITRAC };
+    enqueue(buf, sizeof(buf));
 }
 
 void pixelpostSendSelectEffect(uint8_t idx) {
-    uint8_t msg[2] = { PP_MSG_SELECT_EFFECT, idx };
-    pixelpostEnqueue(msg, sizeof(msg));
-    // Mic gating follows the selected effect — see pixelPostEffectNeedsMic().
-    spectrumSetActive(pixelPostEffectNeedsMic(idx));
+    uint8_t buf[2] = { PP_MSG_SELECT_EFFECT, idx };
+    enqueue(buf, sizeof(buf));
 }
 
 void pixelpostSendTapped() {
-    uint8_t msg = PP_MSG_TAPPED;
-    pixelpostEnqueue(&msg, 1);
+    uint8_t buf[1] = { PP_MSG_TAPPED };
+    enqueue(buf, sizeof(buf));
 }
 
 void pixelpostSendSlider(uint8_t value, bool pressed) {
-    uint8_t msg[3] = { PP_MSG_SLIDER, value, (uint8_t)(pressed ? 1 : 0) };
-    pixelpostEnqueue(msg, sizeof(msg));
+    uint8_t buf[3] = { PP_MSG_SLIDER, value, (uint8_t)(pressed ? 1 : 0) };
+    enqueue(buf, sizeof(buf));
 }
 
 void pixelpostSendMove(uint8_t x, uint8_t y, bool pressed) {
-    uint8_t msg[4] = { PP_MSG_MOVE, x, y, (uint8_t)(pressed ? 1 : 0) };
-    pixelpostEnqueue(msg, sizeof(msg));
+    uint8_t buf[4] = { PP_MSG_MOVE, x, y, (uint8_t)(pressed ? 1 : 0) };
+    enqueue(buf, sizeof(buf));
 }

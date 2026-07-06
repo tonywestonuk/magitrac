@@ -9,8 +9,9 @@
 // Drawn on top of whatever is currently on screen (no fillScreen).
 // Dismiss by tapping outside the box.
 //
-// Row 1 (y=195): [SONG] [INSTRUMENTS] [SETTINGS]
-// Row 2 (y=395): [          PAIR          ]
+// Row 1: [SONG] [INSTRUMENTS] [SETTINGS]
+// Row 2: [BACKUP] [PERFORM] [POSTS] [PAIR]
+// Row 3: [        ORGAN        ]
 
 enum class BootMenuResult : uint8_t {
     NONE,
@@ -20,31 +21,40 @@ enum class BootMenuResult : uint8_t {
     PAIR,
     BACKUP,
     PERFORM,
+    PIXELPOST,
+    DRAWBAR_ORGAN,
     DISMISSED,
 };
 
 static const int BM_BOX_X   = 130;
-static const int BM_BOX_Y   = 140;
+static const int BM_BOX_Y   = 80;
 static const int BM_BOX_W   = 700;
-static const int BM_BOX_H   = 390;   // extended for second row
-static const int BM_BTN_Y   = BM_BOX_Y + 55;  // = 195
-static const int BM_BTN_H   = 150;
+static const int BM_BOX_H   = 450;   // three rows
+static const int BM_BTN_Y   = BM_BOX_Y + 50;  // = 130
+static const int BM_BTN_H   = 140;
 static const int BM_BTN_W   = 210;
 static const int BM_BTN_GAP = 15;
 static const int BM_SONG_X  = BM_BOX_X + 20;                      // = 150
 static const int BM_INST_X  = BM_SONG_X + BM_BTN_W + BM_BTN_GAP; // = 375
 static const int BM_SETT_X  = BM_INST_X + BM_BTN_W + BM_BTN_GAP; // = 600
 
-// Row 2: BACKUP + PERFORM + PAIR side by side
-static const int BM_BTN2_Y   = BM_BTN_Y + BM_BTN_H + 25;  // = 370
-static const int BM_BTN2_H   = 100;
-static const int BM_BTN2_W   = 200;
+// Row 2: BACKUP + PERFORM + PIXELPOST + PAIR side by side
+static const int BM_BTN2_Y   = BM_BTN_Y + BM_BTN_H + 22;  // = 292
+static const int BM_BTN2_H   = 95;
+static const int BM_BTN2_W   = 160;
 static const int BM_BTN2_GAP = 15;
-// Total: 3*200 + 2*15 = 630, margin = (700-630)/2 = 35
-static const int BM_BACKUP_X  = BM_BOX_X + 35;                            // = 165
-static const int BM_PERFORM_X = BM_BACKUP_X + BM_BTN2_W + BM_BTN2_GAP;   // = 380
-static const int BM_PAIR_X    = BM_PERFORM_X + BM_BTN2_W + BM_BTN2_GAP;  // = 595
-static const int BM_PAIR_W    = BM_BTN2_W;
+// Total: 4*160 + 3*15 = 685, margin = (700-685)/2 = 7
+static const int BM_BACKUP_X    = BM_BOX_X + 8;                                // = 138
+static const int BM_PERFORM_X   = BM_BACKUP_X  + BM_BTN2_W + BM_BTN2_GAP;     // = 313
+static const int BM_PIXELPOST_X = BM_PERFORM_X + BM_BTN2_W + BM_BTN2_GAP;     // = 488
+static const int BM_PAIR_X      = BM_PIXELPOST_X + BM_BTN2_W + BM_BTN2_GAP;   // = 663
+static const int BM_PAIR_W      = BM_BTN2_W;
+
+// Row 3: ORGAN, centred (full additive drawbar organ on the server)
+static const int BM_BTN3_Y  = BM_BTN2_Y + BM_BTN2_H + 18;   // = 405
+static const int BM_BTN3_H  = 95;
+static const int BM_ORGAN_X = BM_BOX_X + (BM_BOX_W - BM_BTN_W) / 2;   // = 375
+static const int BM_ORGAN_W = BM_BTN_W;
 
 class BootMenu {
 public:
@@ -71,6 +81,8 @@ private:
     bool hitPair       (int sx, int sy) const;
     bool hitPerform    (int sx, int sy) const;
     bool hitBackup     (int sx, int sy) const;
+    bool hitPixelpost  (int sx, int sy) const;
+    bool hitOrgan      (int sx, int sy) const;
     bool hitInsideBox  (int sx, int sy) const;
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

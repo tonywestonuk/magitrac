@@ -13,13 +13,19 @@
 //                 [Header(8)] [50×Pattern(72)] [Song::columns(160)] [tail] [noteCount] [notes]
 // v17 (compact):  MAX_COLUMNS grew from 8 → 9 (one input + 8 outputs)
 //                 [Header(8)] [50×Pattern(72)] [Song::columns(180)] [tail] [noteCount] [notes]
+// v18 (compact):  MAX_COLUMNS grew from 9 → 21 (one input + 20 outputs)
+//                 [Header(8)] [50×Pattern(72)] [Song::columns(420)] [tail] [noteCount] [notes]
+// v19 (compact):  Song tail gains transposeChMask (uint16_t) between performerMask
+//                 and perfPads; _songPad shrinks 3→1.  Total tail size unchanged,
+//                 but field order shifts — needs explicit byte-level reads on v15-v18.
 //
 // In v11–v15, ColumnSettings sat inside Pattern (228+pad bytes). In v16 it lives
 // in Song. Migration lifts pattern[0]'s columns into Song::columns and discards
 // per-block columns from other patterns.
 
-// Historical column count for v11..v16 file layouts (do NOT track current MAX_COLUMNS).
+// Historical column counts (do NOT track current MAX_COLUMNS).
 static const int V16_MAX_COLUMNS = 8;
+static const int V17_MAX_COLUMNS = 9;
 
 static const int V11_MAX_PATTERNS   = 32;
 static const int V11_MAX_SONG_NOTES = 2048;
@@ -69,6 +75,27 @@ static inline bool readPatternsV15(File& f, Song* out, int count) {
             }
         }
     }
+    return true;
+}
+
+// Read the Song tail from a v15-v18 file (no transposeChMask).
+//   File layout:    numPatterns..performerMask | perfPads | _songPad[3]
+//   Struct layout:  numPatterns..performerMask | <1 pad> | transposeChMask[2] | perfPads | _songPad[1]
+// IMPORTANT: do NOT use offsetof(Song, transposeChMask) as the head size —
+// the compiler inserts a 1-byte alignment padding before that uint16_t, and
+// reading that many bytes from the file would consume the first byte of
+// perfPads, shifting every subsequent read.  We compute the head size from
+// performerMask explicitly so it stays correct regardless of alignment.
+// transposeChMask is set to its default (all channels follow transpose except
+// ch 10, the standard drum channel).
+static inline bool readSongTailV15to18(File& f, Song* out) {
+    static const size_t HEAD_SIZE =
+        offsetof(Song, performerMask) + sizeof(out->performerMask) - offsetof(Song, numPatterns);
+    if (f.read((uint8_t*)&out->numPatterns, HEAD_SIZE) != (int)HEAD_SIZE) return false;
+    if (f.read((uint8_t*)out->perfPads, sizeof(out->perfPads)) != (int)sizeof(out->perfPads)) return false;
+    uint8_t discard[3];
+    if (f.read(discard, sizeof(discard)) != (int)sizeof(discard)) return false;
+    out->transposeChMask = 0xFDFF;  // all channels except ch 10 (drums)
     return true;
 }
 
@@ -207,13 +234,18 @@ static inline bool songMigrateV14FromFile(File& f, Song* out) {
     // 1. Patterns (PatternV15 layout)
     if (!readPatternsV15(f, out, MAX_PATTERNS)) return false;
 
-    // 2. Old song tail — numPatterns through performerMask, then 3 bytes padding
-    static const size_t V14_TAIL_USEFUL = offsetof(Song, perfPads) - offsetof(Song, numPatterns);
+    // 2. Old song tail — numPatterns through performerMask, then 3 bytes padding.
+    // Compute the head size from performerMask explicitly — using
+    // offsetof(transposeChMask) would include alignment padding that doesn't
+    // exist in the v14 file and would shift every subsequent read.
+    static const size_t V14_TAIL_USEFUL =
+        offsetof(Song, performerMask) + sizeof(out->performerMask) - offsetof(Song, numPatterns);
     static const size_t V14_TAIL_PAD    = 3;
     if (f.read((uint8_t*)&out->numPatterns, V14_TAIL_USEFUL) != (int)V14_TAIL_USEFUL) return false;
     uint8_t discard[V14_TAIL_PAD];
     if (f.read(discard, V14_TAIL_PAD) != (int)V14_TAIL_PAD) return false;
-    // perfPads stays zeroed = defaults
+    // perfPads stays zeroed = defaults; transposeChMask gets default below.
+    out->transposeChMask = 0xFDFF;
 
     // 3. Note count
     uint16_t noteCount = 0;
@@ -280,9 +312,8 @@ static inline bool songMigrateV15FromFile(File& f, Song* out) {
     // 1. Patterns (PatternV15 layout) — also lifts pattern[0]'s columns
     if (!readPatternsV15(f, out, MAX_PATTERNS)) return false;
 
-    // 2. Song tail — same layout as v16 (numPatterns..end of struct)
-    static const size_t TAIL_SIZE = sizeof(Song) - offsetof(Song, numPatterns);
-    if (f.read((uint8_t*)&out->numPatterns, TAIL_SIZE) != (int)TAIL_SIZE) return false;
+    // 2. Song tail — v15-v18 layout (no transposeChMask; transposeChMask defaulted)
+    if (!readSongTailV15to18(f, out)) return false;
 
     // 3. Note count
     uint16_t noteCount = 0;
@@ -355,9 +386,8 @@ static inline bool songMigrateV16FromFile(File& f, Song* out) {
         out->columns[c] = v16cols[c];
     }
 
-    // 3. Song tail (numPatterns through _songPad — unchanged since v15)
-    static const size_t TAIL_SIZE = sizeof(Song) - offsetof(Song, numPatterns);
-    if (f.read((uint8_t*)&out->numPatterns, TAIL_SIZE) != (int)TAIL_SIZE) return false;
+    // 3. Song tail — v15-v18 layout (no transposeChMask; transposeChMask defaulted)
+    if (!readSongTailV15to18(f, out)) return false;
 
     // 4. Note count
     uint16_t noteCount = 0;
@@ -403,7 +433,127 @@ static inline bool songMigrateV16FromFile(File& f, Song* out) {
     return true;
 }
 
-// ── Compact format: write (v17) ─────────────────────────────────────────────
+// ── v17 migration (stream from file) ────────────────────────────────────────
+// File must be seeked past the SongFileHeader.
+// v17 differs from current only in Song::columns size (9 cols vs current MAX).
+static inline bool songMigrateV17FromFile(File& f, Song* out) {
+    memset(out, 0, sizeof(Song));
+
+    // 1. Patterns (current Pattern layout — unchanged since v16)
+    if (f.read((uint8_t*)out->patterns, sizeof(out->patterns)) != (int)sizeof(out->patterns)) return false;
+
+    // 2. Per-song column settings — historical 9 entries; remaining cols zeroed
+    static const size_t V17_COLS_BYTES = (size_t)V17_MAX_COLUMNS * sizeof(ColumnSettings);
+    ColumnSettings v17cols[V17_MAX_COLUMNS];
+    if (f.read((uint8_t*)v17cols, V17_COLS_BYTES) != (int)V17_COLS_BYTES) return false;
+    for (int c = 0; c < V17_MAX_COLUMNS && c < MAX_COLUMNS; c++) {
+        out->columns[c] = v17cols[c];
+    }
+
+    // 3. Song tail — v15-v18 layout (no transposeChMask; transposeChMask defaulted)
+    if (!readSongTailV15to18(f, out)) return false;
+
+    // 4. Note count
+    uint16_t noteCount = 0;
+    if (f.read((uint8_t*)&noteCount, sizeof(noteCount)) != (int)sizeof(noteCount)) return false;
+    if (noteCount > MAX_SONG_NOTES) return false;
+
+    // 5. Reset noteHeads (disk values are stale)
+    for (int p = 0; p < MAX_PATTERNS; p++)
+        out->patterns[p].noteHead = NOTE_NULL;
+
+    // 6. Read notes
+    uint16_t tail[MAX_PATTERNS];
+    for (int p = 0; p < MAX_PATTERNS; p++) tail[p] = NOTE_NULL;
+    for (uint16_t i = 0; i < noteCount; i++) {
+        SerializedNote sn;
+        if (f.read((uint8_t*)&sn, sizeof(sn)) != (int)sizeof(sn)) return false;
+        if (sn.pattern >= MAX_PATTERNS) return false;
+
+        NoteNode& node = out->notePool[i];
+        node.row = sn.row; node.col = sn.col; node.note = sn.note;
+        node.velocity = sn.velocity; node.effect = sn.effect; node.param = sn.param;
+        node.next = i;
+
+        uint8_t p = sn.pattern;
+        if (out->patterns[p].noteHead == NOTE_NULL) { out->patterns[p].noteHead = i; tail[p] = i; }
+        else { out->notePool[tail[p]].next = i; tail[p] = i; }
+    }
+
+    // 7. Close circular lists + build free list
+    for (int p = 0; p < MAX_PATTERNS; p++) {
+        if (out->patterns[p].noteHead != NOTE_NULL)
+            out->notePool[tail[p]].next = out->patterns[p].noteHead;
+    }
+    if (noteCount < MAX_SONG_NOTES) {
+        out->noteFreeHead = noteCount;
+        for (uint16_t i = noteCount; i < MAX_SONG_NOTES - 1; i++)
+            out->notePool[i].next = i + 1;
+        out->notePool[MAX_SONG_NOTES - 1].next = NOTE_NULL;
+    } else {
+        out->noteFreeHead = NOTE_NULL;
+    }
+
+    return true;
+}
+
+// ── v18 migration (stream from file) ────────────────────────────────────────
+// v18 differs from current only in the Song tail layout (no transposeChMask).
+// Patterns and columns match the current MAX_COLUMNS = 21.
+static inline bool songMigrateV18FromFile(File& f, Song* out) {
+    memset(out, 0, sizeof(Song));
+
+    // 1. Patterns (current Pattern layout — unchanged since v16)
+    if (f.read((uint8_t*)out->patterns, sizeof(out->patterns)) != (int)sizeof(out->patterns)) return false;
+
+    // 2. Per-song column settings — current size
+    if (f.read((uint8_t*)out->columns, sizeof(out->columns)) != (int)sizeof(out->columns)) return false;
+
+    // 3. Song tail — v15-v18 layout
+    if (!readSongTailV15to18(f, out)) return false;
+
+    // 4. Note count
+    uint16_t noteCount = 0;
+    if (f.read((uint8_t*)&noteCount, sizeof(noteCount)) != (int)sizeof(noteCount)) return false;
+    if (noteCount > MAX_SONG_NOTES) return false;
+
+    for (int p = 0; p < MAX_PATTERNS; p++)
+        out->patterns[p].noteHead = NOTE_NULL;
+
+    uint16_t tail[MAX_PATTERNS];
+    for (int p = 0; p < MAX_PATTERNS; p++) tail[p] = NOTE_NULL;
+    for (uint16_t i = 0; i < noteCount; i++) {
+        SerializedNote sn;
+        if (f.read((uint8_t*)&sn, sizeof(sn)) != (int)sizeof(sn)) return false;
+        if (sn.pattern >= MAX_PATTERNS) return false;
+
+        NoteNode& node = out->notePool[i];
+        node.row = sn.row; node.col = sn.col; node.note = sn.note;
+        node.velocity = sn.velocity; node.effect = sn.effect; node.param = sn.param;
+        node.next = i;
+
+        uint8_t p = sn.pattern;
+        if (out->patterns[p].noteHead == NOTE_NULL) { out->patterns[p].noteHead = i; tail[p] = i; }
+        else { out->notePool[tail[p]].next = i; tail[p] = i; }
+    }
+
+    for (int p = 0; p < MAX_PATTERNS; p++) {
+        if (out->patterns[p].noteHead != NOTE_NULL)
+            out->notePool[tail[p]].next = out->patterns[p].noteHead;
+    }
+    if (noteCount < MAX_SONG_NOTES) {
+        out->noteFreeHead = noteCount;
+        for (uint16_t i = noteCount; i < MAX_SONG_NOTES - 1; i++)
+            out->notePool[i].next = i + 1;
+        out->notePool[MAX_SONG_NOTES - 1].next = NOTE_NULL;
+    } else {
+        out->noteFreeHead = NOTE_NULL;
+    }
+
+    return true;
+}
+
+// ── Compact format: write (v19) ─────────────────────────────────────────────
 // Layout: header + patterns + Song::columns + tail + noteCount + notes.
 
 static inline bool songWriteCompact(File& f, const Song* song) {
@@ -458,6 +608,71 @@ static inline bool songWriteCompact(File& f, const Song* song) {
     }
 
     return true;
+}
+
+// ── CRC32 over the compact serialization (save read-back verify) ────────────
+// magiCrc32 is a streaming, composable CRC-32/IEEE: seed with 0, feed chunks in
+// any order, and the running value equals the CRC of everything fed so far
+// (the leading/trailing inversions make magiCrc32(magiCrc32(0,a),b) == CRC of
+// a‖b).  songCrc32 walks the song in the EXACT byte order songWriteCompact()
+// emits, so its value equals the CRC of the bytes that function writes to disk.
+//
+// KEEP THE TWO IN LOCKSTEP — any change to songWriteCompact's on-disk layout
+// must be mirrored here, or every server save-verify will (loudly) fail.
+static inline uint32_t magiCrc32(uint32_t crc, const void* data, size_t len) {
+    const uint8_t* d = (const uint8_t*)data;
+    crc = ~crc;
+    while (len--) {
+        crc ^= *d++;
+        for (int k = 0; k < 8; k++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+static inline uint32_t songCrc32(const Song* song) {
+    uint32_t c = 0;
+
+    SongFileHeader hdr;
+    hdr.magic   = SONG_FILE_MAGIC;
+    hdr.version = SONG_FILE_VERSION;
+    hdr._pad[0] = hdr._pad[1] = hdr._pad[2] = 0;
+    c = magiCrc32(c, &hdr, sizeof(hdr));
+
+    c = magiCrc32(c, song->patterns, sizeof(song->patterns));
+    c = magiCrc32(c, song->columns,  sizeof(song->columns));
+
+    static const size_t TAIL_SIZE = sizeof(Song) - offsetof(Song, numPatterns);
+    c = magiCrc32(c, &song->numPatterns, TAIL_SIZE);
+
+    uint16_t noteCount = 0;
+    for (int p = 0; p < MAX_PATTERNS; p++) {
+        uint16_t head = song->patterns[p].noteHead;
+        if (head == NOTE_NULL) continue;
+        uint16_t idx = head;
+        do { noteCount++; idx = song->notePool[idx].next; } while (idx != head);
+    }
+    c = magiCrc32(c, &noteCount, sizeof(noteCount));
+
+    for (int p = 0; p < MAX_PATTERNS; p++) {
+        uint16_t head = song->patterns[p].noteHead;
+        if (head == NOTE_NULL) continue;
+        uint16_t idx = head;
+        do {
+            const NoteNode& n = song->notePool[idx];
+            SerializedNote sn;
+            sn.pattern  = (uint8_t)p;
+            sn.row      = n.row;
+            sn.col      = n.col;
+            sn.note     = n.note;
+            sn.velocity = n.velocity;
+            sn.effect   = n.effect;
+            sn.param    = n.param;
+            c = magiCrc32(c, &sn, sizeof(sn));
+            idx = n.next;
+        } while (idx != head);
+    }
+    return c;
 }
 
 // ── Compact format: read (v16) ──────────────────────────────────────────────

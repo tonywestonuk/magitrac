@@ -57,7 +57,7 @@ compiled in via Arduino library discovery (the `.ino` does
 
 - `TrackerData.{h,cpp}` — Song / Pattern / NoteNode + helper formatters
 - `NoteGrid.{h,cpp}` — sparse note-pool abstraction
-- `SongMigration.h` — versioned file readers v11..v17
+- `SongMigration.h` — versioned file readers v11..v18
 - `MagiMsg.h` — wire message structs + types
 - `MagiComms.h` + `MagiCommsEspNow.{h,cpp}` — transport abstraction
 - `PairNVS.{h,cpp}` — NVS pairing storage + HMAC helpers
@@ -71,11 +71,11 @@ When you need to change a shared struct or wire format, edit it once in
 |---|---|---|
 | `MAX_PATTERNS` | 50 | aka "blocks" |
 | `MAX_ROWS` | 64 | per pattern |
-| `MAX_COLUMNS` | 9 | col 0 = input, cols 1–8 = MIDI output |
+| `MAX_COLUMNS` | 21 | col 0 = input, cols 1–20 = MIDI output |
 | `MAX_SONG_NOTES` | 4000 | sparse pool shared across patterns |
 | `MAX_INSTRUMENTS` | 256 | library presets |
 | `INSTRUMENT_NAME_LEN` | 12 | 11 chars + null |
-| `SONG_FILE_VERSION` | 17 | bump when `Pattern`/`Song` tail/`MAX_COLUMNS` changes |
+| `SONG_FILE_VERSION` | 18 | bump when `Pattern`/`Song` tail/`MAX_COLUMNS` changes |
 
 - `NoteNode` is the sparse note record (7 bytes wire, 8 bytes struct +
   `next` index).  Each pattern is a **circular linked list** through
@@ -103,10 +103,10 @@ Wire transfer (ESP-NOW) still uses the **raw `Song` struct** — file format
 and wire format diverge only in note storage.
 
 `SongMigration.h` carries a chain of versioned readers (v11→v13→v14→v15→
-v16→v17).  When changing layout, add a new `songMigrateVNFromFile()`
+v16→v17→v18).  When changing layout, add a new `songMigrateVNFromFile()`
 function and a dispatch line in `SongStorage.cpp` — never break old files.
-Note `V16_MAX_COLUMNS = 8` constant — historical structs lock the column
-count at the value it had when they were written.
+Note `V16_MAX_COLUMNS = 8` / `V17_MAX_COLUMNS = 9` constants — historical
+structs lock the column count at the value it had when they were written.
 
 ## UI pages (each is a class with `open()` / `draw()` / `poll()`)
 
@@ -114,7 +114,7 @@ count at the value it had when they were written.
   inline keyboard via `KeyboardPopup`.
 - **ColumnEditor** — per-column MIDI settings (channel, bank, program, vol,
   transpose, name); also COPY / SWAP / CLEAR column actions with confirm
-  dialogs.  Opened by **tap** on a column header (cols 1–8).
+  dialogs.  Opened by **tap** on a column header (cols 1–20).
 - **ColumnNoteEditorPage** — piano-roll-style note editor for one column
   of one pattern: 13 visible pitches × 16 row-cells per segment, with
   drag-scroll on the pitch axis, segment nav `[<] [>]`, VEL/ATTR popups,

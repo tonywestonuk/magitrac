@@ -40,11 +40,22 @@ static const int PP_PAD_MARGIN = 20;   // outer margin
 static const int PP_PAD_GAP    = 10;   // gap between pads
 static const int PP_PAD_Y0     = 60;   // first row top
 static const int PP_PAD_W      = (960 - 2 * PP_PAD_MARGIN - (PP_PAD_COLS - 1) * PP_PAD_GAP) / PP_PAD_COLS;  // 220
-static const int PP_PAD_H      = 225;
+static const int PP_PAD_H      = 200;  // shortened from 225 to free a light-control strip
 static const int PP_PAD_ROW_GAP = 10;
+
+// Light-control strip (PixelPost) — short button row below the pads.
+// Row 2 bottom = 60 + (200+10) + 200 = 470, so the strip sits at 478.
+static const int PP_LIGHT_Y      = 478;
+static const int PP_LIGHT_H      = 54;
+static const int PP_LIGHT_MARGIN = 20;
+static const int PP_LIGHT_GAP    = 10;
+static const int PP_LIGHT_COUNT  = 4;
+static const int PP_LIGHT_W      = (960 - 2 * PP_LIGHT_MARGIN - (PP_LIGHT_COUNT - 1) * PP_LIGHT_GAP) / PP_LIGHT_COUNT;  // 222
 
 // Hold duration for header buttons (anti-fumble)
 static const uint32_t PP_HOLD_MS = 500;
+// Hold duration on a pad → STOP playback + clear pad lights
+static const uint32_t PP_PAD_HOLD_MS = 1000;
 
 // Pad edit list layout
 static const int PE_ROW_Y0     = 55;
@@ -67,7 +78,7 @@ public:
         SETLIST,    // SETLIST held — open setlist page
     };
 
-    void open(uint8_t currentPattern);
+    void open(uint8_t currentPattern, bool stopped = false);
     void draw();
     Result poll();
 
@@ -88,17 +99,25 @@ private:
     Song&                _song;
 
     bool     _wasDown;
-    uint8_t  _playingPattern;   // currently playing block (white on black)
+    int8_t   _playingPattern;   // currently playing block (white on black); -1 = none lit
     int8_t   _queuedPattern;    // queued block (-1 = none)
     bool     _flashState;       // toggled for queued pad animation
     uint32_t _lastFlashMs;      // millis() of last flash toggle
     bool     _patchPending;     // perfPad config changed, needs server sync
 
-    // Hold tracking for header buttons
-    enum class HoldTarget : uint8_t { NONE, HOME, EDIT, SETLIST };
+    // Hold tracking for header buttons + pads
+    enum class HoldTarget : uint8_t { NONE, HOME, EDIT, SETLIST, PAD };
     HoldTarget _holdTarget;
     uint32_t   _holdStartMs;
     bool       _holdFired;
+    int8_t     _holdPadIdx;     // pad under finger when HoldTarget::PAD is armed
+    // Anti-phantom validation: on-screen count of touches the driver rejected.
+    uint32_t   _lastRejShown  = 0;
+    uint32_t   _lastRejDrawMs = 0;
+
+    // Light-control strip state.
+    int8_t   _lightArmedBtn = -1;    // strip button pressed on finger-down (-1 = none)
+    bool     _lightManual   = false; // we've grabbed PixelPost control → RELEASE enabled
 
     // Sub-views
     bool     _editing;          // true = pad edit list, false = performance pads
@@ -109,6 +128,7 @@ private:
 
     // ── Performance pad view ─────────────────────────────────────────────────
     void drawPerfHeader();
+    void drawRej();          // anti-phantom: small rejected-touch counter in header
     void drawPads();
     void drawPad(int idx);
     int  padX(int idx) const;
@@ -118,6 +138,11 @@ private:
     bool hitSetlist(int sx, int sy) const;
     int  hitPad(int sx, int sy) const;
     Result pollPerf();
+
+    // ── Light-control strip (PixelPost) ──────────────────────────────────────
+    void drawLightStrip();
+    int  hitLightBtn(int sx, int sy) const;   // 0=PREV 1=NEXT 2=POW 3=RELEASE; -1 none
+    void fireLightButton(int btn);            // send the override + refresh strip
 
     // ── Pad edit view ────────────────────────────────────────────────────────
     void drawEditView();

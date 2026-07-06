@@ -9,6 +9,7 @@
 #include "NoteGrid.h"
 #include "SongMigration.h"
 #include "MagiMsg.h"
-#include "MagiComms.h"
 #include "MagiCommsEspNow.h"
+#include "MagiUdpLink.h"
+#include "MagiLink.h"
 #include "PairNVS.h"

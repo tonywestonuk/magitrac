@@ -21,10 +21,12 @@ BlockSettingsPage::BlockSettingsPage(EPD_PainterAdafruit& display,
     , _confirmSplit(false)
     , _didDuplicate(false)
     , _didSplit(false)
+    , _didStructuralChange(false)
     , _keyChangePending(false)
     , _keyChangePat(0)
     , _navChangePending(false)
     , _navChangePat(0)
+    , _openDrum(false)
 {}
 
 // ── open() ────────────────────────────────────────────────────────────────────
@@ -36,8 +38,10 @@ void BlockSettingsPage::open(uint8_t patIdx) {
     _confirmSplit     = false;
     _didDuplicate     = false;
     _didSplit         = false;
+    _didStructuralChange = false;
     _keyChangePending = false;
     _navChangePending = false;
+    _openDrum         = false;
     _holdTrpBtn       = 0;
     _confirmSetAll    = false;
     _setAllAction     = 0;
@@ -326,6 +330,8 @@ void BlockSettingsPage::drawKeyChangeRow() {
         pat().keyChangeMode == (uint8_t)KeyChangeMode::SAME_POS);
     btn(BSP_KCH_TOP_X, btnY, BSP_KCH_TOP_W, BSP_BTN_H, "TOP",
         pat().keyChangeMode == (uint8_t)KeyChangeMode::TOP);
+
+    btn(BSP_KCH_DRUM_X, btnY, BSP_KCH_DRUM_W, BSP_BTN_H, "Drum-Editor", false);
 }
 
 void BlockSettingsPage::drawEndNavRow() {
@@ -340,27 +346,29 @@ void BlockSettingsPage::drawEndNavRow() {
     _d.print("NEXT:");
 
     uint8_t nav  = pat().blockEndNav;
+    bool    isRnt = (nav == NAV_RNT);
     uint8_t mode = nav & NAV_MODE_MASK;
 
     btn(BSP_END_LOOP_X, btnY, BSP_END_LOOP_W, BSP_BTN_H, "LOOP",
-        mode == NAV_LOOP);
+        !isRnt && mode == NAV_LOOP);
     btn(BSP_END_FWD_X, btnY, BSP_END_FWD_W, BSP_BTN_H, "FWD",
-        mode == NAV_FWD);
+        !isRnt && mode == NAV_FWD);
     btn(BSP_END_BACK_X, btnY, BSP_END_BACK_W, BSP_BTN_H, "BACK",
-        mode == NAV_BACK);
+        !isRnt && mode == NAV_BACK);
     btn(BSP_END_ABS_X, btnY, BSP_END_ABS_W, BSP_BTN_H, "ABS",
-        mode == NAV_ABS);
+        !isRnt && mode == NAV_ABS);
+    btn(BSP_END_RNT_X, btnY, BSP_END_RNT_W, BSP_BTN_H, "RNT", isRnt);
 
-    bool active = (mode != NAV_LOOP);
+    // Value cell only active for FWD / BACK / ABS — LOOP and RNT carry no target.
+    bool active = !isRnt && (mode != NAV_LOOP);
     uint8_t target = nav & NAV_TARGET_MASK;
 
     btn(BSP_END_MINUS_X, btnY, BSP_END_ARROW_W, BSP_BTN_H, "-", false, !active);
 
     char val[4];
-    if (mode == NAV_ABS)
-        snprintf(val, sizeof(val), "%02d", target + 1);  // 1-based display
-    else
-        snprintf(val, sizeof(val), "%d", target);
+    if (!active)            val[0] = '\0';
+    else if (mode == NAV_ABS) snprintf(val, sizeof(val), "%02d", target + 1);
+    else                      snprintf(val, sizeof(val), "%d", target);
 
     _d.fillRect(BSP_END_VAL_X, btnY, BSP_END_VAL_W, BSP_BTN_H, active ? 0 : 1);
     _d.drawRect(BSP_END_VAL_X, btnY, BSP_END_VAL_W, BSP_BTN_H, active ? 3 : 1);
@@ -395,6 +403,55 @@ void BlockSettingsPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
 }
 
 void BlockSettingsPage::doDelete() {
+    // Return the deleted pattern's notes to the free list before the memmove
+    // strands them — otherwise they leak pool slots permanently and a song
+    // with enough delete cycles will silently fail to accept new notes.
+    NoteGrid(_song.notePool, &_song.noteFreeHead,
+             &_song.patterns[_patIdx].noteHead).clearAll();
+
+    // Renumber block references before the shift, while every pattern still
+    // has its original index.  A target past the deleted block slides down by
+    // one; a target ON the deleted block falls through to its successor (which
+    // inherits the slot), clamped if the deleted block was last.  FWD/BACK are
+    // stored as distances, so both endpoints are mapped and the distance
+    // re-derived; a distance that collapses to zero degrades to LOOP.
+    // Deliberately untouched: NAV_RNT (dynamic), and FWD/BACK jumps that
+    // already pointed out of range (they wrap at runtime).
+    {
+        const uint8_t D = _patIdx;
+        const uint8_t n = _song.numPatterns;
+        auto mapT = [D, n](uint8_t t) -> uint8_t {
+            uint8_t m = (t > D) ? (uint8_t)(t - 1) : t;
+            return (m > (uint8_t)(n - 2)) ? (uint8_t)(n - 2) : m;
+        };
+        for (uint8_t i = 0; i < n; i++) {
+            if (i == D) continue;
+            Pattern& p    = _song.patterns[i];
+            uint8_t  newI = (i > D) ? (uint8_t)(i - 1) : i;
+            uint8_t  nav  = p.blockEndNav;
+            uint8_t  mode = nav & NAV_MODE_MASK;
+            uint8_t  tgt  = nav & NAV_TARGET_MASK;
+            if (nav != NAV_RNT) {
+                if (mode == NAV_ABS) {
+                    p.blockEndNav = (uint8_t)(NAV_ABS | mapT(tgt));
+                } else if (mode == NAV_FWD && tgt > 0 && i + tgt < n) {
+                    int nd = (int)mapT((uint8_t)(i + tgt)) - (int)newI;
+                    p.blockEndNav = (nd >= 1) ? (uint8_t)(NAV_FWD | nd)
+                                              : (uint8_t)NAV_LOOP;
+                } else if (mode == NAV_BACK && tgt > 0 && tgt <= i) {
+                    int nd = (int)newI - (int)mapT((uint8_t)(i - tgt));
+                    p.blockEndNav = (nd >= 1) ? (uint8_t)(NAV_BACK | nd)
+                                              : (uint8_t)NAV_LOOP;
+                }
+            }
+            for (int k = 0; k < 12; k++) {
+                InputNoteEntry& e = p.inputNotes[k];
+                if (e.switchMode != BlockSwitch::STAY && e.switchTarget < n)
+                    e.switchTarget = mapT(e.switchTarget);
+            }
+        }
+    }
+
     for (uint8_t i = _patIdx; i < _song.numPatterns - 1; i++)
         _song.patterns[i] = _song.patterns[i + 1];
     _song.numPatterns--;
@@ -404,6 +461,7 @@ void BlockSettingsPage::doDelete() {
         _song.startPattern--;
     if (_patIdx >= _song.numPatterns) _patIdx = _song.numPatterns - 1;
     _selNote = 0;
+    _didStructuralChange = true;
     Serial.printf("[BSP] DELETE, now %d patterns\n", _song.numPatterns);
 }
 
@@ -497,6 +555,7 @@ bool BlockSettingsPage::poll() {
                 TransposeAction act = (TransposeAction)_setAllAction;
                 for (int i = 0; i < 12; i++)
                     pat().inputNotes[i].transposeAction = act;
+                _didStructuralChange = true;
                 _confirmSetAll = false;
                 drawTransposeRow(); drawNoteButtons(); _d.paint();
                 return false;
@@ -567,6 +626,7 @@ bool BlockSettingsPage::poll() {
             p.referenceNote = 0;
             _patIdx  = idx;
             _selNote = 0;
+            _didStructuralChange = true;
             Serial.printf("[BSP] NEW pattern %d\n", idx);
             draw(); _d.paint();
 
@@ -590,6 +650,7 @@ bool BlockSettingsPage::poll() {
             _patIdx       = idx;
             _selNote      = 0;
             _didDuplicate = true;
+            _didStructuralChange = true;
             Serial.printf("[BSP] DUPLICATE -> pattern %d\n", idx);
             draw(); _d.paint();
 
@@ -609,6 +670,7 @@ bool BlockSettingsPage::poll() {
     if (ty >= BSP_LEN_Y && ty < BSP_LEN_Y + BSP_LEN_H) {
         int idx = (tx - BSP_LEN_LBL_W) / BSP_LEN_BTN_W;
         if (idx >= 0 && idx < BSP_LEN_COUNT) {
+            if (pat().length != BSP_LENGTHS[idx]) _didStructuralChange = true;
             pat().length = BSP_LENGTHS[idx];
             Serial.printf("[BSP] length=%d\n", pat().length);
             drawLengthRow(); _d.paint();
@@ -635,14 +697,17 @@ bool BlockSettingsPage::poll() {
         InputNoteEntry& e = entry();
 
         if (tx >= BSP_BLK_STAY_X && tx < BSP_BLK_STAY_X + BSP_BLK_STAY_W) {
+            if (e.switchMode != BlockSwitch::STAY) _didStructuralChange = true;
             e.switchMode = BlockSwitch::STAY;
             drawBlockRow(); drawNoteButtons(); _d.paint();
 
         } else if (tx >= BSP_BLK_SPOS_X && tx < BSP_BLK_SPOS_X + BSP_BLK_SPOS_W) {
+            if (e.switchMode != BlockSwitch::SAME_POS) _didStructuralChange = true;
             e.switchMode = BlockSwitch::SAME_POS;
             drawBlockRow(); drawNoteButtons(); _d.paint();
 
         } else if (tx >= BSP_BLK_TOP_X && tx < BSP_BLK_TOP_X + BSP_BLK_TOP_W) {
+            if (e.switchMode != BlockSwitch::TOP) _didStructuralChange = true;
             e.switchMode = BlockSwitch::TOP;
             drawBlockRow(); drawNoteButtons(); _d.paint();
 
@@ -650,11 +715,13 @@ bool BlockSettingsPage::poll() {
             if (tx >= BSP_BLK_MINUS_X && tx < BSP_BLK_MINUS_X + BSP_BLK_ARROW_W) {
                 if (e.switchTarget > 0) {
                     e.switchTarget--;
+                    _didStructuralChange = true;
                     drawBlockRow(); drawNoteButtons(); _d.paint();
                 }
             } else if (tx >= BSP_BLK_PLUS_X && tx < BSP_BLK_PLUS_X + BSP_BLK_ARROW_W) {
                 if (e.switchTarget < _song.numPatterns - 1) {
                     e.switchTarget++;
+                    _didStructuralChange = true;
                     drawBlockRow(); drawNoteButtons(); _d.paint();
                 }
             }
@@ -672,6 +739,9 @@ bool BlockSettingsPage::poll() {
             pat().keyChangeMode = (uint8_t)KeyChangeMode::TOP;
             _keyChangePending = true; _keyChangePat = _patIdx;
             drawKeyChangeRow(); _d.paint();
+        } else if (tx >= BSP_KCH_DRUM_X && tx < BSP_KCH_DRUM_X + BSP_KCH_DRUM_W) {
+            _openDrum = true;
+            return true;
         }
         return false;
     }
@@ -679,8 +749,10 @@ bool BlockSettingsPage::poll() {
     // ── End-nav row (NEXT BLK) ───────────────────────────────────────────────
     if (ty >= BSP_END_Y && ty < BSP_END_Y + BSP_END_H) {
         uint8_t nav    = pat().blockEndNav;
+        bool    isRnt  = (nav == NAV_RNT);
         uint8_t mode   = nav & NAV_MODE_MASK;
-        uint8_t target = nav & NAV_TARGET_MASK;
+        // RNT has no target — treat it as 0 when re-encoding into another mode.
+        uint8_t target = isRnt ? 0 : (nav & NAV_TARGET_MASK);
 
         if (tx >= BSP_END_LOOP_X && tx < BSP_END_LOOP_X + BSP_END_LOOP_W) {
             pat().blockEndNav = NAV_LOOP;
@@ -702,7 +774,12 @@ bool BlockSettingsPage::poll() {
             _navChangePending = true; _navChangePat = _patIdx;
             drawEndNavRow(); _d.paint();
 
-        } else if (mode != NAV_LOOP) {
+        } else if (tx >= BSP_END_RNT_X && tx < BSP_END_RNT_X + BSP_END_RNT_W) {
+            pat().blockEndNav = NAV_RNT;
+            _navChangePending = true; _navChangePat = _patIdx;
+            drawEndNavRow(); _d.paint();
+
+        } else if (!isRnt && mode != NAV_LOOP) {
             if (tx >= BSP_END_MINUS_X && tx < BSP_END_MINUS_X + BSP_END_ARROW_W) {
                 if (target > 0) {
                     pat().blockEndNav = mode | (target - 1);
@@ -726,16 +803,19 @@ bool BlockSettingsPage::poll() {
         InputNoteEntry& e = entry();
 
         if (tx >= BSP_TRP_KEEP_X && tx < BSP_TRP_KEEP_X + BSP_TRP_KEEP_W) {
+            if (e.transposeAction != TransposeAction::KEEP) _didStructuralChange = true;
             e.transposeAction = TransposeAction::KEEP;
             _holdTrpBtn = 1; _holdTrpStart = millis();
             drawTransposeRow(); drawNoteButtons(); _d.paint();
 
         } else if (tx >= BSP_TRP_NOTE_X && tx < BSP_TRP_NOTE_X + BSP_TRP_NOTE_W) {
+            if (e.transposeAction != TransposeAction::NOTE) _didStructuralChange = true;
             e.transposeAction = TransposeAction::NOTE;
             _holdTrpBtn = 2; _holdTrpStart = millis();
             drawTransposeRow(); drawNoteButtons(); _d.paint();
 
         } else if (tx >= BSP_TRP_CUST_X && tx < BSP_TRP_CUST_X + BSP_TRP_CUST_W) {
+            if (e.transposeAction != TransposeAction::CUSTOM) _didStructuralChange = true;
             e.transposeAction = TransposeAction::CUSTOM;
             drawTransposeRow(); drawNoteButtons(); _d.paint();
 
@@ -743,11 +823,13 @@ bool BlockSettingsPage::poll() {
             if (tx >= BSP_TRP_MINUS_X && tx < BSP_TRP_MINUS_X + BSP_BLK_ARROW_W) {
                 if (e.transposeValue > -12) {
                     e.transposeValue--;
+                    _didStructuralChange = true;
                     drawTransposeRow(); drawNoteButtons(); _d.paint();
                 }
             } else if (tx >= BSP_TRP_PLUS_X && tx < BSP_TRP_PLUS_X + BSP_BLK_ARROW_W) {
                 if (e.transposeValue < 12) {
                     e.transposeValue++;
+                    _didStructuralChange = true;
                     drawTransposeRow(); drawNoteButtons(); _d.paint();
                 }
             }
