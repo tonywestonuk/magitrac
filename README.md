@@ -1,6 +1,23 @@
 # MagiTrac
 
-A live-performance MIDI tracker built on ESP32 hardware:
+A live-performance MIDI tracker built on ESP32 hardware. Unlike a normal
+sequencer, MagiTrac **follows the performer**: WAIT/SYNC cues in the song
+snap playback to what you actually play, and the tempo is derived live from
+your timing.
+
+## Documentation
+
+- **[Getting Started](docs/getting-started.md)** — hardware, building the
+  firmware, first pairing, first song
+- **[Tracker Guide](docs/tracker-guide.md)** — the handheld client, page
+  by page
+- **[Server Guide](docs/server-guide.md)** — the stage box: screens,
+  samples, USB file transfer, organ
+- **[Reference](docs/reference.md)** — note cues, effects, block
+  navigation, exact sequencer semantics
+- **[Lights](docs/lights.md)** — the PixelPost/DMX light system
+
+## Repository layout
 
 - **`magitrac/`** — handheld client (LilyGo T5 e-paper touch): song editing, block/setlist management, performance control.
 - **`magitrac_server_s3/`** — server (M5Stack CoreS3 + Module Audio): sequencer, MIDI out, sample playback, drawbar organ, chord recogniser, touch UI.
@@ -12,7 +29,7 @@ Client and server pair over a dedicated softAP network; the client is the editor
 
 ## Building
 
-Sketches build from the Arduino IDE with the ESP32 board package. `magitrac_lib` must be available as a library (symlink or copy into your Arduino libraries folder). The CoreS3 server needs USB Mode set to TinyUSB for USB-MSC file transfer.
+Sketches build from the Arduino IDE with the ESP32 board package. `magitrac_lib` must be available as a library (symlink or copy into your Arduino libraries folder). The CoreS3 server needs USB Mode set to TinyUSB for USB-MSC file transfer. See [Getting Started](docs/getting-started.md) for the full library list and board settings.
 
 ## License
 
