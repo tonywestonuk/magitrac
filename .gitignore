@@ -70,3 +70,6 @@ Testing/
 
 # Local-only WiFi credentials (see wifi_secrets.h.example)
 wifi_secrets.h
+
+# macOS junk
+.DS_Store
