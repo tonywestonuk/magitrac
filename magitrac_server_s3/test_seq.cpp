@@ -27,12 +27,37 @@ HardwareSerial midi;
 // Sketch-side functions that midi_player.cpp references but the test doesn't
 // exercise — stub them out so the link succeeds.
 void debugPrintf(const char* /*fmt*/, ...) {}
-void samplePlayerPlay(const char* /*path*/, int /*vol*/) {}
+void samplePlayerPlay(const char* /*path*/, float /*pitch*/, uint8_t /*vol*/) {}
 void samplePlayerStop() {}
 const char* sampleManifestNameFor(uint8_t /*id*/) { return nullptr; }
 void pixelpostSetTouchpad(uint8_t, uint8_t, bool) {}
 void pixelpostSetSlider(uint8_t) {}
 void pixelpostSetEffect(uint8_t) {}
+bool pixelpostManualActive() { return false; }
+
+// Organ synth stubs (drawbar_organ.cpp is hardware-bound; the tests only need
+// the sequencer's routing to link, with the organ reading "inactive").
+bool organActive() { return false; }
+void organSetActive(bool) {}
+void organNoteOn(uint8_t, uint8_t) {}
+void organNoteOff(uint8_t) {}
+void organSetSustain(bool) {}
+int  organGetType() { return 0; }
+void organSetType(int) {}
+int  organGetProcSound() { return 0; }
+void organSetProcSound(int) {}
+int  organGetDrawbar(int) { return 0; }
+void organSetDrawbar(int, int) {}
+int  organGetParam(int) { return 0; }
+void organSetParam(int, int) {}
+int  organGetVibChorus() { return 0; }
+void organSetVibChorus(int) {}
+int  organGetLeslie() { return 0; }
+void organSetLeslie(int) {}
+int  organGetDrive() { return 0; }
+void organSetDrive(int) {}
+int  organGetReverb() { return 0; }
+void organSetReverb(int) {}
 
 // ── External state required by midi_player.cpp ───────────────────────────────
 #include "TrackerData.h"

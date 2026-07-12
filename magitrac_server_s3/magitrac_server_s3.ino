@@ -870,7 +870,8 @@ static void setScreen(Screen s) {
     if (gScreen == SCR_SAMPLES && s != SCR_SAMPLES) samplePlayerStop();
     if (gScreen == SCR_CHORD   && s != SCR_CHORD)   chordSetActive(false);
     if (gScreen == SCR_SCOPE   && s != SCR_SCOPE) scopeSetActive(false);
-    if (gScreen == SCR_ORGAN   && s != SCR_ORGAN) organSetActive(false);
+    if (gScreen == SCR_ORGAN   && s != SCR_ORGAN &&
+        !sequencerOrganOwned()) organSetActive(false);   // don't cut a playing ORGAN column
     gScreen     = s;
     _touchDown  = false;
     _dragMoved  = false;

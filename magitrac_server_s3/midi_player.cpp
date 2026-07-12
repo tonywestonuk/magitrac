@@ -324,6 +324,10 @@ static void seqOrganGrab() {
     seqOrganOwned = true;
 }
 
+// Screen navigation asks before deactivating the organ on leaving SCR_ORGAN:
+// if the sequencer owns it (song playing an ORGAN column), it must stay up.
+bool sequencerOrganOwned() { return seqOrganOwned; }
+
 static void seqOrganRelease() {
     if (!seqOrganOwned) return;
     organSetActive(false);
@@ -1213,7 +1217,7 @@ void sequencerStart() {
 
     seqSendSlotEnable();
 
-    seqPattern       = 0;
+    seqPattern       = startPat;   // Song::startPattern — setup above matches
     seqRow           = 0;
     seqWaiting       = false;
     seqEndNav        = 0;
@@ -1429,6 +1433,9 @@ void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
     // Fire-and-forget straight to the SamplePlayer queue (no SD, no MIDI
     // running-status involvement), so no need for the raw-audition hold queue.
     if (channel == SFX_CHANNEL) {
+        if (seqRunning) return;   // tune-by-ear is a stopped-state feature: a
+                                  // late/in-flight audition must never replace
+                                  // a song-triggered sample
         if (col >= MAX_COLUMNS || note > 127) return;
         if (organActive()) return;             // organ owns the codec
         const ColumnSettings& cs = seqSong()->columns[col];

@@ -34,6 +34,10 @@ void sequencerAuditionNote(uint8_t pattern, uint8_t row, uint8_t col);
 // what should be a simultaneous chord.
 void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
                               uint8_t col = 0xFF);  // col: SFX sample source column
+
+// True while the SEQUENCER holds the organ (song with an ORGAN column playing)
+// — screen navigation must not deactivate the organ out from under it.
+bool sequencerOrganOwned();
 // Queue a program change for audition (e.g. drum-kit select on ch10).  The
 // actual MIDI emit happens on the MIDI task in sequencerRawAuditionTick so it
 // shares the sequencer's running-status cache — sending the program change as
