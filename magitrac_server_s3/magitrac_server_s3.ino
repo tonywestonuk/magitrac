@@ -16,7 +16,6 @@
 #include "mic_spectrum.h"
 #include "audio_codec.h"
 #include "drawbar_organ.h"
-#include "sample_organ.h"
 #include "sd_mutex.h"
 #include "Battery.h"
 #include "crash_log.h"
@@ -1552,10 +1551,8 @@ void setup() {
     crashSetBootStep(BS_SPECTRUM);
     spectrumInit();
     organInit();
-    sampleOrganInit();
     crashSetBootStep(BS_SONGLIST);
     loadSongList();
-    loadSampleList();   // so the SAMPLE organ can pick samples without visiting the Samples screen
 
     seqSetRowCallback([](uint8_t pattern, uint8_t row) {
         sPosNotify.pattern = pattern;
@@ -1574,9 +1571,11 @@ void setup() {
         sMidiNoteInNotify.dirty     = true;
     });
 
-    // Live MIDI → drawbar organ (only while the organ screen owns the codec).
+    // Live MIDI → drawbar organ — only while the ORGAN SCREEN owns the synth.
+    // When the sequencer grabs the organ for an ORGAN tracker column, the
+    // performer's keys are WAIT/SYNC cues, not organ keys — don't sound them.
     seqSetMidiRawNoteCallback([](bool on, uint8_t note, uint8_t vel) {
-        if (!organActive()) return;
+        if (!organActive() || gScreen != SCR_ORGAN) return;
         if (on) organNoteOn(note, vel);
         else    organNoteOff(note);
     });
@@ -1831,23 +1830,6 @@ void loop() {
         if (now - lastFootMs >= 300) {
             lastFootMs = now;
             drawScopeFooter();
-        }
-    }
-
-    // SAMPLE organ: a sample was selected → load + analyse it here (SD-safe,
-    // ~0.2-0.4 s).  The synth plays silence until the frames are ready.
-    {
-        extern volatile int gSampleLoadReq;
-        if (gSampleLoadReq >= 0) {
-            int idx = gSampleLoadReq;
-            gSampleLoadReq = -1;
-            if (numSamples == 0) loadSampleList();   // lazy scan if not done yet
-            Serial.printf("[SAMPORG] select idx=%d of %d samples\n", idx, numSamples);
-            if (idx >= 0 && idx < numSamples) {
-                char path[80];
-                snprintf(path, sizeof(path), "%s/%s", SRV_SAMPLES_DIR, sampleNames[idx]);
-                sampleOrganLoad(path);
-            }
         }
     }
 

@@ -529,12 +529,14 @@ bool ServerPairing::sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col) 
     return ok;
 }
 
-bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity) {
+bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
+                                        uint8_t col) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgAuditionRawNote msg;
     msg.channel  = channel;
     msg.note     = note;
     msg.velocity = velocity;
+    msg.col      = col;
     gMagiLink.acquireMutex();
     bool ok = gMagiLink.send(&msg, sizeof(msg));
     gMagiLink.releaseMutex();

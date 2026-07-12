@@ -9,13 +9,19 @@ static uint8_t _adc_pin;
 static float   _adc_div;
 static int     _adc_mv_full;
 static int     _adc_mv_empty;
+static int     _adc_chg_pin = -1;
+static bool    _adc_chg_low = true;
 
-void battery_begin_adc(uint8_t pin, float div_ratio, int mv_full, int mv_empty) {
+void battery_begin_adc(uint8_t pin, float div_ratio, int mv_full, int mv_empty,
+                       int chg_stat_pin, bool chg_active_low) {
     _adc_pin      = pin;
     _adc_div      = div_ratio;
     _adc_mv_full  = mv_full;
     _adc_mv_empty = mv_empty;
+    _adc_chg_pin  = chg_stat_pin;
+    _adc_chg_low  = chg_active_low;
     analogSetPinAttenuation(pin, ADC_11db);
+    if (_adc_chg_pin >= 0) pinMode(_adc_chg_pin, INPUT);
     _backend = ADC_DIV;
 }
 
@@ -75,5 +81,10 @@ int battery_read_pct() {
 }
 
 bool battery_is_charging() {
-    return (_backend == BQ25896_I2C) && _bq25896_usb_present();
+    switch (_backend) {
+        case BQ25896_I2C: return _bq25896_usb_present();
+        case ADC_DIV:     return _adc_chg_pin >= 0 &&
+                                 digitalRead(_adc_chg_pin) == (_adc_chg_low ? LOW : HIGH);
+        default:          return false;
+    }
 }

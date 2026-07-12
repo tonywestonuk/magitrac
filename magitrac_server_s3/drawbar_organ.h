@@ -15,7 +15,7 @@
 // at the top of each block.  Latency is one block (~4 ms).
 
 #define ORGAN_DRAWBARS 9
-#define ORGAN_TYPE_COUNT 5   // 0 DRAWBAR, 1 TONEWHEEL, 2 CLAUDE, 3 NEBULA, 4 SAMPLE (spectral resynth)
+#define ORGAN_TYPE_COUNT 5   // 0 DRAWBAR, 1 TONEWHEEL, 2 CLAUDE, 3 NEBULA, 4 PROC (procedural sounds)
 
 // Footage labels for the UI, low harmonic → high (matches the panel order).
 extern const char* const ORGAN_FOOTAGE[ORGAN_DRAWBARS];
@@ -53,14 +53,27 @@ const char* organTypeName(int t);
 // vibChorus: 0=off, 1..3 = V1/V2/V3 (vibrato), 4..6 = C1/C2/C3 (chorus)
 // leslie:    0=stop, 1=slow (chorale), 2=fast (tremolo)
 // drive:     0=off, 1=on (tube-style soft-clip warmth)
+// reverb:    0=off, 1=room, 2=hall (stereo freeverb-lite, last in the chain)
 void organSetVibChorus(int v);
 void organSetLeslie(int v);
 void organSetDrive(int v);
+void organSetReverb(int v);
 int  organGetVibChorus();
+
+// Damper pedal (MIDI CC64): while on, note-offs sustain until the pedal lifts.
+void organSetSustain(bool on);
 int  organGetLeslie();
 int  organGetDrive();
+int  organGetReverb();
 
 // Per-type knob params (0..8).  Meaning depends on the active type:
-// TONEWHEEL [0]=click;  NEBULA [0]=detune, [1]=glide, [2]=bright.
+// TONEWHEEL [0]=click;  NEBULA [0]=detune, [1]=glide, [2]=bright;
+// PROC = the selected sound's sliders, up to 5 (see PROC_SOUNDS in
+// proc_sounds.h — index range is PROC_MAX_PARAMS there).
 void organSetParam(int idx, int value);
 int  organGetParam(int idx);
+
+// PROC type — which procedural sound the voices play (0..PROC_SOUND_COUNT-1).
+// A change applies to notes played after it.
+void organSetProcSound(int i);
+int  organGetProcSound();

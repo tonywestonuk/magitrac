@@ -553,7 +553,80 @@ static inline bool songMigrateV18FromFile(File& f, Song* out) {
     return true;
 }
 
-// ── Compact format: write (v19) ─────────────────────────────────────────────
+// ── v19 migration ────────────────────────────────────────────────────────────
+// v19 = v20 minus Song::organ (the OrganPatch inserted before _songPad).
+// Everything else — patterns, columns, notes — is byte-identical.
+
+static inline bool readSongTailV19(File& f, Song* out) {
+    static const size_t HEAD_SIZE = offsetof(Song, organ) - offsetof(Song, numPatterns);
+    // v19 firmware wrote sizeof(Song_v19) - offsetof(numPatterns) bytes:
+    // HEAD + _songPad[1] + ONE struct-alignment byte (sizeof rounds to even).
+    // Derive the count from the current struct (v19 = v20 minus OrganPatch) so
+    // it can't drift — reading HEAD + 1 here left that alignment byte behind
+    // and shifted the noteCount read (every v19 song failed to load).
+    static const size_t V19_TAIL =
+        (sizeof(Song) - sizeof(OrganPatch)) - offsetof(Song, numPatterns);
+    if (f.read((uint8_t*)&out->numPatterns, HEAD_SIZE) != (int)HEAD_SIZE) return false;
+    uint8_t discard[V19_TAIL - HEAD_SIZE];            // old _songPad[1] + alignment
+    if (f.read(discard, sizeof(discard)) != (int)sizeof(discard)) return false;
+    // out->organ stays zeroed → flags 0 = "no organ patch stored"
+    return true;
+}
+
+static inline bool songMigrateV19FromFile(File& f, Song* out) {
+    memset(out, 0, sizeof(Song));
+
+    // 1. Patterns (current layout)
+    if (f.read((uint8_t*)out->patterns, sizeof(out->patterns)) != (int)sizeof(out->patterns)) return false;
+
+    // 2. Per-song column settings (current layout)
+    if (f.read((uint8_t*)out->columns, sizeof(out->columns)) != (int)sizeof(out->columns)) return false;
+
+    // 3. Song tail — v19 layout (no OrganPatch)
+    if (!readSongTailV19(f, out)) return false;
+
+    // 4. Notes (same rebuild as every other reader)
+    uint16_t noteCount = 0;
+    if (f.read((uint8_t*)&noteCount, sizeof(noteCount)) != (int)sizeof(noteCount)) return false;
+    if (noteCount > MAX_SONG_NOTES) return false;
+
+    for (int p = 0; p < MAX_PATTERNS; p++)
+        out->patterns[p].noteHead = NOTE_NULL;
+
+    uint16_t tail[MAX_PATTERNS];
+    for (int p = 0; p < MAX_PATTERNS; p++) tail[p] = NOTE_NULL;
+    for (uint16_t i = 0; i < noteCount; i++) {
+        SerializedNote sn;
+        if (f.read((uint8_t*)&sn, sizeof(sn)) != (int)sizeof(sn)) return false;
+        if (sn.pattern >= MAX_PATTERNS) return false;
+
+        NoteNode& node = out->notePool[i];
+        node.row = sn.row; node.col = sn.col; node.note = sn.note;
+        node.velocity = sn.velocity; node.effect = sn.effect; node.param = sn.param;
+        node.next = i;
+
+        uint8_t p = sn.pattern;
+        if (out->patterns[p].noteHead == NOTE_NULL) { out->patterns[p].noteHead = i; tail[p] = i; }
+        else { out->notePool[tail[p]].next = i; tail[p] = i; }
+    }
+
+    for (int p = 0; p < MAX_PATTERNS; p++) {
+        if (out->patterns[p].noteHead != NOTE_NULL)
+            out->notePool[tail[p]].next = out->patterns[p].noteHead;
+    }
+    if (noteCount < MAX_SONG_NOTES) {
+        out->noteFreeHead = noteCount;
+        for (uint16_t i = noteCount; i < MAX_SONG_NOTES - 1; i++)
+            out->notePool[i].next = i + 1;
+        out->notePool[MAX_SONG_NOTES - 1].next = NOTE_NULL;
+    } else {
+        out->noteFreeHead = NOTE_NULL;
+    }
+
+    return true;
+}
+
+// ── Compact format: write (v20) ─────────────────────────────────────────────
 // Layout: header + patterns + Song::columns + tail + noteCount + notes.
 
 static inline bool songWriteCompact(File& f, const Song* song) {

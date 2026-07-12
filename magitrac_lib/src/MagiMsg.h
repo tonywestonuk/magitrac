@@ -349,9 +349,12 @@ struct MsgSetWifiChannel {
 //  ORGAN_OP_LESLIE    → rotor: `value` 0=stop,1=slow,2=fast
 //  ORGAN_OP_DRIVE     → tube drive: `value` 0=off,1=on
 //  ORGAN_OP_PARAM     → per-type knob: `index` = knob 0..2, `value` 0..8
+//  ORGAN_OP_PROCSEL   → PROC type: select procedural sound `value`
+//  ORGAN_OP_REVERB    → stereo reverb: `value` 0=off,1=room,2=hall
 enum OrganOp : uint8_t {
     ORGAN_OP_EXIT = 0, ORGAN_OP_ENTER = 1, ORGAN_OP_SET = 2, ORGAN_OP_TYPE = 3,
-    ORGAN_OP_VIBCHORUS = 4, ORGAN_OP_LESLIE = 5, ORGAN_OP_DRIVE = 6, ORGAN_OP_PARAM = 7
+    ORGAN_OP_VIBCHORUS = 4, ORGAN_OP_LESLIE = 5, ORGAN_OP_DRIVE = 6, ORGAN_OP_PARAM = 7,
+    ORGAN_OP_PROCSEL = 8, ORGAN_OP_REVERB = 9
 };
 struct MsgOrgan {
     uint8_t  id     = MSG_ORGAN;
@@ -601,13 +604,16 @@ struct MsgNoteAudition {
 
 // Client → Server: fire a raw MIDI note-on on (channel, note, velocity).
 // No note-off is sent; intended for short percussion samples whose synth
-// envelope finishes them naturally.
+// envelope finishes them naturally.  channel == SFX_CHANNEL plays column
+// `col`'s sample instead, pitched by the raw MIDI note (60 = native + TUNE)
+// — the tune-by-ear path while the sequencer is stopped.
 struct MsgAuditionRawNote {
     uint8_t  id       = MSG_AUDITION_RAW_NOTE;
     uint16_t length   = sizeof(MsgAuditionRawNote);
-    uint8_t  channel;   // 1..16
+    uint8_t  channel;   // 1..16, or SFX_CHANNEL (see col)
     uint8_t  note;      // 0..127
     uint8_t  velocity;  // 0..127
+    uint8_t  col;       // SFX only: source column for sample + tune (0xFF = none)
 };
 
 // Client → Server: program change for audition (drum-kit select etc.).

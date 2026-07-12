@@ -1,4 +1,5 @@
 #pragma once
+#include <stdint.h>
 
 // ── SamplePlayer — non-blocking WAV playback via ES8388 codec ─────────────────
 //
@@ -15,6 +16,7 @@
 // directions stream concurrently on the same I²S peripheral.
 
 void samplePlayerInit();                    // call once in setup() (after audioCodecInit)
-void samplePlayerPlay(const char* path, int pitchSemitones = 0);  // 0 = native pitch (tracker C-4); ±semitones transposes
+void samplePlayerPlay(const char* path, float pitchSemitones = 0,   // 0 = native pitch (tracker C-4); ±semitones transposes (fractional = cents-accurate root tuning)
+                      uint8_t volume = 127);                        // 0..127, squared taper (GM CC7-ish); 127 = unity
 void samplePlayerStop();                    // signal stop, returns immediately
 bool samplePlayerIsPlaying();

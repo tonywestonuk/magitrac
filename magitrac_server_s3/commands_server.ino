@@ -628,6 +628,9 @@ static void sendSongDataFromPath(const char* path, const char* displayName) {
 
             if (hdr.version == SONG_FILE_VERSION) {
                 loaded = songReadCompact(f, song);
+            } else if (hdr.version == 19) {
+                loaded = songMigrateV19FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v19->v%d '%s'\n", SONG_FILE_VERSION, path);
             } else if (hdr.version == 18) {
                 loaded = songMigrateV18FromFile(f, song);
                 if (loaded) Serial.printf("[CMD] migrated v18->v%d '%s'\n", SONG_FILE_VERSION, path);
@@ -745,6 +748,9 @@ bool srvLoadSongLocal(int listIdx) {
 
             if (hdr.version == SONG_FILE_VERSION) {
                 loaded = songReadCompact(f, song);
+            } else if (hdr.version == 19) {
+                loaded = songMigrateV19FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v19->v%d '%s'\n", SONG_FILE_VERSION, path);
             } else if (hdr.version == 18) {
                 loaded = songMigrateV18FromFile(f, song);
                 if (loaded) Serial.printf("[CMD] migrated v18->v%d '%s'\n", SONG_FILE_VERSION, path);
@@ -1541,6 +1547,9 @@ static void reloadActiveSongFromSD() {
 
             if (hdr.version == SONG_FILE_VERSION) {
                 loaded = songReadCompact(f, song);
+            } else if (hdr.version == 19) {
+                loaded = songMigrateV19FromFile(f, song);
+                if (loaded) Serial.printf("[CMD] migrated v19->v%d '%s'\n", SONG_FILE_VERSION, path);
             } else if (hdr.version == 18) {
                 loaded = songMigrateV18FromFile(f, song);
                 if (loaded) Serial.printf("[CMD] migrated v18->v%d '%s'\n", SONG_FILE_VERSION, path);
@@ -2019,6 +2028,8 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 else if (m->op == ORGAN_OP_LESLIE)    organSetLeslie(m->value);
                 else if (m->op == ORGAN_OP_DRIVE)     organSetDrive(m->value);
                 else if (m->op == ORGAN_OP_PARAM)     organSetParam(m->index, m->value);
+                else if (m->op == ORGAN_OP_PROCSEL)   organSetProcSound(m->value);
+                else if (m->op == ORGAN_OP_REVERB)    organSetReverb(m->value);
             }
             break;
 
@@ -2162,7 +2173,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             if (len < (int)sizeof(MsgAuditionRawNote)) return;
             {
                 const MsgAuditionRawNote* a = (const MsgAuditionRawNote*)data;
-                sequencerAuditionRawNote(a->channel, a->note, a->velocity);
+                sequencerAuditionRawNote(a->channel, a->note, a->velocity, a->col);
             }
             break;
 

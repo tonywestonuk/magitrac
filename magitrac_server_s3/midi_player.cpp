@@ -11,6 +11,8 @@
 #endif
 #include "SamplePlayer.h"
 #include "SampleManifest.h"
+#include "drawbar_organ.h"
+#include "proc_sounds.h"   // PROC_SOUND_COUNT — organ-column program → voice map
 
 // Direct UART2 hardware FIFO access — bypasses Arduino's software ring buffer
 // to minimise performer-note latency (saves ~50-200 µs per byte).
@@ -271,20 +273,106 @@ static inline const Song* seqSong() {
     return reinterpret_cast<const Song*>(srvActiveBuf + sizeof(SongFileHeader));
 }
 
-// Chan sentinel marking a column as currently playing a sample (SFX).
-// Distinct from any real 0..15 midi channel.
-#define SEQ_CHAN_SFX 0xFF
+// Chan sentinels marking a column as playing a sample (SFX) or the onboard
+// organ.  Distinct from any real 0..15 midi channel.
+#define SEQ_CHAN_SFX   0xFF
+#define SEQ_CHAN_ORGAN 0xFE
 
 // Tracker note whose sample plays at its recorded (native) pitch.  Note
 // values start at 1 = C-0, so C-4 = 1 + 4*12 = 49; the pitch handed to
 // samplePlayerPlay() is (cell note − this) in semitones.
 #define SAMPLE_ROOT_NOTE 49
 
+// Live tune-by-ear audition (sequencerAuditionRawNote SFX branch): the MIDI
+// note that started the currently-sounding sample, so the local MIDI parser
+// can stop it on that key's note-off (key down = sound, key up = stop).
+// Monophonic last-note rule: releasing an OLDER held key doesn't cut the
+// newer note.  0xFF = none.  Written on the comms task, read on the loop
+// task — single volatile byte.
+static volatile uint8_t seqSfxAudNote = 0xFF;
+
+static void seqSfxAudNoteOff(uint8_t note) {
+    if (seqRunning) return;   // guard: a stale note must never cut song SFX
+    if (note == seqSfxAudNote) {
+        seqSfxAudNote = 0xFF;
+        samplePlayerStop();   // fades out, no click
+    }
+}
+
+// Pitch (fractional semitones) for an SFX cell note: semitone tracking around
+// C-4, plus the column's TRANSPOSE (whole semitones, same field as MIDI
+// columns) and TUNE offset (cents from native — brings an arbitrarily-pitched
+// recording in tune with the band).  All zero = native, the pre-existing
+// behaviour.
+static float sfxPitchFor(const ColumnSettings& cs, uint8_t note) {
+    return (float)((int)note - SAMPLE_ROOT_NOTE + (int)cs.transpose)
+         + (float)cs.sfxTuneCents * 0.01f;
+}
+
+// ── Organ codec ownership ─────────────────────────────────────────────────────
+// The organ synth and SamplePlayer can't both write the codec (no mixer), so
+// the sequencer grabs the organ only when a song/preview/audition needs it and
+// releases only what it grabbed — if the organ screen (or the client's organ
+// page) already owns the synth, seqOrganGrab is a no-op and release leaves it
+// alone.  While the organ is active, SFX columns stay silent.
+static bool seqOrganOwned = false;
+
+static void seqOrganGrab() {
+    if (organActive()) return;         // screen/page already owns it
+    samplePlayerStop();                // codec must be idle before the DMA swap
+    organSetActive(true);
+    seqOrganOwned = true;
+}
+
+static void seqOrganRelease() {
+    if (!seqOrganOwned) return;
+    organSetActive(false);
+    seqOrganOwned = false;
+}
+
+// True if any unmuted column routes to the organ (the song "needs" the organ).
+static bool seqSongUsesOrgan() {
+    const Song* s = seqSong();
+    for (int c = 1; c < MAX_COLUMNS; c++)
+        if (s->columns[c].midiChannel == ORGAN_CHANNEL && !s->columns[c].mute)
+            return true;
+    return false;
+}
+
+// Apply the song's OrganPatch (voice, sliders, drawbars, effects) to the
+// synth.  Deduped per setting, so reapplying every block transition is free —
+// and because the client writes the patch in the same gesture as any live
+// organ-page tweak, a reapply never fights the player's hands.
+// voice: 0..3 = the synth types, 4+k = procedural sound k (PROC type).
+static void seqOrganApplySongPatch() {
+    const OrganPatch& op = seqSong()->organ;
+    if (!(op.flags & 1)) return;             // pre-v20 song — keep current sound
+    uint8_t prog = op.voice;
+    if (prog < ORGAN_TYPE_COUNT - 1) {
+        if (organGetType() != prog) organSetType(prog);
+    } else {
+        int snd = prog - (ORGAN_TYPE_COUNT - 1);
+        if (snd >= PROC_SOUND_COUNT) snd = PROC_SOUND_COUNT - 1;
+        if (organGetType() != ORGAN_TYPE_COUNT - 1) organSetType(ORGAN_TYPE_COUNT - 1);
+        if (organGetProcSound() != snd) organSetProcSound(snd);
+    }
+    for (int k = 0; k < ORGAN_PATCH_SLIDERS; k++)
+        if (organGetParam(k) != op.sliders[k]) organSetParam(k, op.sliders[k]);
+    for (int b = 0; b < ORGAN_PATCH_BARS; b++)
+        if (organGetDrawbar(b) != op.bars[b]) organSetDrawbar(b, op.bars[b]);
+    if (organGetVibChorus() != op.vibChorus) organSetVibChorus(op.vibChorus);
+    if (organGetLeslie()    != op.leslie)    organSetLeslie(op.leslie);
+    if (organGetDrive()     != op.drive)     organSetDrive(op.drive);
+    if (organGetReverb()    != op.reverb)    organSetReverb(op.reverb);
+}
+
 static void seqNoteOff(int col) {
     seqRetrigLeft[col] = 0;            // cancel any ratchet still rolling on this column
     if (seqActiveNote[col] == 0) return;
     if (seqActiveChan[col] == SEQ_CHAN_SFX) {
         samplePlayerStop();
+    } else if (seqActiveChan[col] == SEQ_CHAN_ORGAN) {
+        organNoteOff(seqActiveNote[col]);
     } else {
         uint8_t note = seqActiveNote[col];
         seqWriteStatus((uint8_t)(0x80 | seqActiveChan[col]));
@@ -451,7 +539,8 @@ static void seqPlayRow() {
             // SFX columns don't use MIDI patch changes; the OFF already
             // stopped the sample above.
             if (cs.midiChannel != 0 && cs.midiChannel != SFX_CHANNEL &&
-                cs.midiChannel != PIXELPOST_CHANNEL && !cs.mute) {
+                cs.midiChannel != PIXELPOST_CHANNEL &&
+                cs.midiChannel != ORGAN_CHANNEL && !cs.mute) {
                 uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
                 uint8_t vol    = cs.volume > 0 ? cs.volume : 100;
                 if (seqChanBank[midiCh] != cs.bankMSB || seqChanProg[midiCh] != cs.program) {
@@ -480,14 +569,31 @@ static void seqPlayRow() {
             seqNoteOff(col);
 
             if (cs.midiChannel == SFX_CHANNEL) {
+                if (organActive()) continue;   // organ owns the codec — SFX silent
                 const char* fname = sampleManifestNameFor(cs.program);
                 if (fname) {
                     char path[64];
                     snprintf(path, sizeof(path), "/samples/%s", fname);
-                    samplePlayerPlay(path, (int)nn.note - SAMPLE_ROOT_NOTE);
+                    samplePlayerPlay(path, sfxPitchFor(cs, nn.note), cs.volume);
                     seqActiveNote[col] = 1;               // any non-zero marks "active"
                     seqActiveChan[col] = SEQ_CHAN_SFX;    // route stop to SamplePlayer
                 }
+                continue;
+            }
+
+            if (cs.midiChannel == ORGAN_CHANNEL) {
+                if (!organActive()) continue;   // codec not ours — stay silent
+                if (nn.note < 1 || nn.note > NOTE_MAX) continue;
+                // Same note transform as MIDI columns; performer transpose
+                // always applies (the organ is melodic, never drums).
+                int raw = (int)nn.note + TRACKER_TO_MIDI_OFFSET + seqTranspose
+                        + (int)cs.transpose;
+                if (raw < 0)   raw = 0;
+                if (raw > 127) raw = 127;
+                uint8_t vel = (nn.velocity & 0x80) ? 100 : nn.velocity;
+                organNoteOn((uint8_t)raw, vel ? vel : 100);
+                seqActiveNote[col] = (uint8_t)raw;
+                seqActiveChan[col] = SEQ_CHAN_ORGAN;   // route stop to the organ
                 continue;
             }
 
@@ -902,6 +1008,7 @@ static void sequencerPollMidiInBody() {
                 midiCount = 0;
                 // Raw monitor first — sees every note on any channel (organ).
                 if (seqRawNoteCallback) seqRawNoteCallback(velocity > 0, midiByte1, velocity);
+                if (velocity == 0) seqSfxAudNoteOff(midiByte1);   // running-status note-off
                 if (velocity >= 20) {
                     const Song* s = seqSong();
                     uint8_t ch = midiStatus & 0x0F;  // 0-based channel
@@ -928,6 +1035,17 @@ static void sequencerPollMidiInBody() {
             } else {
                 midiCount = 0;       // velocity byte — message complete
                 if (seqRawNoteCallback) seqRawNoteCallback(false, midiByte1, 0);
+                seqSfxAudNoteOff(midiByte1);
+            }
+        } else if ((midiStatus & 0xF0) == 0xB0) {
+            if (midiCount == 0) {
+                midiByte1 = b;       // controller number
+                midiCount = 1;
+            } else {
+                midiCount = 0;       // controller value — message complete
+                // CC64 damper pedal → organ sustain (any channel; the synth
+                // ignores it unless it's active, so no gating needed here).
+                if (midiByte1 == 64) organSetSustain(b >= 64);
             }
         }
     }
@@ -950,6 +1068,10 @@ static void seqSendColumnSetup(uint8_t pattern, bool force) {
         if (cs.midiChannel == 0 || cs.mute) continue;        // unset or muted — skip
         if (cs.midiChannel == SFX_CHANNEL) continue;        // SFX has no MIDI patch
         if (cs.midiChannel == PIXELPOST_CHANNEL) continue;  // pixel_post has no MIDI patch
+        if (cs.midiChannel == ORGAN_CHANNEL) {   // organ: no MIDI — apply the
+            seqOrganApplySongPatch();            // song's patch (deduped, cheap)
+            continue;
+        }
         uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
         if (chanDone[midiCh]) continue;                     // already set this pass
         chanDone[midiCh] = true;
@@ -1009,14 +1131,27 @@ static void seqPlayPreviewRow() {
             } else if (nn.note != NOTE_EMPTY && nn.note != NOTE_ANY) {
                 seqNoteOff(seqPreviewCol);
                 if (cs.midiChannel == SFX_CHANNEL) {
+                    if (organActive()) return;   // organ owns the codec — SFX silent
                     const char* fname = sampleManifestNameFor(cs.program);
                     if (fname) {
                         char path[64];
                         snprintf(path, sizeof(path), "/samples/%s", fname);
-                        samplePlayerPlay(path, (int)nn.note - SAMPLE_ROOT_NOTE);
+                        samplePlayerPlay(path, sfxPitchFor(cs, nn.note), cs.volume);
                         seqActiveNote[seqPreviewCol] = 1;
                         seqActiveChan[seqPreviewCol] = SEQ_CHAN_SFX;
                     }
+                    return;
+                }
+                if (cs.midiChannel == ORGAN_CHANNEL) {
+                    if (!organActive()) return;
+                    if (nn.note < 1 || nn.note > NOTE_MAX) return;
+                    int raw = (int)nn.note + TRACKER_TO_MIDI_OFFSET + (int)cs.transpose;
+                    if (raw < 0)   raw = 0;
+                    if (raw > 127) raw = 127;
+                    uint8_t vel = (nn.velocity & 0x80) ? 100 : nn.velocity;
+                    organNoteOn((uint8_t)raw, vel ? vel : 100);
+                    seqActiveNote[seqPreviewCol] = (uint8_t)raw;
+                    seqActiveChan[seqPreviewCol] = SEQ_CHAN_ORGAN;
                     return;
                 }
                 if (cs.midiChannel == PIXELPOST_CHANNEL) {
@@ -1068,6 +1203,12 @@ void sequencerStart() {
 
     const Song* s = seqSong();
     uint8_t startPat = s->startPattern < s->numPatterns ? s->startPattern : 0;
+
+    // Organ codec ownership follows the song (~60 ms DMA swap, so at start
+    // only): grab if any unmuted organ column, release ours otherwise.
+    if (seqSongUsesOrgan()) seqOrganGrab();
+    else                    seqOrganRelease();
+
     seqSendColumnSetup(startPat, /*force=*/true);
 
     seqSendSlotEnable();
@@ -1114,6 +1255,8 @@ void sequencerResume() {
     seqCurrentBPM = seqSong()->bpm > 0 ? seqSong()->bpm : 100;
     seqHaveLastSnap = false;
     seqNextRowMs = millis();
+    if (seqSongUsesOrgan()) seqOrganGrab();
+    else                    seqOrganRelease();
     // Force-resend bank/program/volume on PLAY in case the user manually
     // changed the synth while stopped.
     seqSendColumnSetup(seqPattern, /*force=*/true);
@@ -1129,6 +1272,7 @@ void sequencerStop() {
     seqQueuedPattern  = -1;    // clear any performance mode queue
     seqLastPitchClass = 0xFF;
     for (int c = 0; c < MAX_COLUMNS; c++) seqNoteOff(c);
+    seqOrganRelease();
     seqOutStatus = 0;  // force full status byte on next start
     debugPrintf("[SEQ] stop t=%lu\n", millis());
     if (seqStateCallback) seqStateCallback(false);
@@ -1148,6 +1292,7 @@ void sequencerStartPreview(uint8_t pat, uint8_t col) {
     seqPreviewCol    = col;
     seqPreviewRow    = 0;
     seqPreviewNextMs = millis();
+    if (s->columns[col].midiChannel == ORGAN_CHANNEL) seqOrganGrab();
     memset(seqChanBank, 0xFF, sizeof(seqChanBank));
     memset(seqChanProg, 0xFF, sizeof(seqChanProg));
     memset(seqChanVol,  0xFF, sizeof(seqChanVol));
@@ -1159,6 +1304,7 @@ void sequencerStopPreview() {
     if (!seqPreview) return;
     seqPreview = false;
     seqNoteOff(seqPreviewCol);
+    seqOrganRelease();
     seqOutStatus = 0;
     debugPrintf("[SEQ] preview stop\n");
 }
@@ -1207,11 +1353,15 @@ void sequencerAuditionNote(uint8_t pat, uint8_t row, uint8_t col) {
     seqNoteOff(col);   // silence anything stale on this column
 
     if (cs.midiChannel == SFX_CHANNEL) {
+        // Editing convenience: an SFX audition takes the codec back from a
+        // sequencer-owned organ (a screen-owned organ keeps it — stay silent).
+        seqOrganRelease();
+        if (organActive()) return;
         const char* fname = sampleManifestNameFor(cs.program);
         if (fname) {
             char path[64];
             snprintf(path, sizeof(path), "/samples/%s", fname);
-            samplePlayerPlay(path, (int)nn.note - SAMPLE_ROOT_NOTE);
+            samplePlayerPlay(path, sfxPitchFor(cs, nn.note), cs.volume);
             seqActiveNote[col] = 1;
             seqActiveChan[col] = SEQ_CHAN_SFX;
             seqAuditionCol   = col;
@@ -1220,6 +1370,23 @@ void sequencerAuditionNote(uint8_t pat, uint8_t row, uint8_t col) {
         }
         return;
     }
+
+    if (cs.midiChannel == ORGAN_CHANNEL) {
+        seqOrganGrab();
+        int raw = (int)nn.note + TRACKER_TO_MIDI_OFFSET + (int)cs.transpose;
+        if (raw < 0)   raw = 0;
+        if (raw > 127) raw = 127;
+        uint8_t vel = (nn.velocity & 0x80) ? 100 : nn.velocity;
+        organNoteOn((uint8_t)raw, vel ? vel : 100);
+        seqActiveNote[col] = (uint8_t)raw;
+        seqActiveChan[col] = SEQ_CHAN_ORGAN;
+        seqAuditionCol   = col;
+        seqAuditionEndMs = millis() + 500;
+        debugPrintf("[SEQ] audition col=%u ORGAN note=%d\n", col, raw);
+        return;
+    }
+
+    if (cs.midiChannel == PIXELPOST_CHANNEL) return;   // nothing sensible to audition
 
     uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
     int raw = (int)nn.note + TRACKER_TO_MIDI_OFFSET + (int)cs.transpose;
@@ -1255,7 +1422,26 @@ static volatile bool    seqAudProgPending = false;
 static volatile uint8_t seqAudProgChan    = 0;
 static volatile uint8_t seqAudProgram     = 0;
 
-void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity) {
+void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
+                              uint8_t col) {
+    // SFX: play column `col`'s sample at the raw MIDI pitch (60 = native +
+    // TUNE) — the client's tune-by-ear path while the sequencer is stopped.
+    // Fire-and-forget straight to the SamplePlayer queue (no SD, no MIDI
+    // running-status involvement), so no need for the raw-audition hold queue.
+    if (channel == SFX_CHANNEL) {
+        if (col >= MAX_COLUMNS || note > 127) return;
+        if (organActive()) return;             // organ owns the codec
+        const ColumnSettings& cs = seqSong()->columns[col];
+        const char* fname = sampleManifestNameFor(cs.program);
+        if (!fname) return;
+        char path[64];
+        snprintf(path, sizeof(path), "/samples/%s", fname);
+        samplePlayerPlay(path, (float)((int)note - 60 + (int)cs.transpose)
+                             + (float)cs.sfxTuneCents * 0.01f,
+                         cs.volume);
+        seqSfxAudNote = note;   // the local MIDI parser stops it on note-off
+        return;
+    }
     if (channel < 1 || channel > 16) return;
     if (note > 127 || velocity == 0 || velocity > 127) return;
     if (seqRawAudCount >= SEQ_RAW_AUD_Q_MAX) return;

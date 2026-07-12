@@ -69,6 +69,9 @@ bool loadSong(const char* path, Song* out) {
     } else if (hdr.version == 18) {
         ok = songMigrateV18FromFile(f, out);
         Serial.printf("[SD] loadSong %s: migrated v18->v%d %s\n", path, SONG_FILE_VERSION, ok ? "OK" : "FAIL");
+    } else if (hdr.version == 19) {
+        ok = songMigrateV19FromFile(f, out);
+        Serial.printf("[SD] loadSong %s: migrated v19->v%d %s\n", path, SONG_FILE_VERSION, ok ? "OK" : "FAIL");
     } else if (hdr.version == SONG_FILE_VERSION) {
         ok = songReadCompact(f, out);
         Serial.printf("[SD] loadSong %s: %s\n", path, ok ? "OK" : "FAIL");

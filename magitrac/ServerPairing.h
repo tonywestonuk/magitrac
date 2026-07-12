@@ -119,7 +119,8 @@ public:
     bool sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col);
     // Fire a raw MIDI note-on (no note-off).  Used by DrumTrackImportPage to
     // audition drum blocks before import.
-    bool sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity);
+    bool sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
+                             uint8_t col = 0xFF);   // col: SFX sample audition source
     // Select an audition program (e.g. drum kit on ch10).  Emitted on the
     // server's MIDI task so it stays coherent with running status.
     bool sendAuditionProgram(uint8_t channel, uint8_t program);

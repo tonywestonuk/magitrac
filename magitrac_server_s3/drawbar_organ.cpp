@@ -1,6 +1,6 @@
 #include "drawbar_organ.h"
 #include "audio_codec.h"
-#include "sample_organ.h"
+#include "proc_sounds.h"
 #include <Arduino.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
@@ -49,14 +49,46 @@ static float    s_leslieRate  = 0.0f;                 // current Hz (ramped)
 // Tube drive: 0=off, 1=on — gentle soft-clip warmth.
 static const float DRIVE_GAIN = 1.8f;
 
+// Stereo reverb: 0=off, 1=room, 2=hall.  Freeverb-lite — 6 parallel damped
+// feedback combs + 3 series allpasses per channel, mono-fed, with the right
+// channel's delays offset (+23 samples, freeverb's "stereospread") so the tail
+// decorrelates into width.  Lengths are the classic 44.1 kHz tunings rescaled
+// to 32 kHz.  ~33 KB of int16 delay lines, ~150 int ops/sample — the wash that
+// fills the spectrum valleys ("spacy"), which no dry voice tweak can.
+#define RV_COMBS 6
+#define RV_APS   3
+#define RV_COMB_MAX 1140
+#define RV_AP_MAX   428
+static const int16_t RV_COMB_LEN[2][RV_COMBS] = {
+    {  809,  877,  937, 1007, 1061, 1117 },
+    {  832,  900,  960, 1030, 1084, 1140 },
+};
+static const int16_t RV_AP_LEN[2][RV_APS] = {
+    { 405, 321, 247 },
+    { 428, 344, 270 },
+};
+static int16_t s_rvCombBuf[2][RV_COMBS][RV_COMB_MAX];
+static int16_t s_rvApBuf[2][RV_APS][RV_AP_MAX];
+static int32_t s_rvCombLp[2][RV_COMBS];     // per-comb damping filter state
+static int16_t s_rvCombPos[2][RV_COMBS];
+static int16_t s_rvApPos[2][RV_APS];
+// Per-mode voicing: room = tighter/darker, hall = the long spacy wash.
+static const int RV_FB_Q15[3]   = { 0, 26214, 29491 };  // comb feedback .80/.90
+static const int RV_DAMP_Q8[3]  = { 0,    90,     64 }; // LP amount .35/.25
+static const int RV_WET_Q15[3]  = { 0, 19661, 29491 };  // wet mix   .60/.90
+static const int RV_IN_Q15 = 655;                       // input scale ~0.02
+
 static volatile int s_vibChorus = 0;   // 0..6
 static volatile int s_leslie    = 0;   // 0..2
 static volatile int s_drive     = 0;   // 0..1
+static volatile int s_reverb    = 0;   // 0..2
+static volatile bool s_sustain  = false;   // damper pedal (MIDI CC64) held
 
 // Per-type knob params (0..8 each).  Meaning depends on the active type:
 //  TONEWHEEL: [0]=click.   NEBULA: [0]=detune, [1]=glide, [2]=bright.
-#define ORGAN_PARAMS 3
-static volatile int s_param[ORGAN_PARAMS] = { 4, 5, 6 };
+//  PROC: the selected sound's sliders (5 fit — no drawbars in that mode).
+#define ORGAN_PARAMS PROC_MAX_PARAMS
+static volatile int s_param[ORGAN_PARAMS] = { 4, 5, 6, 4, 4 };
 static volatile bool s_nebRetune = false;   // NEBULA detune changed → re-tune held voices
 
 // Master output scale.  mix accumulator is shifted right by this and clamped to
@@ -74,18 +106,17 @@ static const int32_t ENV_RELEASE_DEC = 32767 / (12 * AUDIO_CODEC_RATE_HZ / 1000)
 
 // Voice model.
 enum OrganType { ORGAN_DRAWBAR = 0, ORGAN_TONEWHEEL = 1, ORGAN_CLAUDE = 2, ORGAN_NEBULA = 3,
-                 ORGAN_SAMPLE = 4 };
+                 ORGAN_PROC = 4 };
 static volatile int s_type = ORGAN_DRAWBAR;
 static const char* const ORGAN_TYPE_NAMES[ORGAN_TYPE_COUNT] =
-    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "SAMPLE" };
+    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "PROC" };
 
-// SAMPLE type: drawbar footages are wavetable oscillators reading a per-voice
-// "morphed" wavetable (crossfade of two sample-analysis frames), advancing
-// through the frames as the note is held.  See sample_organ.cpp.  Knobs:
-// [0]=SAMPLE select (→ deferred SD load), [1]=MORPH speed, [2]=BRIGHT.
-static int16_t s_voiceScratch[ORGAN_VOICES][SAMPLE_ORGAN_WT];   // current morphed wavetable per voice
-static int32_t s_sampLp = 0;            // BRIGHT one-pole state (global, SAMPLE only)
-volatile int   gSampleLoadReq = -1;     // sample index to (re)analyse; consumed by the loop task
+// PROC type: hand-written procedural generators (see proc_sounds.cpp) — no
+// drawbars; the client picks a sound from a list and its param sliders map to
+// s_param.  Each voice reads a per-voice morphed wavetable rebuilt per block.
+static int16_t s_voiceScratch[ORGAN_VOICES][PROC_WT];   // current morphed wavetable per voice
+static int32_t s_procLp   = 0;    // BRIGHT one-pole state (global, PROC only)
+static volatile int s_procSel = 0;    // selected procedural sound
 
 // NEBULA: a sci-fi, THX-flavoured but playable voice.  Each footage is TWO
 // widely-detuned oscillators (thick chorused wall) read from a BRIGHT wheel
@@ -139,6 +170,7 @@ enum EnvStage { ENV_IDLE = 0, ENV_ATTACK, ENV_SUSTAIN, ENV_RELEASE };
 struct Voice {
     uint8_t  note;
     uint8_t  stage;       // EnvStage
+    uint8_t  sustained;   // key released while the damper pedal was down
     int32_t  env;         // Q15, 0..32767
     int32_t  clickEnv;    // Q15 key-click transient (tonewheel only)
     uint32_t rng;         // per-voice noise state (key click)
@@ -147,7 +179,7 @@ struct Voice {
     uint32_t phase2[ORGAN_DRAWBARS];// NEBULA detuned twin oscillators
     uint32_t inc2[ORGAN_DRAWBARS];
     int32_t  glideQ16;              // NEBULA attack pitch glide, Q16 (65536 = settled)
-    float    morphPos;             // SAMPLE morph position (frames), advances from note onset
+    ProcVoiceState proc;            // PROC generator state
 };
 static Voice voices[ORGAN_VOICES];
 static volatile int s_voiceCount = 0;   // for the header readout
@@ -162,8 +194,16 @@ static inline float midiHz(uint8_t note) {
 }
 
 static void voiceStart(Voice& v, uint8_t note) {
-    v.note  = note;
-    v.stage = ENV_ATTACK;
+    v.note      = note;
+    v.stage     = ENV_ATTACK;
+    v.sustained = 0;
+    if (s_type == ORGAN_PROC) {
+        if (v.proc.rng == 0) v.proc.rng = 0x1234567u ^ (note * 2654435761u);
+        procNoteOn(s_procSel, v.proc, midiHz(note), s_param);
+        v.clickEnv = 0;
+        v.glideQ16 = 65536;
+        return;
+    }
     bool tw     = (s_type == ORGAN_TONEWHEEL);
     bool claude = (s_type == ORGAN_CLAUDE);
     bool neb    = (s_type == ORGAN_NEBULA);
@@ -201,7 +241,6 @@ static void voiceStart(Voice& v, uint8_t note) {
         }
     }
     v.clickEnv = tw ? 32767 : 0;            // key click on attack (tonewheel)
-    v.morphPos = 0.0f;                      // SAMPLE: start at the sample's onset frame
     // NEBULA: start flat and glide up to pitch.  GLIDE knob (s_param[1]) sets the
     // depth: 0 = no glide, 8 = ~-96 cents.
     float glCents = -(float)s_param[1] * 12.0f;
@@ -233,7 +272,10 @@ static void applyNoteOff(uint8_t note) {
     for (int i = 0; i < ORGAN_VOICES; i++) {
         if (voices[i].stage != ENV_IDLE && voices[i].stage != ENV_RELEASE &&
             voices[i].note == note) {
-            voices[i].stage = ENV_RELEASE;
+            // Damper pedal down: the key is up but the note rings on until the
+            // pedal lifts (voices with keys still held are never `sustained`).
+            if (s_sustain) voices[i].sustained = 1;
+            else           voices[i].stage = ENV_RELEASE;
         }
     }
 }
@@ -243,6 +285,15 @@ static void drainEvents() {
     while (s_evtQueue && xQueueReceive(s_evtQueue, &e, 0) == pdTRUE) {
         if (e.on && e.vel > 0) applyNoteOn(e.note, e.vel);
         else                   applyNoteOff(e.note);
+    }
+    if (!s_sustain) {
+        // Pedal lifted (or was never down): release everything it was holding.
+        for (int i = 0; i < ORGAN_VOICES; i++) {
+            if (voices[i].sustained) {
+                voices[i].sustained = 0;
+                if (voices[i].stage != ENV_IDLE) voices[i].stage = ENV_RELEASE;
+            }
+        }
     }
 }
 
@@ -268,13 +319,30 @@ static void renderBlock(int16_t* out) {
     bool tw     = (s_type == ORGAN_TONEWHEEL);
     bool claude = (s_type == ORGAN_CLAUDE);
     bool neb  = (s_type == ORGAN_NEBULA);
-    bool samp = (s_type == ORGAN_SAMPLE);
+    bool proc = (s_type == ORGAN_PROC);
     const int16_t* wtab = neb ? nebTab : (tw ? twTab : sineTab);
 
-    // SAMPLE: morph rate (frames advanced per block) from the MORPH knob, and
-    // how many analysis frames are loaded (0 = nothing → silent).
-    int   sampFrames = samp ? sampleOrganFrameCount() : 0;
-    float morphStep  = 0.01f * s_param[1];   // ~0.1 s/frame at knob 4; 0 = freeze
+    // PROC: snapshot the sound selection + noise slider once per block, and
+    // let the sound override the organ's near-instant envelope (CHOIR swells
+    // over an ATTACK-slider time and releases slowly).
+    int procSel  = s_procSel;
+    int procAtk  = s_param[0];
+    int procGain = PROC_SOUNDS[procSel].gain;
+    int32_t envAtkInc = ENV_ATTACK_INC;
+    int32_t envRelDec = ENV_RELEASE_DEC;
+    if (proc) {
+        const ProcSoundInfo& si = PROC_SOUNDS[procSel];
+        if (si.envParam != 0xFF) {
+            int sv = s_param[si.envParam];
+            int ms = 5 + sv * sv * 12;                    // 5..773 ms
+            envAtkInc = 32767 / (ms * (int)(AUDIO_CODEC_RATE_HZ / 1000));
+            if (envAtkInc < 1) envAtkInc = 1;
+        }
+        if (si.relMs) {
+            envRelDec = 32767 / ((int)si.relMs * (int)(AUDIO_CODEC_RATE_HZ / 1000));
+            if (envRelDec < 1) envRelDec = 1;
+        }
+    }
 
     // DETUNE knob moved → re-tune every sounding NEBULA voice in place.
     if (neb && s_nebRetune) {
@@ -309,6 +377,11 @@ static void renderBlock(int16_t* out) {
     int  vcDepthQ8 = (CHORUS_DEPTH_Q8 * vcLevel) / 3;
 
     bool driveOn = (s_drive != 0);
+
+    int rvb      = s_reverb;
+    int rvFb     = RV_FB_Q15[rvb];
+    int rvDamp   = RV_DAMP_Q8[rvb];
+    int rvWet    = RV_WET_Q15[rvb];
 
     // Leslie rotor speed ramps toward its target (inertia on a slow/fast/stop switch).
     float lesTarget = (s_leslie == 2) ? LESLIE_FAST_HZ : (s_leslie == 1) ? LESLIE_SLOW_HZ : 0.0f;
@@ -353,29 +426,12 @@ static void renderBlock(int16_t* out) {
                                            wtab[v.phase2[h] >> (32 - SINE_BITS)]) >> 1);
                     acc += (int32_t)s * db[h];
                 }
-            } else if (samp) {
-                // SAMPLE: build this voice's morphed wavetable once per block,
-                // then the footages read it at their pitches.
-                if (n == 0 && sampFrames > 0) {
-                    v.morphPos += morphStep;
-                    float maxp = (float)(sampFrames - 1) - 0.001f;
-                    if (maxp < 0) maxp = 0;
-                    if (v.morphPos > maxp) v.morphPos = maxp;
-                    int a = (int)v.morphPos; int fri = (int)((v.morphPos - a) * 256.0f);
-                    const int16_t* f0 = sampleOrganFrame(a);
-                    const int16_t* f1 = sampleOrganFrame(a + 1); if (!f1) f1 = f0;
-                    int16_t* sc = s_voiceScratch[i];
-                    for (int j = 0; j < SAMPLE_ORGAN_WT; j++)
-                        sc[j] = (int16_t)((f0[j] * (256 - fri) + f1[j] * fri) >> 8);
-                }
-                if (sampFrames > 0) {
-                    const int16_t* sc = s_voiceScratch[i];
-                    for (int h = 0; h < ORGAN_DRAWBARS; h++) {
-                        if (v.inc[h] == 0 || db[h] == 0) continue;
-                        v.phase[h] += v.inc[h];
-                        acc += (int32_t)sc[v.phase[h] >> 22] * db[h];   // WT=1024 → top 10 bits
-                    }
-                }
+            } else if (proc) {
+                // PROC: rebuild this voice's morphed wavetable once per block,
+                // then the generator's oscillators read it.  Gain comes from
+                // the sound's registry entry (RMS-matched to the drawbars).
+                if (n == 0) procBlockPrep(procSel, v.proc, s_voiceScratch[i], s_param);
+                acc = procSample(procSel, v.proc, s_voiceScratch[i], procAtk) * procGain;
             } else {
                 for (int h = 0; h < ORGAN_DRAWBARS; h++) {
                     if (v.inc[h] == 0 || db[h] == 0) continue;
@@ -389,11 +445,11 @@ static void renderBlock(int16_t* out) {
             // Per-voice envelope (Q15), advanced once per sample.
             switch (v.stage) {
                 case ENV_ATTACK:
-                    v.env += ENV_ATTACK_INC;
+                    v.env += envAtkInc;
                     if (v.env >= 32767) { v.env = 32767; v.stage = ENV_SUSTAIN; }
                     break;
                 case ENV_RELEASE:
-                    v.env -= ENV_RELEASE_DEC;
+                    v.env -= envRelDec;
                     if (v.env <= 0) { v.env = 0; v.stage = ENV_IDLE; }
                     break;
                 default: break;
@@ -415,11 +471,15 @@ static void renderBlock(int16_t* out) {
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
 
-        // SAMPLE BRIGHT knob — global one-pole low-pass tone control.
-        if (samp) {
+        // PROC BRIGHT slider — global one-pole low-pass tone control — then the
+        // THROAT formant (boost can exceed int16, so re-clamp before the FX
+        // chain writes int16 delay buffers).
+        if (proc) {
             int alpha = 16 + s_param[2] * 30;          // 16 (dark) .. 256 (open)
-            s_sampLp += ((s - s_sampLp) * alpha) >> 8;
-            s = s_sampLp;
+            s_procLp += ((s - s_procLp) * alpha) >> 8;
+            s = procFormant(s_procLp, procSel, s_param[4]);
+            if (s >  32767) s =  32767;
+            if (s < -32768) s = -32768;
         }
 
         // 1. Scanner vibrato/chorus — dry mixed with an LFO-swept fractional delay.
@@ -465,6 +525,44 @@ static void renderBlock(int16_t* out) {
             int ampR = 32768 - ((LESLIE_AM_Q15 * rot) >> 15);
             l = ((int32_t)dopL * ampL) >> 15;
             r = ((int32_t)dopR * ampR) >> 15;
+        }
+
+        // 4. Stereo reverb — mono-fed comb/allpass bank per channel, added on
+        // top of the dry signal.  The tail keeps ringing after note-off (the
+        // synth task only sleeps when the organ deactivates, so tails play out).
+        if (rvb) {
+            int32_t inp = ((l + r) * RV_IN_Q15) >> 16;   // (l+r)/2 × 0.02
+            for (int c = 0; c < 2; c++) {
+                int32_t wet = 0;
+                for (int k = 0; k < RV_COMBS; k++) {
+                    int16_t* buf = s_rvCombBuf[c][k];
+                    int pos = s_rvCombPos[c][k];
+                    int32_t y = buf[pos];
+                    // one-pole damping in the feedback path (dulls the tail)
+                    s_rvCombLp[c][k] += ((y - s_rvCombLp[c][k]) * (256 - rvDamp)) >> 8;
+                    int32_t fb = inp + ((s_rvCombLp[c][k] * rvFb) >> 15);
+                    if (fb >  32767) fb =  32767;
+                    if (fb < -32768) fb = -32768;
+                    buf[pos] = (int16_t)fb;
+                    if (++pos >= RV_COMB_LEN[c][k]) pos = 0;
+                    s_rvCombPos[c][k] = (int16_t)pos;
+                    wet += y;
+                }
+                for (int k = 0; k < RV_APS; k++) {
+                    int16_t* buf = s_rvApBuf[c][k];
+                    int pos = s_rvApPos[c][k];
+                    int32_t y = buf[pos];
+                    int32_t in2 = wet + (y >> 1);        // allpass g = 0.5
+                    if (in2 >  32767) in2 =  32767;
+                    if (in2 < -32768) in2 = -32768;
+                    buf[pos] = (int16_t)in2;
+                    if (++pos >= RV_AP_LEN[c][k]) pos = 0;
+                    s_rvApPos[c][k] = (int16_t)pos;
+                    wet = y - (in2 >> 1);
+                }
+                int32_t& ch = c ? r : l;
+                ch += (wet * rvWet) >> 15;
+            }
         }
 
         if (l >  32767) l =  32767;
@@ -535,8 +633,11 @@ void organInit() {
         s_breathInc[h]   = (uint32_t)((double)rate * BLOCK_FRAMES / AUDIO_CODEC_RATE_HZ * 4294967296.0);
         s_breathPhase[h] = h * 0x20000000u;   // spread starting phases
     }
+    procSoundsInit();
     s_evtQueue = xQueueCreate(64, sizeof(OrganEvent));
-    xTaskCreatePinnedToCore(organTaskFn, "ORGAN", 4096, nullptr, 5, nullptr, 0);  // Core 0
+    // 6144: sized when the render path grew floats (formant biquad) + the PROC
+    // noteOn path (soft-double powf) — 4096 left thin margin.
+    xTaskCreatePinnedToCore(organTaskFn, "ORGAN", 6144, nullptr, 5, nullptr, 0);  // Core 0
 }
 
 void organSetActive(bool on) {
@@ -549,8 +650,11 @@ void organSetActive(bool on) {
         s_active = true;
     } else {
         s_active = false;          // stop the synth task streaming first
-        for (int i = 0; i < ORGAN_VOICES; i++) { voices[i].stage = ENV_IDLE; voices[i].env = 0; }
+        for (int i = 0; i < ORGAN_VOICES; i++) {
+            voices[i].stage = ENV_IDLE; voices[i].env = 0; voices[i].sustained = 0;
+        }
         s_voiceCount = 0;
+        s_sustain    = false;      // don't carry a held pedal into the next session
         if (s_evtQueue) xQueueReset(s_evtQueue);
         audioCodecSetLowLatency(false);   // restore the SD-robust DMA for SamplePlayer
     }
@@ -596,9 +700,12 @@ const char* organTypeName(int t) {
 void organSetVibChorus(int v) { if (v >= 0 && v <= 6) s_vibChorus = v; }
 void organSetLeslie(int v)    { if (v >= 0 && v <= 2) s_leslie    = v; }
 void organSetDrive(int v)     { if (v >= 0 && v <= 1) s_drive     = v; }
+void organSetReverb(int v)    { if (v >= 0 && v <= 2) s_reverb    = v; }
+void organSetSustain(bool on) { s_sustain = on; }
 int  organGetVibChorus()      { return s_vibChorus; }
 int  organGetLeslie()         { return s_leslie; }
 int  organGetDrive()          { return s_drive; }
+int  organGetReverb()         { return s_reverb; }
 
 void organSetParam(int idx, int value) {
     if (idx < 0 || idx >= ORGAN_PARAMS) return;
@@ -607,9 +714,12 @@ void organSetParam(int idx, int value) {
     s_param[idx] = value;
     // NEBULA DETUNE (idx 0) is note-onset baked — flag held voices to re-tune.
     if (idx == 0 && s_type == ORGAN_NEBULA) s_nebRetune = true;
-    // SAMPLE select (idx 0) → ask the loop task to (re)analyse that sample.
-    if (idx == 0 && s_type == ORGAN_SAMPLE) gSampleLoadReq = value;
 }
 int organGetParam(int idx) {
     return (idx >= 0 && idx < ORGAN_PARAMS) ? s_param[idx] : 0;
 }
+
+void organSetProcSound(int i) {
+    if (i >= 0 && i < PROC_SOUND_COUNT) s_procSel = i;   // applies to notes played next
+}
+int organGetProcSound() { return s_procSel; }

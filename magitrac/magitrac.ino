@@ -92,7 +92,7 @@ DrumTrackImportPage drumTrackImportPage(display, touch, song);
 PerformancePage    performancePage(display, touch, song);
 PixelPostManualPage pixelpostManualPage(display, touch);
 SetlistPage        setlistPage(display, touch, song);
-OrganPage          organPage(display, touch);
+OrganPage          organPage(display, touch, song);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
 WiFiSettingsPage   wifiSettingsPage(display, touch);
@@ -418,8 +418,11 @@ void setup() {
     // be ignored or tear down the AP.
 
     // Battery — LilyGo T5 S3 has BQ25896 PMIC on I2C with ADC fallback;
-    // M5PaperS3 has neither, so leave battery backend as NONE.
-    if (!m5paper) {
+    // M5PaperS3 senses via ADC: BAT_ADC on GPIO 3 (2:1 divider), charge
+    // status on GPIO 4 (low = charging) — pin map per M5Unified Power_Class.
+    if (m5paper) {
+        battery_begin_adc(3, 2.0f, 4200, 3000, /*chg_stat_pin=*/4);
+    } else {
         battery_begin_adc(4, 2.0f);
         if (display.getConfig().i2c.wire)
             battery_begin_bq25896(display.getConfig().i2c.wire);
@@ -1001,6 +1004,18 @@ void loop() {
 
     // ── Column editor page ──────────────────────────────────────────────────
     if (columnEditorOpen) {
+        // Tune-by-ear: while stopped, MIDI keys play the edited SFX column's
+        // sample at the played pitch (+ the TUNE field being adjusted).
+        {
+            uint8_t inNote, inVel;
+            if (!gServerPairing.serverPlaying() &&
+                gServerPairing.pollMidiNoteIn(&inNote, &inVel) &&
+                song.columns[columnEditor.editCol()].midiChannel == SFX_CHANNEL) {
+                gServerPairing.sendAuditionRawNote(SFX_CHANNEL, inNote,
+                                                   inVel ? inVel : 100,
+                                                   columnEditor.editCol());
+            }
+        }
         if (gServerPairing.isPaired() && columnEditor.patchPending()) {
             // Sync the edited column's settings to the server (per-song)
             uint8_t c = columnEditor.editCol();
@@ -1483,6 +1498,21 @@ void loop() {
         uint8_t midiNote;
         uint8_t midiVelocity;
         if (!gServerPairing.serverPlaying() &&
+            !ui.noSong() &&
+            !ui.editMode() &&
+            gServerPairing.pollMidiNoteIn(&midiNote, &midiVelocity))
+        {
+            // Not editing: an SFX column under the cursor still sounds the
+            // played note (tune-by-ear without writing cells).
+            int8_t sc = ui.selectedCol();
+            if (sc >= 1 && sc < MAX_COLUMNS &&
+                song.columns[sc].midiChannel == SFX_CHANNEL) {
+                gServerPairing.sendAuditionRawNote(SFX_CHANNEL, midiNote,
+                                                   midiVelocity ? midiVelocity : 100,
+                                                   (uint8_t)sc);
+            }
+        }
+        else if (!gServerPairing.serverPlaying() &&
             !ui.noSong() &&
             ui.editMode() &&
             gServerPairing.pollMidiNoteIn(&midiNote, &midiVelocity))

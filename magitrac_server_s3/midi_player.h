@@ -32,7 +32,8 @@ void sequencerAuditionNote(uint8_t pattern, uint8_t row, uint8_t col);
 // Notes are buffered for SEQ_RAW_AUD_HOLD_MS after the first arrival, then
 // fired together — this quantises the within-step jitter that WiFi adds to
 // what should be a simultaneous chord.
-void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity);
+void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
+                              uint8_t col = 0xFF);  // col: SFX sample source column
 // Queue a program change for audition (e.g. drum-kit select on ch10).  The
 // actual MIDI emit happens on the MIDI task in sequencerRawAuditionTick so it
 // shares the sequencer's running-status cache — sending the program change as

@@ -23,7 +23,8 @@ static volatile bool             s_playing    = false;
 static SemaphoreHandle_t         s_trigger    = nullptr;
 static portMUX_TYPE              s_pathMux    = portMUX_INITIALIZER_UNLOCKED;
 static char                      s_pendingPath[64];
-static volatile int              s_pendingPitch = 0;   // semitones for the next play
+static volatile float            s_pendingPitch = 0;   // semitones for the next play (fractional OK)
+static volatile uint8_t          s_pendingVol   = 127; // 0..127 for the next play
 static volatile bool             s_havePending = false;
 
 static const int                 IN_SAMPLES   = 1024;
@@ -71,7 +72,7 @@ struct Resampler {
     int16_t  lastL     = 0;
     int16_t  lastR     = 0;
 
-    void configure(uint32_t inRateHz, int numChannels, int pitchSemitones = 0) {
+    void configure(uint32_t inRateHz, int numChannels, float pitchSemitones = 0) {
         if (inRateHz == 0) inRateHz = AUDIO_CODEC_RATE_HZ;
         // Base step = file-rate → codec-rate (native pitch).  Pitch tracking
         // scales it by 2^(semitones/12); clamp to ±4 octaves so the step can't
@@ -127,8 +128,9 @@ struct Resampler {
 };
 
 static void wavTaskFn(void*) {
-    char activePath[64];
-    int  activePitch = 0;
+    char  activePath[64];
+    float activePitch = 0;
+    int32_t activeGainQ15 = 32767;
     for (;;) {
         crashSetAudioPhase(CP_IDLE);   // breadcrumb: WAV task idle/blocked
         xSemaphoreTake(s_trigger, portMAX_DELAY);
@@ -139,6 +141,10 @@ static void wavTaskFn(void*) {
         if (havePath) {
             memcpy(activePath, s_pendingPath, sizeof(activePath));
             activePitch = s_pendingPitch;
+            // Squared taper (GM CC7-ish): perceived loudness tracks the value
+            // better than linear, and 127 stays exactly unity.
+            int v = s_pendingVol;
+            activeGainQ15 = (int32_t)(v * v * 32767L) / (127 * 127);
             s_havePending = false;
         }
         portEXIT_CRITICAL(&s_pathMux);
@@ -230,6 +236,10 @@ static void wavTaskFn(void*) {
                 int outFrames = rs.process(inBuf + done * numCh, frames - done,
                                            outBuf, OUT_FRAMES_MAX, consumed);
                 if (outFrames > 0) {
+                    if (activeGainQ15 < 32767) {
+                        for (int k = 0; k < outFrames * 2; k++)
+                            outBuf[k] = (int16_t)(((int32_t)outBuf[k] * activeGainQ15) >> 15);
+                    }
                     audioCodecPlay((const uint8_t*)outBuf, outFrames * 4);
                 }
                 if (consumed <= 0) break;   // safety: never spin
@@ -260,11 +270,12 @@ void samplePlayerInit() {
     xTaskCreatePinnedToCore(wavTaskFn, "WAV", 4096, nullptr, 5, nullptr, 0);  // Core 0
 }
 
-void samplePlayerPlay(const char* path, int pitchSemitones) {
+void samplePlayerPlay(const char* path, float pitchSemitones, uint8_t volume) {
     portENTER_CRITICAL(&s_pathMux);
     strncpy(s_pendingPath, path, sizeof(s_pendingPath) - 1);
     s_pendingPath[sizeof(s_pendingPath) - 1] = '\0';
     s_pendingPitch = pitchSemitones;
+    s_pendingVol   = volume;
     s_havePending = true;
     portEXIT_CRITICAL(&s_pathMux);
     s_stop = true;

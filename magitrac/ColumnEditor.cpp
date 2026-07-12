@@ -8,6 +8,27 @@
 static inline bool isSfx(uint8_t ch) { return ch == SFX_CHANNEL; }
 static inline bool isPxl(uint8_t ch) { return ch == PIXELPOST_CHANNEL; }
 static inline bool isDrums(uint8_t ch) { return ch == DRUM_MIDI_CHANNEL; }
+static inline bool isOrgan(uint8_t ch) { return ch == ORGAN_CHANNEL; }
+
+// ORGAN columns: the VOICE field picks the voice — the 4 synth types then the
+// procedural sounds.  Order mirrors the server's ORGAN_TYPE_NAMES +
+// PROC_SOUNDS registries (0..3 = types, 4+k = proc sound k).  The voice (and
+// the rest of the organ patch) lives ONCE per song in Song::organ.
+static const char* const ORGAN_VOICES[] =
+    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "TWO TRIBES", "CHOIR" };
+#define ORGAN_VOICE_COUNT 6
+
+// First ORGAN column creates the song's organ patch with playable defaults
+// (classic 888 registration); the organ page refines it from there.
+static void organPatchEnsure(Song& s) {
+    if (s.organ.flags & 1) return;
+    memset(&s.organ, 0, sizeof(s.organ));
+    s.organ.flags = 1;
+    static const uint8_t bars[ORGAN_PATCH_BARS]  = { 8, 8, 8, 0, 0, 0, 0, 0, 0 };
+    static const uint8_t sl[ORGAN_PATCH_SLIDERS] = { 4, 4, 8, 4, 4 };
+    memcpy(s.organ.bars,    bars, sizeof(bars));
+    memcpy(s.organ.sliders, sl,   sizeof(sl));
+}
 
 // Strip ".wav" suffix and truncate to fit the column NAME field.
 static void copySampleNameToCol(const char* fname, char* nameField) {
@@ -93,8 +114,11 @@ void ColumnEditor::drawHeader() {
 
 void ColumnEditor::fieldLabel(int field, char* out) const {
     static const char* labels[] = { "MIDI CH", "BANK", "PROGRAM", "VOLUME", "TRANSPOSE", "NAME" };
-    // On the drum channel the program field is a kit picker.
-    if (field == 2 && isDrums(_song.columns[_col].midiChannel)) { strcpy(out, "KIT"); return; }
+    // On the drum channel the program field is a kit picker; on the organ
+    // channel it picks the voice.
+    if (field == 2 && isDrums(_song.columns[_col].midiChannel)) { strcpy(out, "KIT");   return; }
+    if (field == 2 && isOrgan(_song.columns[_col].midiChannel)) { strcpy(out, "VOICE"); return; }
+    if (field == 1 && isSfx(_song.columns[_col].midiChannel))   { strcpy(out, "TUNE");  return; }
     strcpy(out, labels[field]);
 }
 
@@ -105,11 +129,17 @@ void ColumnEditor::fieldValue(int field, char* out) const {
             if      (c.midiChannel == 0)                strcpy(out, "OFF");
             else if (c.midiChannel == SFX_CHANNEL)      strcpy(out, "SFX");
             else if (c.midiChannel == PIXELPOST_CHANNEL) strcpy(out, "PXL");
+            else if (c.midiChannel == ORGAN_CHANNEL)     strcpy(out, "ORGAN");
             else                                         snprintf(out, 16, "%d", c.midiChannel);
             break;
-        case 1:  // BANK — meaningless on SFX and PXL
-            if (isSfx(c.midiChannel) || isPxl(c.midiChannel)) strcpy(out, "--");
-            else                                              snprintf(out, 16, "%d", c.bankMSB + 1);
+        case 1:  // BANK — TUNE (± semitones.cents from native) on SFX; meaningless on PXL/ORGAN
+            if (isSfx(c.midiChannel)) {
+                int v = c.sfxTuneCents;
+                int a = (v < 0) ? -v : v;
+                snprintf(out, 16, "%c%d.%02d", (v < 0) ? '-' : '+', a / 100, a % 100);
+            }
+            else if (isPxl(c.midiChannel) || isOrgan(c.midiChannel)) strcpy(out, "--");
+            else snprintf(out, 16, "%d", c.bankMSB + 1);
             break;
         case 2:  // PROGRAM — SFX shows sample id (0 = none); PXL none; drums show kit
             if (isSfx(c.midiChannel)) {
@@ -117,6 +147,10 @@ void ColumnEditor::fieldValue(int field, char* out) const {
                 else                snprintf(out, 16, "%d", c.program);
             } else if (isPxl(c.midiChannel)) {
                 strcpy(out, "--");
+            } else if (isOrgan(c.midiChannel)) {
+                int v = _song.organ.voice;
+                if (v >= ORGAN_VOICE_COUNT) v = ORGAN_VOICE_COUNT - 1;
+                strcpy(out, ORGAN_VOICES[v]);
             } else if (isDrums(c.midiChannel)) {
                 int k = drumKitIndexForProgram(c.program);
                 strcpy(out, DRUM_KITS[k < 0 ? 0 : k].name);
@@ -143,9 +177,11 @@ void ColumnEditor::drawFieldRow(int field) {
 
     bool sfx = isSfx(_song.columns[_col].midiChannel);
     bool pxl = isPxl(_song.columns[_col].midiChannel);
-    // BANK is meaningless on SFX and PXL; PROGRAM is meaningless on PXL.
-    // Render greyed and disable +/-.
-    bool disabled = (sfx && field == 1) || (pxl && (field == 1 || field == 2));
+    bool org = isOrgan(_song.columns[_col].midiChannel);
+    // BANK is meaningless on PXL and ORGAN (on SFX it hosts the live ROOT
+    // field); PROGRAM is meaningless on PXL.  Render greyed and disable +/-.
+    (void)sfx;
+    bool disabled = (org && field == 1) || (pxl && (field == 1 || field == 2));
     uint16_t fg = disabled ? COL_DKGREY : COL_BLACK;
 
     _d.setTextSize(3);
@@ -170,9 +206,10 @@ void ColumnEditor::drawFieldRow(int field) {
             uiButton(_d, CE_MINUS_X, btnY, CE_BTN_W, CE_BTN_H, "-", COL_WHITE, COL_BLACK, 3);
             uiButton(_d, CE_PLUS_X,  btnY, CE_BTN_W, CE_BTN_H, "+", COL_WHITE, COL_BLACK, 3);
         }
-    } else if (!pxl && !isDrums(_song.columns[_col].midiChannel)) {
+    } else if (!pxl && !org && !isDrums(_song.columns[_col].midiChannel)) {
         // PXL has no picker (name fixed to "PIXEL POST"); drums pick a kit via
-        // the KIT field, not the melodic instrument library.
+        // the KIT field, organ a voice via the VOICE field — not the melodic
+        // instrument library.
         const char* pickLabel = sfx ? "PICK SAMPLE" : "PICK INSTR";
         uiButton(_d, CE_PICK_X, btnY, CE_PICK_W, CE_BTN_H,
                  pickLabel, COL_WHITE, COL_BLACK, 2);
@@ -552,12 +589,13 @@ void ColumnEditor::doClearColumn(uint8_t col) {
 void ColumnEditor::adjustField(int field, int delta) {
     ColumnSettings& c = cs();
     switch (field) {
-        case 0: {  // MIDI CH: 0(off)..16, 17=SFX, 18=PXL (pixel_post)
+        case 0: {  // MIDI CH: 0(off)..16, 17=SFX, 18=PXL (pixel_post), 19=ORGAN
             int v = (int)c.midiChannel + delta;
             if (v < 0) v = 0;
-            if (v > PIXELPOST_CHANNEL) v = PIXELPOST_CHANNEL;
+            if (v > ORGAN_CHANNEL) v = ORGAN_CHANNEL;
             bool enteredSfx = (v == SFX_CHANNEL       && c.midiChannel != SFX_CHANNEL);
             bool enteredPxl = (v == PIXELPOST_CHANNEL && c.midiChannel != PIXELPOST_CHANNEL);
+            bool enteredOrgan = (v == ORGAN_CHANNEL   && c.midiChannel != ORGAN_CHANNEL);
             bool enteredDrums = (v == DRUM_MIDI_CHANNEL && c.midiChannel != DRUM_MIDI_CHANNEL);
             c.midiChannel = (uint8_t)v;
             // Entering the drum channel — snap PROGRAM onto a real kit slot so
@@ -576,16 +614,48 @@ void ColumnEditor::adjustField(int field, int delta) {
                 strncpy(c.name, "PIXEL POST", INSTRUMENT_NAME_LEN - 1);
                 c.name[INSTRUMENT_NAME_LEN - 1] = '\0';
             }
+            // First entry into ORGAN — default the name, and make sure the
+            // song has an organ patch to play (one per song; see Song::organ).
+            if (enteredOrgan) {
+                strncpy(c.name, "ORGAN", INSTRUMENT_NAME_LEN - 1);
+                c.name[INSTRUMENT_NAME_LEN - 1] = '\0';
+                organPatchEnsure(_song);
+                gServerPairing.sendSongPatch(_song, &_song.organ, (uint8_t)sizeof(OrganPatch));
+            }
             break;
         }
-        case 1: {  // BANK — locked on SFX and PXL
-            if (isSfx(c.midiChannel) || isPxl(c.midiChannel)) return;
+        case 1: {  // BANK — ROOT on SFX; locked on PXL and ORGAN
+            if (isSfx(c.midiChannel)) {
+                // TUNE: ± cents from native pitch.  HoldRepeat's delta never
+                // accelerates (fixed ±1 every 80 ms), so grow the step while
+                // calls arrive back-to-back: a lone tap = 1 cent fine-tune, a
+                // hold sweeps ever faster (cap 100 = a semitone per step).
+                static uint32_t s_tuneLastMs = 0;
+                static int      s_tuneStep   = 1;
+                uint32_t now = millis();
+                s_tuneStep = (now - s_tuneLastMs < 200)
+                           ? min(s_tuneStep + s_tuneStep / 4 + 1, 100) : 1;
+                s_tuneLastMs = now;
+                int v = (int)c.sfxTuneCents + delta * s_tuneStep;
+                c.sfxTuneCents = (int16_t)constrain(v, -4800, 4800);
+                break;
+            }
+            if (isPxl(c.midiChannel) || isOrgan(c.midiChannel)) return;
             int v = (int)c.bankMSB + delta;
             c.bankMSB = (uint8_t)constrain(v, 0, (int)gMaxBank);
             break;
         }
-        case 2: {  // PROGRAM — locked on PXL; KIT picker on drums; sample on SFX
+        case 2: {  // PROGRAM — locked on PXL; KIT on drums; sample on SFX; voice on ORGAN
             if (isPxl(c.midiChannel)) return;
+            if (isOrgan(c.midiChannel)) {
+                // VOICE edits the song's single organ patch — every ORGAN
+                // column shows/plays the same voice by construction.
+                organPatchEnsure(_song);
+                int v = (int)_song.organ.voice + ((delta > 0) ? 1 : -1);
+                _song.organ.voice = (uint8_t)constrain(v, 0, ORGAN_VOICE_COUNT - 1);
+                gServerPairing.sendSongPatch(_song, &_song.organ, (uint8_t)sizeof(OrganPatch));
+                break;
+            }
             if (isDrums(c.midiChannel)) {
                 // Cycle the SAM2695's populated kit slots.  The gMaxProgram
                 // limit is a melodic-patch guard and doesn't apply here.
@@ -906,9 +976,9 @@ bool ColumnEditor::poll() {
         int btnY = ry + (CE_ROW_H - CE_BTN_H) / 2;
 
         if (f == 5) break;  // NAME handled above on falling edge
-        // Suppress +/- on disabled rows: BANK is locked on SFX and PXL,
-        // PROGRAM is locked on PXL.
-        if (f == 1 && (isSfx(cs().midiChannel) || isPxl(cs().midiChannel))) break;
+        // Suppress +/- on disabled rows: BANK is locked on PXL (on SFX it's
+        // the live ROOT field), PROGRAM is locked on PXL.
+        if (f == 1 && isPxl(cs().midiChannel)) break;
         if (f == 2 && isPxl(cs().midiChannel)) break;
         // −/+ buttons (fields 0-4)
         int sign = 0;

@@ -137,6 +137,13 @@ struct PerfPadConfig {
 // is selected by ColumnSettings::program (id into /samples/samples.txt).
 #define SFX_CHANNEL  17
 
+// Special "channel" routing a column to the server's onboard organ synth
+// (drawbar_organ.cpp) instead of UART MIDI.  The organ's full patch (voice,
+// drawbars, sliders, effects) lives ONCE per song in Song::organ — one organ
+// per song; ORGAN columns just play it.  The organ owns the codec while a
+// song with an unmuted organ column plays, so SFX columns are silent then.
+#define ORGAN_CHANNEL  19
+
 // Special "channel" routing a column to pixel_post broadcasts (no MIDI).
 //   note.note      → MSG_SELECT_EFFECT effect index = note - 1 (C-0=0, C#0=1, …)
 //                    Deduped per column; only sent when it changes.  NOTE_OFF
@@ -156,10 +163,34 @@ struct ColumnSettings {
     uint8_t volume;                    // CC7, 0–127
     int8_t  transpose;                 // semitones, –24 to +24
     uint8_t mute;                      // 0 = unmuted, 1 = muted
-    uint8_t _pad[2];                   // reserved, write as 0
+    int16_t sfxTuneCents;              // SFX: pitch offset from native, cents
+                                       // (±4800).  C-4 plays the file at native
+                                       // rate + this; other notes relative in
+                                       // semitones.  0 (and all pre-existing
+                                       // songs — this was _pad) = native.
     char    name[INSTRUMENT_NAME_LEN]; // display name (11 chars + null)
 };
 // sizeof(ColumnSettings) = 20
+
+// The song's organ patch — the full state of the organ page, stored once per
+// song (one organ per song; every ORGAN column plays this patch).  flags bit0
+// set = patch present; songs saved before v20 read as absent and the synth
+// keeps its current settings.  Slider meaning depends on the voice (they map
+// to the synth's s_param in order).
+#define ORGAN_PATCH_BARS    9
+#define ORGAN_PATCH_SLIDERS 5
+struct OrganPatch {
+    uint8_t flags;                        // bit0 = present
+    uint8_t voice;                        // 0..3 = synth types, 4+k = procedural sound k
+    uint8_t bars[ORGAN_PATCH_BARS];       // drawbar registration 0..8
+    uint8_t sliders[ORGAN_PATCH_SLIDERS]; // voice/sound sliders 0..8
+    uint8_t vibChorus;                    // 0=off, 1-3 V1-3, 4-6 C1-3
+    uint8_t leslie;                       // 0=stop, 1=slow, 2=fast
+    uint8_t drive;                        // 0=off, 1=on
+    uint8_t reverb;                       // 0=off, 1=room, 2=hall (was _pad, so
+                                          // pre-reverb v20 songs read as OFF)
+};
+// sizeof(OrganPatch) = 20
 
 struct Pattern {
     uint16_t       noteHead;       // index into Song::notePool of first note (NOTE_NULL = empty)
@@ -190,6 +221,7 @@ struct Song {
     uint8_t    performerMask;      // bits 0-3: MIDI channels 1-4 driven by performer keyboard
     uint16_t   transposeChMask;    // bit n = MIDI channel (n+1) follows performer transpose; default 0xFDFF (all except ch 10)
     PerfPadConfig perfPads[PERF_PAD_COUNT];  // performance mode pad config
+    OrganPatch organ;              // one-organ-per-song patch (v20+; flags=0 in older songs)
     uint8_t    _songPad[1];        // reserved, write as 0
 };
 
@@ -259,7 +291,7 @@ struct SerializedNote {
 // or when MAX_COLUMNS changes (it sizes Song::columns).
 
 #define SONG_FILE_MAGIC   0x4D414754UL   // "MAGT" as uint32
-#define SONG_FILE_VERSION 19
+#define SONG_FILE_VERSION 20   // v20: OrganPatch added to the Song tail
 
 struct SongFileHeader {
     uint32_t magic;    // must equal SONG_FILE_MAGIC
