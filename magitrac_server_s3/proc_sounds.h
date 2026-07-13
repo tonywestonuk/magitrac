@@ -70,9 +70,11 @@ void procBlockTick(int sound);
 void procBlockPrep(int sound, ProcVoiceState& ps, int16_t* scratch,
                    const volatile int* param);
 
-// Frame tables (built by procSoundsInit; exposed for the inline sampler).
-extern int16_t gProcTabA[PROC_SOUND_COUNT][PROC_WT];   // ATTACK frame
-extern int16_t gProcTabS[PROC_SOUND_COUNT][PROC_WT];   // SUSTAIN frame
+// Frame tables (built by procSoundsInit into PSRAM — only procBlockPrep reads
+// them, sequentially at block rate; the per-sample hot path reads the voice's
+// INTERNAL scratch copy, so PSRAM latency never touches the audio loop).
+extern int16_t* gProcTabA[PROC_SOUND_COUNT];   // ATTACK frame
+extern int16_t* gProcTabS[PROC_SOUND_COUNT];   // SUSTAIN frame
 
 // Per-sound formant stack — up to 3 global peaking biquads on the PROC output
 // (pitch-INDEPENDENT, like a vocal tract; a wavetable bump would move with the

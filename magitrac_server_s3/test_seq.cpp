@@ -70,8 +70,9 @@ void organSetReverb(int) {}
 Instrument srvInstruments[MAX_INSTRUMENTS] = {};
 
 static uint8_t _buf[sizeof(SongFileHeader) + sizeof(Song)];
-uint8_t   srvActiveBuf[sizeof(SongFileHeader) + sizeof(Song)];
-uint32_t  srvActiveBufLen = sizeof(srvActiveBuf);
+static uint8_t _srvBufStore[sizeof(SongFileHeader) + sizeof(Song)];
+uint8_t*  srvActiveBuf    = _srvBufStore;   // firmware: PSRAM pointer
+uint32_t  srvActiveBufLen = sizeof(_srvBufStore);
 bool      srvHasActive    = true;
 
 // ── Pull in the implementation under test ────────────────────────────────────
@@ -107,7 +108,7 @@ static void initPool(Song* song) {
 // setTranspose=false → KEEP (only exact pitch resolves WAIT — good for isolation tests)
 // setTranspose=true  → SET  (each pitch sets transpose to its own index — demo style)
 static void buildWaitPattern(bool setTranspose) {
-    memset(srvActiveBuf, 0, sizeof(srvActiveBuf));
+    memset(srvActiveBuf, 0, sizeof(_srvBufStore));
 
     SongFileHeader* hdr = (SongFileHeader*)srvActiveBuf;
     hdr->magic   = SONG_FILE_MAGIC;
@@ -225,7 +226,7 @@ static void test_wrong_pitch_does_not_resolve_wait() {
 //   PASS can still match.
 // WAIT semantics are unchanged.
 static void buildSyncAtRow2Pattern() {
-    memset(srvActiveBuf, 0, sizeof(srvActiveBuf));
+    memset(srvActiveBuf, 0, sizeof(_srvBufStore));
     SongFileHeader* hdr = (SongFileHeader*)srvActiveBuf;
     hdr->magic   = SONG_FILE_MAGIC;
     hdr->version = SONG_FILE_VERSION;
@@ -414,7 +415,7 @@ static void test_fumble_double_note_ignored() {
 //   row 5: WAIT C-4   (the cue a later C should still be able to reach)
 // 8-row pattern, KEEP transpose.
 static void buildPassedSyncPattern(uint8_t syncPitchTracker) {
-    memset(srvActiveBuf, 0, sizeof(srvActiveBuf));
+    memset(srvActiveBuf, 0, sizeof(_srvBufStore));
     SongFileHeader* hdr = (SongFileHeader*)srvActiveBuf;
     hdr->magic   = SONG_FILE_MAGIC;
     hdr->version = SONG_FILE_VERSION;
@@ -447,7 +448,7 @@ static void buildPassedSyncPattern(uint8_t syncPitchTracker) {
 static void test_passed_sync_does_not_snap_backward() {
     printf("\ntest_passed_sync_does_not_snap_backward\n");
     // Only row 0 WAIT + row 2 SYNC, both C-4.  No later cue.
-    memset(srvActiveBuf, 0, sizeof(srvActiveBuf));
+    memset(srvActiveBuf, 0, sizeof(_srvBufStore));
     SongFileHeader* hdr = (SongFileHeader*)srvActiveBuf;
     hdr->magic = SONG_FILE_MAGIC; hdr->version = SONG_FILE_VERSION;
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
@@ -529,7 +530,7 @@ static void test_passed_sync_does_not_block_later_wait() {
 // Pattern: row 0 WAIT C-4, row 3 PASS C-4, row 5 WAIT C-4.  Used by tests where
 // the PASS sits AHEAD of the playhead.
 static void buildPassAheadPattern() {
-    memset(srvActiveBuf, 0, sizeof(srvActiveBuf));
+    memset(srvActiveBuf, 0, sizeof(_srvBufStore));
     SongFileHeader* hdr = (SongFileHeader*)srvActiveBuf;
     hdr->magic = SONG_FILE_MAGIC; hdr->version = SONG_FILE_VERSION;
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
@@ -600,7 +601,7 @@ static void test_consumed_pass_lets_next_note_reach_wait() {
 static void test_passed_pass_does_not_consume() {
     printf("\ntest_passed_pass_does_not_consume\n");
     // Pattern: row 0 WAIT C-4, row 2 PASS C-4, row 5 WAIT C-4
-    memset(srvActiveBuf, 0, sizeof(srvActiveBuf));
+    memset(srvActiveBuf, 0, sizeof(_srvBufStore));
     SongFileHeader* hdr = (SongFileHeader*)srvActiveBuf;
     hdr->magic = SONG_FILE_MAGIC; hdr->version = SONG_FILE_VERSION;
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
@@ -647,7 +648,7 @@ static void test_passed_pass_does_not_consume() {
 // block enter at the same tempo the performer was already at.
 
 static void buildAvrgAtRow0Pattern() {
-    memset(srvActiveBuf, 0, sizeof(srvActiveBuf));
+    memset(srvActiveBuf, 0, sizeof(_srvBufStore));
     SongFileHeader* hdr = (SongFileHeader*)srvActiveBuf;
     hdr->magic = SONG_FILE_MAGIC; hdr->version = SONG_FILE_VERSION;
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));

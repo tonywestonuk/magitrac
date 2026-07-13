@@ -382,9 +382,11 @@ static void wavTaskFn(void*) {
         const int OUT_FRAMES_MAX = (IN_FRAMES * AUDIO_CODEC_RATE_HZ + sampleRate - 1) / sampleRate + 4;
         const int OUT_BYTES_MAX  = OUT_FRAMES_MAX * 4;   // stereo int16
 
-        int16_t* inBuf   = (int16_t*)malloc(IN_BYTES);
-        int16_t* nextBuf = (int16_t*)malloc(IN_BYTES);
-        int16_t* outBuf  = (int16_t*)malloc(OUT_BYTES_MAX);
+        // PSRAM: sequential, double-buffered — internal heap stays free for
+        // the radios exactly when playback + WiFi are busiest (live set).
+        int16_t* inBuf   = (int16_t*)heap_caps_malloc(IN_BYTES, MALLOC_CAP_SPIRAM);
+        int16_t* nextBuf = (int16_t*)heap_caps_malloc(IN_BYTES, MALLOC_CAP_SPIRAM);
+        int16_t* outBuf  = (int16_t*)heap_caps_malloc(OUT_BYTES_MAX, MALLOC_CAP_SPIRAM);
         if (!inBuf || !nextBuf || !outBuf) {
             Serial.println("[SP] buffer alloc failed");
             free(inBuf); free(nextBuf); free(outBuf);

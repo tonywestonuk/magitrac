@@ -190,7 +190,7 @@ static uint8_t  seqAuditionCol  = 0xFF;     // 0xFF = no audition active
 static uint32_t seqAuditionEndMs = 0;
 
 // ── External references ───────────────────────────────────────────────────────
-extern uint8_t        srvActiveBuf[];
+extern uint8_t*       srvActiveBuf;    // PSRAM (commands_server allocates)
 extern uint32_t       srvActiveBufLen;
 extern bool           srvHasActive;
 extern Instrument     srvInstruments[];

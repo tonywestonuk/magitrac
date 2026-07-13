@@ -142,7 +142,10 @@ static bool srvInstLoadPending   = false;
 
 // ── Active song buffer ─────────────────────────────────────────────────────────
 // Holds the last song sent to the client so MSG_NOTE_UPDATE can be applied in-memory
-uint8_t  srvActiveBuf[SRV_SONG_XFER_MAX];
+// PSRAM — 36 KB of control-rate data (sequencer row walks, patches, CRC);
+// internal RAM is reserved for the radios + audio hot loops (see
+// feedback_internal_ram_budget).  Allocated in commandsInit.
+uint8_t* srvActiveBuf     = nullptr;
 uint32_t srvActiveBufLen  = 0;
 static char     srvActiveName[SRV_FNAME_MAX] = {};  // filename (with .mgt)
 bool     srvHasActive     = false;
@@ -337,6 +340,14 @@ static void sdPowerCycle() {
 }
 
 void commandsInit() {
+    // Active-song buffer in PSRAM (internal fallback so a bad PSRAM day
+    // still boots — the wrong-board incident proved that can happen).
+    srvActiveBuf = (uint8_t*)heap_caps_malloc(SRV_SONG_XFER_MAX, MALLOC_CAP_SPIRAM);
+    if (!srvActiveBuf) {
+        srvActiveBuf = (uint8_t*)malloc(SRV_SONG_XFER_MAX);
+        Serial.println("[CMD] srvActiveBuf: PSRAM alloc FAILED — using internal");
+    }
+
     sdPowerCycle();                                // real Vcc cycle: unwedge the card
     srvSdOk = false;
     for (int attempt = 0; attempt < 4 && !srvSdOk; ++attempt) {

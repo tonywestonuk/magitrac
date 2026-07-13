@@ -1,6 +1,8 @@
 #include "proc_sounds.h"
 #include "audio_codec.h"
 #include <math.h>
+#include <stdlib.h>
+#include "esp_heap_caps.h"
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 // Slider meanings (TWO TRIBES): ATTACK = pick-noise amount (live); CHORUS =
@@ -94,8 +96,8 @@ static const int32_t MORPH_INC[PROC_SOUND_COUNT] = {
     (int32_t)(65536.0 * 128 /* BLOCK_FRAMES */ / (0.300 * AUDIO_CODEC_RATE_HZ)),
 };
 
-int16_t gProcTabA[PROC_SOUND_COUNT][PROC_WT];
-int16_t gProcTabS[PROC_SOUND_COUNT][PROC_WT];
+int16_t* gProcTabA[PROC_SOUND_COUNT];   // PSRAM (procSoundsInit allocates)
+int16_t* gProcTabS[PROC_SOUND_COUNT];
 
 ProcFormantState gProcFormant[PROC_FORMANT_STAGES] = {};
 uint8_t gProcFormantNstage[PROC_SOUND_COUNT];
@@ -132,7 +134,20 @@ static void buildFormantStage(int sound, int stage,
 // companion tables in the same units (the CHOIR fundamental subtractor).
 static void buildFramePair(int sound, const float* hA, const float* hS, int nh,
                            float* scOut = nullptr) {
-    static float a[PROC_WT], s[PROC_WT];
+    // Init-time only — everything transient PSRAM (8 KB of static floats here
+    // used to sit in internal RAM forever for two boot-time calls).
+    float* a = (float*)heap_caps_malloc(PROC_WT * sizeof(float), MALLOC_CAP_SPIRAM);
+    float* s = (float*)heap_caps_malloc(PROC_WT * sizeof(float), MALLOC_CAP_SPIRAM);
+    if (!gProcTabA[sound])
+        gProcTabA[sound] = (int16_t*)heap_caps_malloc(PROC_WT * sizeof(int16_t),
+                                                      MALLOC_CAP_SPIRAM);
+    if (!gProcTabS[sound])
+        gProcTabS[sound] = (int16_t*)heap_caps_malloc(PROC_WT * sizeof(int16_t),
+                                                      MALLOC_CAP_SPIRAM);
+    if (!a || !s || !gProcTabA[sound] || !gProcTabS[sound]) {
+        free(a); free(s);
+        return;   // PROC sound stays silent; everything else lives
+    }
     for (int i = 0; i < PROC_WT; i++) { a[i] = 0.0f; s[i] = 0.0f; }
     uint32_t seed = 0x2F6E2B1u;
     for (int h = 1; h <= nh; h++) {
@@ -156,6 +171,8 @@ static void buildFramePair(int sound, const float* hA, const float* hS, int nh,
         gProcTabS[sound][i] = (int16_t)lrintf(s[i] * sc);
     }
     if (scOut) *scOut = sc;
+    free(a);
+    free(s);
 }
 
 void procSoundsInit() {
