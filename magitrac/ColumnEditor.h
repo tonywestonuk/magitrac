@@ -124,6 +124,11 @@ public:
     bool importRequested() const { return _importRequested; }
     void clearImportRequest()    { _importRequested = false; }
 
+    // Set when the user taps EDIT on an SFX column's NAME row.  The page
+    // closes; the caller opens SampleEditPage for the column's sample.
+    bool sampleEditRequested() const { return _sampleEditRequested; }
+    void clearSampleEditRequest()    { _sampleEditRequested = false; }
+
 private:
     EPD_PainterAdafruit& _d;
     GT911_Lite&          _touch;
@@ -153,6 +158,7 @@ private:
     uint8_t  _actionDst;    // remembered destination column for CONFIRM_COPY
     uint32_t _resyncMask;   // bits of columns whose settings + notes need resync
     bool     _importRequested = false;
+    bool     _sampleEditRequested = false;
     bool     _pressedOnName; // true if last touch-down landed in the NAME row
                              // (gates the falling-edge keyboard popup so other
                              //  overlays' YES/NO buttons don't trigger it)

@@ -149,6 +149,13 @@ static uint8_t  seqRetrigCh[MAX_COLUMNS]         = {};
 static uint8_t  seqChanBank[16];
 static uint8_t  seqChanProg[16];
 static uint8_t  seqChanVol[16];
+// SFX columns: RAM voice handle when the column's sample plays from the PSRAM
+// cache (polyphonic), -1 when it streams from SD (mono) or is silent.
+static int seqSfxVoice[MAX_COLUMNS];
+static bool _seqSfxVoiceInit = [](){
+    for (int i = 0; i < MAX_COLUMNS; i++) seqSfxVoice[i] = -1;
+    return true;
+}();
 
 // Forward declaration — defined below sequencerStart()
 static void seqSendColumnSetup(uint8_t pattern, bool force = false);
@@ -291,11 +298,26 @@ static inline const Song* seqSong() {
 // task — single volatile byte.
 static volatile uint8_t seqSfxAudNote = 0xFF;
 
+// Preloaded samples make tune-by-ear POLYPHONIC: each held key owns a RAM
+// voice, tracked here so its own note-off releases exactly that voice.
+// (Streamed samples stay mono and use seqSfxAudNote above.)
+#define SEQ_AUD_POLY 6
+static struct { uint8_t note; int voice; } seqSfxAudPoly[SEQ_AUD_POLY] = {
+    { 0, -1 }, { 0, -1 }, { 0, -1 }, { 0, -1 }, { 0, -1 }, { 0, -1 },
+};
+
 static void seqSfxAudNoteOff(uint8_t note) {
     if (seqRunning) return;   // guard: a stale note must never cut song SFX
+    for (int i = 0; i < SEQ_AUD_POLY; i++) {
+        if (seqSfxAudPoly[i].voice >= 0 && seqSfxAudPoly[i].note == note) {
+            sampleStopVoice(seqSfxAudPoly[i].voice);
+            seqSfxAudPoly[i].voice = -1;
+            return;
+        }
+    }
     if (note == seqSfxAudNote) {
         seqSfxAudNote = 0xFF;
-        samplePlayerStop();   // fades out, no click
+        samplePlayerStopStream();   // fades out, no click
     }
 }
 
@@ -307,6 +329,28 @@ static void seqSfxAudNoteOff(uint8_t note) {
 static float sfxPitchFor(const ColumnSettings& cs, uint8_t note) {
     return (float)((int)note - SAMPLE_ROOT_NOTE + (int)cs.transpose)
          + (float)cs.sfxTuneCents * 0.01f;
+}
+
+// Trigger a column's sample: preloaded → polyphonic RAM voice; not cached →
+// SD stream (mono, replaces any running stream).  Records the RAM handle so
+// the column's note-off stops ITS voice, not everyone's.  Returns false if
+// the sample doesn't exist at all.
+static bool sfxTrigger(int col, const ColumnSettings& cs, uint8_t note) {
+    int h = samplePlayRam(cs.program, sfxPitchFor(cs, note), cs.volume);
+    if (h >= 0) {
+        seqSfxVoice[col] = h;
+        return true;
+    }
+    const char* fname = sampleManifestNameFor(cs.program);
+    if (!fname) return false;
+    char path[64];
+    snprintf(path, sizeof(path), "/samples/%s", fname);
+    const SampleTrim* tr = sampleTrimFor(cs.program);
+    samplePlayerPlay(path, sfxPitchFor(cs, note), cs.volume,
+                     tr ? tr->startFrame : 0, tr ? tr->endFrame : 0,
+                     tr && tr->loop);
+    seqSfxVoice[col] = -1;
+    return true;
 }
 
 // ── Organ codec ownership ─────────────────────────────────────────────────────
@@ -374,7 +418,12 @@ static void seqNoteOff(int col) {
     seqRetrigLeft[col] = 0;            // cancel any ratchet still rolling on this column
     if (seqActiveNote[col] == 0) return;
     if (seqActiveChan[col] == SEQ_CHAN_SFX) {
-        samplePlayerStop();
+        if (seqSfxVoice[col] >= 0) {
+            sampleStopVoice(seqSfxVoice[col]);   // this column's RAM voice only
+            seqSfxVoice[col] = -1;
+        } else {
+            samplePlayerStopStream();            // it was the (single) SD stream;
+        }                                        // other columns' RAM voices ring on
     } else if (seqActiveChan[col] == SEQ_CHAN_ORGAN) {
         organNoteOff(seqActiveNote[col]);
     } else {
@@ -574,11 +623,7 @@ static void seqPlayRow() {
 
             if (cs.midiChannel == SFX_CHANNEL) {
                 if (organActive()) continue;   // organ owns the codec — SFX silent
-                const char* fname = sampleManifestNameFor(cs.program);
-                if (fname) {
-                    char path[64];
-                    snprintf(path, sizeof(path), "/samples/%s", fname);
-                    samplePlayerPlay(path, sfxPitchFor(cs, nn.note), cs.volume);
+                if (sfxTrigger(col, cs, nn.note)) {
                     seqActiveNote[col] = 1;               // any non-zero marks "active"
                     seqActiveChan[col] = SEQ_CHAN_SFX;    // route stop to SamplePlayer
                 }
@@ -1136,11 +1181,7 @@ static void seqPlayPreviewRow() {
                 seqNoteOff(seqPreviewCol);
                 if (cs.midiChannel == SFX_CHANNEL) {
                     if (organActive()) return;   // organ owns the codec — SFX silent
-                    const char* fname = sampleManifestNameFor(cs.program);
-                    if (fname) {
-                        char path[64];
-                        snprintf(path, sizeof(path), "/samples/%s", fname);
-                        samplePlayerPlay(path, sfxPitchFor(cs, nn.note), cs.volume);
+                    if (sfxTrigger(seqPreviewCol, cs, nn.note)) {
                         seqActiveNote[seqPreviewCol] = 1;
                         seqActiveChan[seqPreviewCol] = SEQ_CHAN_SFX;
                     }
@@ -1361,16 +1402,12 @@ void sequencerAuditionNote(uint8_t pat, uint8_t row, uint8_t col) {
         // sequencer-owned organ (a screen-owned organ keeps it — stay silent).
         seqOrganRelease();
         if (organActive()) return;
-        const char* fname = sampleManifestNameFor(cs.program);
-        if (fname) {
-            char path[64];
-            snprintf(path, sizeof(path), "/samples/%s", fname);
-            samplePlayerPlay(path, sfxPitchFor(cs, nn.note), cs.volume);
+        if (sfxTrigger(col, cs, nn.note)) {
             seqActiveNote[col] = 1;
             seqActiveChan[col] = SEQ_CHAN_SFX;
             seqAuditionCol   = col;
             seqAuditionEndMs = millis() + 500;
-            debugPrintf("[SEQ] audition col=%u SFX=%s\n", col, fname);
+            debugPrintf("[SEQ] audition col=%u SFX id=%u\n", col, cs.program);
         }
         return;
     }
@@ -1439,13 +1476,29 @@ void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
         if (col >= MAX_COLUMNS || note > 127) return;
         if (organActive()) return;             // organ owns the codec
         const ColumnSettings& cs = seqSong()->columns[col];
+        float semis = (float)((int)note - 60 + (int)cs.transpose)
+                    + (float)cs.sfxTuneCents * 0.01f;
+        int h = samplePlayRam(cs.program, semis, cs.volume);
+        if (h >= 0) {
+            // Polyphonic live playing: pair the voice with its key so the
+            // note-off releases exactly this one.  Table full → oldest slot.
+            int slot = 0;
+            for (int i = 0; i < SEQ_AUD_POLY; i++)
+                if (seqSfxAudPoly[i].voice < 0) { slot = i; break; }
+            if (seqSfxAudPoly[slot].voice >= 0)          // table full: evict
+                sampleStopVoice(seqSfxAudPoly[slot].voice);
+            seqSfxAudPoly[slot].note  = note;
+            seqSfxAudPoly[slot].voice = h;
+            return;
+        }
         const char* fname = sampleManifestNameFor(cs.program);
         if (!fname) return;
         char path[64];
         snprintf(path, sizeof(path), "/samples/%s", fname);
-        samplePlayerPlay(path, (float)((int)note - 60 + (int)cs.transpose)
-                             + (float)cs.sfxTuneCents * 0.01f,
-                         cs.volume);
+        const SampleTrim* tr = sampleTrimFor(cs.program);
+        samplePlayerPlay(path, semis, cs.volume,
+                         tr ? tr->startFrame : 0, tr ? tr->endFrame : 0,
+                         tr && tr->loop);
         seqSfxAudNote = note;   // the local MIDI parser stops it on note-off
         return;
     }

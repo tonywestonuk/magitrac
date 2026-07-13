@@ -210,7 +210,15 @@ void ColumnEditor::drawFieldRow(int field) {
         // PXL has no picker (name fixed to "PIXEL POST"); drums pick a kit via
         // the KIT field, organ a voice via the VOICE field — not the melodic
         // instrument library.
-        const char* pickLabel = sfx ? "PICK SAMPLE" : "PICK INSTR";
+        // SFX: the PICK gap also hosts EDIT (trim/loop editor) — see poll().
+        if (sfx) {
+            uiButton(_d, CE_PICK_X, btnY, 170, CE_BTN_H,
+                     "PICK", COL_WHITE, COL_BLACK, 2);
+            uiButton(_d, CE_PICK_X + 180, btnY, CE_PICK_W - 180, CE_BTN_H,
+                     "EDIT", COL_WHITE, COL_BLACK, 2);
+            return;
+        }
+        const char* pickLabel = "PICK INSTR";
         uiButton(_d, CE_PICK_X, btnY, CE_PICK_W, CE_BTN_H,
                  pickLabel, COL_WHITE, COL_BLACK, 2);
     }
@@ -1004,9 +1012,19 @@ bool ColumnEditor::poll() {
     }
 
     // PICK INSTRUMENT / SAMPLE button — no picker on PXL or drums (kit picker).
+    // On SFX the gap is split: [PICK][EDIT] — EDIT opens the trim/loop editor.
     if (!isPxl(cs().midiChannel) && !isDrums(cs().midiChannel) &&
         ty >= CE_PICK_Y && ty < CE_PICK_Y + CE_PICK_H) {
-        if (tx >= CE_PICK_X && tx < CE_PICK_X + CE_PICK_W) {
+        if (isSfx(cs().midiChannel) &&
+            tx >= CE_PICK_X + 180 && tx < CE_PICK_X + CE_PICK_W) {
+            if (cs().program != 0) {          // needs a sample selected
+                _sampleEditRequested = true;
+                return true;                  // close; .ino opens the editor
+            }
+            return false;
+        }
+        if (tx >= CE_PICK_X &&
+            tx < CE_PICK_X + (isSfx(cs().midiChannel) ? 170 : CE_PICK_W)) {
             _pickPage = 0;
             if (isSfx(cs().midiChannel)) {
                 _pickingSample = true;

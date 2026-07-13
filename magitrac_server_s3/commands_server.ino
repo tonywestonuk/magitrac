@@ -10,6 +10,7 @@
 #include "SongMigration.h"
 #include "midi_player.h"
 #include "SampleManifest.h"
+#include "esp32s3_dsp.h"   // ESP32S3_FFT — spectrogram (same engine as pixelpost bands)
 
 // ── Direct-from-Mac PixelPost OTA (client FW button) ──────────────────────────
 // The client's FW button triggers MSG_PIXELPOST_FIRMWARE_UPDATE; the server then
@@ -171,6 +172,21 @@ static volatile uint8_t sNoteSetQTail = 0;
 // Cell-tap audition, deferred behind the note-set queue (see MSG_NOTE_AUDITION).
 static volatile bool sAuditionPending = false;
 static uint8_t       sAuditionPat = 0, sAuditionRow = 0, sAuditionCol = 0;
+
+// PSRAM sample-preload sync: set whenever the active song (or its column
+// settings) changes; commandsTick runs samplePreloadSync on the loop task when
+// the sequencer is stopped and the player is quiet (SD reads + buffer frees).
+static volatile bool gSamplePreloadDirty = false;
+
+// Sample-editor requests, deferred to the loop task (overview = a windowed
+// SD read; trim save = an SD write).  Latest-wins single slots.
+static volatile bool     sSampleInfoPending = false;
+static volatile uint8_t  sSampleInfoId      = 0;
+static volatile uint32_t sSampleInfoVs      = 0;   // requested view window
+static volatile uint32_t sSampleInfoVe      = 0;   // 0,0 = whole file
+static volatile bool     sTrimSavePending   = false;
+static volatile bool     sSampleSpecPending = false;   // spectrogram request
+static volatile uint8_t  sSampleSpecId      = 0;
 
 // ── Deferred song-load request ─────────────────────────────────────────────────
 // sendSongData is blocking (~750ms); calling it from the ESP-NOW receive callback
@@ -670,7 +686,7 @@ static void sendSongDataFromPath(const char* path, const char* displayName) {
 
     strncpy(srvActiveName, displayName, sizeof(srvActiveName) - 1);
     srvActiveName[sizeof(srvActiveName) - 1] = '\0';
-    srvHasActive = true;
+    srvHasActive = true;  gSamplePreloadDirty = true;
 
     // Push the loaded song to the client via the MagiLink HEADER+BODY stream.
     // Same path as the unsolicited push after handshake.
@@ -699,6 +715,228 @@ static void sendSongDataByName(const char* name) {
     sendSongDataFromPath(path, display);
 }
 
+// ── Sample editor: build + send meta + waveform overview ──────────────────────
+// Windowed SD read (min/max peaks per bucket over [vs, ve); 0,0 = whole file)
+// — called from commandsTick on the loop task only.  A zoomed-in client asks
+// for its visible window and gets full-resolution peaks for it.
+static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
+    const char* fname = sampleManifestNameFor(id);
+    if (!fname) return;
+    char path[64];
+    snprintf(path, sizeof(path), "/samples/%s", fname);
+
+    // Transient PSRAM — internal RAM is the radios' budget (see the
+    // spectrogram builder below for the incident that taught us this).
+    MsgSampleInfo* infoP =
+        (MsgSampleInfo*)heap_caps_malloc(sizeof(MsgSampleInfo), MALLOC_CAP_SPIRAM);
+    int16_t* rdP = (int16_t*)heap_caps_malloc(1024 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!infoP || !rdP) { free(infoP); free(rdP); return; }
+    MsgSampleInfo& info = *infoP;
+    info = MsgSampleInfo();      // NSDMI: id + length
+
+    uint32_t totalFrames = 0, rate = 0;
+    uint16_t numCh = 0;
+    bool ok = false;
+    memset(info.peaks, 0, sizeof(info.peaks));
+    {
+        SdLock _;
+        File f = SD.open(path);
+        if (f) do {
+            uint8_t hdr[44];
+            if (f.read(hdr, sizeof(hdr)) != sizeof(hdr)) break;
+            rate  = (uint32_t)hdr[24] | ((uint32_t)hdr[25] << 8)
+                  | ((uint32_t)hdr[26] << 16) | ((uint32_t)hdr[27] << 24);
+            numCh = (uint16_t)hdr[22] | ((uint16_t)hdr[23] << 8);
+            uint16_t bitsPer = (uint16_t)hdr[34] | ((uint16_t)hdr[35] << 8);
+            if ((numCh != 1 && numCh != 2) || bitsPer != 16) break;
+            uint32_t frameBytes = (uint32_t)numCh * 2;
+            totalFrames = ((uint32_t)f.size() - sizeof(hdr)) / frameBytes;
+
+            // Clamp the requested window.
+            if (vs >= totalFrames) vs = 0;
+            if (ve == 0 || ve > totalFrames || ve <= vs) ve = totalFrames;
+            uint32_t viewFrames = ve - vs;
+            if (vs && !f.seek(sizeof(hdr) + vs * frameBytes)) break;
+
+            // Min/max of the LEFT channel per bucket, scaled int16 → int8.
+            uint32_t bucket = (viewFrames + SAMPLE_OVERVIEW_N - 1) / SAMPLE_OVERVIEW_N;
+            if (bucket == 0) bucket = 1;
+            uint32_t frame = 0;
+            int      col   = 0;
+            int16_t  mn = 32767, mx = -32768;
+            while (frame < viewFrames && col < SAMPLE_OVERVIEW_N) {
+                int got = f.read((uint8_t*)rdP, 1024 * sizeof(int16_t));
+                if (got <= 0) break;
+                int n = got / (int)frameBytes;
+                for (int i = 0; i < n && col < SAMPLE_OVERVIEW_N; i++) {
+                    if (frame >= viewFrames) break;
+                    int16_t s = rdP[i * numCh];
+                    if (s < mn) mn = s;
+                    if (s > mx) mx = s;
+                    if (++frame % bucket == 0) {
+                        info.peaks[col * 2]     = (int8_t)(mn >> 8);
+                        info.peaks[col * 2 + 1] = (int8_t)(mx >> 8);
+                        col++;
+                        mn = 32767; mx = -32768;
+                    }
+                }
+            }
+            if (col < SAMPLE_OVERVIEW_N && mn != 32767) { // final partial bucket
+                info.peaks[col * 2]     = (int8_t)(mn >> 8);
+                info.peaks[col * 2 + 1] = (int8_t)(mx >> 8);
+            }
+            info.viewStart = vs;
+            info.viewEnd   = ve;
+            ok = true;
+        } while (false);
+        if (f) f.close();
+    }
+
+    if (ok) {
+        const SampleTrim* tr = sampleTrimFor(id);
+        info.sampleId    = id;
+        info.channels    = (uint8_t)numCh;
+        info.loop        = tr ? tr->loop : 0;
+        info.kind        = 0;              // waveform overview
+        info.totalFrames = totalFrames;
+        info.rate        = rate;
+        info.startFrame  = tr ? tr->startFrame : 0;
+        info.endFrame    = tr ? tr->endFrame   : 0;
+
+        gMagiLink.acquireMutex();
+        gMagiLink.send(&info, sizeof(info));
+        gMagiLink.releaseMutex();
+    }
+    free(infoP);
+    free(rdP);
+}
+
+// ── Sample editor: spectrogram (Fairlight Page-D waterfall, display only) ─────
+// SAMPLE_SPEC_SLICES time slices across the TRIMMED region; per slice one
+// 1024-point FFT via the S3's DSP engine (ESP32S3_FFT, esp32s3_dsp.cpp — the
+// same accelerated path the pixelpost bands use, own instance so it never
+// touches the mic path's buffers), folded into SAMPLE_SPEC_BINS log-spaced
+// display bins (60 Hz .. 8 kHz), normalised to bytes and shipped as
+// SAMPLE_SPEC_PAGES MsgSampleInfo packets (kind = page+1, payload in
+// peaks[]).  Loop task only — SD reads + ~2 ms/slice of FFT.
+static void sendSampleSpectrum(uint8_t id) {
+    const char* fname = sampleManifestNameFor(id);
+    if (!fname) return;
+    char path[64];
+    snprintf(path, sizeof(path), "/samples/%s", fname);
+
+    // All working memory is TRANSIENT PSRAM — ~30 KB of static internal RAM
+    // here starved WiFi ("Connecting..." forever).  Internal RAM is the
+    // radios' budget; big one-shot buffers go to PSRAM and are freed on exit.
+    const int FFTN = 1024;
+    uint8_t* spec = (uint8_t*)heap_caps_malloc(SAMPLE_SPEC_BYTES, MALLOC_CAP_SPIRAM);
+    float*   mag  = (float*)heap_caps_malloc(SAMPLE_SPEC_BYTES * sizeof(float), MALLOC_CAP_SPIRAM);
+    int16_t* rd   = (int16_t*)heap_caps_malloc(2048 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    float*   fin  = (float*)heap_caps_malloc(FFTN * sizeof(float), MALLOC_CAP_SPIRAM);
+    float*   fout = (float*)heap_caps_malloc(FFTN * sizeof(float), MALLOC_CAP_SPIRAM);
+    MsgSampleInfo* infoP =
+        (MsgSampleInfo*)heap_caps_malloc(sizeof(MsgSampleInfo), MALLOC_CAP_SPIRAM);
+    static ESP32S3_FFT sFft;                 // instance itself is small; its
+                                             // buffers are PSRAM via init()
+    bool fftUp = spec && mag && rd && fin && fout && infoP &&
+                 sFft.init(FFTN, FFTN, SPECTRAL_AVERAGE);
+    if (!fftUp) {
+        free(spec); free(mag); free(rd); free(fin); free(fout); free(infoP);
+        return;
+    }
+    memset(spec, 0, SAMPLE_SPEC_BYTES);
+    memset(mag,  0, SAMPLE_SPEC_BYTES * sizeof(float));
+
+    bool ok = false;
+    {
+        SdLock _;
+        File f = SD.open(path);
+        if (f) do {
+        uint8_t hdr[44];
+        if (f.read(hdr, sizeof(hdr)) != sizeof(hdr)) break;
+        uint32_t rate  = (uint32_t)hdr[24] | ((uint32_t)hdr[25] << 8)
+                       | ((uint32_t)hdr[26] << 16) | ((uint32_t)hdr[27] << 24);
+        uint16_t numCh = (uint16_t)hdr[22] | ((uint16_t)hdr[23] << 8);
+        uint16_t bits  = (uint16_t)hdr[34] | ((uint16_t)hdr[35] << 8);
+        if ((numCh != 1 && numCh != 2) || bits != 16 ||
+            rate < 8000 || rate > 48000) break;
+        uint32_t frameBytes  = (uint32_t)numCh * 2;
+        uint32_t totalFrames = ((uint32_t)f.size() - sizeof(hdr)) / frameBytes;
+
+        const SampleTrim* tr = sampleTrimFor(id);
+        uint32_t st = tr ? tr->startFrame : 0;
+        uint32_t en = (tr && tr->endFrame) ? tr->endFrame : totalFrames;
+        if (st >= totalFrames) st = 0;
+        if (en > totalFrames || en <= st) en = totalFrames;
+
+        uint32_t segFrames = (en - st) / SAMPLE_SPEC_SLICES;
+        if (segFrames == 0) segFrames = 1;
+
+        // Log-spaced display-bin edges → linear FFT bin ranges.
+        float fTop = (rate / 2 > 8500) ? 8000.0f : (float)rate * 0.45f;
+
+        for (int s = 0; s < SAMPLE_SPEC_SLICES; s++) {
+            uint32_t frame0 = st + (uint32_t)s * segFrames;
+            if (!f.seek(sizeof(hdr) + frame0 * frameBytes)) break;
+            uint32_t want = segFrames;
+            if (want > (uint32_t)FFTN) want = FFTN;
+            int got = f.read((uint8_t*)rd, want * frameBytes);
+            int n = got / (int)frameBytes;
+            if (n < 32) continue;
+            for (int i = 0; i < n; i++)    fin[i] = (float)rd[i * numCh];
+            for (int i = n; i < FFTN; i++) fin[i] = 0.0f;
+
+            sFft.compute(fin, fout);       // hardware-accelerated, hann window
+
+            for (int b = 0; b < SAMPLE_SPEC_BINS; b++) {
+                float f0 = 60.0f * powf(fTop / 60.0f, (float)b / SAMPLE_SPEC_BINS);
+                float f1 = 60.0f * powf(fTop / 60.0f, (float)(b + 1) / SAMPLE_SPEC_BINS);
+                int k0 = (int)(f0 * FFTN / rate);
+                int k1 = (int)(f1 * FFTN / rate);
+                if (k0 < 1) k0 = 1;
+                if (k1 <= k0) k1 = k0 + 1;
+                if (k1 > FFTN / 2) k1 = FFTN / 2;
+                float pk = 0;
+                for (int k = k0; k < k1; k++)
+                    if (fout[k] > pk) pk = fout[k];
+                mag[s * SAMPLE_SPEC_BINS + b] = pk;
+            }
+        }
+        ok = true;
+        } while (false);
+        if (f) f.close();
+    }
+    sFft.end();
+
+    if (ok) {
+        // Log-compress and normalise to the loudest bin in the whole plot.
+        float mx = 1.0f;
+        for (int i = 0; i < SAMPLE_SPEC_BYTES; i++) if (mag[i] > mx) mx = mag[i];
+        float lmx = logf(mx);
+        const float RANGE = 5.5f;                // ~48 dB of visible dynamics
+        for (int i = 0; i < SAMPLE_SPEC_BYTES; i++) {
+            float l = (mag[i] > 1.0f) ? logf(mag[i]) : 0.0f;
+            float v = (l - (lmx - RANGE)) / RANGE;
+            if (v < 0) v = 0;
+            spec[i] = (uint8_t)(v * 255.0f);
+        }
+
+        MsgSampleInfo& info = *infoP;
+        info = MsgSampleInfo();                  // NSDMI: id + length
+        for (int p = 0; p < SAMPLE_SPEC_PAGES; p++) {
+            info.sampleId = id;
+            info.kind     = (uint8_t)(p + 1);
+            memcpy(info.peaks, spec + p * SAMPLE_SPEC_PAGE_BYTES,
+                   SAMPLE_SPEC_PAGE_BYTES);
+            gMagiLink.acquireMutex();
+            gMagiLink.send(&info, sizeof(info));
+            gMagiLink.releaseMutex();
+            delay(5);   // let the client's dispatcher drain between pages
+        }
+    }
+    free(spec); free(mag); free(rd); free(fin); free(fout); free(infoP);
+}
+
 // ── Apply a generic song memory patch to the active song buffer ───────────────
 static void applySongPatch(const MsgSetSongData* msg) {
     if (!srvHasActive) return;
@@ -717,6 +955,14 @@ static void applySongPatch(const MsgSetSongData* msg) {
     uint16_t pmOff = (uint16_t)offsetof(Song, performerMask);
     if (msg->offset <= pmOff && msg->offset + msg->dataLen > pmOff) {
         seqSendSlotEnable();
+    }
+
+    // If column settings were touched (sample re-pick, channel change), the
+    // PSRAM preload cache may need to follow.
+    uint32_t colsOff = (uint32_t)offsetof(Song, columns);
+    uint32_t colsEnd = colsOff + sizeof(s->columns);
+    if (msg->offset < colsEnd && msg->offset + msg->dataLen > colsOff) {
+        gSamplePreloadDirty = true;
     }
 }
 
@@ -785,7 +1031,7 @@ bool srvLoadSongLocal(int listIdx) {
         srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
         strncpy(srvActiveName, raw[listIdx], sizeof(srvActiveName) - 1);
         srvActiveName[sizeof(srvActiveName) - 1] = '\0';
-        srvHasActive = true;
+        srvHasActive = true;  gSamplePreloadDirty = true;
     }
 
     Serial.printf("[CMD] srvLoadSongLocal: '%s' %u bytes %s\n",
@@ -917,7 +1163,7 @@ static void finaliseSongSave() {
     h2->version = SONG_FILE_VERSION;
     h2->_pad[0] = h2->_pad[1] = h2->_pad[2] = 0;
     srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
-    srvHasActive = true;
+    srvHasActive = true;  gSamplePreloadDirty = true;
 
     srvSaveActive = false;
 }
@@ -1311,7 +1557,7 @@ static void finaliseNewSong() {
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
     initSong(song);
     srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
-    srvHasActive    = true;
+    srvHasActive    = true;  gSamplePreloadDirty = true;
     srvActiveName[0] = '\0';
     sequencerReset();
     Serial.println("[CMD] new-song: server memory wiped");
@@ -1322,7 +1568,7 @@ static void finaliseNewSong() {
 // srvHasActive and resets the sequencer.
 static void finaliseMagiLinkSongSave() {
     srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
-    srvHasActive    = true;
+    srvHasActive    = true;  gSamplePreloadDirty = true;
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
 
     if (sMagiSaveName[0] != '\0') {
@@ -1583,7 +1829,7 @@ static void reloadActiveSongFromSD() {
     h2->version = SONG_FILE_VERSION;
     h2->_pad[0] = h2->_pad[1] = h2->_pad[2] = 0;
     srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
-    srvHasActive = true;
+    srvHasActive = true;  gSamplePreloadDirty = true;
     Serial.printf("[CMD] reloaded active song '%s' %u bytes\n", path, srvActiveBufLen);
 
     // Push to client
@@ -1692,6 +1938,28 @@ void commandsTick() {
     if (sAuditionPending) {
         sAuditionPending = false;
         sequencerAuditionNote(sAuditionPat, sAuditionRow, sAuditionCol);
+    }
+
+    // PSRAM sample preload follows the active song.  Deferred until the
+    // sequencer is stopped and the player is quiet — samplePreloadSync
+    // returns false (retry next tick) while anything is still sounding.
+    if (gSamplePreloadDirty && !sequencerIsRunning() && srvHasActive) {
+        Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
+        if (samplePreloadSync(song)) gSamplePreloadDirty = false;
+    }
+
+    // Sample editor: persist trim edits, serve meta/overview requests.
+    if (sTrimSavePending) {
+        sTrimSavePending = false;
+        sampleTrimSave();
+    }
+    if (sSampleInfoPending) {
+        sSampleInfoPending = false;
+        sendSampleInfo(sSampleInfoId, sSampleInfoVs, sSampleInfoVe);
+    }
+    if (sSampleSpecPending) {
+        sSampleSpecPending = false;
+        sendSampleSpectrum(sSampleSpecId);
     }
 
     // Push active song to client on connect or song change (deferred from pairing/main)
@@ -2182,6 +2450,30 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             {
                 const MsgAuditionProgram* a = (const MsgAuditionProgram*)data;
                 sequencerAuditionProgram(a->channel, a->program);
+            }
+            break;
+
+        case MSG_SAMPLE_EDIT:
+            if (len < (int)sizeof(MsgSampleEdit)) return;
+            {
+                const MsgSampleEdit* m = (const MsgSampleEdit*)data;
+                if (m->op == SAMPLE_EDIT_GET) {
+                    sSampleInfoId      = m->sampleId;   // overview reads SD —
+                    sSampleInfoVs      = m->startFrame; // deferred to the loop
+                    sSampleInfoVe      = m->endFrame;
+                    sSampleInfoPending = true;
+                } else if (m->op == SAMPLE_EDIT_SET) {
+                    // RAM table updates inline (playback picks it up on the
+                    // next trigger); the SD write + cache re-bake defer.
+                    sampleTrimSet(m->sampleId, m->startFrame, m->endFrame, m->loop);
+                    sTrimSavePending    = true;
+                    gSamplePreloadDirty = true;
+                } else if (m->op == SAMPLE_EDIT_STOP) {
+                    samplePlayerStop();                 // ends a looping audition
+                } else if (m->op == SAMPLE_EDIT_SPEC) {
+                    sSampleSpecId      = m->sampleId;   // Goertzel over SD data —
+                    sSampleSpecPending = true;          // deferred to the loop
+                }
             }
             break;
 

@@ -121,6 +121,20 @@ public:
     // audition drum blocks before import.
     bool sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
                              uint8_t col = 0xFF);   // col: SFX sample audition source
+
+    // Sample editor: GET requests meta+overview (arrives via sampleInfo*),
+    // SET stores trim/loop metadata, STOP ends a looping audition.
+    bool sendSampleEdit(uint8_t op, uint8_t sampleId,
+                        uint32_t startFrame = 0, uint32_t endFrame = 0,
+                        uint8_t loop = 0);
+    bool sampleInfoPending() const   { return _sampleInfoPending; }
+    void clearSampleInfo()           { _sampleInfoPending = false; }
+    const MsgSampleInfo& sampleInfo() const { return _sampleInfo; }
+
+    // Spectrogram pages (SAMPLE_EDIT_SPEC reply) — complete when all arrived.
+    bool           specComplete() const { return _specMask == (1u << SAMPLE_SPEC_PAGES) - 1; }
+    void           clearSpec()          { _specMask = 0; }
+    const uint8_t* specData() const     { return _specData; }
     // Select an audition program (e.g. drum kit on ch10).  Emitted on the
     // server's MIDI task so it stays coherent with running status.
     bool sendAuditionProgram(uint8_t channel, uint8_t program);
@@ -319,6 +333,12 @@ private:
     uint8_t  _midiNoteIn     = 0;
     uint8_t  _midiVelocityIn = 0;
     bool     _midiNoteInPending = false;
+
+    MsgSampleInfo _sampleInfo = {};        // last MSG_SAMPLE_INFO received
+    volatile bool _sampleInfoPending = false;
+    uint8_t*         _specData = nullptr;  // PSRAM, lazily allocated — internal
+                                           // RAM is the radio's budget
+    volatile uint8_t _specMask = 0;        // bit per arrived spectrogram page
 
     // Latest preview-row position from server
     uint8_t  _previewRow         = 0;

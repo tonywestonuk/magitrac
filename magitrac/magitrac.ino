@@ -27,6 +27,7 @@
 #include "InstrumentsPage.h"
 #include "SongConfigPage.h"
 #include "ColumnEditor.h"
+#include "SampleEditPage.h"
 #include "DrumTrackImportPage.h"
 #include "SettingsPage.h"
 #include "BackupRestorePage.h"
@@ -88,6 +89,7 @@ BootMenu           bootMenu(display, touch);
 InstrumentsPage    instrumentsPage(display, touch, gInstruments);
 SongConfigPage     songConfigPage(display, touch, song);
 ColumnEditor       columnEditor(display, touch, song, gInstruments);
+SampleEditPage     sampleEditPage(display, touch);
 DrumTrackImportPage drumTrackImportPage(display, touch, song);
 PerformancePage    performancePage(display, touch, song);
 PixelPostManualPage pixelpostManualPage(display, touch);
@@ -231,6 +233,7 @@ static bool     songPageOpen        = false;
 static bool     instrumentsPageOpen = false;
 static bool     songConfigPageOpen  = false;
 static bool     columnEditorOpen    = false;
+static bool     sampleEditOpen      = false;
 static bool     drumTrackImportOpen = false;
 static bool     noteEditorPageOpen  = false;
 static bool     drumEditorOpen      = false;
@@ -605,7 +608,7 @@ void loop() {
         gServerPairing.isPaired() && gMagiLink.isConnected() &&
         !bootMenu.isOpen() && !gPairingUiOpen &&
         !songPageOpen && !instrumentsPageOpen && !songConfigPageOpen &&
-        !columnEditorOpen && !noteEditorPageOpen && !settingsPageOpen &&
+        !columnEditorOpen && !sampleEditOpen && !noteEditorPageOpen && !settingsPageOpen &&
         !wifiSettingsPageOpen && !backupRestorePageOpen &&
         !drumTrackImportOpen && !drumEditorOpen &&
         !performancePageOpen && !pixelpostManualPageOpen && !setlistPageOpen &&
@@ -1060,11 +1063,30 @@ void loop() {
                 drumTrackImportOpen = true;
                 drumTrackImportPage.open(columnEditor.editPattern(),
                                           columnEditor.editCol());
+            } else if (columnEditor.sampleEditRequested()) {
+                columnEditor.clearSampleEditRequest();
+                uint8_t c = columnEditor.editCol();
+                sampleEditOpen = true;
+                sampleEditPage.open(song.columns[c].program,
+                                    song.columns[c].name, c);
             } else {
                 display.clear();
                 ui.drawAll();
                 display.paintLater();
             }
+        }
+        return;
+    }
+
+    // ── Sample trim/loop editor ─────────────────────────────────────────────
+    if (sampleEditOpen) {
+        if (sampleEditPage.poll()) {
+            sampleEditOpen   = false;
+            columnEditorOpen = true;    // back to the column that opened it
+            columnEditor.open(columnEditor.editPattern(), columnEditor.editCol());
+            display.clear();            // open() doesn't draw — same recipe as
+            columnEditor.draw();        // the tracker's entry point
+            display.paint();
         }
         return;
     }

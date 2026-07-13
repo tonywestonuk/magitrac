@@ -114,6 +114,27 @@ void ServerPairing::begin() {
             static_cast<ServerPairing*>(ctx)->_onMagiLinkSampleList(msg, len);
         }, this);
 
+    // MagiLink: sample editor info — kind 0 = waveform overview, kind 1..N =
+    // spectrogram pages (accumulated here so back-to-back pages can't race
+    // the main loop's consumption of a single pending slot).
+    gMagiLink.registerCallback(MSG_SAMPLE_INFO,
+        [](const uint8_t* msg, size_t len, void* ctx) {
+            ServerPairing* sp = static_cast<ServerPairing*>(ctx);
+            if (len < sizeof(MsgSampleInfo)) return;
+            const MsgSampleInfo* mi = (const MsgSampleInfo*)msg;
+            if (mi->kind == 0) {
+                memcpy(&sp->_sampleInfo, msg, sizeof(MsgSampleInfo));
+                sp->_sampleInfoPending = true;
+            } else if (mi->kind <= SAMPLE_SPEC_PAGES) {
+                if (!sp->_specData)
+                    sp->_specData = (uint8_t*)ps_malloc(SAMPLE_SPEC_BYTES);
+                if (!sp->_specData) return;   // no PSRAM → popup never completes
+                memcpy(sp->_specData + (mi->kind - 1) * SAMPLE_SPEC_PAGE_BYTES,
+                       mi->peaks, SAMPLE_SPEC_PAGE_BYTES);
+                sp->_specMask |= (uint8_t)(1u << (mi->kind - 1));
+            }
+        }, this);
+
     // MagiLink: generic file list + load.  Load is a 3-part stream (HEADER,
     // N×BODY, EndOfData) so we route all three IDs into one dispatcher.
     gMagiLink.registerCallback(MSG_FILE_LIST_RESP,
@@ -537,6 +558,22 @@ bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t v
     msg.note     = note;
     msg.velocity = velocity;
     msg.col      = col;
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+    return ok;
+}
+
+bool ServerPairing::sendSampleEdit(uint8_t op, uint8_t sampleId,
+                                   uint32_t startFrame, uint32_t endFrame,
+                                   uint8_t loop) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgSampleEdit msg;
+    msg.op         = op;
+    msg.sampleId   = sampleId;
+    msg.startFrame = startFrame;
+    msg.endFrame   = endFrame;
+    msg.loop       = loop;
     gMagiLink.acquireMutex();
     bool ok = gMagiLink.send(&msg, sizeof(msg));
     gMagiLink.releaseMutex();

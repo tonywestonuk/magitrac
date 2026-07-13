@@ -205,6 +205,10 @@ enum MagiMsgType : uint8_t {
     // POST track (NEXT/PREV/POW) or hand it back (RELEASE).
     MSG_PIXELPOST_OVERRIDE        = 0xA0,
 
+    // Sample editor (non-destructive trim/loop metadata; see structs below).
+    MSG_SAMPLE_EDIT  = 0xA1,   // client → server: GET / SET / STOP
+    MSG_SAMPLE_INFO  = 0xA2,   // server → client: meta + waveform overview
+
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
 
@@ -631,6 +635,58 @@ struct MsgMidiNoteIn {
     MagiMsgType type;        // MSG_MIDI_NOTE_IN
     uint8_t     midiNote;    // raw MIDI note number 0–127
     uint8_t     velocity;    // MIDI velocity 0–127
+};
+
+// ── Sample editor (non-destructive trim/loop) ─────────────────────────────────
+// The WAV files never change: per-sample metadata (start/end frame + loop
+// flag) lives in /samples/trim.txt on the server and is applied at playback
+// (and at PSRAM preload — the cache holds just the trimmed region).
+enum SampleEditOp : uint8_t {
+    SAMPLE_EDIT_GET  = 0,   // reply with MsgSampleInfo; startFrame/endFrame =
+                            // the VIEW window to render peaks for (0,0 = all),
+                            // so a zoomed view gets full-resolution peaks
+    SAMPLE_EDIT_SET  = 1,   // store startFrame/endFrame/loop for sampleId
+    SAMPLE_EDIT_STOP = 2,   // stop audition playback (needed for looped play)
+    SAMPLE_EDIT_SPEC = 3,   // reply with a spectrogram of the trimmed region:
+                            // SAMPLE_SPEC_PAGES × MsgSampleInfo, kind = page+1,
+                            // peaks[] = SAMPLE_SPEC_PAGE_BYTES of slice data
+};
+
+// Spectrogram (Fairlight Page-D waterfall — display only): SLICES time steps
+// × BINS log-spaced frequency bins (60 Hz .. 8 kHz), one magnitude byte each.
+#define SAMPLE_SPEC_SLICES      50
+#define SAMPLE_SPEC_BINS        64
+#define SAMPLE_SPEC_BYTES       (SAMPLE_SPEC_SLICES * SAMPLE_SPEC_BINS)   // 3200
+#define SAMPLE_SPEC_PAGE_BYTES  800     // = SAMPLE_OVERVIEW_N * 2 (fits peaks[])
+#define SAMPLE_SPEC_PAGES       (SAMPLE_SPEC_BYTES / SAMPLE_SPEC_PAGE_BYTES)
+struct MsgSampleEdit {
+    uint8_t  id     = MSG_SAMPLE_EDIT;
+    uint16_t length = sizeof(MsgSampleEdit);
+    uint8_t  op;            // SampleEditOp
+    uint8_t  sampleId;      // manifest id
+    uint32_t startFrame;    // SET only
+    uint32_t endFrame;      // SET only; 0 = end of file
+    uint8_t  loop;          // SET only; 0/1
+};
+
+// Waveform overview: min/max peak pairs, int8 (-127..127), one pair per
+// column.  400 pairs = 800 bytes — fits a single MagiLink message.
+#define SAMPLE_OVERVIEW_N 400
+struct MsgSampleInfo {
+    uint8_t  id     = MSG_SAMPLE_INFO;
+    uint16_t length = sizeof(MsgSampleInfo);
+    uint8_t  sampleId;
+    uint8_t  channels;      // 1/2
+    uint8_t  loop;          // stored meta (0/1)
+    uint8_t  kind;          // 0 = waveform overview; 1..SAMPLE_SPEC_PAGES =
+                            // spectrogram page (peaks[] carries slice bytes)
+    uint32_t totalFrames;
+    uint32_t rate;          // Hz
+    uint32_t startFrame;    // stored meta
+    uint32_t endFrame;      // stored meta; 0 = end of file
+    uint32_t viewStart;     // window the peaks cover (echoes the GET request)
+    uint32_t viewEnd;
+    int8_t   peaks[SAMPLE_OVERVIEW_N * 2];   // min,max per column of the window
 };
 
 // ── Sample list (SFX column) ──────────────────────────────────────────────────

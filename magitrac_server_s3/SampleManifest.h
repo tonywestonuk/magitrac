@@ -31,3 +31,24 @@ const SmEntry* sampleManifestAt(int idx);
 
 // Filename for stable id 1..127, or nullptr if no entry exists.
 const char* sampleManifestNameFor(uint8_t id);
+
+// ── /samples/trim.txt — non-destructive trim/loop metadata ───────────────────
+// The WAVs never change; playback (and the PSRAM preloader) applies these.
+// Format: <id>=<startFrame>:<endFrame>:<loop>\n   (endFrame 0 = end of file)
+
+struct SampleTrim {
+    uint8_t  id;           // 0 = free slot
+    uint32_t startFrame;
+    uint32_t endFrame;     // 0 = end of file
+    uint8_t  loop;
+};
+
+// Loaded alongside the manifest by sampleManifestSync().
+// nullptr = no trim stored (play the whole file, no loop).
+const SampleTrim* sampleTrimFor(uint8_t id);
+
+// Update/insert in RAM (start==0 && end==0 && !loop removes the entry).
+void sampleTrimSet(uint8_t id, uint32_t startFrame, uint32_t endFrame, uint8_t loop);
+
+// Persist the RAM table to /samples/trim.txt (SD write — loop task only).
+bool sampleTrimSave();

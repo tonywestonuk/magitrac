@@ -146,6 +146,69 @@ static void sortById() {
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
+// ── Trim/loop metadata (/samples/trim.txt) ───────────────────────────────────
+
+static const char* ST_PATH = "/samples/trim.txt";
+static SampleTrim  s_trim[SM_MAX_ENTRIES];
+static int         s_trimCount = 0;
+
+static void loadTrims() {
+    SdLock _;
+    s_trimCount = 0;
+    File f = SD.open(ST_PATH);
+    if (!f) return;
+    char line[64];
+    while (s_trimCount < SM_MAX_ENTRIES && readLine(f, line, sizeof(line))) {
+        // <id>=<startFrame>:<endFrame>:<loop>
+        const char* eq = strchr(line, '=');
+        if (!eq) continue;
+        int id = atoi(line);
+        if (id < 1 || id > 127) continue;
+        uint32_t st = 0, en = 0; int lp = 0;
+        if (sscanf(eq + 1, "%lu:%lu:%d",
+                   (unsigned long*)&st, (unsigned long*)&en, &lp) != 3) continue;
+        SampleTrim& t = s_trim[s_trimCount++];
+        t.id = (uint8_t)id; t.startFrame = st; t.endFrame = en; t.loop = (uint8_t)(lp != 0);
+    }
+    f.close();
+    Serial.printf("[SM] trim.txt: %d entr%s\n", s_trimCount, s_trimCount == 1 ? "y" : "ies");
+}
+
+const SampleTrim* sampleTrimFor(uint8_t id) {
+    for (int i = 0; i < s_trimCount; i++)
+        if (s_trim[i].id == id) return &s_trim[i];
+    return nullptr;
+}
+
+void sampleTrimSet(uint8_t id, uint32_t startFrame, uint32_t endFrame, uint8_t loop) {
+    bool remove = (startFrame == 0 && endFrame == 0 && !loop);   // back to defaults
+    for (int i = 0; i < s_trimCount; i++) {
+        if (s_trim[i].id != id) continue;
+        if (remove) { s_trim[i] = s_trim[--s_trimCount]; }
+        else        { s_trim[i].startFrame = startFrame;
+                      s_trim[i].endFrame   = endFrame;
+                      s_trim[i].loop       = loop; }
+        return;
+    }
+    if (remove || s_trimCount >= SM_MAX_ENTRIES) return;
+    SampleTrim& t = s_trim[s_trimCount++];
+    t.id = id; t.startFrame = startFrame; t.endFrame = endFrame; t.loop = loop;
+}
+
+bool sampleTrimSave() {
+    SdLock _;
+    if (SD.exists(ST_PATH)) SD.remove(ST_PATH);
+    File f = SD.open(ST_PATH, FILE_WRITE);
+    if (!f) return false;
+    for (int i = 0; i < s_trimCount; i++)
+        f.printf("%u=%lu:%lu:%u\n", (unsigned)s_trim[i].id,
+                 (unsigned long)s_trim[i].startFrame,
+                 (unsigned long)s_trim[i].endFrame,
+                 (unsigned)s_trim[i].loop);
+    f.close();
+    return true;
+}
+
 bool sampleManifestSync() {
     s_count = 0;
     {
@@ -160,6 +223,7 @@ bool sampleManifestSync() {
     bool changed = scanAndAppend();
     sortById();
     if (changed) writeManifest();
+    loadTrims();
     return true;
 }
 

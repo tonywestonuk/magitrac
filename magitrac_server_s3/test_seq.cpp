@@ -27,9 +27,15 @@ HardwareSerial midi;
 // Sketch-side functions that midi_player.cpp references but the test doesn't
 // exercise — stub them out so the link succeeds.
 void debugPrintf(const char* /*fmt*/, ...) {}
-void samplePlayerPlay(const char* /*path*/, float /*pitch*/, uint8_t /*vol*/) {}
+void samplePlayerPlay(const char* /*path*/, float /*pitch*/, uint8_t /*vol*/,
+                      uint32_t /*startFrame*/, uint32_t /*endFrame*/, bool /*loop*/) {}
 void samplePlayerStop() {}
+void samplePlayerStopStream() {}
+int  samplePlayRam(uint8_t /*id*/, float /*pitch*/, uint8_t /*vol*/) { return -1; }
+void sampleStopVoice(int /*voice*/) {}
 const char* sampleManifestNameFor(uint8_t /*id*/) { return nullptr; }
+#include "SampleManifest.h"   // SampleTrim type for the stub below
+const SampleTrim* sampleTrimFor(uint8_t /*id*/) { return nullptr; }
 void pixelpostSetTouchpad(uint8_t, uint8_t, bool) {}
 void pixelpostSetSlider(uint8_t) {}
 void pixelpostSetEffect(uint8_t) {}
