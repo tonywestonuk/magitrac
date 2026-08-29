@@ -129,15 +129,14 @@ static int  sampleScrollOff  = 0;
 static int  samplePlayingIdx = -1;   // row currently playing (green highlight)
 
 // ── Song list (loaded from SD) ────────────────────────────────────────────────
-static char songNames[SRV_MAX_FILES][SRV_FNAME_MAX];
+static char songNames[SRV_MAX_SONGS][SRV_FNAME_MAX];
 static int  numSongs = 0;
 
 void loadSongList() {
-    char raw[SRV_MAX_FILES][SRV_FNAME_MAX];
-    numSongs = srvListSongs(raw, SRV_MAX_FILES);
+    // Enumerate straight into songNames (it is the SRV_MAX_SONGS-sized store),
+    // then strip the .mgt extension in place — no second buffer needed.
+    numSongs = srvListSongs(songNames, SRV_MAX_SONGS);
     for (int i = 0; i < numSongs; i++) {
-        strncpy(songNames[i], raw[i], SRV_FNAME_MAX - 1);
-        songNames[i][SRV_FNAME_MAX - 1] = '\0';
         int len = (int)strlen(songNames[i]);
         if (len > 4 && songNames[i][len - 4] == '.')
             songNames[i][len - 4] = '\0';
@@ -349,6 +348,7 @@ void loadSong(int idx) {
     int listIdx = idx - SONG_IDX_OFFSET;
     if (srvLoadSongLocal(listIdx)) {
         sequencerReset();
+        sequencerSendPatchesNow();   // patches up before the first note
         extern bool sSongPushPending;
         if (pairingIsConnected()) sSongPushPending = true;
     }
@@ -1052,9 +1052,9 @@ static Bezel gBezel;
 
 // ── Idle → Tempo screen ──────────────────────────────────────────────────────
 // 10 s of no touch (glass or bezel) flips into a big-BPM readout to help the
-// performer hold tempo.  Average of the last 4 distinct BPM measurements is
-// shown smaller below.  Any touch returns to the previously-visible screen.
-// Suppressed while a pairing overlay is up.
+// performer hold tempo.  The big number is the mean BPM over the last second;
+// a steadier 2-second mean is shown smaller below.  Any touch returns to the
+// previously-visible screen.  Suppressed while a pairing overlay is up.
 static const uint32_t TEMPO_IDLE_MS = 10000;
 static uint32_t gLastInputMs       = 0;
 static bool     gTempoMode         = false;
@@ -1062,23 +1062,34 @@ static bool     gTempoTouchLatched = false;   // require fresh press to exit
 static bool     gTempoExitLatched  = false;   // swallow the exit touch's release
 static uint16_t gTempoLastDrawn    = 0;
 
-static uint16_t gBpmHist[4]   = {0, 0, 0, 0};
-static int      gBpmHistCount = 0;
-static int      gBpmHistHead  = 0;
-static uint16_t gBpmLastSeen  = 0;
+// Time-windowed BPM smoothing for the tempo readout.  seqCurrentBPM snaps
+// around on every performer note; sampling it at a fixed cadence and showing
+// rolling means over fixed wall-clock windows stops the number flickering.
+// Big number = mean over the last 1 s; "avg" line = steadier mean over 2 s.
+static const int BPM_SAMPLE_CAP = 48;   // ~50 ms cadence covers >2 s
+static uint32_t  gBpmSampleMs [BPM_SAMPLE_CAP] = {};
+static uint16_t  gBpmSampleVal[BPM_SAMPLE_CAP] = {};
+static int       gBpmSampleCount  = 0;
+static int       gBpmSampleHead   = 0;
+static uint32_t  gBpmLastSampleMs = 0;
 
-static void bpmHistPush(uint16_t bpm) {
-    if (bpm == 0) return;
-    gBpmHist[gBpmHistHead] = bpm;
-    gBpmHistHead = (gBpmHistHead + 1) & 3;
-    if (gBpmHistCount < 4) gBpmHistCount++;
+static void bpmSamplePush(uint32_t now, uint16_t bpm) {
+    gBpmSampleMs [gBpmSampleHead] = now;
+    gBpmSampleVal[gBpmSampleHead] = bpm;
+    gBpmSampleHead = (gBpmSampleHead + 1) % BPM_SAMPLE_CAP;
+    if (gBpmSampleCount < BPM_SAMPLE_CAP) gBpmSampleCount++;
 }
 
-static uint16_t bpmHistAverage() {
-    if (gBpmHistCount == 0) return 0;
-    uint32_t sum = 0;
-    for (int i = 0; i < gBpmHistCount; i++) sum += gBpmHist[i];
-    return (uint16_t)((sum + gBpmHistCount / 2) / gBpmHistCount);
+// Mean of all samples no older than windowMs.  0 if none in window.
+static uint16_t bpmWindowAverage(uint32_t now, uint32_t windowMs) {
+    uint32_t sum = 0; int n = 0;
+    for (int i = 0; i < gBpmSampleCount; i++) {
+        if (gBpmSampleVal[i] == 0)            continue;
+        if (now - gBpmSampleMs[i] > windowMs) continue;
+        sum += gBpmSampleVal[i]; n++;
+    }
+    if (n == 0) return 0;
+    return (uint16_t)((sum + n / 2) / n);
 }
 
 static void drawTempoBPMArea(uint16_t bpm, uint16_t avg) {
@@ -1121,8 +1132,9 @@ static void enterTempoMode() {
     gTempoMode         = true;
     gTempoTouchLatched = false;
     drawTempoChrome();
-    uint16_t bpm = sequencerCurrentBPM();
-    drawTempoBPMArea(bpm, bpmHistAverage());
+    uint32_t now = millis();
+    uint16_t bpm = bpmWindowAverage(now, 1000);
+    drawTempoBPMArea(bpm, bpmWindowAverage(now, 2000));
     gTempoLastDrawn = bpm;
 }
 
@@ -1173,6 +1185,7 @@ static void midiTaskFn(void* /*pv*/) {
     for (;;) {
         sequencerPollMidiIn();
         sequencerTick();
+        sequencerMidiClockTick();
         sequencerRawAuditionTick();
         vTaskDelay(1);
     }
@@ -1689,17 +1702,17 @@ void loop() {
         }
     }
 
-    // Idle-watcher input tracking + BPM-history sampling.  Touching anything
-    // on the panel (glass or bezel zones) — or being inside a pairing flow
-    // — resets the idle countdown.  BPM history captures each distinct
-    // non-zero reading, so the "avg" reflects real performer snaps.
+    // Idle-watcher input tracking + BPM sampling.  Touching anything on the
+    // panel (glass or bezel zones) — or being inside a pairing flow — resets
+    // the idle countdown.  BPM is sampled at a ~50 ms cadence so the tempo
+    // readout can show rolling wall-clock-windowed means.
     bool anyTouch = M5.Touch.getDetail().isPressed();
     if (anyTouch || pairingIsActive()) gLastInputMs = millis();
     {
-        uint16_t bpmNow = sequencerCurrentBPM();
-        if (bpmNow != gBpmLastSeen) {
-            bpmHistPush(bpmNow);
-            gBpmLastSeen = bpmNow;
+        uint32_t nowMs = millis();
+        if (nowMs - gBpmLastSampleMs >= 50) {
+            gBpmLastSampleMs = nowMs;
+            bpmSamplePush(nowMs, sequencerCurrentBPM());
         }
     }
 
@@ -1708,11 +1721,32 @@ void loop() {
         gLastBPM = 0;
         if (gTempoMode) {
             drawTempoChrome();
-            uint16_t bpm = sequencerCurrentBPM();
-            drawTempoBPMArea(bpm, bpmHistAverage());
+            uint32_t now = millis();
+            uint16_t bpm = bpmWindowAverage(now, 1000);
+            drawTempoBPMArea(bpm, bpmWindowAverage(now, 2000));
             gTempoLastDrawn = bpm;
         } else {
             drawScreen();
+        }
+    }
+
+    // Remote organ screen control from the client.  Handled HERE — before the
+    // tempo-mode early-returns below — so selecting the organ page on the
+    // client always lands, even while the idle BPM screensaver is showing.
+    // (Previously the request sat queued in gOrganScreenReq until the server
+    // itself was touched, which is why it "only worked after visiting organ on
+    // the server".)  Only auto-switch while STOPPED — during live playback we
+    // leave the server display alone.
+    if (gOrganScreenReq) {
+        int req = gOrganScreenReq; gOrganScreenReq = 0;
+        if (req == 1 && gScreen != SCR_ORGAN && !sequencerIsRunning()) {
+            gTempoMode   = false;    // drop the screensaver if it's up
+            gLastInputMs = millis();
+            setScreen(SCR_ORGAN);
+        } else if (req == 2 && gScreen == SCR_ORGAN) {
+            gTempoMode   = false;
+            gLastInputMs = millis();
+            setScreen(SCR_SONGS);
         }
     }
 
@@ -1732,12 +1766,17 @@ void loop() {
         if (!anyTouch) gTempoTouchLatched = false;
 
         static uint32_t lastTempoDrawMs = 0;
-        uint32_t now    = millis();
-        uint16_t bpmNow = sequencerCurrentBPM();
-        if (bpmNow != gTempoLastDrawn && (now - lastTempoDrawMs >= 250)) {
-            gTempoLastDrawn = bpmNow;
-            lastTempoDrawMs = now;
-            drawTempoBPMArea(bpmNow, bpmHistAverage());
+        static uint16_t lastTempoAvg    = 0;
+        uint32_t now = millis();
+        if (now - lastTempoDrawMs >= 250) {
+            uint16_t big = bpmWindowAverage(now, 1000);
+            uint16_t avg = bpmWindowAverage(now, 2000);
+            if (big != gTempoLastDrawn || avg != lastTempoAvg) {
+                gTempoLastDrawn = big;
+                lastTempoAvg    = avg;
+                lastTempoDrawMs = now;
+                drawTempoBPMArea(big, avg);
+            }
         }
         return;
     }
@@ -1835,12 +1874,8 @@ void loop() {
         }
     }
 
-    // Remote organ control from the client (applied here, on the loop task).
-    if (gOrganScreenReq) {
-        int req = gOrganScreenReq; gOrganScreenReq = 0;
-        if (req == 1 && gScreen != SCR_ORGAN)      setScreen(SCR_ORGAN);
-        else if (req == 2 && gScreen == SCR_ORGAN) setScreen(SCR_SONGS);
-    }
+    // (Remote organ screen ENTER/EXIT is handled earlier, before the
+    // tempo-mode returns — see gOrganScreenReq above.)
     if (gScreen == SCR_ORGAN && gOrganBarDirty) {
         uint16_t d = gOrganBarDirty; gOrganBarDirty = 0;
         for (int i = 0; i < ORG_BAR_N; i++) if (d & (1u << i)) drawOrganBar(i);

@@ -43,6 +43,14 @@ bool sequencerOrganOwned();
 // shares the sequencer's running-status cache — sending the program change as
 // raw MIDI from the command task would desync that cache and silence the synth.
 void sequencerAuditionProgram(uint8_t channel, uint8_t program);
+// Request a full bank/program/volume flush for every column of the loaded
+// song, without starting playback.  Called on song load so the synth is
+// already on the right patches when the performer plays — waiting for the
+// first block start means the opening notes come out on whatever the previous
+// song left behind.  Same reasoning as sequencerAuditionProgram: the emit is
+// deferred to the MIDI task (in sequencerRawAuditionTick) so it shares the
+// running-status cache instead of racing it from the command/loop task.
+void sequencerSendPatchesNow();
 // Call every main-loop iteration to drain the audition queue when its
 // hold timer expires.
 void sequencerRawAuditionTick();
@@ -51,6 +59,7 @@ bool     sequencerIsRunning();
 uint16_t sequencerCurrentBPM();  // live BPM — updated each performer snap
 void     sequencerSetBPM(uint16_t bpm);  // set live BPM immediately (e.g. from config edit)
 void sequencerTick();
+void sequencerMidiClockTick();  // emit 24-PPQN MIDI clock at the live tempo (Song::flags gated)
 void sequencerPollMidiIn();  // call every loop() — reads performer MIDI in
 bool sequencerSongReaderBusy();  // true while a loop-task walk of srvActiveBuf is in flight
 void seqSendSlotEnable();    // send CC 115 ch16 with current performerMask

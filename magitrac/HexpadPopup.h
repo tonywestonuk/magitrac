@@ -29,6 +29,12 @@ static const int HP_ROW3_Y    = HP_ROW2_Y + HP_ROW_H;        // 258
 static const int HP_ROW4_Y    = HP_ROW3_Y + HP_ROW_H;        // 342
 static const int HP_ROW5_Y    = HP_ROW4_Y + HP_ROW_H;        // 426
 
+// CHOOSE button — optional, sits in the right of the text-field header.
+static const int HP_CHOOSE_W  = 210;
+static const int HP_CHOOSE_X  = HP_W - HP_CHOOSE_W - 10;     // 740
+static const int HP_CHOOSE_Y  = 15;
+static const int HP_CHOOSE_H  = HP_FIELD_H - 30;             // 60
+
 class HexpadPopup {
 public:
     HexpadPopup(EPD_PainterAdafruit& display, GT911_Lite& touch);
@@ -42,16 +48,20 @@ public:
     // fingerDown: true if a finger is still pressing the screen at open time
     // (caller invoked on rising edge / during press). When false, the popup
     // does not swallow the first lift, so the first button tap registers.
+    // showChoose: draw a CHOOSE button in the header (effect-picker handoff).
+    // When it is tapped, poll() returns true with chooseRequested()==true and
+    // isDone()==false; effect()/param() carry whatever is currently typed.
     void open(uint8_t hi, uint8_t lo, uint8_t numDigits, const char* title,
-              bool fingerDown = true);
+              bool fingerDown = true, bool showChoose = false);
 
     bool isOpen() const { return _open; }
     void draw();
 
-    // Returns true when SET, CLR, or CANCEL pressed.
+    // Returns true when SET, CLR, CANCEL, or CHOOSE pressed.
     bool poll();
-    bool isDone()    const { return _done; }
-    bool isCleared() const { return _cleared; }
+    bool isDone()          const { return _done; }
+    bool isCleared()       const { return _cleared; }
+    bool chooseRequested() const { return _chooseReq; }
 
     // Result — valid after isDone() returns true
     uint8_t effect() const { return _resultEffect; }
@@ -64,6 +74,8 @@ private:
     bool    _open;
     bool    _done;
     bool    _cleared;
+    bool    _chooseReq;     // CHOOSE was tapped (caller should open the picker)
+    bool    _showChoose;    // draw the CHOOSE button in the header
     bool    _wasDown;
     bool    _swallowLift;   // ignore first lift after open (belongs to opening tap)
 
@@ -77,5 +89,6 @@ private:
 
     void drawTextField();
     void drawKey(int x, int y, int w, int h, const char* label);
+    void parseResult();   // digits → _resultEffect/_resultParam (right-justified)
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

@@ -1,6 +1,9 @@
 #include "FileBrowser.h"
+#include "Constants.h"   // INERTIA_DECAY, INERTIA_MIN_VEL
+#include <Arduino.h>     // millis, abs
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -11,6 +14,9 @@ FileBrowser::FileBrowser(EPD_PainterAdafruit& d, GT911_Lite& touch)
     , _itemCount(0)
     , _listMode(false), _scroll(0)
     , _dragStartY(0), _dragStartScroll(0), _dragMoved(false)
+    , _scrollF(0.0f), _inertiaVel(0.0f), _inertiaActive(false), _inertiaMs(0)
+    , _velSampleY(0), _velSampleMs(0), _suppressTap(false)
+    , _dragStartX(0), _gestureDir(0), _pressRow(-1), _swipeItem(-1)
 {
     _title[0]      = '\0';
     _loadedName[0] = '\0';
@@ -24,11 +30,22 @@ void FileBrowser::open() {
     _wasDown   = _touch.isTouched;
     _scroll    = 0;
     _dragMoved = false;
+    _scrollF   = 0.0f;
+    _inertiaVel = 0.0f;
+    _inertiaActive = false;
+    _suppressTap = false;
+    _gestureDir = 0;
+    _swipeItem  = -1;
 }
 
 void FileBrowser::setListMode(bool v) {
     _listMode = v;
     _scroll   = 0;
+    _scrollF  = 0.0f;
+    _inertiaVel = 0.0f;
+    _inertiaActive = false;
+    _gestureDir = 0;
+    _swipeItem  = -1;
 }
 
 void FileBrowser::setTitle(const char* title) {
@@ -61,6 +78,7 @@ void FileBrowser::addItem(const char* name) {
 }
 
 void FileBrowser::onBootPress() {
+    if (_listMode) return;   // list uses swipe-to-delete; no DEL mode here
     _altMode = !_altMode;
     _d.fillScreen(COL_WHITE);
     draw();
@@ -78,9 +96,11 @@ void FileBrowser::drawHeader() {
     _d.setCursor((960 - tw) / 2, (FB_HDR_H - 24) / 2);
     _d.print(title);
 
-    // Right: HOME (exit). Left: DEL (delete-mode toggle).
+    // Right: HOME (exit).  Left: DEL delete-mode toggle — GRID mode only; the
+    // list uses per-row swipe-to-delete instead.
     uiButton(_d, FB_HOME_X, 0, FB_HOME_W, FB_HDR_H, "HOME", COL_BLACK, COL_WHITE, 3);
-    uiButton(_d, FB_DEL_X,  0, FB_DEL_W,  FB_HDR_H, "DEL",  COL_BLACK, COL_WHITE, 3);
+    if (!_listMode)
+        uiButton(_d, FB_DEL_X, 0, FB_DEL_W, FB_HDR_H, "DEL", COL_BLACK, COL_WHITE, 3);
 }
 
 void FileBrowser::drawToolbar() {
@@ -190,8 +210,8 @@ void FileBrowser::drawListToolbar() {
     int first = _scroll + 1;
     int last  = _scroll + FB_LIST_ROWS;
     if (last > _itemCount) last = _itemCount;
-    char hint[48];
-    snprintf(hint, sizeof(hint), "%d-%d of %d  (drag to scroll)",
+    char hint[64];
+    snprintf(hint, sizeof(hint), "%d-%d of %d  (drag scroll - swipe left to delete)",
              first, last, _itemCount);
     _d.setTextSize(2);
     _d.setTextColor(COL_BLACK);
@@ -220,21 +240,37 @@ void FileBrowser::drawList() {
 
         bool isLoaded = (_loadedName[0] != '\0' &&
                          strcmp(_items[idx], _loadedName) == 0);
-        uint8_t bg = _altMode ? COL_BLACK : COL_WHITE;
-        uint8_t fg = _altMode ? COL_WHITE : COL_BLACK;
 
-        _d.fillRect(8, y + 2, 944, FB_LROW_H - 4, bg);
-        _d.drawRect(8, y + 2, 944, FB_LROW_H - 4, _altMode ? COL_WHITE : COL_BLACK);
+        _d.fillRect(8, y + 2, 944, FB_LROW_H - 4, COL_WHITE);
+        _d.drawRect(8, y + 2, 944, FB_LROW_H - 4, COL_BLACK);
 
         _d.setTextSize(3);
-        _d.setTextColor(fg);
+        _d.setTextColor(COL_BLACK);
         _d.setCursor(24, y + (FB_LROW_H - 24) / 2);
         _d.print(_items[idx]);
         if (isLoaded) {  // bold simulation
             _d.setCursor(25, y + (FB_LROW_H - 24) / 2);
             _d.print(_items[idx]);
         }
+
+        // Swipe-revealed DEL button on this row (drawn over the right edge).
+        if (idx == _swipeItem) {
+            int dxL = 952 - FB_ROWDEL_W;
+            _d.fillRect(dxL, y + 2, FB_ROWDEL_W - 2, FB_LROW_H - 4, COL_BLACK);
+            _d.setTextColor(COL_WHITE);
+            _d.setCursor(dxL + (FB_ROWDEL_W - 3 * 18) / 2, y + (FB_LROW_H - 24) / 2);
+            _d.print("DEL");
+        }
     }
+}
+
+bool FileBrowser::hitRowDel(int sx, int sy) const {
+    if (_swipeItem < 0) return false;
+    int vi = _swipeItem - _scroll;
+    if (vi < 0 || vi >= FB_LIST_ROWS) return false;
+    int y = FB_LIST_Y + vi * FB_LROW_H;
+    return (sy >= y && sy < y + FB_LROW_H &&
+            sx >= 952 - FB_ROWDEL_W && sx < 952);
 }
 
 int FileBrowser::hitListItem(int sx, int sy) const {
@@ -247,57 +283,153 @@ int FileBrowser::hitListItem(int sx, int sy) const {
 
 // ── Poll ──────────────────────────────────────────────────────────────────────
 
+// Advance the fling one tick — called on finger-up frames.  Row-granular on
+// e-paper (each integer step is a repaint), fractional truth in _scrollF.
+void FileBrowser::coastInertia() {
+    if (!_inertiaActive) return;
+    uint32_t now = millis();
+    float dt = (float)(now - _inertiaMs) / 1000.0f;
+    if (dt <= 0.0f) return;
+    _inertiaMs = now;
+
+    _scrollF   += _inertiaVel * dt;
+    _inertiaVel *= expf(-INERTIA_DECAY * dt);
+
+    int mx = maxScroll();
+    if (_scrollF < 0.0f)      { _scrollF = 0.0f;      _inertiaVel = 0.0f; }
+    if (_scrollF > (float)mx) { _scrollF = (float)mx; _inertiaVel = 0.0f; }
+
+    int ns = (int)(_scrollF + 0.5f);
+    if (ns != _scroll) {
+        _scroll = ns;
+        drawListToolbar();
+        drawList();
+        _d.paintLater();
+    }
+    if (fabsf(_inertiaVel) < INERTIA_MIN_VEL) _inertiaActive = false;
+}
+
 FileBrowserResult FileBrowser::pollList() {
     FileBrowserResult r { FileBrowserEvent::NONE, -1 };
 
-    if (!_touch.read()) return r;
-    bool down = _touch.isTouched;
+    bool ev   = _touch.read();
+    bool down = ev ? _touch.isTouched : _wasDown;   // no event → state unchanged
     int sx, sy;
     rawToScreen(_touch.x, _touch.y, sx, sy);
 
+    // Finger up and the release already processed → coast the fling.
+    if (!down && !_wasDown) {
+        coastInertia();
+        return r;
+    }
+
     if (down && !_wasDown) {
+        // ── Press ── stop any coast; begin a gesture.
         _wasDown         = true;
+        _dragStartX      = sx;
         _dragStartY      = sy;
         _dragStartScroll = _scroll;
         _dragMoved       = false;
-    } else if (down && _wasDown) {
+        _gestureDir      = 0;
+        _pressRow        = hitListItem(sx, sy);
+        _velSampleY      = sy;
+        _velSampleMs     = millis();
+        _suppressTap     = _inertiaActive;   // a coast was running → tap only stops it
+        _inertiaActive   = false;
+        _inertiaVel      = 0.0f;
+        _scrollF         = (float)_scroll;
+        return r;
+    }
+
+    if (down && _wasDown) {
+        // ── Move ── decide gesture direction, then scroll or reveal.
+        int dx = sx - _dragStartX;
         int dy = sy - _dragStartY;
-        if (!_dragMoved && (dy >= FB_LIST_DRAG_THRESH || dy <= -FB_LIST_DRAG_THRESH))
-            _dragMoved = true;
-        if (_dragMoved) {
+
+        if (_gestureDir == 0) {
+            if (abs(dy) >= FB_LIST_DRAG_THRESH && abs(dy) >= abs(dx)) {
+                _gestureDir = 1;                          // vertical scroll
+                _dragMoved  = true;
+                if (_swipeItem >= 0) { _swipeItem = -1; drawList(); _d.paintLater(); }
+            } else if (abs(dx) >= FB_SWIPE_THRESH && abs(dx) > abs(dy)) {
+                _gestureDir = 2;                          // horizontal swipe
+            }
+        }
+
+        if (_gestureDir == 1) {
             int rowDelta  = -dy / FB_LROW_H;
             int newScroll = _dragStartScroll + rowDelta;
-            if (newScroll < 0)            newScroll = 0;
-            if (newScroll > maxScroll())  newScroll = maxScroll();
+            if (newScroll < 0)           newScroll = 0;
+            if (newScroll > maxScroll()) newScroll = maxScroll();
             if (newScroll != _scroll) {
-                _scroll = newScroll;
+                _scroll  = newScroll;
+                _scrollF = (float)newScroll;
                 drawListToolbar();
                 drawList();
                 _d.paintLater();
             }
-        }
-    } else if (!down && _wasDown) {
-        _wasDown = false;
-        if (_dragMoved) { _dragMoved = false; return r; }  // swallow tap after a drag
-
-        if (hitHome(sx, sy)) {
-            r.event = FileBrowserEvent::HOME;
-        } else if (hitDel(sx, sy)) {
-            onBootPress();                       // toggle delete mode
-        } else if (hitNew(sx, sy)) {
-            r.event = FileBrowserEvent::NEW;
-        } else if (hitSave(sx, sy)) {
-            r.event = FileBrowserEvent::SAVE;
-        } else if (hitSaveAs(sx, sy)) {
-            r.event = FileBrowserEvent::SAVE_AS;
-        } else {
-            int idx = hitListItem(sx, sy);
-            if (idx >= 0) {
-                r.event  = _altMode ? FileBrowserEvent::ITEM_DELETE
-                                    : FileBrowserEvent::ITEM_TAP;
-                r.index  = idx;                  // absolute index into the list
+            // Sample velocity (rows/sec of scroll) for the fling; a pause before
+            // release naturally decays it to ~0 (no fling).
+            uint32_t now = millis();
+            uint32_t sdt = now - _velSampleMs;
+            if (sdt >= 15) {
+                _inertiaVel  = -(float)(sy - _velSampleY) * 1000.0f
+                             / (float)FB_LROW_H / (float)sdt;
+                _velSampleY  = sy;
+                _velSampleMs = now;
+            }
+        } else if (_gestureDir == 2) {
+            // Reveal DEL on a left-swipe of the pressed row; a right-swipe hides.
+            int want = (dx <= -FB_SWIPE_THRESH && _pressRow >= 0 &&
+                        _pressRow < _itemCount) ? _pressRow : -1;
+            if (want != _swipeItem) {
+                _swipeItem = want;
+                drawList();
+                _d.paintLater();
             }
         }
+        return r;
+    }
+
+    // ── Release ──
+    _wasDown = false;
+
+    if (_gestureDir == 1) {                       // end of a scroll → maybe fling
+        _dragMoved  = false;
+        _gestureDir = 0;
+        if (fabsf(_inertiaVel) >= INERTIA_MIN_VEL) {
+            _inertiaActive = true;
+            _inertiaMs     = millis();
+            _scrollF       = (float)_scroll;
+        }
+        return r;                                 // swallow tap
+    }
+    if (_gestureDir == 2) { _gestureDir = 0; return r; }   // swipe handled
+
+    // A tap.  If a DEL is revealed: its button deletes, anywhere else dismisses.
+    if (_swipeItem >= 0) {
+        if (hitRowDel(sx, sy)) {
+            r.event = FileBrowserEvent::ITEM_DELETE;
+            r.index = _swipeItem;                 // caller shows the confirm
+        }
+        _swipeItem = -1;
+        drawList();
+        _d.paintLater();
+        return r;                                 // never also loads
+    }
+    if (_suppressTap) { _suppressTap = false; return r; }  // tap only stopped a coast
+
+    if (hitHome(sx, sy)) {
+        r.event = FileBrowserEvent::HOME;
+    } else if (hitNew(sx, sy)) {
+        r.event = FileBrowserEvent::NEW;
+    } else if (hitSave(sx, sy)) {
+        r.event = FileBrowserEvent::SAVE;
+    } else if (hitSaveAs(sx, sy)) {
+        r.event = FileBrowserEvent::SAVE_AS;
+    } else {
+        int idx = hitListItem(sx, sy);
+        if (idx >= 0) { r.event = FileBrowserEvent::ITEM_TAP; r.index = idx; }
     }
     return r;
 }

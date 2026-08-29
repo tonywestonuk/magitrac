@@ -18,6 +18,14 @@ const ProcSoundInfo PROC_SOUNDS[PROC_SOUND_COUNT] = {
                        { 4, 4, 8, 4, 4 }, 40, 0xFF, 0 },
     { "CHOIR",      5, { "BREATH", "ENSMBL", "BRIGHT", "ATTACK", "AHH" },
                        { 4, 4, 8, 4, 4 }, 25, 3, 250 },
+    // THX DEEP NOTE — the converging cluster (own render path; see thx* below).
+    // envParam=0: SWEEP also sets the amp swell (5..773 ms) so a longer sweep
+    // fades in more gently.  relMs 2500 = a long ring-out tail.
+    // gain 128: the 16 random-phase saws partially cancel, so THX needs a much
+    // higher gain than the coherent-wavetable sounds to match their loudness.
+    // Peaks stay well clear of clip at 1-3 notes; raise further if still quiet.
+    { "THX",        5, { "SWEEP", "SPREAD", "BRIGHT", "STACK", "DETUNE" },
+                       { 5, 4, 6, 6, 3 }, 128, 0, 2500 },
 };
 
 // ── TWO TRIBES — the FGTH bass stab ───────────────────────────────────────────
@@ -94,10 +102,16 @@ static int32_t  s_chWowQ16 = 0;
 static const int32_t MORPH_INC[PROC_SOUND_COUNT] = {
     (int32_t)(65536.0 * 128 /* BLOCK_FRAMES */ / (0.080 * AUDIO_CODEC_RATE_HZ)),
     (int32_t)(65536.0 * 128 /* BLOCK_FRAMES */ / (0.300 * AUDIO_CODEC_RATE_HZ)),
+    0,   // THX has its own render path — no wavetable morph
 };
 
 int16_t* gProcTabA[PROC_SOUND_COUNT];   // PSRAM (procSoundsInit allocates)
 int16_t* gProcTabS[PROC_SOUND_COUNT];
+
+// THX sawtooth: additive to ~24 harmonics (mildly band-limited — tames aliasing
+// on the high octaves of the final chord without going dull).  Small internal
+// table (2 KB), read by thxSample in the hot loop.
+int16_t gThxSaw[PROC_WT];
 
 ProcFormantState gProcFormant[PROC_FORMANT_STAGES] = {};
 uint8_t gProcFormantNstage[PROC_SOUND_COUNT];
@@ -192,6 +206,150 @@ void procSoundsInit() {
     buildFormantStage(1, 0,  590.0f, 2.0f, 2.25f, true);   // "ah" F1 (open-mouth)
     buildFormantStage(1, 1, 1050.0f, 3.0f, 2.00f, true);   // "ah" F2
     buildFormantStage(1, 2, 2800.0f, 3.0f, 2.00f, true);   // singer's formant
+    gProcFormantNstage[PROC_IDX_THX] = 0;                  // THX: no formant
+
+    // THX sawtooth wavetable (sum of harmonics 1/h, mildly band-limited).
+    {
+        float peak = 0.0f;
+        for (int i = 0; i < PROC_WT; i++) {
+            float y = 0.0f;
+            for (int h = 1; h <= 24; h++)
+                y += sinf(2.0f * (float)M_PI * h * i / PROC_WT) / (float)h;
+            gThxSaw[i] = (int16_t)lrintf(y * 1000.0f);   // temp scale
+            float a = fabsf(y);
+            if (a > peak) peak = a;
+        }
+        float sc = 30000.0f / (peak * 1000.0f);
+        for (int i = 0; i < PROC_WT; i++)
+            gThxSaw[i] = (int16_t)lrintf((float)gThxSaw[i] * sc);
+    }
+}
+
+// ── THX DEEP NOTE ─────────────────────────────────────────────────────────────
+static const int   THX_BLK_RATE   = AUDIO_CODEC_RATE_HZ / 128;  // ~250 Hz (blocks/s)
+static const float THX_START_CTR  = 280.0f;   // centre of the initial "mumble" band
+
+// Stereo-wander tunables (ear-tune).  SMOOTH = one-pole shift, higher = slower
+// drift.  PHASE_MAX = biggest wandering L/R phase offset (Q32; 1<<29 ≈ ⅛ cycle).
+static const int      THX_PAN_SMOOTH   = 7;          // pan position drift (~0.5 s)
+static const int      THX_PHASE_SMOOTH = 6;          // width/phase drift (~0.25 s)
+static const uint32_t THX_PHASE_MAX    = (1u << 30);
+
+void thxNoteOn(ThxVoice& tv, float rootHz, const volatile int* param) {
+    int sweep  = param[0];   // 0..8  convergence time
+    int spread = param[1];   // 0..8  width/chaos of the initial cluster
+    int stack  = param[3];   // 0..8  octave span of the final chord
+    int detune = param[4];   // 0..8  per-osc shimmer in the final chord
+    if (tv.rng == 0) tv.rng = 0xC0FFEEu ^ (uint32_t)(rootHz * 1000.0f);
+
+    float sec  = 2.0f + sweep * 2.0f;                 // 2..18 s glide
+    tv.glidePos = 0;
+    tv.glideInc = (uint32_t)(65536.0f / (sec * (float)THX_BLK_RATE));
+    if (tv.glideInc == 0) tv.glideInc = 1;
+
+    float octaves = 3.0f + stack * 0.5f;              // 3..7 octaves span
+    float halfW   = 60.0f + spread * 42.0f;           // ±60..±396 Hz start spread
+    const double kInc = 4294967296.0 / AUDIO_CODEC_RATE_HZ;
+    const float  nyq  = AUDIO_CODEC_RATE_HZ * 0.5f;
+
+    for (int j = 0; j < THX_OSC; j++) {
+        // Start: random absolute pitch — the iconic low mumble (note-independent).
+        tv.rng = tv.rng * 1664525u + 1013904223u;
+        float u  = (float)(tv.rng >> 8) / 16777216.0f;      // 0..1
+        float fs = THX_START_CTR - halfW + u * (2.0f * halfW);
+        if (fs < 30.0f) fs = 30.0f;
+
+        // Target: EXACT stacked octaves on the root — every 3rd voice a perfect
+        // fifth above its octave (the D/A "power" voicing), bottom octave kept
+        // pure root for a solid bass.  These are the in-tune pitches the cluster
+        // must land on.
+        int   oct      = (int)((float)j * octaves / THX_OSC);   // 0..octaves-1
+        float interval = (oct >= 1 && (j % 3) == 2) ? 1.5f : 1.0f;   // 1.5 = pure fifth
+        // Chorus detune only (±DETUNE cents) — small enough that the settled
+        // chord stays IN TUNE with a shimmer, not the old ±(4·DETUNE) that read
+        // as out of tune.  DETUNE 0 = dead exact.
+        tv.rng = tv.rng * 1664525u + 1013904223u;
+        float dc = (((float)(tv.rng >> 8) / 16777216.0f) - 0.5f) * (detune * 2.0f);
+        float ft = rootHz * powf(2.0f, (float)oct) * interval * powf(2.0f, dc / 1200.0f);
+        while (ft >= nyq) ft *= 0.5f;
+
+        tv.incStart[j]  = (uint32_t)((double)fs * kInc);
+        tv.incTarget[j] = (uint32_t)((double)ft * kInc);
+        tv.incCur[j]    = tv.incStart[j];
+        tv.wob[j]       = 0;
+
+        // UNIFORM glide rate (256 = 1.0): every oscillator follows the same eased
+        // progress, so they all lock onto the chord at the SAME instant — the
+        // satisfying "whoosh into place".  (A spread here smears the arrival; the
+        // start pitches + wobble still keep the sweep itself alive.)
+        tv.rateQ8[j] = 256;
+
+        // Amplitude weight: bass octaves ~1.5×, top ~0.9×; scaled so the bank
+        // sums to roughly one int16 (÷ THX_OSC baked in).  The live pan gains are
+        // derived from this per block (thxBlockPrep) as each osc wanders.
+        float w   = 1.5f - ((float)oct / octaves) * 0.6f;
+        float amp = w * 224.0f / THX_OSC;
+        tv.ampBaseQ8[j] = (uint16_t)amp;
+        // Pan-wander WIDTH by octave: bass stays near centre (solid low end),
+        // higher octaves swing wide → the immersive, swimming wall.
+        float spread = (octaves > 1.0f) ? ((float)oct / (octaves - 1.0f)) : 0.0f;  // 0 bass..1 top
+        tv.wanderWQ8[j] = (uint8_t)(64.0f + spread * 191.0f);        // 64..255 (Q8)
+        tv.panWob[j] = 0; tv.phOffWob[j] = 0; tv.phOff[j] = 0;
+        tv.ampLQ8[j] = (uint16_t)(amp * 0.70711f);                   // centred until 1st block
+        tv.ampRQ8[j] = tv.ampLQ8[j];
+
+        // Random start phase (no attack click from aligned saws).
+        tv.rng = tv.rng * 1664525u + 1013904223u;
+        tv.ph[j] = tv.rng;
+    }
+}
+
+void thxBlockPrep(ThxVoice& tv) {
+    if (tv.glidePos < 65536) {
+        tv.glidePos += tv.glideInc;
+        if (tv.glidePos > 65536) tv.glidePos = 65536;
+    }
+    uint32_t gp = tv.glidePos;
+    for (int j = 0; j < THX_OSC; j++) {
+        uint32_t p = (uint32_t)(((uint64_t)gp * tv.rateQ8[j]) >> 8);
+        if (p > 65536) p = 65536;
+        // Smoothstep 3p²−2p³ (Q16): slow wander at the start, then a graceful
+        // deceleration INTO the target so the unified arrival settles rather
+        // than snapping (p² alone arrives at full pitch-velocity → a kink).
+        uint32_t p2 = (uint32_t)(((uint64_t)p * p) >> 16);
+        uint32_t pc = (uint32_t)(((uint64_t)p2 * (uint32_t)(196608 - 2 * p)) >> 16);
+        int64_t  d  = (int64_t)tv.incTarget[j] - (int64_t)tv.incStart[j];
+        uint32_t inc = (uint32_t)((int64_t)tv.incStart[j] + ((d * (int64_t)pc) >> 16));
+
+        // Smoothed per-osc detune wobble (one-pole random walk), fading out as the
+        // voice converges → the "living" mumble that settles into a steady chord.
+        tv.rng = tv.rng * 1664525u + 1013904223u;
+        int32_t tgt = ((int32_t)((tv.rng >> 16) & 0xFFFF) - 32768) >> 4;   // ±2048
+        tv.wob[j] += (tgt - tv.wob[j]) >> 4;                               // ~smoothed
+        int32_t fade = 65536 - (int32_t)p;                                 // 0 when settled
+        int32_t cQ16 = ((int64_t)tv.wob[j] * fade) >> 16;                  // Q16 mult factor
+        tv.incCur[j] = (uint32_t)(((uint64_t)inc * (uint32_t)(65536 + cQ16)) >> 16);
+
+        // ── Stereo wander (continuous — keeps the sustained chord swimming) ──
+        // Pan POSITION: smoothed random walk → recompute constant-power gains.
+        tv.rng = tv.rng * 1664525u + 1013904223u;
+        int32_t pt = (int32_t)((tv.rng >> 16) & 0xFFFF) - 32768;           // ±32768
+        tv.panWob[j] += (pt - tv.panWob[j]) >> THX_PAN_SMOOTH;
+        float pan = 0.5f + (tv.panWob[j] * (1.0f / 32768.0f)) * 0.5f
+                          * (tv.wanderWQ8[j] * (1.0f / 256.0f));
+        if (pan < 0.0f) pan = 0.0f; else if (pan > 1.0f) pan = 1.0f;
+        float th  = pan * 1.5707963f;
+        float amp = (float)tv.ampBaseQ8[j];
+        tv.ampLQ8[j] = (uint16_t)(amp * cosf(th));
+        tv.ampRQ8[j] = (uint16_t)(amp * sinf(th));
+
+        // WIDTH: wandering inter-channel phase offset (the "wide" — decorrelates
+        // L/R per osc).  Signed → negative wraps modulo 2³² (= reading earlier).
+        tv.rng = tv.rng * 1664525u + 1013904223u;
+        int32_t ot = (int32_t)((tv.rng >> 16) & 0xFFFF) - 32768;
+        tv.phOffWob[j] += (ot - tv.phOffWob[j]) >> THX_PHASE_SMOOTH;
+        tv.phOff[j] = (uint32_t)(int32_t)(((int64_t)tv.phOffWob[j] * (int64_t)THX_PHASE_MAX) >> 15);
+    }
 }
 
 // uint32 LFO phase → triangle -32768..32767.

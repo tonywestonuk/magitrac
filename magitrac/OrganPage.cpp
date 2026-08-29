@@ -13,8 +13,14 @@ static const char* const OR_VC_NAMES[OR_VC_N]   = { "OFF", "V1", "V2", "V3", "C1
 static const char* const OR_LES_NAMES[OR_LES_N] = { "STOP", "SLOW", "FAST" };
 static const char* const OR_DRV_NAMES[OR_DRV_N] = { "OFF", "ON" };
 static const char* const OR_RVB_NAMES[OR_RVB_N] = { "OFF", "ROOM", "HALL" };
+static const char* const OR_VOC_NAMES[OR_VOC_N] = { "OFF", "ON" };
 
 static int orFxX(int i) { return OR_FX_X0 + i * (OR_FX_W + OR_FX_GAP); }
+
+// Paged effects (top bar slots 1..3).  Add new effects here and they page
+// automatically.
+enum { FX_VIB = 0, FX_LES, FX_DRIVE, FX_VERB, FX_VOCODER, FX_COUNT };
+static int orFxPages() { return (FX_COUNT + OR_FX_PER_PAGE - 1) / OR_FX_PER_PAGE; }
 
 // Per-type knob column.  Order/meaning must match the server's s_param mapping.
 struct OrKnobCfg { int n; const char* names[OR_NKNOB]; };
@@ -34,6 +40,8 @@ static const OrProcCfg OR_PROC[OR_PROC_N] = {
                     { 4, 4, 8, 4, 4 } },
     { "CHOIR",      { 5, { "BREATH", "ENSMBL", "BRIGHT", "ATTACK", "AHH" } },
                     { 4, 4, 8, 4, 4 } },
+    { "THX",        { 5, { "SWEEP", "SPREAD", "BRIGHT", "STACK", "DETUNE" } },
+                    { 5, 4, 6, 6, 3 } },
 };
 
 // PROC's 5-slider column starts further left (no drawbars in that mode).
@@ -60,12 +68,15 @@ OrganPage::OrganPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song
     , _wasDown(false)
     , _dragCol(-1)
     , _dragKnob(-1)
+    , _tipShown(false)
     , _activePreset(1)   // JAZZ — matches the default registration below
     , _type(0)           // DRAWBAR
     , _vibChorus(0)      // effects default OFF so the page opens dry
     , _leslie(0)
     , _drive(0)
     , _reverb(0)
+    , _vocoder(0)
+    , _fxPage(0)
     , _procSel(0)
 {
     // Classic full-drawbar default: 16' 5 1/3' 8' pulled, rest in.
@@ -102,7 +113,7 @@ void OrganPage::applyToSong() {
     if (!used) return;
 
     OrganPatch& op = _song.organ;
-    op.flags = 1;
+    op.flags = 1 | (_vocoder ? 2 : 0);   // bit0 = present, bit1 = vocoder on
     op.voice = (_type < OR_TYPE_PROC) ? (uint8_t)_type
                                       : (uint8_t)(OR_TYPE_PROC + _procSel);
     for (int b = 0; b < ORGAN_PATCH_BARS; b++) op.bars[b] = _bars[b];
@@ -135,6 +146,7 @@ void OrganPage::adoptFromSong() {
     _leslie       = op.leslie    % OR_LES_N;
     _drive        = op.drive     % OR_DRV_N;
     _reverb       = op.reverb    % OR_RVB_N;
+    _vocoder      = (op.flags & 2) ? 1 : 0;
     _activePreset = -1;   // registration came from the song, not a preset
 }
 
@@ -152,6 +164,7 @@ void OrganPage::open() {
     gServerPairing.sendOrgan(ORGAN_OP_TYPE,      0, (uint8_t)_type);
     if (_type == OR_TYPE_PROC)
         gServerPairing.sendOrgan(ORGAN_OP_PROCSEL, 0, (uint8_t)_procSel);
+    gServerPairing.sendOrgan(ORGAN_OP_VOCODER,   0, (uint8_t)_vocoder);
     gServerPairing.sendOrgan(ORGAN_OP_VIBCHORUS, 0, (uint8_t)_vibChorus);
     gServerPairing.sendOrgan(ORGAN_OP_LESLIE,    0, (uint8_t)_leslie);
     gServerPairing.sendOrgan(ORGAN_OP_DRIVE,     0, (uint8_t)_drive);
@@ -162,6 +175,7 @@ void OrganPage::open() {
 
 void OrganPage::draw() {
     _d.fillRect(0, 0, 960, 540, COL_WHITE);
+    _tipShown = false;   // full repaint took the tooltip with it
     drawHeader();
     if (_type == OR_TYPE_PROC) {
         drawProcList();
@@ -233,29 +247,57 @@ void OrganPage::applyPreset(int idx) {
     applyToSong();
 }
 
+// One effect button.  Inverts (black) when the effect is not OFF, so an active
+// effect reads at a glance.
+void OrganPage::drawFxButton(int slot, int id) {
+    char buf[20];
+    bool on = false;
+    switch (id) {
+        case FX_VIB:   snprintf(buf, sizeof(buf), "VIB %s",   OR_VC_NAMES[_vibChorus]); on = _vibChorus; break;
+        case FX_LES:   snprintf(buf, sizeof(buf), "LES %s",   OR_LES_NAMES[_leslie]);   on = _leslie;    break;
+        case FX_DRIVE: snprintf(buf, sizeof(buf), "DRIVE %s", OR_DRV_NAMES[_drive]);    on = _drive;     break;
+        case FX_VERB:  snprintf(buf, sizeof(buf), "VERB %s",  OR_RVB_NAMES[_reverb]);   on = _reverb;    break;
+        case FX_VOCODER: snprintf(buf, sizeof(buf), "VOCODE %s", OR_VOC_NAMES[_vocoder]); on = _vocoder; break;
+        default:       return;
+    }
+    uiButton(_d, orFxX(slot), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf,
+             on ? COL_BLACK : COL_WHITE, on ? COL_WHITE : COL_BLACK, 2);
+}
+
+void OrganPage::cycleFx(int id) {
+    switch (id) {
+        case FX_VIB:   _vibChorus = (_vibChorus + 1) % OR_VC_N;
+                       gServerPairing.sendOrgan(ORGAN_OP_VIBCHORUS, 0, (uint8_t)_vibChorus); break;
+        case FX_LES:   _leslie    = (_leslie + 1) % OR_LES_N;
+                       gServerPairing.sendOrgan(ORGAN_OP_LESLIE,    0, (uint8_t)_leslie);    break;
+        case FX_DRIVE: _drive     = (_drive + 1) % OR_DRV_N;
+                       gServerPairing.sendOrgan(ORGAN_OP_DRIVE,     0, (uint8_t)_drive);     break;
+        case FX_VERB:  _reverb    = (_reverb + 1) % OR_RVB_N;
+                       gServerPairing.sendOrgan(ORGAN_OP_REVERB,    0, (uint8_t)_reverb);    break;
+        case FX_VOCODER: _vocoder = (_vocoder + 1) % OR_VOC_N;
+                       gServerPairing.sendOrgan(ORGAN_OP_VOCODER,   0, (uint8_t)_vocoder);   break;
+        default:       return;
+    }
+    applyToSong();
+}
+
 void OrganPage::drawHeader() {
     _d.fillRect(0, 0, 960, OR_HDR_H, COL_BLACK);
 
-    // Four tap-to-cycle controls.  Effect buttons invert (black) when not OFF,
-    // so an active effect reads at a glance.
     char buf[20];
+    // Slot 0: voice TYPE (always shown).
     snprintf(buf, sizeof(buf), "%s", OR_TYPE_NAMES[_type]);
     uiButton(_d, orFxX(0), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf, COL_WHITE, COL_BLACK, 2);
 
-    bool vcOn  = (_vibChorus != 0), lesOn = (_leslie != 0);
-    bool drvOn = (_drive != 0),     rvbOn = (_reverb != 0);
-    snprintf(buf, sizeof(buf), "VIB %s", OR_VC_NAMES[_vibChorus]);
-    uiButton(_d, orFxX(1), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf,
-             vcOn ? COL_BLACK : COL_WHITE, vcOn ? COL_WHITE : COL_BLACK, 2);
-    snprintf(buf, sizeof(buf), "LES %s", OR_LES_NAMES[_leslie]);
-    uiButton(_d, orFxX(2), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf,
-             lesOn ? COL_BLACK : COL_WHITE, lesOn ? COL_WHITE : COL_BLACK, 2);
-    snprintf(buf, sizeof(buf), "DRIVE %s", OR_DRV_NAMES[_drive]);
-    uiButton(_d, orFxX(3), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf,
-             drvOn ? COL_BLACK : COL_WHITE, drvOn ? COL_WHITE : COL_BLACK, 2);
-    snprintf(buf, sizeof(buf), "VERB %s", OR_RVB_NAMES[_reverb]);
-    uiButton(_d, orFxX(4), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf,
-             rvbOn ? COL_BLACK : COL_WHITE, rvbOn ? COL_WHITE : COL_BLACK, 2);
+    // Slots 1..OR_FX_PER_PAGE: the current page of effects (blank if none).
+    for (int slot = 1; slot <= OR_FX_PER_PAGE; slot++) {
+        int id = _fxPage * OR_FX_PER_PAGE + (slot - 1);
+        if (id < FX_COUNT) drawFxButton(slot, id);   // else leave black
+    }
+
+    // Slot 4: effect-page cycler (ltgrey so it reads as nav, not an effect).
+    snprintf(buf, sizeof(buf), "FX %d/%d", _fxPage + 1, orFxPages());
+    uiButton(_d, orFxX(4), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf, COL_LTGREY, COL_BLACK, 2);
 
     uiButton(_d, OR_HOME_X, OR_BTN_Y, OR_HOME_W, OR_BTN_H, "HOME", COL_WHITE, COL_BLACK, 3);
 }
@@ -295,6 +337,48 @@ void OrganPage::drawKnob(int k) {
     _d.setTextSize(1); _d.setTextColor(COL_BLACK);
     int lw = (int)strlen(lab) * 6;
     _d.setCursor(cx - lw / 2, OR_LABEL_Y + 2); _d.print(lab);
+}
+
+// Left edge of the tooltip box — always just clear of the slider column, which
+// itself shifts left in PROC mode.
+static int orTipX(int type) { return orKnobX(type, 0) - 10 - OR_TIP_W; }
+
+void OrganPage::drawKnobTip(int k) {
+    const OrKnobCfg& cfg = orActiveCfg(_type, _procSel);
+    if (k < 0 || k >= cfg.n) return;
+
+    int x = orTipX(_type);
+    _d.fillRect(x, OR_TIP_Y, OR_TIP_W, OR_TIP_H, COL_WHITE);
+    _d.drawRect(x,     OR_TIP_Y,     OR_TIP_W,     OR_TIP_H,     COL_BLACK);
+    _d.drawRect(x + 2, OR_TIP_Y + 2, OR_TIP_W - 4, OR_TIP_H - 4, COL_BLACK);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%s  %d", cfg.names[k], (int)knobRef(k));
+    _d.setTextSize(3);
+    _d.setTextColor(COL_BLACK);
+    int tw = (int)strlen(buf) * 18;
+    _d.setCursor(x + (OR_TIP_W - tw) / 2, OR_TIP_Y + (OR_TIP_H - 24) / 2);
+    _d.print(buf);
+
+    _tipShown = true;
+}
+
+void OrganPage::hideKnobTip() {
+    if (!_tipShown) return;
+    _tipShown = false;
+
+    int x = orTipX(_type);
+    _d.fillRect(x, OR_TIP_Y, OR_TIP_W, OR_TIP_H, COL_WHITE);
+
+    // Repaint whatever the box sat on top of.  PROC mode's sound list is above
+    // it, so there's nothing to restore there; otherwise redraw the drawbars
+    // whose columns the box overlapped (drawBar wipes + rebuilds its own slot).
+    if (_type != OR_TYPE_PROC) {
+        for (int i = 0; i < OR_N; i++) {
+            int bx = OR_MARGIN + i * OR_COL_W;
+            if (bx + OR_COL_W > x && bx < x + OR_TIP_W) drawBar(i);
+        }
+    }
 }
 
 void OrganPage::syncKnobs() {
@@ -384,6 +468,12 @@ OrganPage::Result OrganPage::poll() {
                         sx < OR_MARGIN + OR_COL_W * OR_N)
                        ? (sx - OR_MARGIN) / OR_COL_W : -1;
             _dragKnob = (_dragCol < 0) ? hitKnob(sx, sy) : -1;
+            if (_dragKnob >= 0) {
+                // Show which slider is under the finger straight away — the
+                // labels under the column are too small to read mid-drag.
+                drawKnobTip(_dragKnob);
+                _d.paintLater();
+            }
         }
         int span = OR_BOT - OR_TOP;
         int v = ((sy - OR_TOP) * 8 + span / 2) / span;
@@ -404,6 +494,7 @@ OrganPage::Result OrganPage::poll() {
                 gServerPairing.sendOrgan(ORGAN_OP_PARAM, (uint8_t)_dragKnob, (uint8_t)v);
                 applyToSong();
                 drawKnob(_dragKnob);
+                drawKnobTip(_dragKnob);   // keep the big readout in step
                 _d.paintLater();
             }
         }
@@ -411,6 +502,7 @@ OrganPage::Result OrganPage::poll() {
         _wasDown = false;
         int col = _dragCol, knob = _dragKnob;
         _dragCol = -1; _dragKnob = -1;
+        if (_tipShown) { hideKnobTip(); _d.paintLater(); }
         if (col < 0 && knob < 0) {
             if (hitHome(sx, sy)) {
                 _open = false;
@@ -427,34 +519,28 @@ OrganPage::Result OrganPage::poll() {
 
             int fx = hitFx(sx, sy);
             if (fx >= 0) {
-                switch (fx) {
-                    case 0: {
-                            bool wasProc = (_type == OR_TYPE_PROC);
-                            _type = (_type + 1) % OR_TYPE_N;
-                            gServerPairing.sendOrgan(ORGAN_OP_TYPE,      0, (uint8_t)_type);
-                            if (_type == OR_TYPE_PROC)
-                                gServerPairing.sendOrgan(ORGAN_OP_PROCSEL, 0, (uint8_t)_procSel);
-                            syncKnobs();          // push the new type's knob values
-                            applyToSong();
-                            if (wasProc || _type == OR_TYPE_PROC) draw();   // body layout swaps
-                            else drawKnobs();     // its knob column differs
-                            break;
-                            }
-                    case 1: _vibChorus = (_vibChorus + 1) % OR_VC_N;
-                            gServerPairing.sendOrgan(ORGAN_OP_VIBCHORUS, 0, (uint8_t)_vibChorus);
-                            applyToSong(); break;
-                    case 2: _leslie    = (_leslie + 1) % OR_LES_N;
-                            gServerPairing.sendOrgan(ORGAN_OP_LESLIE,    0, (uint8_t)_leslie);
-                            applyToSong(); break;
-                    case 3: _drive     = (_drive + 1) % OR_DRV_N;
-                            gServerPairing.sendOrgan(ORGAN_OP_DRIVE,     0, (uint8_t)_drive);
-                            applyToSong(); break;
-                    case 4: _reverb    = (_reverb + 1) % OR_RVB_N;
-                            gServerPairing.sendOrgan(ORGAN_OP_REVERB,    0, (uint8_t)_reverb);
-                            applyToSong(); break;
+                bool changed = true;
+                if (fx == 0) {                       // slot 0: cycle voice TYPE
+                    bool wasProc = (_type == OR_TYPE_PROC);
+                    _type = (_type + 1) % OR_TYPE_N;
+                    gServerPairing.sendOrgan(ORGAN_OP_TYPE, 0, (uint8_t)_type);
+                    if (_type == OR_TYPE_PROC)
+                        gServerPairing.sendOrgan(ORGAN_OP_PROCSEL, 0, (uint8_t)_procSel);
+                    syncKnobs();          // push the new type's knob values
+                    applyToSong();
+                    if (wasProc || _type == OR_TYPE_PROC) draw();   // body layout swaps
+                    else drawKnobs();     // its knob column differs
+                } else if (fx == OR_FX_N - 1) {      // last slot: cycle effect page
+                    _fxPage = (_fxPage + 1) % orFxPages();
+                } else {                             // slots 1..3: cycle that effect
+                    int id = _fxPage * OR_FX_PER_PAGE + (fx - 1);
+                    if (id < FX_COUNT) cycleFx(id);
+                    else changed = false;            // tap on a blank slot
                 }
-                drawHeader();
-                _d.paintLater();
+                if (changed) {
+                    drawHeader();
+                    _d.paintLater();
+                }
             }
         }
     }

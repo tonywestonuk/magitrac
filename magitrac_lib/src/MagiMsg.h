@@ -5,7 +5,17 @@
 
 // ── SD / file constants (shared between main sketch and commands) ─────────────
 #define SRV_FNAME_MAX  24
+// Backup/restore filenames (drumtrack .txt names are long, e.g. 47 chars).
+// Separate from SRV_FNAME_MAX so widening it doesn't touch every message.
+#define BK_FNAME_MAX   64
 #define SRV_MAX_FILES  32
+// Song-library enumeration cap.  Deliberately separate from (and larger than)
+// SRV_MAX_FILES: the client browses the song list one 7-name packet at a time,
+// so it needs no array of this size — only the server materialises + sorts the
+// whole directory.  Keeping it distinct means growing the song limit doesn't
+// bloat the client's SRV_MAX_FILES-sized backup buffers.  The server is the
+// only user of this define.
+#define SRV_MAX_SONGS  128
 
 // Magitrac default port — used for the MagiLink TCP listener and the
 // MagiUdpLink datagram listener (TCP/UDP namespaces are disjoint so they
@@ -355,10 +365,11 @@ struct MsgSetWifiChannel {
 //  ORGAN_OP_PARAM     → per-type knob: `index` = knob 0..2, `value` 0..8
 //  ORGAN_OP_PROCSEL   → PROC type: select procedural sound `value`
 //  ORGAN_OP_REVERB    → stereo reverb: `value` 0=off,1=room,2=hall
+//  ORGAN_OP_VOCODER   → mic vocoder: `value` 0=off,1=on (organ = carrier, mic = modulator)
 enum OrganOp : uint8_t {
     ORGAN_OP_EXIT = 0, ORGAN_OP_ENTER = 1, ORGAN_OP_SET = 2, ORGAN_OP_TYPE = 3,
     ORGAN_OP_VIBCHORUS = 4, ORGAN_OP_LESLIE = 5, ORGAN_OP_DRIVE = 6, ORGAN_OP_PARAM = 7,
-    ORGAN_OP_PROCSEL = 8, ORGAN_OP_REVERB = 9
+    ORGAN_OP_PROCSEL = 8, ORGAN_OP_REVERB = 9, ORGAN_OP_VOCODER = 10
 };
 struct MsgOrgan {
     uint8_t  id     = MSG_ORGAN;
@@ -731,12 +742,12 @@ struct MsgStartBackup {
 struct MsgBackupHeader {
     uint8_t  id     = MSG_BACKUP_HEADER;
     uint16_t length = sizeof(MsgBackupHeader);
-    char     filename[24];
+    char     filename[BK_FNAME_MAX];   // 64
     uint32_t file_size;
     uint16_t file_index;  // 1-based
     uint16_t file_total;
 };
-// 35 bytes
+// 1 + 2 + 64 + 4 + 2 + 2 = 75 bytes
 
 struct MsgBackupBody {
     uint8_t  id     = MSG_BACKUP_BODY;
@@ -813,11 +824,11 @@ struct MsgInstrumentsPushBody {
 struct MsgRestoreHeader {
     uint8_t  id     = MSG_RESTORE_HEADER;
     uint16_t length = sizeof(MsgRestoreHeader);
-    char     name[SRV_FNAME_MAX];   // 24 — filename (with extension)
+    char     name[BK_FNAME_MAX];    // 64 — filename (with extension)
     uint8_t  isInstruments;         // 1 = /instruments.mgt, 0 = /songs/<name>
     uint32_t total_size;            // bytes that follow across BODY messages
 };
-// 1 + 2 + 24 + 1 + 4 = 32 bytes
+// 1 + 2 + 64 + 1 + 4 = 72 bytes
 
 struct MsgRestoreBody {
     uint8_t  id     = MSG_RESTORE_BODY;

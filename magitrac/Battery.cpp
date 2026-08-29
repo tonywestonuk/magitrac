@@ -25,10 +25,14 @@ void battery_begin_adc(uint8_t pin, float div_ratio, int mv_full, int mv_empty,
     _backend = ADC_DIV;
 }
 
-static int _read_adc() {
+static int _read_adc_mv() {
     uint32_t sum = 0;
     for (int i = 0; i < 4; i++) sum += analogReadMilliVolts(_adc_pin);
-    int bat_mv = (int)(sum / 4 * _adc_div);
+    return (int)(sum / 4 * _adc_div);
+}
+
+static int _read_adc() {
+    int bat_mv = _read_adc_mv();
     return constrain((bat_mv - _adc_mv_empty) * 100 / (_adc_mv_full - _adc_mv_empty), 0, 100);
 }
 
@@ -55,11 +59,39 @@ static bool _bq_read_reg(uint8_t reg, uint8_t& out) {
     return true;
 }
 
-static int _read_bq25896_pct() {
+static bool _bq_write_reg(uint8_t reg, uint8_t val) {
+    _wire->beginTransmission(_bq_addr);
+    _wire->write(reg);
+    _wire->write(val);
+    return _wire->endTransmission() == 0;
+}
+
+// REG0E (BATV) is only refreshed by an ADC conversion.  In the POR one-shot
+// mode CONV_START never fires on its own, so a cold read returns the reset
+// value (2304 mV → 0 %) and the meter looks frozen.  Kick a one-shot
+// conversion (REG02 bit 7) and wait for it to auto-clear before reading.
+static void _bq_kick_adc() {
+    uint8_t reg02;
+    if (!_bq_read_reg(0x02, reg02)) return;
+    if (!_bq_write_reg(0x02, reg02 | 0x80)) return;   // CONV_START
+    for (int i = 0; i < 40; i++) {                    // ≤ ~120 ms guard
+        if (!_bq_read_reg(0x02, reg02)) return;
+        if (!(reg02 & 0x80)) return;                  // conversion complete
+        delay(3);
+    }
+}
+
+static int _read_bq25896_mv() {
     if (!_wire) return -1;
+    _bq_kick_adc();
     uint8_t reg0e;
     if (!_bq_read_reg(0x0E, reg0e)) return -1;
-    int bat_mv = 2304 + (int)(reg0e & 0x7F) * 20;
+    return 2304 + (int)(reg0e & 0x7F) * 20;
+}
+
+static int _read_bq25896_pct() {
+    int bat_mv = _read_bq25896_mv();
+    if (bat_mv < 0) return -1;
     return constrain((bat_mv - 3000) * 100 / (4200 - 3000), 0, 100);
 }
 
@@ -87,4 +119,39 @@ bool battery_is_charging() {
                                  digitalRead(_adc_chg_pin) == (_adc_chg_low ? LOW : HIGH);
         default:          return false;
     }
+}
+
+int battery_read_mv() {
+    switch (_backend) {
+        case ADC_DIV:     return _read_adc_mv();
+        case BQ25896_I2C: return _read_bq25896_mv();
+        default:          return -1;
+    }
+}
+
+BatteryChargePhase battery_charge_phase() {
+    switch (_backend) {
+        case BQ25896_I2C: {
+            uint8_t reg0b;
+            if (!_wire || !_bq_read_reg(0x0B, reg0b)) return BATT_DISCHARGING;
+            switch ((reg0b >> 3) & 0x3) {          // CHRG_STAT
+                case 0x1: return BATT_PRECHARGE;
+                case 0x2: return BATT_FAST_CHARGE;
+                case 0x3: return BATT_CHARGE_DONE;
+                default:  return BATT_DISCHARGING;  // 0x0 = not charging
+            }
+        }
+        case ADC_DIV:
+            return battery_is_charging() ? BATT_FAST_CHARGE : BATT_DISCHARGING;
+        default:
+            return BATT_DISCHARGING;
+    }
+}
+
+int battery_charge_current_ma() {
+    if (_backend != BQ25896_I2C || !_wire) return -1;
+    _bq_kick_adc();
+    uint8_t reg12;
+    if (!_bq_read_reg(0x12, reg12)) return -1;
+    return (int)(reg12 & 0x7F) * 50;   // ICHGR: 50 mA / LSB
 }

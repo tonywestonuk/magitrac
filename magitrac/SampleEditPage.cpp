@@ -9,9 +9,11 @@ void SampleEditPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
     sy = 540 - rx;
 }
 
-void SampleEditPage::open(uint8_t sampleId, const char* name, uint8_t col) {
-    _sampleId = sampleId;
-    _col      = col;
+void SampleEditPage::open(uint8_t sampleId, const char* name, uint8_t col,
+                          int16_t tuneCents) {
+    _sampleId  = sampleId;
+    _col       = col;
+    _tuneCents = tuneCents;
     strncpy(_name, name ? name : "", sizeof(_name) - 1);
     _name[sizeof(_name) - 1] = '\0';
     _loading    = true;
@@ -114,9 +116,28 @@ void SampleEditPage::drawWave() {
     int64_t stRel = ((int64_t)_start - (int64_t)_viewStart) * SAMPLE_OVERVIEW_N / (int64_t)len;
     int64_t enRel = ((int64_t)endF   - (int64_t)_viewStart) * SAMPLE_OVERVIEW_N / (int64_t)len;
 
+    // Each screen column maps to a frame, looked up in whatever window the
+    // server last sent (_info.viewStart..viewEnd).  While drag-panning, the
+    // view can slide beyond that window — unloaded regions draw as a flat
+    // midline until the release-triggered fetch fills them in.
+    uint64_t iVs = _info.viewStart, iVe = _info.viewEnd;
+    bool haveData = (iVe > iVs);
     for (int c = 0; c < SAMPLE_OVERVIEW_N; c++) {
-        int mn = _info.peaks[c * 2];
-        int mx = _info.peaks[c * 2 + 1];
+        uint64_t f = (uint64_t)_viewStart + ((uint64_t)c * len) / SAMPLE_OVERVIEW_N;
+        bool have = false;
+        int mn = 0, mx = 0;
+        if (haveData && f >= iVs && f < iVe) {
+            int sc = (int)(((f - iVs) * SAMPLE_OVERVIEW_N) / (iVe - iVs));
+            if (sc >= 0 && sc < SAMPLE_OVERVIEW_N) {
+                mn = _info.peaks[sc * 2];
+                mx = _info.peaks[sc * 2 + 1];
+                have = true;
+            }
+        }
+        if (!have) {                               // not loaded yet: flat line
+            _d.fillRect(SE_WAVE_X + c * 2, midY, 2, 1, COL_LTGREY);
+            continue;
+        }
         int y0 = midY - (mx * (SE_WAVE_H / 2)) / 128;
         int y1 = midY - (mn * (SE_WAVE_H / 2)) / 128;
         if (y1 <= y0) y1 = y0 + 1;
@@ -351,11 +372,26 @@ bool SampleEditPage::poll() {
         } else {
             _info = gServerPairing.sampleInfo();
         }
-        _viewStart = _info.viewStart;
-        _viewEnd   = _info.viewEnd;
+        // Sync the view to the echoed window (server may have clamped) —
+        // unless the user is already panning again, in which case the
+        // window-mapped renderer just uses the new data where it overlaps.
+        if (!_dragWave && !_dragScroll) {
+            _viewStart = _info.viewStart;
+            _viewEnd   = _info.viewEnd;
+        }
         if (first) draw();
         else { drawWave(); drawScrollbar(); drawZoomRow(); }
         _d.paintLater();
+    }
+
+    // A non-looping audition ends on its own — flip STOP back to PLAY.
+    // (Looping ones really do play until stopped, so they keep STOP.)
+    if (_playing && !_loop && (int32_t)(millis() - _playEndMs) > 0) {
+        _playing = false;
+        if (_specMode == 0) {
+            drawHeader();
+            _d.paintLater();
+        }
     }
 
     // Spectrogram popup: render when the pages have all arrived; any touch
@@ -423,6 +459,30 @@ bool SampleEditPage::poll() {
         return false;
     }
 
+    // ── Waveform pan in progress: content follows the finger ─────────────────
+    if (_dragWave) {
+        if (down) {
+            uint32_t len   = viewLen();
+            uint32_t total = _info.totalFrames;
+            int64_t dFrames = ((int64_t)(_dragAnchorX - tx) * (int64_t)len) / SE_WAVE_W;
+            int64_t vs = (int64_t)_dragAnchorVs + dFrames;
+            if (vs < 0) vs = 0;
+            if ((uint64_t)vs + len > total) vs = (int64_t)total - (int64_t)len;
+            if ((uint32_t)vs != _viewStart) {
+                _viewStart = (uint32_t)vs;
+                _viewEnd   = _viewStart + len;
+                drawWave();             // unloaded regions show as a flat line
+                drawScrollbar();
+                _d.paintLater();
+            }
+        } else {
+            _dragWave = false;          // released: fill in the revealed region
+            _wasDown  = false;
+            fetchView();
+        }
+        return false;
+    }
+
     if (down && !_wasDown) {
         _wasDown = true;
 
@@ -445,6 +505,16 @@ bool SampleEditPage::poll() {
                     auditionStop();
                 } else {
                     _playing = true;
+                    // Predict the end so the button resets itself: trimmed
+                    // length at the audition's playback speed (TUNE), plus a
+                    // little margin for the wire + the release fade.
+                    uint32_t endF   = _end ? _end : _info.totalFrames;
+                    uint32_t frames = (endF > _start) ? endF - _start : 0;
+                    uint32_t rate   = _info.rate ? _info.rate : 32000;
+                    float    spd    = exp2f((float)_tuneCents / 1200.0f);
+                    uint32_t ms     = (uint32_t)((float)frames * 1000.0f
+                                                 / ((float)rate * spd));
+                    _playEndMs = millis() + ms + 400;
                     gServerPairing.sendAuditionRawNote(SFX_CHANNEL, 60, 100, _col);
                 }
                 drawHeader();
@@ -455,7 +525,8 @@ bool SampleEditPage::poll() {
         if (_loading) return false;
 
         // Touch-down near a marker line grabs it; it then follows the drag
-        // and locks in (meta stored) on release.
+        // and locks in (meta stored) on release.  Away from the markers (and
+        // zoomed in), the same touch pans the view instead.
         if (ty >= SE_WAVE_Y - 20 && ty < SE_WAVE_Y + SE_WAVE_H + 20 &&
             tx >= SE_WAVE_X - 20 && tx < SE_WAVE_X + SE_WAVE_W + 20) {
             int dS = tx - markerX(0); if (dS < 0) dS = -dS;
@@ -463,6 +534,11 @@ bool SampleEditPage::poll() {
             const int GRAB = 60;                   // finger-sized capture zone
             if (dS <= dE && dS <= GRAB)      _dragMarker = 0;
             else if (dE < dS && dE <= GRAB)  _dragMarker = 1;
+            else if (viewLen() < _info.totalFrames) {
+                _dragWave     = true;              // pan the zoomed view
+                _dragAnchorX  = tx;
+                _dragAnchorVs = _viewStart;
+            }
             return false;
         }
 

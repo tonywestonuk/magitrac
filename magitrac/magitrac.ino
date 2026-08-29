@@ -37,6 +37,7 @@
 #include "OrganPage.h"
 #include "WiFiSettingsPage.h"
 #include "Battery.h"
+#include "BatteryGauge.h"
 #include "Autosave.h"
 #include <SD.h>
 #include <I2C_BM8563.h>
@@ -90,6 +91,7 @@ InstrumentsPage    instrumentsPage(display, touch, gInstruments);
 SongConfigPage     songConfigPage(display, touch, song);
 ColumnEditor       columnEditor(display, touch, song, gInstruments);
 SampleEditPage     sampleEditPage(display, touch);
+ConfirmDialog      pasteConfirm(display, touch);   // "Paste selected rows?" over the grid
 DrumTrackImportPage drumTrackImportPage(display, touch, song);
 PerformancePage    performancePage(display, touch, song);
 PixelPostManualPage pixelpostManualPage(display, touch);
@@ -108,6 +110,41 @@ SongSource gSongSource = SongSource::NONE;
 // Tracker note → MIDI note: midi = tracker + 11  (tracker C4=49, MIDI C4=60)
 #define TRACKER_TO_MIDI  11
 static uint8_t gMidiActiveNote[MAX_COLUMNS] = {};  // 0 = no note active on that channel
+
+// Paste the row-selection (source column ui.rsCol(), rows ui.rsLo()..rsHi())
+// into the current block starting at (targetRow, targetCol), one row down per
+// selected row.  Stops at the end of the block.  Source cells are snapshotted
+// first so a same-column overlapping paste can't read its own writes.
+static void applyRowPaste(int8_t targetRow, int8_t targetCol) {
+    uint8_t  srcPat = ui.rsPat();                  // block the copy came from
+    uint8_t  dstPat = engine.currentPattern();     // block we're pasting into
+    int8_t   srcCol = ui.rsCol();
+    int8_t   lo     = ui.rsLo();
+    int8_t   hi     = ui.rsHi();
+    if (srcCol < 0 || lo < 0 || hi < lo) return;
+    if (srcPat >= song.numPatterns) return;
+
+    int n = hi - lo + 1;
+    Note buf[MAX_ROWS];
+    {   // snapshot source first — a same-block overlapping paste mustn't read its writes
+        NoteGrid src(song.notePool, &song.noteFreeHead, &song.patterns[srcPat].noteHead);
+        for (int i = 0; i < n && i < MAX_ROWS; i++)
+            buf[i] = src.get((uint8_t)(lo + i), (uint8_t)srcCol);
+    }
+
+    int patLen = song.patterns[dstPat].length;
+    NoteGrid dst(song.notePool, &song.noteFreeHead, &song.patterns[dstPat].noteHead);
+    for (int i = 0; i < n && i < MAX_ROWS; i++) {
+        int tr = (int)targetRow + i;
+        if (tr >= patLen) break;                       // don't spill past the block
+        const Note& s = buf[i];
+        bool empty = (s.note == 0 && s.effect == 0 && s.param == 0);
+        if (empty) dst.clear((uint8_t)tr, (uint8_t)targetCol);
+        else       dst.set  ((uint8_t)tr, (uint8_t)targetCol, s);
+        if (gServerPairing.isPaired())
+            gServerPairing.sendNoteSet(song, dstPat, (uint8_t)tr, (uint8_t)targetCol);
+    }
+}
 
 static void sendMidiRow(uint8_t patIdx, uint8_t row) {
     if (!gServerPairing.isPaired()) return;
@@ -234,6 +271,8 @@ static bool     instrumentsPageOpen = false;
 static bool     songConfigPageOpen  = false;
 static bool     columnEditorOpen    = false;
 static bool     sampleEditOpen      = false;
+static bool     pasteConfirmOpen    = false;   // row-paste confirm modal over the grid
+static int8_t   gPasteRow = 0, gPasteCol = 0;  // long-pressed paste target
 static bool     drumTrackImportOpen = false;
 static bool     noteEditorPageOpen  = false;
 static bool     drumEditorOpen      = false;
@@ -316,6 +355,16 @@ void setup() {
         while (1) {}
     }
     display.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
+    // Drive changed greys straight to their new level with the board's
+    // tuned NORMAL direct trains — no erase-to-white two-step flash on
+    // every UI repaint. Pairs without a train keep the two-step.
+    if (!display.driver().setDirectTransitions(true))
+        Serial.println("[EPD] direct transitions refused (allocation) — two-step path");
+    // Power-cycle ghosts root-caused and fixed in the library (powerOn
+    // SPH re-arm, decision-engine 1e7ebe2) — the 120 s mitigation timeout
+    // is no longer needed. Short timeout for now to exercise the fix with
+    // frequent rail cycles; raise/remove once trusted.
+    display.driver().setIdleTimeout(3);
     display.clear();
 
     // Display is up.  Bring up the pairing transport + (if paired) the
@@ -430,6 +479,15 @@ void setup() {
         if (display.getConfig().i2c.wire)
             battery_begin_bq25896(display.getConfig().i2c.wire);
     }
+    batteryGaugeBegin();
+    if (batteryLastDeath().flatBattery) {
+        // Surfaced on the header status line until pairing overwrites it; also
+        // logged to serial and persisted in NVS by the gauge.
+        char msg[32];
+        snprintf(msg, sizeof(msg), "Battery ran flat (%u%%)",
+                 batteryLastDeath().lastSoc);
+        ui.setStatus(msg);
+    }
 
     initSong(&song);
 
@@ -472,6 +530,13 @@ void loop() {
                           WiFi.gatewayIP().toString().c_str(),
                           (int)gServerPairing.isPaired(),
                           (int)gMagiLink.isConnected());
+            // EPD corruption hunt: engine flags + template pointers + heap
+            // watermarks. The library also self-reports two tripwires on
+            // this serial: "template overlay ACTIVE" (must NEVER appear —
+            // magitrac doesn't use templates) and "CORRUPTION: screenbuffer
+            // changed BETWEEN drives" (external write clobbered the delta
+            // engine's state — the un-erasable-ghost mechanism).
+            display.driver().debugState();
         }
     }
 
@@ -555,8 +620,9 @@ void loop() {
     // ── Battery poll — every 30 s, redraw header if value changed ────────────
     if (now - gLastBattMs >= 30000 || gLastBattPct == -2) {
         gLastBattMs = now;
-        int  pct = battery_read_pct();
-        bool chg = battery_is_charging();
+        batteryGaugeUpdate(now);
+        int  pct = batteryGaugePct();
+        bool chg = batteryGaugeCharging();
         if (pct >= 0 && (pct != gLastBattPct || chg != gLastBattChg)) {
             gLastBattPct = pct;
             gLastBattChg = chg;
@@ -705,14 +771,6 @@ void loop() {
                 pixelpostManualPage.draw();
                 display.paint();
                 break;
-            case BootMenuResult::PAIR:
-                gPairingUiOpen    = true;
-                gPairingUiWasDown = touch.isTouched;
-                gLastPairState    = gServerPairing.pairState();
-                gServerPairing.startPairCeremony();
-                display.clear();
-                drawPairingScreen();
-                break;
             case BootMenuResult::DRAWBAR_ORGAN:
                 organPageOpen = true;
                 organPage.open();   // draws + tells the server to enter organ mode
@@ -733,7 +791,8 @@ void loop() {
         if (pollPairingUi()) {
             gPairingUiOpen = false;
             display.clear();
-            ui.drawAll();
+            if (settingsPageOpen && settingsPage) settingsPage->draw();
+            else                                  ui.drawAll();
             display.paintLater();
         }
         return;
@@ -933,6 +992,9 @@ void loop() {
             const uint8_t* start = (const uint8_t*)&song.bpm;
             const uint8_t* end   = (const uint8_t*)&song.transposeChMask + sizeof(song.transposeChMask);
             gServerPairing.sendSongPatch(song, start, (uint8_t)(end - start));
+            // Song::flags lives in the tail (past organ), outside that range —
+            // a separate 1-byte patch keeps the server's MIDI-clock flag in sync.
+            gServerPairing.sendSongPatch(song, &song.flags, 1);
             songConfigPage.clearPatch();
         }
         if (songConfigPage.poll()) {
@@ -1001,6 +1063,15 @@ void loop() {
             display.clear();
             wifiSettingsPage.draw();
             display.paintLater();
+        } else if (rc == 3) {
+            // Pairing ceremony — SettingsPage stays "open" underneath so the
+            // ceremony returns here rather than to the tracker grid.
+            gPairingUiOpen    = true;
+            gPairingUiWasDown = touch.isTouched;
+            gLastPairState    = gServerPairing.pairState();
+            gServerPairing.startPairCeremony();
+            display.clear();
+            drawPairingScreen();
         }
         return;
     }
@@ -1031,6 +1102,17 @@ void loop() {
                 off += chunk;
             }
             columnEditor.clearPatch();
+        }
+        if (gServerPairing.isPaired() && columnEditor.pasteNotesPending()) {
+            // PASTE changed one column's notes in the current block only —
+            // resync just that block's cells (settings rode patchPending above).
+            // All MAX_ROWS: paste writes the full column, so rows past the
+            // block length (cleared) must sync too or client/server drift.
+            uint8_t p = columnEditor.editPattern();
+            uint8_t c = columnEditor.editCol();
+            for (uint8_t r = 0; r < MAX_ROWS; r++)
+                gServerPairing.sendNoteSet(song, p, r, c);
+            columnEditor.clearPasteNotes();
         }
         if (gServerPairing.isPaired() && columnEditor.resyncMask()) {
             // After COPY / SWAP / CLEAR: push settings + every cell of every
@@ -1068,7 +1150,8 @@ void loop() {
                 uint8_t c = columnEditor.editCol();
                 sampleEditOpen = true;
                 sampleEditPage.open(song.columns[c].program,
-                                    song.columns[c].name, c);
+                                    song.columns[c].name, c,
+                                    song.columns[c].sfxTuneCents);
             } else {
                 display.clear();
                 ui.drawAll();
@@ -1354,6 +1437,20 @@ void loop() {
         }
     }
 
+    // ── Row-paste confirm modal (overlay over the grid) ───────────────────────
+    if (pasteConfirmOpen) {
+        if (pasteConfirm.poll()) {
+            pasteConfirmOpen = false;
+            if (pasteConfirm.confirmed()) applyRowPaste(gPasteRow, gPasteCol);
+            // Selection deliberately KEPT — the same run is usually pasted to
+            // several places.  Tap a selected cell's gap to clear it.
+            display.clear();
+            ui.drawAll();
+            display.paintLater();
+        }
+        return;
+    }
+
     // ── Handle touch ──────────────────────────────────────────────────────────
     TouchResult t = handler.poll();
 
@@ -1494,6 +1591,25 @@ void loop() {
             ui.toggleVelCapture();
             needsStatusRedraw = true;
             break;
+
+        case TouchAction::GAP_TAP:
+            // Mark/extend the row selection (source of a copy).
+            ui.rowSelGapTap(t.row, t.col);
+            needsGridRedraw = true;
+            break;
+
+        case TouchAction::CELL_HOLD:
+            // Long-press a cell with a selection active → confirm, then paste
+            // the selected rows starting here.
+            if (ui.hasRowSel()) {
+                gPasteRow = t.row;
+                gPasteCol = t.col;
+                pasteConfirm.open("Paste selected rows?");
+                pasteConfirm.draw();
+                display.paintLater();
+                pasteConfirmOpen = true;
+            }
+            return;
 
         case TouchAction::CELL_TAP:
             // Only open note editor when server is stopped — while playing, a tap

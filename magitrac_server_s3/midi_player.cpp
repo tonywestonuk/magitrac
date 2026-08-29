@@ -280,6 +280,70 @@ static inline const Song* seqSong() {
     return reinterpret_cast<const Song*>(srvActiveBuf + sizeof(SongFileHeader));
 }
 
+// ── MIDI clock out (24 PPQN) ──────────────────────────────────────────────────
+// Emits 0xF8 timing clock at the live tempo while a clock-enabled song plays,
+// bracketed by 0xFA (Start) / 0xFC (Stop) so external gear follows the
+// performer.  Transport also tracks WAITs: a WAIT that TIMES OUT halts the
+// clock (0xFC), and the next row to play "starts the block again" and
+// re-Starts it (0xFA) — so a slaved drum machine drops out when the performer
+// misses a cue and re-locks to their downbeat when they return.  A WAIT the
+// performer resolves in time is seamless (clock never stops).
+// micros()-based so the average rate is drift-free (integer 2500/bpm ms would
+// run ~4% fast).  Real-time bytes don't affect running status → call midiTx
+// directly and never clear seqOutStatus.  All on the MIDI task (Core 1), the
+// single midiTx producer.
+static bool     seqClockActive = false;   // 0xFA sent, pulses running
+static bool     seqClockHalted = false;   // stopped by a WAIT timeout; a row re-Starts
+static uint32_t seqClockNextUs = 0;
+
+static inline bool seqClockEnabled() {
+    const Song* s = seqSong();
+    return s && (s->flags & SONG_FLAG_MIDI_CLOCK);
+}
+
+// WAIT timed out (performer missed the cue): stop the external gear and arm a
+// re-Start for whenever the block plays again.
+static void seqClockOnWaitTimeout() {
+    if (seqClockActive) { midiTx(0xFC); seqClockActive = false; }
+    if (seqClockEnabled()) seqClockHalted = true;
+}
+
+// A row fired.  If a timeout had halted us, the block has started again →
+// re-Start (0xFA).  Normal rows (not halted) are a cheap no-op.
+static void seqClockOnRowPlayed() {
+    if (seqClockHalted && seqClockEnabled()) {
+        midiTx(0xFA);
+        seqClockActive = true;
+        seqClockHalted = false;
+        seqClockNextUs = micros();
+    }
+}
+
+void sequencerMidiClockTick() {
+    if (!seqClockEnabled() || !seqRunning) {   // disabled / stopped → ensure Stop
+        if (seqClockActive) { midiTx(0xFC); seqClockActive = false; }
+        seqClockHalted = false;
+        return;
+    }
+    if (!seqClockActive) {
+        if (seqClockHalted) return;            // timed-out WAIT — await a row-play
+        midiTx(0xFA);                          // song start, or enabled mid-play
+        seqClockActive = true;
+        seqClockNextUs = micros();
+    }
+    uint16_t bpm = seqCurrentBPM ? seqCurrentBPM : 120;
+    uint32_t periodUs = 2500000UL / bpm;       // 60e6 / (bpm * 24) = one 1/24 note
+    uint32_t nowUs = micros();
+    if ((int32_t)(nowUs - seqClockNextUs) >= 0) {
+        midiTx(0xF8);                          // Timing Clock
+        seqClockNextUs += periodUs;
+        // Fell more than a period behind (tempo jump / task stall)? resync to
+        // now instead of bursting a run of catch-up pulses.
+        if ((int32_t)(nowUs - seqClockNextUs) >= (int32_t)periodUs)
+            seqClockNextUs = nowUs + periodUs;
+    }
+}
+
 // Chan sentinels marking a column as playing a sample (SFX) or the onboard
 // organ.  Distinct from any real 0..15 midi channel.
 #define SEQ_CHAN_SFX   0xFF
@@ -412,6 +476,8 @@ static void seqOrganApplySongPatch() {
     if (organGetLeslie()    != op.leslie)    organSetLeslie(op.leslie);
     if (organGetDrive()     != op.drive)     organSetDrive(op.drive);
     if (organGetReverb()    != op.reverb)    organSetReverb(op.reverb);
+    int voc = (op.flags & 2) ? 1 : 0;        // vocoder rides flags bit1 (no format bump)
+    if (organGetVocoder()   != voc)          organSetVocoder(voc);
 }
 
 static void seqNoteOff(int col) {
@@ -497,6 +563,7 @@ static void seqPlayRow() {
     const Song*    s   = seqSong();
     const uint16_t head = s->patterns[seqPattern].noteHead;
 
+    seqClockOnRowPlayed();      // re-Start MIDI clock if a WAIT timeout halted it
     seqA0RowOverride = false;   // fresh per row walk
 
     // Walk nodes at seqRow in list order (col 0 first, then col 1+).
@@ -1463,6 +1530,11 @@ static volatile bool    seqAudProgPending = false;
 static volatile uint8_t seqAudProgChan    = 0;
 static volatile uint8_t seqAudProgram     = 0;
 
+// Pending "flush every column's patch" request — set on song load by the
+// command/loop task, emitted on the MIDI task for the same running-status
+// reason as the audition program change above.
+static volatile bool seqColSetupPending = false;
+
 void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
                               uint8_t col) {
     // SFX: play column `col`'s sample at the raw MIDI pitch (60 = native +
@@ -1520,7 +1592,28 @@ void sequencerAuditionProgram(uint8_t channel, uint8_t program) {
     seqAudProgPending = true;
 }
 
+void sequencerSendPatchesNow() {
+    seqColSetupPending = true;
+}
+
 void sequencerRawAuditionTick() {
+    // Song just loaded — put every channel on its column's bank/program/volume
+    // now, so the performer's first notes (or a PLAY straight into a block)
+    // sound on the right patches instead of whatever the previous song left.
+    // Skipped while running or previewing: those paths own the cache and are
+    // already sending their own setup at block boundaries.  Runs on the MIDI
+    // task — same task seqSendColumnSetup already runs on at every block
+    // transition, so the ORGAN-column patch apply it performs is nothing new.
+    if (seqColSetupPending) {
+        seqColSetupPending = false;
+        if (srvHasActive && !seqRunning && !seqPreview) {
+            const Song* s = seqSong();
+            uint8_t pat = (s && s->startPattern < s->numPatterns) ? s->startPattern : 0;
+            seqSendColumnSetup(pat, /*force=*/true);
+            seqOutStatus = 0;
+        }
+    }
+
     // Emit any pending program change first so the kit is selected before the
     // next note.  A program change leaves the synth in PC running status, so
     // reset seqOutStatus to force a fresh status byte on the following note —
@@ -1767,6 +1860,7 @@ static void sequencerTickBody() {
             seqNextRowMs    = now;
             seqHaveLastSnap = false;
             seqReposition(0);
+            seqClockOnWaitTimeout();   // stop external gear; a row-play re-Starts it
             if (seqRowCallback) seqRowCallback(seqPattern, seqRow);
         }
         // else: silently waiting — no spam

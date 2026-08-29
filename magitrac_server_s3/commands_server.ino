@@ -147,6 +147,9 @@ static bool srvInstLoadPending   = false;
 // feedback_internal_ram_budget).  Allocated in commandsInit.
 uint8_t* srvActiveBuf     = nullptr;
 uint32_t srvActiveBufLen  = 0;
+// False when srvActiveBuf could not be allocated at all — every path that
+// writes a Song through that pointer must bail rather than fault.
+bool     srvBufOk         = false;
 static char     srvActiveName[SRV_FNAME_MAX] = {};  // filename (with .mgt)
 bool     srvHasActive     = false;
 
@@ -206,7 +209,7 @@ static uint8_t srvListPendingPage   = 0;
 static bool    srvRestoreActive          = false;
 static bool    srvRestoreFinaliseNeeded  = false;
 static bool    srvRestoreIsInstruments   = false;
-static char    srvRestoreName[SRV_FNAME_MAX] = {};
+static char    srvRestoreName[BK_FNAME_MAX] = {};
 static uint8_t srvRestoreTotal   = 0;
 static uint8_t srvRestoreGot     = 0;
 static File    srvRestoreFile;
@@ -342,10 +345,30 @@ static void sdPowerCycle() {
 void commandsInit() {
     // Active-song buffer in PSRAM (internal fallback so a bad PSRAM day
     // still boots — the wrong-board incident proved that can happen).
+    // Report what the PSRAM chip actually gave us before asking for any of it —
+    // a dead or unconfigured PSRAM reads as size 0 here, which is the one fact
+    // that distinguishes "bad hardware" from "heap merely full".
+    Serial.printf("[CMD] PSRAM: %u bytes total, %u free\n",
+                  (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram());
+
     srvActiveBuf = (uint8_t*)heap_caps_malloc(SRV_SONG_XFER_MAX, MALLOC_CAP_SPIRAM);
     if (!srvActiveBuf) {
         srvActiveBuf = (uint8_t*)malloc(SRV_SONG_XFER_MAX);
         Serial.println("[CMD] srvActiveBuf: PSRAM alloc FAILED — using internal");
+    }
+    // Both allocators can fail (dead PSRAM *and* a tight internal heap).  Every
+    // song path casts this buffer straight to a Song* and writes through it, so
+    // a null here is not a degraded mode — it is a StoreProhibited panic on the
+    // first load, with the song list still working because it needs no buffer.
+    // Every other PSRAM site in this sketch already degrades gracefully; this
+    // one has to as well.
+    srvBufOk = (srvActiveBuf != nullptr);
+    if (!srvBufOk) {
+        Serial.printf("[CMD] srvActiveBuf: ALLOC FAILED for %u bytes — "
+                      "song load/save DISABLED (internal free=%u, largest=%u)\n",
+                      (unsigned)SRV_SONG_XFER_MAX,
+                      (unsigned)ESP.getFreeHeap(),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     }
 
     sdPowerCycle();                                // real Vcc cycle: unwedge the card
@@ -385,6 +408,13 @@ static int srvNameCmp(const void* a, const void* b) {
     return strcasecmp((const char*)a, (const char*)b);
 }
 
+// Shared scratch for a full /songs enumeration.  Every user below (list, load,
+// load-local) is deferred to the loop task, so they never run concurrently and
+// a single static buffer is race-free — and at SRV_MAX_SONGS entries it is too
+// big (~3 KB) to want on the loop-task stack.  Same "one task only" rationale
+// as the backup path's static names[] buffer.
+static char srvSongScratch[SRV_MAX_SONGS][SRV_FNAME_MAX];
+
 // ── List .mgt files in /songs ──────────────────────────────────────────────────
 // Returns names sorted alphabetically (case-insensitive) so every paginated
 // list the client assembles is in a stable, sorted order.
@@ -421,8 +451,8 @@ int srvListSongs(char names[][SRV_FNAME_MAX], int maxFiles) {
 
 // ── Send song list page to client ──────────────────────────────────────────────
 static void sendSongList(uint8_t page) {
-    char files[SRV_MAX_FILES][SRV_FNAME_MAX];
-    int total = srvListSongs(files, SRV_MAX_FILES);
+    char (*files)[SRV_FNAME_MAX] = srvSongScratch;
+    int total = srvListSongs(files, SRV_MAX_SONGS);
 
     int totalPages = total > 0 ? (total + SL_PER_PKT - 1) / SL_PER_PKT : 1;
     if (page >= totalPages) page = totalPages - 1;
@@ -612,6 +642,10 @@ static void sendSampleList(uint8_t page) {
 // This handles legacy v7..v16 files transparently — the client always
 // receives a current-version payload regardless of the on-disk format.
 static void sendSongDataFromPath(const char* path, const char* displayName) {
+    if (!srvBufOk) {
+        Serial.println("[CMD] load ignored — no song buffer (see PSRAM report at boot)");
+        return;
+    }
     // Explicit load is the user's "discard draft" path.
     // Clear the autosave draft for:
     //   (a) the song being loaded — they asked for the canonical /songs/
@@ -707,15 +741,20 @@ static void sendSongDataFromPath(const char* path, const char* displayName) {
 }
 
 static void sendSongData(uint8_t page, uint8_t index) {
-    char files[SRV_MAX_FILES][SRV_FNAME_MAX];
-    int total = srvListSongs(files, SRV_MAX_FILES);
+    char (*files)[SRV_FNAME_MAX] = srvSongScratch;
+    int total = srvListSongs(files, SRV_MAX_SONGS);
 
     int fileIdx = (int)page * SL_PER_PKT + (int)index;
     if (fileIdx < 0 || fileIdx >= total) return;
 
+    // Copy the name out of the shared scratch before the send call — keeps this
+    // independent of whether sendSongDataFromPath ever re-enumerates.
+    char name[SRV_FNAME_MAX];
+    strncpy(name, files[fileIdx], sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
     char path[48];
-    snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, files[fileIdx]);
-    sendSongDataFromPath(path, files[fileIdx]);
+    snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, name);
+    sendSongDataFromPath(path, name);
 }
 
 static void sendSongDataByName(const char* name) {
@@ -980,8 +1019,12 @@ static void applySongPatch(const MsgSetSongData* msg) {
 // ── Load song into active buffer without sending to client ────────────────────
 // Returns true if the song was loaded successfully into srvActiveBuf.
 bool srvLoadSongLocal(int listIdx) {
-    char raw[SRV_MAX_FILES][SRV_FNAME_MAX];
-    int total = srvListSongs(raw, SRV_MAX_FILES);
+    if (!srvBufOk) {
+        Serial.println("[CMD] load ignored — no song buffer (see PSRAM report at boot)");
+        return false;
+    }
+    char (*raw)[SRV_FNAME_MAX] = srvSongScratch;
+    int total = srvListSongs(raw, SRV_MAX_SONGS);
     if (listIdx < 0 || listIdx >= total) return false;
 
     char path[48];
@@ -1226,7 +1269,7 @@ static void sendInstrumentsData() {
 // SdLock serializes against SamplePlayer.  This avoids a 35 KB RAM
 // buffer that would blow DRAM on the M5 ESP32.
 static File     sMagiRestoreFile;
-static char     sMagiRestoreName[SRV_FNAME_MAX] = {};
+static char     sMagiRestoreName[BK_FNAME_MAX] = {};
 static bool     sMagiRestoreIsInstruments       = false;
 static uint32_t sMagiRestoreExpectedBytes       = 0;
 static uint32_t sMagiRestoreReceivedBytes       = 0;
@@ -1290,7 +1333,7 @@ void onMagiLinkRestoreBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
 // temp file to its destination, reloads instruments if relevant, and
 // reloads the active song if the restored file matches.
 static void finaliseMagiLinkRestore() {
-    char path[64];
+    char path[BK_FNAME_MAX + 32];
     if (sMagiRestoreIsInstruments) {
         strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
     } else {
@@ -1426,6 +1469,7 @@ static uint32_t sMagiSaveReceivedBytes       = 0;  // Song bytes received so far
 static bool     sMagiSavePending             = false;
 
 void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
+    if (!srvBufOk) return;   // nowhere to receive the song into
     if (len < sizeof(MsgSongSaveHeader)) return;
     const MsgSongSaveHeader* h = (const MsgSongSaveHeader*)msg;
     if (h->song_bytes > sizeof(Song)) {
@@ -1600,16 +1644,210 @@ static void finaliseMagiLinkSongSave() {
     crashSetPhase(CP_IDLE);   // song-push complete
 }
 
-// ── MagiLink backup — streams every /songs/*.mgt + instruments.mgt ─────────
+// ── MagiLink backup — streams the whole library (songs, instruments, ──────
+//                       drumtracks, setlists), with NO fixed capacity.
 //
 // Called from the MagiLink MSG_START_BACKUP handler (worker task context,
 // transaction mutex already held).  Sends:
 //   MsgBackupHeader, MsgBackupBody×N    ← for each file
 //   MsgEndOfData                         ← run complete
 //
-// SD reads gated by SdLock so SamplePlayer / other tasks can interleave
-// safely.  Sends are fire-and-forget — TCP backpressure paces via
+// The file list is never materialised — files are counted (pass 1, for an
+// accurate "X of Y") then streamed straight off SD (pass 2).  So the backup
+// captures EVERYTHING; the old SRV_MAX_FILES=32 array silently dropped songs
+// past the 32nd.  SD reads are gated by SdLock so SamplePlayer / other tasks
+// interleave safely; sends are fire-and-forget, TCP backpressure paces via
 // blocking peer.write in MagiLink::send.
+
+// Per-source backup filters (operate on the bare basename).
+// Common guard: skip macOS "._" AppleDouble sidecars (Finder junk) and any
+// name too long for the wire header — it would otherwise be truncated and
+// fail to open (or restore under the wrong name).
+static bool backupNameOk(const char* nm) {
+    if (nm[0] == '.' && nm[1] == '_') return false;
+    if (strlen(nm) >= BK_FNAME_MAX) {
+        Serial.printf("[BK-SRV] name too long (%u >= %u), skipped: '%s'\n",
+                      (unsigned)strlen(nm), (unsigned)BK_FNAME_MAX, nm);
+        return false;
+    }
+    return true;
+}
+static bool backupIsSong(const char* nm) {
+    if (!backupNameOk(nm)) return false;
+    int n = (int)strlen(nm);
+    return n >= 4 && nm[n-4] == '.'
+        && (nm[n-3]=='m'||nm[n-3]=='M') && (nm[n-2]=='g'||nm[n-2]=='G')
+        && (nm[n-1]=='t'||nm[n-1]=='T');
+}
+static bool backupIsDrumtrack(const char* nm) {
+    if (!backupNameOk(nm)) return false;
+    int n = (int)strlen(nm);
+    return n >= 4 && nm[n-4] == '.'
+        && (nm[n-3]=='t'||nm[n-3]=='T') && (nm[n-2]=='x'||nm[n-2]=='X')
+        && (nm[n-1]=='t'||nm[n-1]=='T');
+}
+static bool backupIsSetlist(const char* nm) {
+    if (!backupNameOk(nm)) return false;
+    int n = (int)strlen(nm);
+    bool isSet = n >= 4 && nm[n-4] == '.'
+        && (nm[n-3]=='s'||nm[n-3]=='S') && (nm[n-2]=='e'||nm[n-2]=='E')
+        && (nm[n-1]=='t'||nm[n-1]=='T');
+    return isSet || strcasecmp(nm, "master.txt") == 0;
+}
+
+// Diagnostic: print a raw name as text + hex so a corrupt directory entry
+// (non-printable bytes, lost LFN → 8.3 alias) is unmistakable on the log.
+static void backupDumpName(const char* tag, const char* nm, uint32_t size, bool match) {
+    bool clean = true;
+    for (const char* c = nm; *c; c++) if (*c < 0x20 || *c > 0x7E) { clean = false; break; }
+    Serial.printf("[BK-SRV] %s '%s' len=%u size=%u match=%d%s",
+                  tag, nm, (unsigned)strlen(nm), (unsigned)size, match ? 1 : 0,
+                  clean ? "" : " NONPRINTABLE hex=");
+    if (!clean) for (const char* c = nm; *c; c++) Serial.printf("%02X", (uint8_t)*c);
+    Serial.println();
+}
+
+// Pass 1: count matching files in `dir` (0 if it isn't a directory).
+static uint16_t backupCountDir(const char* dir, bool (*pred)(const char*)) {
+    uint16_t c = 0;
+    SdLock _;
+    File d = SD.open(dir);
+    if (!d || !d.isDirectory()) { if (d) d.close(); return 0; }
+    for (;;) {
+        File e = d.openNextFile();
+        if (!e) break;
+        if (!e.isDirectory()) {
+            const char* nm = e.name();
+            const char* sl = strrchr(nm, '/'); if (sl) nm = sl + 1;
+            bool m = pred(nm);
+            backupDumpName("count", nm, (uint32_t)e.size(), m);
+            if (m) c++;
+        } else {
+            Serial.printf("[BK-SRV] count subdir '%s' (skipped)\n", e.name());
+        }
+        e.close();
+    }
+    d.close();
+    Serial.printf("[BK-SRV] count dir %s -> %u\n", dir, (unsigned)c);
+    return c;
+}
+
+// Stream one file (header + body chunks).  Returns false only on a wire
+// failure; a local open failure is non-fatal (skips the body — the client
+// tolerates a header followed straight by the next header).
+static uint16_t sBkFileFailures = 0;   // open/size/read failures (non-fatal to the stream)
+
+static bool backupStreamOne(const char* name, const char* fullPath,
+                            uint32_t size, uint16_t index, uint16_t total) {
+    MsgBackupHeader hdr;
+    memset(hdr.filename, 0, sizeof(hdr.filename));
+    strncpy(hdr.filename, name, sizeof(hdr.filename) - 1);
+    hdr.file_size  = size;
+    hdr.file_index = index;
+    hdr.file_total = total;
+    if (!gMagiLink.send(&hdr, sizeof(hdr))) {
+        Serial.printf("[BK-SRV] header send failed at file %u\n", (unsigned)index);
+        return false;
+    }
+
+    File f;
+    { SdLock _; f = SD.open(fullPath); }
+    if (!f) {
+        sBkFileFailures++;
+        Serial.printf("[BK-SRV] file %u/%u OPEN FAILED '%s' (dir said size=%u)\n",
+                      (unsigned)index, (unsigned)total, fullPath, (unsigned)size);
+        return true;   // skip body, keep the run going
+    }
+    uint32_t openSize;
+    { SdLock _; openSize = (uint32_t)f.size(); }
+    if (openSize != size)
+        sBkFileFailures++;
+        Serial.printf("[BK-SRV] file %u/%u SIZE MISMATCH dir=%u open=%u '%s'\n",
+                      (unsigned)index, (unsigned)total, (unsigned)size,
+                      (unsigned)openSize, fullPath);
+    sStreamBody.id = MSG_BACKUP_BODY;   // song push may have left another id
+    bool ok = true;
+    uint32_t sent = 0;
+    uint32_t t0 = millis();
+    while (ok && sent < size) {
+        uint32_t want = size - sent;
+        if (want > sizeof(sStreamBody.data)) want = sizeof(sStreamBody.data);
+        int got;
+        { SdLock _; got = f.read(sStreamBody.data, want); }
+        if (got <= 0) {
+            sBkFileFailures++;
+            Serial.printf("[BK-SRV] file %u/%u READ FAILED got=%d at %u/%u '%s'\n",
+                          (unsigned)index, (unsigned)total, got,
+                          (unsigned)sent, (unsigned)size, fullPath);
+            break;
+        }
+        if ((uint32_t)got < want)
+            Serial.printf("[BK-SRV] file %u/%u short read want=%u got=%d at %u\n",
+                          (unsigned)index, (unsigned)total, (unsigned)want, got,
+                          (unsigned)sent);
+        sStreamBody.data_len = (uint16_t)got;
+        ok = gMagiLink.send(&sStreamBody, sizeof(sStreamBody));
+        if (!ok)
+            Serial.printf("[BK-SRV] body send failed at file %u sent=%u\n",
+                          (unsigned)index, (unsigned)sent);
+        sent += got;
+    }
+    { SdLock _; f.close(); }
+    Serial.printf("[BK-SRV] file %u/%u %s sent=%u/%u in %ums '%s'\n",
+                  (unsigned)index, (unsigned)total,
+                  sent == size ? "ok" : "INCOMPLETE",
+                  (unsigned)sent, (unsigned)size, (unsigned)(millis() - t0), name);
+    return ok;
+}
+
+// Pass 2: stream every matching file in `dir` (paths built as dir/name),
+// advancing *idx.  The directory handle stays open across the per-file sends
+// — the same open-across-SdLock-windows pattern backupStreamOne uses for the
+// body, so no in-memory file list is ever needed.
+static bool backupStreamDir(const char* dir, bool (*pred)(const char*),
+                            uint16_t total, uint16_t* idx) {
+    File d;
+    { SdLock _; d = SD.open(dir); }
+    if (!d || !d.isDirectory()) { if (d) { SdLock _; d.close(); } return true; }
+    bool ok = true;
+    for (;;) {
+        char name[BK_FNAME_MAX];
+        uint32_t size = 0;
+        bool have = false, end = false;
+        {
+            SdLock _;
+            File e = d.openNextFile();
+            if (!e) {
+                end = true;
+            } else {
+                if (!e.isDirectory()) {
+                    const char* nm = e.name();
+                    const char* sl = strrchr(nm, '/'); if (sl) nm = sl + 1;
+                    bool m = pred(nm);
+                    backupDumpName("stream", nm, (uint32_t)e.size(), m);
+                    if (m) {
+                        strncpy(name, nm, sizeof(name) - 1);
+                        name[sizeof(name) - 1] = '\0';
+                        size = (uint32_t)e.size();
+                        have = true;
+                    }
+                }
+                e.close();
+            }
+        }
+        if (end) break;
+        if (have) {
+            char full[BK_FNAME_MAX + 32];
+            snprintf(full, sizeof(full), "%s/%s", dir, name);
+            (*idx)++;
+            ok = backupStreamOne(name, full, size, *idx, total);
+            if (!ok) break;
+        }
+    }
+    { SdLock _; d.close(); }
+    return ok;
+}
+
 void sendBackupToClient() {
     if (!srvSdOk) {
         Serial.println("[BK-SRV] SD not available — sending bare END_OF_DATA");
@@ -1618,165 +1856,40 @@ void sendBackupToClient() {
         return;
     }
 
-    // Step 1: enumerate files (one SdLock window, kept tight).
-    // names/sizes/body are static — they're large (~2 KB combined) and
-    // sendBackupToClient is only ever called from one task at a time,
-    // so static keeps the worker task's stack usage low.
-    static char     names[SRV_MAX_FILES][SRV_FNAME_MAX];
-    static uint32_t sizes[SRV_MAX_FILES];
-    uint16_t count = 0;
-    {
-        SdLock _;
-        File d = SD.open(SRV_SONGS_DIR);
-        if (d && d.isDirectory()) {
-            while (count < SRV_MAX_FILES) {
-                File entry = d.openNextFile();
-                if (!entry) break;
-                if (!entry.isDirectory()) {
-                    const char* nm = entry.name();
-                    if (nm && strstr(nm, ".mgt")) {
-                        strncpy(names[count], nm, SRV_FNAME_MAX - 1);
-                        names[count][SRV_FNAME_MAX - 1] = '\0';
-                        sizes[count] = (uint32_t)entry.size();
-                        count++;
-                    }
-                }
-                entry.close();
-            }
-            d.close();
-        }
-        // Add instruments.mgt at the end.
-        if (count < SRV_MAX_FILES && SD.exists(SRV_INSTRUMENTS_PATH)) {
-            File ins = SD.open(SRV_INSTRUMENTS_PATH);
-            if (ins) {
-                strncpy(names[count], "instruments.mgt", SRV_FNAME_MAX - 1);
-                names[count][SRV_FNAME_MAX - 1] = '\0';
-                sizes[count] = (uint32_t)ins.size();
-                count++;
-                ins.close();
-            }
-        }
-        // Append every /drumtracks/*.txt (including gm_map.txt — it's a
-        // legitimate part of the user's drum-import config).  The client
-        // restore path routes by extension: .mgt → /songs/, .txt → /drumtracks/.
-        File dt = SD.open(SRV_DRUMTRACKS_DIR);
-        if (dt && dt.isDirectory()) {
-            while (count < SRV_MAX_FILES) {
-                File entry = dt.openNextFile();
-                if (!entry) break;
-                if (!entry.isDirectory()) {
-                    const char* nm = entry.name();
-                    const char* sl = nm ? strrchr(nm, '/') : nullptr;
-                    if (sl) nm = sl + 1;
-                    int nlen = nm ? (int)strlen(nm) : 0;
-                    if (nlen >= 4 && (nm[nlen-4] == '.')
-                        && (nm[nlen-3] == 't' || nm[nlen-3] == 'T')
-                        && (nm[nlen-2] == 'x' || nm[nlen-2] == 'X')
-                        && (nm[nlen-1] == 't' || nm[nlen-1] == 'T')) {
-                        strncpy(names[count], nm, SRV_FNAME_MAX - 1);
-                        names[count][SRV_FNAME_MAX - 1] = '\0';
-                        sizes[count] = (uint32_t)entry.size();
-                        count++;
-                    }
-                }
-                entry.close();
-            }
-            dt.close();
-        }
-        // Append every /setlists/*.set plus the master.txt catalog so the
-        // performer's setlists travel with the backup.  Restore routes .set →
-        // /setlists by extension, and master.txt → /setlists by name.
-        File sld = SD.open(SRV_SETLISTS_DIR);
-        if (sld && sld.isDirectory()) {
-            while (count < SRV_MAX_FILES) {
-                File entry = sld.openNextFile();
-                if (!entry) break;
-                if (!entry.isDirectory()) {
-                    const char* nm = entry.name();
-                    const char* sl = nm ? strrchr(nm, '/') : nullptr;
-                    if (sl) nm = sl + 1;
-                    int nlen = nm ? (int)strlen(nm) : 0;
-                    bool isSet = (nlen >= 4 && (nm[nlen-4] == '.')
-                        && (nm[nlen-3] == 's' || nm[nlen-3] == 'S')
-                        && (nm[nlen-2] == 'e' || nm[nlen-2] == 'E')
-                        && (nm[nlen-1] == 't' || nm[nlen-1] == 'T'));
-                    bool isMaster = (nm && strcasecmp(nm, "master.txt") == 0);
-                    if (isSet || isMaster) {
-                        strncpy(names[count], nm, SRV_FNAME_MAX - 1);
-                        names[count][SRV_FNAME_MAX - 1] = '\0';
-                        sizes[count] = (uint32_t)entry.size();
-                        count++;
-                    }
-                }
-                entry.close();
-            }
-            sld.close();
-        }
+    // Pass 1 — count so each header carries an accurate "X of Y".  Same
+    // sources, same order as the streaming pass below.
+    uint16_t total = 0;
+    sBkFileFailures = 0;
+    total += backupCountDir(SRV_SONGS_DIR, backupIsSong);
+    { SdLock _; if (SD.exists(SRV_INSTRUMENTS_PATH)) total++; }
+    total += backupCountDir(SRV_DRUMTRACKS_DIR, backupIsDrumtrack);
+    total += backupCountDir(SRV_SETLISTS_DIR, backupIsSetlist);
+    Serial.printf("[BK-SRV] sending %u files\n", (unsigned)total);
+
+    // Pass 2 — stream everything, in the same order the count visited it.
+    // The client restore routes each file back by extension: .mgt → /songs
+    // (instruments.mgt → root), .txt → /drumtracks, .set → /setlists.
+    uint16_t idx = 0;
+    bool ok = backupStreamDir(SRV_SONGS_DIR, backupIsSong, total, &idx);
+    if (ok) {                                   // instruments.mgt (root)
+        uint32_t isz = 0; bool exists = false;
+        { SdLock _; File ins = SD.open(SRV_INSTRUMENTS_PATH);
+          if (ins) { exists = true; isz = (uint32_t)ins.size(); ins.close(); } }
+        if (exists) { idx++; ok = backupStreamOne("instruments.mgt",
+                                    SRV_INSTRUMENTS_PATH, isz, idx, total); }
     }
-    Serial.printf("[BK-SRV] sending %u files\n", (unsigned)count);
+    if (ok) ok = backupStreamDir(SRV_DRUMTRACKS_DIR, backupIsDrumtrack, total, &idx);
+    if (ok) ok = backupStreamDir(SRV_SETLISTS_DIR, backupIsSetlist, total, &idx);
 
-    // Step 2: send each file as header + N×body.
-    // Use the shared sStreamBody buffer.  Set id explicitly since song
-    // push may have left it as MSG_SONG_PUSH_BODY.
-    sStreamBody.id = MSG_BACKUP_BODY;
-
-    bool ok = true;
-    for (uint16_t i = 0; i < count && ok; i++) {
-        MsgBackupHeader hdr;
-        memset(hdr.filename, 0, sizeof(hdr.filename));
-        strncpy(hdr.filename, names[i], sizeof(hdr.filename) - 1);
-        hdr.file_size  = sizes[i];
-        hdr.file_index = (uint16_t)(i + 1);
-        hdr.file_total = count;
-        ok = gMagiLink.send(&hdr, sizeof(hdr));
-        if (!ok) {
-            Serial.printf("[BK-SRV] header send failed at file %u\n", (unsigned)i);
-            break;
-        }
-
-        // Open the file.  Path depends on extension (same mapping as restore):
-        // instruments.mgt → root, .txt → /drumtracks, .set → /setlists,
-        // everything else → /songs.
-        char path[80];
-        if (strcmp(names[i], "instruments.mgt") == 0) {
-            strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
-        } else {
-            snprintf(path, sizeof(path), "%s/%s",
-                     backupDirForName(names[i]), names[i]);
-        }
-        path[sizeof(path) - 1] = '\0';
-
-        File f;
-        { SdLock _; f = SD.open(path); }
-        if (!f) {
-            Serial.printf("[BK-SRV] open failed '%s'\n", path);
-            continue;
-        }
-
-        // Stream body chunks.
-        uint32_t sent = 0;
-        while (ok && sent < sizes[i]) {
-            uint32_t want = sizes[i] - sent;
-            if (want > sizeof(sStreamBody.data)) want = sizeof(sStreamBody.data);
-            int got;
-            { SdLock _; got = f.read(sStreamBody.data, want); }
-            if (got <= 0) break;
-            sStreamBody.data_len = (uint16_t)got;
-            ok = gMagiLink.send(&sStreamBody, sizeof(sStreamBody));
-            if (!ok) {
-                Serial.printf("[BK-SRV] body send failed at file %u sent=%u\n",
-                              (unsigned)i, (unsigned)sent);
-                break;
-            }
-            sent += got;
-        }
-        { SdLock _; f.close(); }
-    }
-
-    // Step 3: end-of-data marker.
+    if (idx != total)
+        Serial.printf("[BK-SRV] COUNT/STREAM MISMATCH counted=%u streamed=%u\n",
+                      (unsigned)total, (unsigned)idx);
     MsgEndOfData eod;
     gMagiLink.send(&eod, sizeof(eod));
-    Serial.printf("[BK-SRV] backup done (ok=%d)\n", ok ? 1 : 0);
+    if (sBkFileFailures) ok = false;        // a backup with unreadable files is not OK
+    Serial.printf("[BK-SRV] backup done (ok=%d) streamed=%u/%u failed=%u free=%u\n",
+                  ok ? 1 : 0, (unsigned)idx, (unsigned)total,
+                  (unsigned)sBkFileFailures, (unsigned)ESP.getFreeHeap());
 }
 
 // ── Reload the active song from SD into srvActiveBuf and push to client ──────
@@ -1856,7 +1969,7 @@ static void finaliseRestore() {
         if (srvRestoreFile) srvRestoreFile.close();
         return;
     }
-    char path[48];
+    char path[BK_FNAME_MAX + 32];
     if (srvRestoreIsInstruments) {
         strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
     } else {
@@ -1999,6 +2112,7 @@ void commandsTick() {
                           srvLoadByNameStr, millis());
             sequencerStop();
             sequencerReset();
+            sequencerSendPatchesNow();   // patches up before the first note
             int matchIdx = -1;
             for (int i = 0; i < numSongs; i++) {
                 if (strcmp(songNames[i], srvLoadByNameStr) == 0) {
@@ -2025,6 +2139,7 @@ void commandsTick() {
                           fileIdx, millis());
             sequencerStop();
             sequencerReset();
+            sequencerSendPatchesNow();   // patches up before the first note
             // Sync the server display cursor to the song the client just loaded
             int newCursor = fileIdx + SONG_IDX_OFFSET;
             if (newCursor < 0) newCursor = 0;
@@ -2309,6 +2424,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 else if (m->op == ORGAN_OP_PARAM)     organSetParam(m->index, m->value);
                 else if (m->op == ORGAN_OP_PROCSEL)   organSetProcSound(m->value);
                 else if (m->op == ORGAN_OP_REVERB)    organSetReverb(m->value);
+                else if (m->op == ORGAN_OP_VOCODER)   organSetVocoder(m->value);
             }
             break;
 

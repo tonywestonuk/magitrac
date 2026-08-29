@@ -51,16 +51,19 @@ static const int SP_MIDI_PLUS_X  = 825;
 static const int SP_MIDI_BTN_W   = 75;
 static const int SP_MIDI_BTN_H   = 38;
 
-// ── WIFI section ──────────────────────────────────────────────────────────────
-// Single button — opens the dedicated WiFiSettingsPage which owns the
-// SSID/PSK/mode/channel controls.
+// ── NETWORK section ───────────────────────────────────────────────────────────
+// Two buttons: WIFI opens the dedicated WiFiSettingsPage (SSID/PSK/mode/
+// channel); PAIR starts the server pairing ceremony (moved off the boot menu —
+// it's a one-off setup action, not something you reach for mid-gig).
 static const int SP_WIFI_LBL_Y = SP_MIDI_Y + SP_NUM_MIDI * SP_MIDI_ROW_H;  // 430
 static const int SP_WIFI_LBL_H = 20;
 static const int SP_WIFI_Y     = SP_WIFI_LBL_Y + SP_WIFI_LBL_H;            // 450
 static const int SP_WIFI_ROW_H = 50;
 static const int SP_WIFI_BTN_H = 38;
 static const int SP_WIFI_PAGE_X = 590;
-static const int SP_WIFI_PAGE_W = 360;
+static const int SP_WIFI_PAGE_W = 175;
+static const int SP_PAIR_X      = 775;
+static const int SP_PAIR_W      = 175;
 
 // ── Global MIDI limits (persisted via NVS) ────────────────────────────────────
 // Loaded on boot, saved when changed on SettingsPage.
@@ -87,7 +90,8 @@ public:
 
     void open();
     void draw();
-    // Returns:  0 = stay open,  1 = HOME tapped,  2 = WiFi page requested.
+    // Returns:  0 = stay open,  1 = HOME tapped,  2 = WiFi page requested,
+    //           3 = pairing ceremony requested.
     int  poll();
 
 private:
@@ -123,5 +127,6 @@ private:
     int  hitMidiMinus(int sx, int sy) const;
     int  hitMidiPlus(int sx, int sy) const;
     bool hitWifiPageBtn(int sx, int sy) const;
+    bool hitPairBtn(int sx, int sy) const;
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

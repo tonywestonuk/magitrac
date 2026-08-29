@@ -17,7 +17,7 @@
 //   y=248  ├─ VOL row (60px) ─────────────────────────────────────────────────┤
 //   y=308  ├─ TRANS row (60px) ───────────────────────────────────────────────┤
 //   y=368  ├─ NAME row (60px) — name value at left, [PICK INSTR] in right gap ┤
-//   y=428  ├─ Action bar: [CLEAR COL] [COPY TO COL...] [SWAP WITH COL...] ───┤
+//   y=428  ├─ Action bar: [CLEAR COL] [COPY] [PASTE] [IMPORT DRUMS] ─────────┤
 //   y=488  └─ (gap / overlays) ──────────────────────────────────────────────┘
 
 static const int CE_W = 960;
@@ -60,7 +60,7 @@ static const int CE_LIST_PREV_X = 0;
 static const int CE_LIST_NEXT_X = CE_W - 130;
 static const int CE_LIST_NAV_W  = 130;
 
-// Action bar (bottom): CLEAR / COPY / SWAP / IMPORT buttons (4 across)
+// Action bar (bottom): CLEAR / COPY / PASTE / IMPORT buttons (4 across)
 static const int CE_ACT_Y       = 428;
 static const int CE_ACT_H       = 60;
 static const int CE_ACT_BTN_H   = 50;
@@ -112,7 +112,12 @@ public:
     uint8_t editPattern() const { return _patIdx; }
     uint8_t editCol()     const { return _col; }
 
-    // After COPY/SWAP, returns a bitmask of column indices that need full
+    // After PASTE, the current (pattern, col)'s notes changed — the caller
+    // resyncs just that block's cells (settings ride patchPending()).
+    bool     pasteNotesPending() const { return _pasteNotesPending; }
+    void     clearPasteNotes()         { _pasteNotesPending = false; }
+
+    // After CLEAR, returns a bitmask of column indices that need full
     // (settings + notes across all patterns) resync to the server.  Caller
     // dispatches the syncing and then calls clearResync().
     uint32_t resyncMask() const { return _resyncMask; }
@@ -145,17 +150,15 @@ private:
     int     _pickPage;      // 0-based page of instrument / sample list
     KeyboardPopup _keyboard;
 
-    // COPY / SWAP destination-picker + confirm overlay
+    // Confirm overlays (destructive PASTE / CLEAR).
     enum class Action : uint8_t {
         NONE,
-        PICK_COPY_DST,
-        PICK_SWAP_DST,
-        CONFIRM_COPY,
+        CONFIRM_PASTE,
         CONFIRM_CLEAR,
         PICK_SAMPLE,
     };
     Action   _action;
-    uint8_t  _actionDst;    // remembered destination column for CONFIRM_COPY
+    bool     _pasteNotesPending = false;  // paste changed this block's notes
     uint32_t _resyncMask;   // bits of columns whose settings + notes need resync
     bool     _importRequested = false;
     bool     _sampleEditRequested = false;
@@ -175,20 +178,16 @@ private:
     void drawPickButton();
     void drawPickList();               // instrument list overlay
     void drawPickSampleList();         // sample list overlay (SFX columns)
-    void drawActionBar();              // COPY / SWAP buttons (bottom of normal view)
-    void drawColumnPicker();           // overlay: pick destination column
-    void drawCopyConfirm();            // overlay: confirm destructive copy
+    void drawActionBar();              // COPY / PASTE buttons (bottom of normal view)
+    void drawPasteConfirm();           // overlay: confirm destructive paste
     void drawClearConfirm();           // overlay: confirm destructive clear
 
-    // Returns target col (1..MAX_COLUMNS-1) for a tap inside the column
-    // picker grid, or -1 if the tap missed (or hit the current column).
-    int  hitColumnPicker(int sx, int sy) const;
-
-    // Apply COPY src → dst (overwrites dst settings + notes in every pattern).
-    void doCopyColumn(uint8_t srcCol, uint8_t dstCol);
-
-    // Apply SWAP between two columns (settings + notes across patterns).
-    void doSwapColumn(uint8_t a, uint8_t b);
+    // COPY: capture the current column's settings + this block's notes into a
+    // static clipboard that survives closing/reopening the editor.
+    void copyToClip();
+    // PASTE: overwrite the current column's settings + this block's notes from
+    // the clipboard, and flag the block's notes for resync.
+    void pasteFromClip();
 
     // Reset col to default settings and delete all its notes (every pattern).
     void doClearColumn(uint8_t col);

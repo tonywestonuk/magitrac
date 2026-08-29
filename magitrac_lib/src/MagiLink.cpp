@@ -336,6 +336,16 @@ bool MagiLink::send(const void* msg, size_t len) {
         if (w <= 0) {
             if (!_impl->peer.connected() ||
                 (millis() - lastProgressMs) > SEND_TIMEOUT_MS) {
+                // A stalled send means the peer stopped draining its socket —
+                // and if any bytes of this message already went out, the wire
+                // now carries a half-frame the receiver cannot resync from
+                // (framing is bare id+len+payload).  Either way the socket is
+                // in a bad state: kill it so both ends tear down and the
+                // normal reconnect path re-establishes a clean stream.  No
+                // app-level retry — the connect edge is the recovery path.
+                Serial.printf("[LINK] send stalled/failed (%u/%u bytes) — dropping connection\n",
+                              (unsigned)off, (unsigned)len);
+                _impl->peer.stop();
                 if (weAcquired) releaseMutex();
                 return false;
             }

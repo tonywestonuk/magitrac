@@ -48,6 +48,18 @@ void SongConfigPage::drawHeader() {
     _d.print(title);
 
     uiButton(_d, SC_HOME_X, 0, SC_HOME_W, SC_HDR_H, "HOME", COL_BLACK, COL_WHITE, 3);
+
+    drawMidiClockBtn();
+}
+
+// MIDI clock output toggle (per-song).  Explicit ON/OFF text + colour so it
+// reads on the black header: lit white when on, dim grey when off.
+void SongConfigPage::drawMidiClockBtn() {
+    bool on = (_song.flags & SONG_FLAG_MIDI_CLOCK) != 0;
+    uiButton(_d, SC_CLK_X, SC_CLK_Y, SC_CLK_W, SC_CLK_H,
+             on ? "MIDI CLK ON" : "MIDI CLK OFF",
+             on ? COL_WHITE  : COL_DKGREY,
+             on ? COL_BLACK  : COL_WHITE, 2);
 }
 
 // ── Sub-page 0: BPM + MIDI IN + SLOT ENABLE ──────────────────────────────────
@@ -314,6 +326,15 @@ bool SongConfigPage::poll() {
 
         if (hitHome(sx, sy)) return true;
 
+        // MIDI clock toggle (header, falling edge)
+        if (hitMidiClock(sx, sy)) {
+            _song.flags ^= SONG_FLAG_MIDI_CLOCK;
+            drawMidiClockBtn();
+            _patchPending = true;
+            _d.paintLater();
+            return false;
+        }
+
         // NOTE LOW / NOTE HIGH row tap → open picker
         for (int f = 1; f <= 2; f++) {
             int rowY = SC_MI_Y + f * SC_MI_ROW_H;
@@ -362,6 +383,10 @@ bool SongConfigPage::poll() {
 
 bool SongConfigPage::hitHome(int sx, int sy) const {
     return (sx >= SC_HOME_X && sx < SC_HOME_X + SC_HOME_W && sy >= 0 && sy < SC_HDR_H);
+}
+
+bool SongConfigPage::hitMidiClock(int sx, int sy) const {
+    return (sx >= SC_CLK_X && sx < SC_CLK_X + SC_CLK_W && sy >= 0 && sy < SC_HDR_H);
 }
 
 int SongConfigPage::hitRowMinus(int baseY, int rowH, int numRows, int sx, int sy) const {

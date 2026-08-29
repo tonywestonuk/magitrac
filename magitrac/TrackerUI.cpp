@@ -365,6 +365,51 @@ bool TrackerUI::hitMuteButton(int tx, int ty, int8_t& col) const {
     return true;
 }
 
+// ── Row copy/paste selection ─────────────────────────────────────────────────
+
+void TrackerUI::clearRowSel() {
+    _rsState = 0;
+    _rsCol = _rsAnchor = _rsLo = _rsHi = -1;
+}
+
+void TrackerUI::rowSelGapTap(int8_t row, int8_t col) {
+    // Tapping an already-selected cell clears the selection.  A selection now
+    // survives a paste (so it can be pasted repeatedly), so this is the way
+    // out of one.
+    if (_rsState >= 1 && col == _rsCol && row >= _rsLo && row <= _rsHi &&
+        _rsPat == _engine.currentPattern()) {
+        clearRowSel();
+        return;
+    }
+    _rsPat = _engine.currentPattern();   // selection belongs to the viewed block
+    if (_rsState == 1 && col == _rsCol) {
+        // Second tap in the same column → contiguous range anchor..row.
+        _rsLo = (row < _rsAnchor) ? row : _rsAnchor;
+        _rsHi = (row > _rsAnchor) ? row : _rsAnchor;
+        _rsState = 2;
+    } else {
+        // Fresh anchor (first tap, new column, or after a completed range).
+        _rsCol = col; _rsAnchor = row; _rsLo = row; _rsHi = row; _rsState = 1;
+    }
+}
+
+bool TrackerUI::hitGridGap(int tx, int ty, int8_t& row, int8_t& col) const {
+    if (tx < ROW_NUM_W || tx >= DISPLAY_W)       return false;
+    if (ty < GRID_Y    || ty >= GRID_Y + GRID_H) return false;
+    int vcol = (tx - ROW_NUM_W) / COL_W;
+    if (vcol < 0 || vcol >= VISIBLE_COLUMNS) return false;
+    int cxLeft = ROW_NUM_W + vcol * COL_W;
+    if (tx < cxLeft + GAP_START_X) return false;   // left of the gap strip
+    int vi  = (ty - GRID_Y) / ROW_H;
+    int pat = topRow() + vi;
+    int c   = _colOffset + vcol;
+    if (pat < 0 || pat >= _song.patterns[_engine.currentPattern()].length) return false;
+    if (c < 0 || c >= MAX_COLUMNS) return false;
+    row = (int8_t)pat;
+    col = (int8_t)c;
+    return true;
+}
+
 bool TrackerUI::hitColumnHeader(int tx, int ty, int8_t& col, bool inclInput) const {
     if (ty < CHAN_HDR_Y || ty >= CHAN_HDR_Y + COL_HDR_H) return false;
     if (tx < ROW_NUM_W) return false;
@@ -461,6 +506,20 @@ void TrackerUI::drawRow(int vi, int patRow) {
             } else {
                 uint8_t fg = reader ? (isInput ? COL_BLACK : COL_WHITE) : COL_BLACK;
                 drawCell(cx + 10, y + TEXT_PAD_Y, n, fg, !isInput);
+            }
+        }
+
+        // Row-select marker: a filled dot in the source column's gap for every
+        // row in the selection — only in the block the selection was made in.
+        if (_rsState >= 1 && _rsPat == _engine.currentPattern() &&
+            patRow >= _rsLo && patRow <= _rsHi) {
+            int vcol = _rsCol - _colOffset;
+            if (vcol >= 0 && vcol < VISIBLE_COLUMNS) {
+                int gx = ROW_NUM_W + vcol * COL_W + GAP_START_X;
+                int dw = COL_W - GAP_START_X;          // gap width
+                int dot = 14;
+                _d.fillRect(gx + (dw - dot) / 2, y + (ROW_H - dot) / 2, dot, dot,
+                            reader ? COL_WHITE : COL_BLACK);
             }
         }
     }

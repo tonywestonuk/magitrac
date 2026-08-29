@@ -66,6 +66,11 @@ int  organGetLeslie();
 int  organGetDrive();
 int  organGetReverb();
 
+// Vocoder: the organ voices become the carrier, the mic the modulator, so the
+// held chord "sings" whatever is spoken/sung into the mic.  0=off, 1=on.
+void organSetVocoder(int v);
+int  organGetVocoder();
+
 // Per-type knob params (0..8).  Meaning depends on the active type:
 // TONEWHEEL [0]=click;  NEBULA [0]=detune, [1]=glide, [2]=bright;
 // PROC = the selected sound's sliders, up to 5 (see PROC_SOUNDS in

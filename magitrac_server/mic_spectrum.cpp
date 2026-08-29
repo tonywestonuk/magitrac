@@ -32,6 +32,14 @@
 
 extern void pixelpostEnqueue(const uint8_t* payload, size_t len);
 
+// PixelPost is compiled out (see pixelpost_send.ino) and pixelpost_proto.h no
+// longer defines the per-event message types, so keep the two this file used
+// as locals.  The enqueue is a no-op and spectrumInit() is never called, so
+// this whole task is dead code — retained only so restoring the lights is a
+// one-line change rather than a rewrite.
+#define PP_MSG_BEAT      0x06
+#define PP_MSG_SPECTRUM  0x07
+
 // Heap-allocated in startMic / freed in stopMic.  10 KB total (4 KB each
 // for vReal/vImag floats + 2 KB for the int16 sample buffer) — kept off
 // BSS so they cost nothing while the mic is idle.

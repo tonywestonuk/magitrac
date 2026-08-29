@@ -24,6 +24,12 @@
 static const int SC_HDR_H       = 50;
 static const int SC_HOME_X      = 830;
 static const int SC_HOME_W      = 130;
+// MIDI-clock toggle sits on the LEFT of the header (clear of the centred title
+// and the right-edge HOME).  Dim when off, lit white when on.
+static const int SC_CLK_X       = 15;
+static const int SC_CLK_Y       = 6;
+static const int SC_CLK_W       = 230;
+static const int SC_CLK_H       = SC_HDR_H - 12;
 
 // ── BPM section ───────────────────────────────────────────────────────────────
 static const int SC_BPM_LBL_Y   = SC_HDR_H;
@@ -102,6 +108,7 @@ private:
 
     void drawPage0();
     void drawHeader();
+    void drawMidiClockBtn();
     void drawBpmSection();
     void drawBpmRow(int field);
     void drawMidiInSection();
@@ -119,6 +126,7 @@ private:
 
     void fireHeld();
     bool hitHome      (int sx, int sy) const;
+    bool hitMidiClock (int sx, int sy) const;
     int  hitRowMinus  (int baseY, int rowH, int numRows, int sx, int sy) const;
     int  hitRowPlus   (int baseY, int rowH, int numRows, int sx, int sy) const;
     int  hitSlot      (int sx, int sy) const;

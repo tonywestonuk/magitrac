@@ -222,8 +222,14 @@ struct Song {
     uint16_t   transposeChMask;    // bit n = MIDI channel (n+1) follows performer transpose; default 0xFDFF (all except ch 10)
     PerfPadConfig perfPads[PERF_PAD_COUNT];  // performance mode pad config
     OrganPatch organ;              // one-organ-per-song patch (v20+; flags=0 in older songs)
-    uint8_t    _songPad[1];        // reserved, write as 0
+    uint8_t    flags;              // SONG_FLAG_* bits (was _songPad, always 0 in
+                                   // older songs → reads as all-off; no format
+                                   // bump).  LAST tail byte: the next new field
+                                   // needs a real SONG_FILE_VERSION bump.
 };
+
+// Song::flags bits.
+#define SONG_FLAG_MIDI_CLOCK 0x01  // emit 24-PPQN MIDI clock (+ Start/Stop) while playing
 
 // ── Helper functions ──────────────────────────────────────────────────────────
 

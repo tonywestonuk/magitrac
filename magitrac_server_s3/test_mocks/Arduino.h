@@ -8,6 +8,7 @@
 typedef unsigned char byte;
 
 uint32_t millis();
+static inline uint32_t micros() { return millis() * 1000u; }
 static inline void delay(uint32_t /*ms*/) {}
 
 class HardwareSerial {

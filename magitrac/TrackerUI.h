@@ -63,6 +63,11 @@ static const int MENU_BTN_W = 140;
 // Mute button in column header (right edge of each output column)
 static const int MUTE_BTN_W = 34;   // touch target width (right edge of column)
 
+// Row-select gap: the strip between a cell's effect text (ends ~col+256) and
+// the next column.  A quick tap here marks rows for copy; long-press a cell
+// pastes.  ~44px wide.
+static const int GAP_START_X = 256;   // px from a column's left edge
+
 // ── Drag thresholds (used by TouchHandler) ────────────────────────────────────
 static const int AXIS_LOCK_PX = 20;  // deadzone before axis is committed
 static const int COL_DRAG_PX  = 80;  // horizontal pixels to shift one column
@@ -118,6 +123,20 @@ public:
     void    setColOffset(uint8_t offset);
     uint8_t colOffset()     const { return _colOffset; }
 
+    // ── Row copy/paste selection (gap-tap source; long-press cell = paste) ────
+    // First gap-tap marks an anchor row; a second tap in the SAME column selects
+    // the contiguous range between them.  A tap in a new column (or after a
+    // completed range) starts a fresh anchor.
+    void   rowSelGapTap(int8_t row, int8_t col);
+    bool   hasRowSel() const { return _rsState >= 1; }
+    void   clearRowSel();
+    int8_t  rsCol() const { return _rsCol; }
+    int8_t  rsLo()  const { return _rsLo; }
+    int8_t  rsHi()  const { return _rsHi; }
+    uint8_t rsPat() const { return _rsPat; }   // source block of the selection
+    // True + fills row/col if a grid touch landed in a column's right-edge gap.
+    bool   hitGridGap(int tx, int ty, int8_t& row, int8_t& col) const;
+
     // MIDI step-input target column — last output column (1+) edited via note editor
     void    setMidiInputCol(uint8_t col);
     uint8_t midiInputCol() const { return _midiInputCol; }
@@ -158,6 +177,14 @@ private:
     int8_t               _selRow;
     int8_t               _selCol;
     uint8_t              _colOffset;   // first visible column index (0 for MVP)
+
+    // Row-select (copy source) state.  _rsState: 0 none, 1 anchor dot, 2 range.
+    int8_t  _rsCol    = -1;
+    int8_t  _rsAnchor = -1;
+    int8_t  _rsLo     = -1;
+    int8_t  _rsHi     = -1;
+    uint8_t _rsPat    = 0;    // block the selection was made in (source of paste)
+    uint8_t _rsState  = 0;
     uint8_t              _midiInputCol; // MIDI step-input target (1+ = output col)
     uint8_t              _stepAdvance;  // rows to advance after MIDI step-input (1–4)
     bool                 _editMode;     // true = MIDI step-input writes to channel
@@ -177,6 +204,11 @@ private:
     void stampEmptyCell(int x, int y);  // memcpy pre-rendered cell into framebuffer
 
     // Pre-rendered empty cell (white bg + "--- -- -----" at TEXT_SIZE 4), built once.
+    // 12 KB pre-rendered empty cell, kept in INTERNAL RAM on purpose: it is a
+    // hot render cache (stampEmptyCell memcpys it per empty cell, every grid
+    // redraw incl. drag-scroll).  PSRAM here thrashes against the 507 KB
+    // framebuffer writes and slows rendering — the fast-source memcpy is the
+    // whole point of the cache.  (Cold caches go to PSRAM; this one doesn't.)
     uint8_t _emptyCellCache[COL_W * ROW_H];
     bool    _emptyCellCached;
 

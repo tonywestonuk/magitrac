@@ -10,6 +10,8 @@ HexpadPopup::HexpadPopup(EPD_PainterAdafruit& display, GT911_Lite& touch)
     , _open(false)
     , _done(false)
     , _cleared(false)
+    , _chooseReq(false)
+    , _showChoose(false)
     , _wasDown(false)
     , _swallowLift(false)
     , _numDigits(0)
@@ -22,10 +24,12 @@ HexpadPopup::HexpadPopup(EPD_PainterAdafruit& display, GT911_Lite& touch)
 }
 
 void HexpadPopup::open(uint8_t hi, uint8_t lo, uint8_t numDigits, const char* title,
-                       bool fingerDown) {
+                       bool fingerDown, bool showChoose) {
     _open    = true;
     _done    = false;
     _cleared = false;
+    _chooseReq   = false;
+    _showChoose  = showChoose;
     _wasDown     = fingerDown;
     _swallowLift = fingerDown;
     _maxDigits = (numDigits == 2) ? 2 : 4;
@@ -111,6 +115,18 @@ void HexpadPopup::drawTextField() {
     int tw = pos * 24;
     _d.setCursor((HP_W - tw) / 2, HP_FIELD_H / 2 + 4);
     _d.print(formatted);
+
+    // CHOOSE button (right side of the header) — opens the effect picker.
+    if (_showChoose) {
+        _d.fillRect(HP_CHOOSE_X, HP_CHOOSE_Y, HP_CHOOSE_W, HP_CHOOSE_H, COL_WHITE);
+        _d.drawRect(HP_CHOOSE_X, HP_CHOOSE_Y, HP_CHOOSE_W, HP_CHOOSE_H, COL_WHITE);
+        _d.setTextSize(3);
+        _d.setTextColor(COL_BLACK);
+        int lw = 6 * 18;   // "CHOOSE"
+        _d.setCursor(HP_CHOOSE_X + (HP_CHOOSE_W - lw) / 2,
+                     HP_CHOOSE_Y + (HP_CHOOSE_H - 24) / 2);
+        _d.print("CHOOSE");
+    }
 }
 
 void HexpadPopup::drawKey(int x, int y, int w, int h, const char* label) {
@@ -134,6 +150,19 @@ static uint8_t hexVal(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return 0;
+}
+
+// Parse the typed digits (right-justified within _maxDigits) into the result.
+void HexpadPopup::parseResult() {
+    char padded[5] = {'0','0','0','0','\0'};
+    int offset = _maxDigits - _numDigits;
+    for (int i = 0; i < _numDigits; i++)
+        padded[offset + i] = _digits[i];
+
+    _resultEffect = (hexVal(padded[0]) << 4) | hexVal(padded[1]);
+    _resultParam  = (_maxDigits == 2)
+                    ? 0
+                    : ((hexVal(padded[2]) << 4) | hexVal(padded[3]));
 }
 
 // ── Poll ─────────────────────────────────────────────────────────────────────
@@ -181,24 +210,25 @@ bool HexpadPopup::poll() {
             }
             if (col == 3) {
                 // SET — parse digits, right-justified within _maxDigits.
-                char padded[5] = {'0','0','0','0','\0'};
-                int offset = _maxDigits - _numDigits;
-                for (int i = 0; i < _numDigits; i++)
-                    padded[offset + i] = _digits[i];
-
-                if (_maxDigits == 2) {
-                    _resultEffect = (hexVal(padded[0]) << 4) | hexVal(padded[1]);
-                    _resultParam  = 0;
-                } else {
-                    _resultEffect = (hexVal(padded[0]) << 4) | hexVal(padded[1]);
-                    _resultParam  = (hexVal(padded[2]) << 4) | hexVal(padded[3]);
-                }
+                parseResult();
                 _cleared = false;
                 _done    = true;
                 _open    = false;
                 return true;
             }
             return false;
+        }
+
+        // CHOOSE button (header) — hand back to the caller to open the picker.
+        if (_showChoose &&
+            sy >= HP_CHOOSE_Y && sy < HP_CHOOSE_Y + HP_CHOOSE_H &&
+            sx >= HP_CHOOSE_X && sx < HP_CHOOSE_X + HP_CHOOSE_W) {
+            parseResult();          // seed effect()/param() with what's typed
+            _chooseReq = true;
+            _done      = false;
+            _cleared   = false;
+            _open      = false;
+            return true;
         }
 
         // Hex key rows (rows 1-4)

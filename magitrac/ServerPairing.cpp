@@ -49,6 +49,12 @@ static void onPairRecv(const uint8_t* data, int len) {
 void ServerPairing::begin() {
     if (!_songBuf) _songBuf = new uint8_t[SONG_TRANSFER_MAX]();
     if (!_instBuf) _instBuf = new uint8_t[MAX_INSTRUMENTS * sizeof(Instrument)]();
+    // List caches to PSRAM (ps_malloc forces it — under the 4 KB new→PSRAM
+    // threshold).  Control-rate, and guarded null-safe at the population sites.
+    if (!_sampleCache)
+        _sampleCache = (SampleCacheEntry*)ps_malloc(SAMPLE_CACHE_MAX * sizeof(SampleCacheEntry));
+    if (!_fileListNames)
+        _fileListNames = (char(*)[FILE_NAME_LEN])ps_malloc(FILE_LIST_CACHE_MAX * FILE_NAME_LEN);
     if (_ready) return;
 
     // Load existing pairing (server MAC + secret).
@@ -1237,7 +1243,7 @@ void ServerPairing::_onMagiLinkSampleList(const uint8_t* msg, size_t len) {
     _sampleTotal      = r->totalEntries;
 
     int n = r->count <= SAMPLES_PER_PKT ? r->count : SAMPLES_PER_PKT;
-    for (int i = 0; i < n && _sampleCount < SAMPLE_CACHE_MAX; i++) {
+    for (int i = 0; i < n && _sampleCount < SAMPLE_CACHE_MAX && _sampleCache; i++) {
         _sampleCache[_sampleCount].id = r->entries[i].id;
         strncpy(_sampleCache[_sampleCount].name,
                 r->entries[i].name, SAMPLE_NAME_LEN - 1);
@@ -1270,7 +1276,7 @@ void ServerPairing::_onMagiLinkFileList(const uint8_t* msg, size_t len) {
     _fileListTotalPages = r->totalPages > 0 ? r->totalPages : 1;
 
     int n = r->count <= FILE_LIST_PER_PKT ? r->count : FILE_LIST_PER_PKT;
-    for (int i = 0; i < n && _fileListCount < FILE_LIST_CACHE_MAX; i++) {
+    for (int i = 0; i < n && _fileListCount < FILE_LIST_CACHE_MAX && _fileListNames; i++) {
         strncpy(_fileListNames[_fileListCount], r->names[i], FILE_NAME_LEN - 1);
         _fileListNames[_fileListCount][FILE_NAME_LEN - 1] = '\0';
         _fileListCount++;

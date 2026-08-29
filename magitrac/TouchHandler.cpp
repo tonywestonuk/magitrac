@@ -17,6 +17,8 @@ TouchHandler::TouchHandler(GT911_Lite& touch, TrackerUI& ui,
     , _dragStartColOffset(0)
     , _wasDown(false)
     , _suppressTap(false)
+    , _startInGap(false)
+    , _cellHoldArmed(false)
     , _holdStart(0)
     , _holdFired(false)
     , _lastDragY(0)
@@ -86,6 +88,20 @@ TouchResult TouchHandler::poll() {
         return result;
     }
 
+    // Grid-cell long-press → paste (only armed when a row selection exists and
+    // the sequencer is stopped; see the rising edge).  Same hand-off as above.
+    if (_state == TouchState::DRAG_UNDECIDED && _cellHoldArmed &&
+        !_holdFired && millis() - _holdStart >= 500) {
+        result.action = TouchAction::CELL_HOLD;
+        result.row    = _dragStartRow;
+        result.col    = _dragStartCol;
+        _state     = TouchState::IDLE;
+        _wasDown   = false;
+        _holdFired = false;
+        DBG("[TOUCH] -> CELL_HOLD row=%d col=%d\n", _dragStartRow, _dragStartCol);
+        return result;
+    }
+
     if (!_touch.read()) return result;
 
     bool down = _touch.isTouched;
@@ -112,14 +128,20 @@ TouchResult TouchHandler::poll() {
                 DBGLN("[TOUCH] -> button fired");
             }
         } else if (_state == TouchState::DRAG_UNDECIDED) {
-            if (!_suppressTap) {
+            if (_suppressTap) {
+                DBGLN("[TOUCH] -> tap suppressed (was stopping inertia)");
+            } else if (_startInGap) {
+                result.action = TouchAction::GAP_TAP;   // row-select mark
+                result.row    = _dragStartRow;
+                result.col    = _dragStartCol;
+                DBG("[TOUCH] -> GAP_TAP  row=%d  col=%d\n",
+                    _dragStartRow, _dragStartCol);
+            } else {
                 result.action = TouchAction::CELL_TAP;
                 result.row    = _dragStartRow;
                 result.col    = _dragStartCol;
                 DBG("[TOUCH] -> CELL_TAP  row=%d  col=%d\n",
                     _dragStartRow, _dragStartCol);
-            } else {
-                DBGLN("[TOUCH] -> tap suppressed (was stopping inertia)");
             }
         } else if (_state == TouchState::DRAG_VERTICAL) {
             // Use the rolling velocity tracked during drag — GT911 up-event coords
@@ -178,6 +200,15 @@ TouchResult TouchHandler::poll() {
             _dragVel            = 0.0f;
             _lastDragY          = ty;
             _lastDragTime       = millis();
+            // Row copy/paste (stopped only, so the play-mode press stays a pure
+            // pause/scrub gesture): a tap in the gap marks rows; a hold on a
+            // cell pastes when a selection is active.
+            bool stopped = !_ui.serverPlaying();
+            int8_t grow, gcol;
+            _startInGap    = stopped && _ui.hitGridGap(tx, ty, grow, gcol);
+            _cellHoldArmed = stopped && _ui.hasRowSel();
+            _holdStart     = millis();
+            _holdFired     = false;
             DBG("[TOUCH] -> grid touch  row=%d  col=%d  colOffset=%d\n",
                 row, col, _ui.colOffset());
             return result;

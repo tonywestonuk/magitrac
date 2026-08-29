@@ -6,6 +6,7 @@
 #include "HexpadPopup.h"
 #include "HoldRepeat.h"
 #include "PixelPostPicker.h"
+#include "EffectPicker.h"
 
 // ── Full-screen popup layout (960×540) ───────────────────────────────────────
 //
@@ -140,6 +141,9 @@ private:
     // Pixel-post picker (only opened for PIXELPOST_CHANNEL columns)
     PixelPostPicker _picker;
 
+    // Scrollable effect/command picker (output MIDI columns) — CHOOSE button
+    EffectPicker _fxpicker;
+
     // Hold-repeat for velocity +/-
     HoldRepeat _hold;
 
@@ -154,7 +158,7 @@ private:
     void drawOctaveButtons();
     void drawInstControl();
     void drawVelocity();
-    void drawAttrButton();
+    void drawAttrButton(int ax, int aw);
     void drawInputOptions();
     void drawActionButtons();
 

@@ -259,7 +259,7 @@ void SettingsPage::drawWifiSection() {
     _d.setTextSize(2);
     _d.setTextColor(COL_BLACK);
     _d.setCursor(10, SP_WIFI_LBL_Y + (SP_WIFI_LBL_H - 16) / 2);
-    _d.print("WIFI");
+    _d.print("NETWORK");
 
     int btnY = SP_WIFI_Y + (SP_WIFI_ROW_H - SP_WIFI_BTN_H) / 2;
     _d.fillRect(0, SP_WIFI_Y, SP_W, SP_WIFI_ROW_H, COL_WHITE);
@@ -268,16 +268,24 @@ void SettingsPage::drawWifiSection() {
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
     _d.setCursor(SP_LABEL_X, SP_WIFI_Y + (SP_WIFI_ROW_H - 24) / 2);
-    _d.print("NETWORK");
+    _d.print("SERVER LINK");
 
     uiButton(_d, SP_WIFI_PAGE_X, btnY, SP_WIFI_PAGE_W, SP_WIFI_BTN_H,
-             "WIFI SETTINGS...", COL_BLACK, COL_WHITE, 2);
+             "WIFI...", COL_BLACK, COL_WHITE, 2);
+    uiButton(_d, SP_PAIR_X, btnY, SP_PAIR_W, SP_WIFI_BTN_H,
+             "PAIR SERVER", COL_BLACK, COL_WHITE, 2);
 }
 
 bool SettingsPage::hitWifiPageBtn(int sx, int sy) const {
     int btnY = SP_WIFI_Y + (SP_WIFI_ROW_H - SP_WIFI_BTN_H) / 2;
     if (sy < btnY || sy >= btnY + SP_WIFI_BTN_H) return false;
     return sx >= SP_WIFI_PAGE_X && sx < SP_WIFI_PAGE_X + SP_WIFI_PAGE_W;
+}
+
+bool SettingsPage::hitPairBtn(int sx, int sy) const {
+    int btnY = SP_WIFI_Y + (SP_WIFI_ROW_H - SP_WIFI_BTN_H) / 2;
+    if (sy < btnY || sy >= btnY + SP_WIFI_BTN_H) return false;
+    return sx >= SP_PAIR_X && sx < SP_PAIR_X + SP_PAIR_W;
 }
 
 // ── Hit tests — MIDI rows ─────────────────────────────────────────────────
@@ -364,6 +372,7 @@ int SettingsPage::poll() {
 
         if (hitHome(sx, sy)) return 1;
         if (hitWifiPageBtn(sx, sy)) return 2;
+        if (hitPairBtn(sx, sy)) return 3;
 
         if (hitTime(sx, sy)) {
             _editing = 1;

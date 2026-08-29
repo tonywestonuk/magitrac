@@ -54,6 +54,9 @@ static const int FB_MAX_ITEMS = 64;
 static const int FB_LROW_H           = FB_ROW_H;                        // 54
 static const int FB_LIST_ROWS        = (FB_FOOT_Y - FB_LIST_Y) / FB_LROW_H; // 7
 static const int FB_LIST_DRAG_THRESH = 12;
+// Swipe-left on a list row reveals a per-row DEL button (iOS-style).
+static const int FB_SWIPE_THRESH     = 55;    // px leftward to reveal DEL
+static const int FB_ROWDEL_W         = 150;   // DEL button width on a revealed row
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
@@ -144,6 +147,26 @@ private:
     int   _dragStartY;
     int   _dragStartScroll;
     bool  _dragMoved;
+
+    // Inertia (fling) — same model as the tracker grid: fractional-row position
+    // + rows/sec velocity, exp-decayed (INERTIA_DECAY / INERTIA_MIN_VEL).
+    float    _scrollF;        // fractional _scroll (coast truth; round → _scroll)
+    float    _inertiaVel;     // rows/sec, signed like a _scroll delta
+    bool     _inertiaActive;
+    uint32_t _inertiaMs;      // last coast tick
+    int      _velSampleY;     // drag velocity sampling: last sy
+    uint32_t _velSampleMs;    //                         last time
+    bool     _suppressTap;    // finger-down cancelled a coast → don't select
+    void coastInertia();      // advance the fling one tick (finger-up frames)
+
+    // Swipe-to-delete: a horizontal left-swipe on a row reveals its DEL button;
+    // vertical scroll (or a tap elsewhere) hides it.  Replaces the list's
+    // old header DEL-mode toggle (grid mode still uses _altMode).
+    int   _dragStartX;        // press x (horizontal-swipe detection)
+    int   _gestureDir;        // 0 undecided, 1 vertical scroll, 2 horizontal
+    int   _pressRow;          // abs item index under the press (-1 = none)
+    int   _swipeItem;         // abs item index showing DEL, -1 = none
+    bool  hitRowDel(int sx, int sy) const;   // tap on the revealed row's DEL
 
     void drawHeader ();
     void drawToolbar();

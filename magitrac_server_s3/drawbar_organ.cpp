@@ -84,6 +84,88 @@ static volatile int s_drive     = 0;   // 0..1
 static volatile int s_reverb    = 0;   // 0..2
 static volatile bool s_sustain  = false;   // damper pedal (MIDI CC64) held
 
+// ── Vocoder ────────────────────────────────────────────────────────────────────
+// Classic channel vocoder: the mic (modulator) is split into N log-spaced bands;
+// each band's amplitude envelope gates the SAME band of the organ (carrier), so
+// the held chord "speaks/sings" the mic.  Bandpass biquads are RBJ BPF (0 dB peak
+// gain), one coefficient set per band shared by the modulator + carrier filters.
+// A sibilance path injects filtered noise so consonants (s/t/f) come through.
+// Runs in float (the FX chain already does); only when both organ + vocoder on.
+#define VOC_BANDS 16
+static const float VOC_F_LO = 180.0f, VOC_F_HI = 7000.0f, VOC_Q = 5.0f;
+static const float VOC_ATK  = 0.030f, VOC_REL = 0.0030f;  // env one-pole coefs (fast up / slow down)
+static float s_vocGain = 3.2f;    // makeup loudness — ear-tune knob
+static float s_vocSib  = 1.5f;    // sibilance/noise amount — ear-tune knob
+
+static volatile bool s_vocoder = false;
+static int16_t s_micBlock[BLOCK_FRAMES * 2];   // modulator block (LEFT = mic), full-duplex
+
+// b1 = 0 for a BPF, so store only b0(=-b2), a1, a2.
+static float voc_b0[VOC_BANDS], voc_a1[VOC_BANDS], voc_a2[VOC_BANDS];
+static float voc_mx1[VOC_BANDS], voc_mx2[VOC_BANDS], voc_my1[VOC_BANDS], voc_my2[VOC_BANDS];
+static float voc_cx1[VOC_BANDS], voc_cx2[VOC_BANDS], voc_cy1[VOC_BANDS], voc_cy2[VOC_BANDS];
+static float voc_env[VOC_BANDS];
+static float voc_hpLp = 0.0f, voc_sibEnv = 0.0f;
+static uint32_t voc_rng = 0x1357BD13u;
+
+static void vocoderReset() {
+    for (int b = 0; b < VOC_BANDS; b++) {
+        voc_mx1[b]=voc_mx2[b]=voc_my1[b]=voc_my2[b]=0.0f;
+        voc_cx1[b]=voc_cx2[b]=voc_cy1[b]=voc_cy2[b]=0.0f;
+        voc_env[b]=0.0f;
+    }
+    voc_hpLp = 0.0f; voc_sibEnv = 0.0f;
+}
+
+static void vocoderInit() {
+    for (int b = 0; b < VOC_BANDS; b++) {
+        float f0 = VOC_F_LO * powf(VOC_F_HI / VOC_F_LO, (float)b / (VOC_BANDS - 1));
+        float w0 = 2.0f * PI * f0 / AUDIO_CODEC_RATE_HZ;
+        float alpha = sinf(w0) / (2.0f * VOC_Q);
+        float a0 = 1.0f + alpha;
+        voc_b0[b] = alpha / a0;                 // b2 = -b0, b1 = 0
+        voc_a1[b] = (-2.0f * cosf(w0)) / a0;
+        voc_a2[b] = (1.0f - alpha) / a0;
+    }
+    vocoderReset();
+}
+
+static inline float vocBiquad(float x, int b, float& x1, float& x2, float& y1, float& y2) {
+    float y = voc_b0[b] * (x - x2) - voc_a1[b] * y1 - voc_a2[b] * y2;   // b1=0, b2=-b0
+    x2 = x1; x1 = x; y2 = y1; y1 = y;
+    return y;
+}
+
+// carrier = organ sample, mod = mic sample (both int, int16-ish range).
+static int32_t vocoderProcess(int32_t carrier, int32_t mod) {
+    float c = (float)carrier, m = (float)mod;
+    float acc = 0.0f;
+    for (int b = 0; b < VOC_BANDS; b++) {
+        float mbp = vocBiquad(m, b, voc_mx1[b], voc_mx2[b], voc_my1[b], voc_my2[b]);
+        float a = fabsf(mbp);
+        float e = voc_env[b];
+        e += (a - e) * ((a > e) ? VOC_ATK : VOC_REL);   // fast attack, slow release
+        voc_env[b] = e;
+        float cbp = vocBiquad(c, b, voc_cx1[b], voc_cx2[b], voc_cy1[b], voc_cy2[b]);
+        acc += cbp * e;
+    }
+    float out = acc * (s_vocGain / 32768.0f);           // env is ~amplitude → normalise
+
+    // Sibilance: highpass the mic, follow its envelope, inject white noise so
+    // unvoiced consonants (which have no pitch for the bands to track) come through.
+    voc_hpLp += (m - voc_hpLp) * 0.35f;                 // ~3 kHz corner
+    float hp = m - voc_hpLp;
+    float sa = fabsf(hp);
+    voc_sibEnv += (sa - voc_sibEnv) * ((sa > voc_sibEnv) ? 0.05f : 0.004f);
+    voc_rng = voc_rng * 1664525u + 1013904223u;
+    float noise = (float)((int16_t)(voc_rng >> 16));
+    out += noise * voc_sibEnv * (s_vocSib / 32768.0f);
+
+    if (out >  32767.0f) out =  32767.0f;
+    if (out < -32768.0f) out = -32768.0f;
+    return (int32_t)out;
+}
+
 // Per-type knob params (0..8 each).  Meaning depends on the active type:
 //  TONEWHEEL: [0]=click.   NEBULA: [0]=detune, [1]=glide, [2]=bright.
 //  PROC: the selected sound's sliders (5 fit — no drawbars in that mode).
@@ -114,7 +196,12 @@ static const char* const ORGAN_TYPE_NAMES[ORGAN_TYPE_COUNT] =
 // PROC type: hand-written procedural generators (see proc_sounds.cpp) — no
 // drawbars; the client picks a sound from a list and its param sliders map to
 // s_param.  Each voice reads a per-voice morphed wavetable rebuilt per block.
-static int16_t s_voiceScratch[ORGAN_VOICES][PROC_WT];   // current morphed wavetable per voice
+// alignas(4): the THX sound reinterprets each voice's scratch row as a ThxVoice
+// (which has uint32 members) to avoid a second 24 KB buffer — needs 4-byte
+// alignment, and each 2048-byte row then stays aligned.
+alignas(4) static int16_t s_voiceScratch[ORGAN_VOICES][PROC_WT];   // current morphed wavetable per voice
+static_assert(sizeof(ThxVoice) <= sizeof(s_voiceScratch[0]),
+              "ThxVoice must fit inside one voice scratch row");
 static int32_t s_procLp   = 0;    // BRIGHT one-pole state (global, PROC only)
 static volatile int s_procSel = 0;    // selected procedural sound
 
@@ -198,8 +285,15 @@ static void voiceStart(Voice& v, uint8_t note) {
     v.stage     = ENV_ATTACK;
     v.sustained = 0;
     if (s_type == ORGAN_PROC) {
-        if (v.proc.rng == 0) v.proc.rng = 0x1234567u ^ (note * 2654435761u);
-        procNoteOn(s_procSel, v.proc, midiHz(note), s_param);
+        if (s_procSel == PROC_IDX_THX) {
+            int vi = (int)(&v - voices);   // this voice's index → its scratch row
+            ThxVoice* tv = (ThxVoice*)s_voiceScratch[vi];
+            if (tv->rng == 0) tv->rng = 0x1234567u ^ (note * 2654435761u);
+            thxNoteOn(*tv, midiHz(note), s_param);
+        } else {
+            if (v.proc.rng == 0) v.proc.rng = 0x1234567u ^ (note * 2654435761u);
+            procNoteOn(s_procSel, v.proc, midiHz(note), s_param);
+        }
         v.clickEnv = 0;
         v.glideQ16 = 65536;
         return;
@@ -390,13 +484,14 @@ static void renderBlock(int16_t* out) {
     uint32_t leslieInc = (uint32_t)((double)s_leslieRate * 4294967296.0 / AUDIO_CODEC_RATE_HZ);
 
     for (int n = 0; n < BLOCK_FRAMES; n++) {
-        int32_t mix = 0;
+        int32_t mixL = 0, mixR = 0;
 
         for (int i = 0; i < ORGAN_VOICES; i++) {
             Voice& v = voices[i];
             if (v.stage == ENV_IDLE) continue;
 
-            int32_t acc = 0;
+            int32_t acc = 0, accR = 0;   // accR + vStereo used only by THX (stereo pan)
+            bool    vStereo = false;
 #if ORGAN_SINGLE_SINE
             // DEBUG: one pure sine per note — the 8' fundamental only, its
             // level set by the 8' drawbar (index 2).  Flip ORGAN_SINGLE_SINE
@@ -426,6 +521,14 @@ static void renderBlock(int16_t* out) {
                                            wtab[v.phase2[h] >> (32 - SINE_BITS)]) >> 1);
                     acc += (int32_t)s * db[h];
                 }
+            } else if (proc && procSel == PROC_IDX_THX) {
+                // THX DEEP NOTE: a converging cluster of detuned saws sharing the
+                // voice's scratch row as its ThxVoice state.  Glide advances once
+                // per block; the oscillator bank is summed per sample.
+                ThxVoice* tv = (ThxVoice*)s_voiceScratch[i];
+                if (n == 0) thxBlockPrep(*tv);
+                int32_t tl, tr; thxSampleStereo(*tv, tl, tr);
+                acc = tl * procGain; accR = tr * procGain; vStereo = true;
             } else if (proc) {
                 // PROC: rebuild this voice's morphed wavetable once per block,
                 // then the generator's oscillators read it.  Gain comes from
@@ -454,20 +557,31 @@ static void renderBlock(int16_t* out) {
                     break;
                 default: break;
             }
-            mix += (int32_t)(((int64_t)acc * v.env) >> 15);   // 64-bit: acc*env overflows int32
+            // 64-bit: acc*env overflows int32.  Centred voices apply the same
+            // value to both channels; THX carries its stereo pan in accR.
+            int32_t eL = (int32_t)(((int64_t)acc  * v.env) >> 15);
+            int32_t eR = vStereo ? (int32_t)(((int64_t)accR * v.env) >> 15) : eL;
+            mixL += eL;
+            mixR += eR;
 
             // Key click — a fast-decaying noise burst on attack, added outside
-            // the tonal envelope so it isn't swallowed by the attack ramp.
+            // the tonal envelope so it isn't swallowed by the attack ramp.  Mono.
             if (v.clickEnv > 0) {
                 v.rng = v.rng * 1664525u + 1013904223u;       // LCG noise
                 int16_t noise = (int16_t)(v.rng >> 16);
-                mix += (((int32_t)noise * v.clickEnv) >> 15) * s_param[0];   // CLICK knob
+                int32_t cn = (((int32_t)noise * v.clickEnv) >> 15) * s_param[0];   // CLICK knob
+                mixL += cn; mixR += cn;
                 v.clickEnv -= CLICK_DECAY;
                 if (v.clickEnv < 0) v.clickEnv = 0;
             }
         }
 
-        int32_t s = mix >> ORGAN_MASTER_SHIFT;
+        // Mid/side: the FX chain stays mono (processes the mid); THX's stereo pan
+        // lives in the side, re-added at the output.  Every other (centred) sound
+        // has mixL==mixR → side==0 → bit-identical to the old mono path.
+        int32_t mid  = (mixL + mixR) >> 1;
+        int32_t side = (mixL - mixR) >> 1;
+        int32_t s = mid >> ORGAN_MASTER_SHIFT;
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
 
@@ -481,6 +595,11 @@ static void renderBlock(int16_t* out) {
             if (s >  32767) s =  32767;
             if (s < -32768) s = -32768;
         }
+
+        // Vocoder: shape the organ tone (carrier) with the mic (modulator) so the
+        // held chord speaks/sings.  Placed before the spatial FX so reverb washes
+        // over the voice.  Mic = LEFT channel of the full-duplex record block.
+        if (s_vocoder) s = vocoderProcess(s, s_micBlock[2 * n]);
 
         // 1. Scanner vibrato/chorus — dry mixed with an LFO-swept fractional delay.
         if (vcOn) {
@@ -565,6 +684,9 @@ static void renderBlock(int16_t* out) {
             }
         }
 
+        // Add the stereo side (THX pan width) — dry, on top of the FX stereo.
+        int32_t sd = side >> ORGAN_MASTER_SHIFT;
+        l += sd; r -= sd;
         if (l >  32767) l =  32767;
         if (l < -32768) l = -32768;
         if (r >  32767) r =  32767;
@@ -583,6 +705,8 @@ static void organTaskFn(void*) {
     for (;;) {
         if (!s_active) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
         drainEvents();
+        // Full-duplex: grab the mic block as the vocoder modulator before render.
+        if (s_vocoder) audioCodecRecord((uint8_t*)s_micBlock, sizeof(s_micBlock));
         renderBlock(block);
         audioCodecPlay((const uint8_t*)block, sizeof(block));  // blocks → paces us
     }
@@ -634,6 +758,7 @@ void organInit() {
         s_breathPhase[h] = h * 0x20000000u;   // spread starting phases
     }
     procSoundsInit();
+    vocoderInit();
     s_evtQueue = xQueueCreate(64, sizeof(OrganEvent));
     // 6144: sized when the render path grew floats (formant biquad) + the PROC
     // noteOn path (soft-double powf) — 4096 left thin margin.
@@ -707,6 +832,17 @@ int  organGetLeslie()         { return s_leslie; }
 int  organGetDrive()          { return s_drive; }
 int  organGetReverb()         { return s_reverb; }
 
+void organSetVocoder(int v) {
+    bool on = (v != 0);
+    if (on == s_vocoder) return;
+    // vocoderReset() is race-free here: s_vocoder is still false, so the audio
+    // task isn't touching the filter state yet.  Mic bias is already on+verified
+    // from audioCodecInit(), so we don't re-touch I²C from this (command) task.
+    if (on) vocoderReset();           // clear stale filter state → no click/ring
+    s_vocoder = on;
+}
+int  organGetVocoder()        { return s_vocoder ? 1 : 0; }
+
 void organSetParam(int idx, int value) {
     if (idx < 0 || idx >= ORGAN_PARAMS) return;
     if (value < 0) value = 0;
@@ -720,6 +856,15 @@ int organGetParam(int idx) {
 }
 
 void organSetProcSound(int i) {
-    if (i >= 0 && i < PROC_SOUND_COUNT) s_procSel = i;   // applies to notes played next
+    if (i < 0 || i >= PROC_SOUND_COUNT || i == s_procSel) return;
+    // THX overlays its oscillator bank on the per-voice scratch that the other
+    // sounds use as a wavetable — so crossing the THX boundary with notes still
+    // held would reinterpret stale bytes (a loud blast).  Release sounding
+    // voices cleanly across that boundary; other switches morph in place.
+    if (i == PROC_IDX_THX || s_procSel == PROC_IDX_THX) {
+        for (int v = 0; v < ORGAN_VOICES; v++)
+            if (voices[v].stage != ENV_IDLE) voices[v].stage = ENV_RELEASE;
+    }
+    s_procSel = i;   // applies to notes played next
 }
 int organGetProcSound() { return s_procSel; }

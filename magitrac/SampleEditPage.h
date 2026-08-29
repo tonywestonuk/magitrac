@@ -53,7 +53,10 @@ public:
     SampleEditPage(EPD_PainterAdafruit& d, GT911_Lite& touch)
         : _d(d), _touch(touch) {}
 
-    void open(uint8_t sampleId, const char* name, uint8_t col);
+    // tuneCents: the column's TUNE — playback speed shifts the audition's
+    // real duration, which drives the PLAY button's auto-reset.
+    void open(uint8_t sampleId, const char* name, uint8_t col,
+              int16_t tuneCents = 0);
     bool poll();        // returns true when BACK tapped (return to ColumnEditor)
 
 private:
@@ -92,6 +95,11 @@ private:
     bool     _wasDown    = false;
     int      _dragMarker = -1;            // 0=START, 1=END while finger holds it
     bool     _dragScroll = false;
+    bool     _dragWave   = false;         // panning the view by dragging the wave
+    int      _dragAnchorX  = 0;           // finger x at grab
+    uint32_t _dragAnchorVs = 0;           // viewStart at grab
+    int16_t  _tuneCents  = 0;             // column TUNE (audition speed)
+    uint32_t _playEndMs  = 0;             // when a non-looping audition ends
     bool     _backArmed  = false;         // BACK pressed; fires on RELEASE so the
                                           // reopened ColumnEditor (HOME shares the
                                           // corner) never sees this gesture

@@ -741,7 +741,11 @@ void setup() {
     commandsInit();
     samplePlayerInit();  // SD init after WiFi/ESP-NOW is fully up
     sampleManifestSync();  // load /samples/samples.txt + register any new wavs
-    spectrumInit();        // PDM mic + FFT task (suspended until effect 13 active)
+    // spectrumInit();     // mic + FFT existed only to feed the pixelpost
+                           // SoundSpectrum effect, which is compiled out here.
+                           // Leaving it off also means the mic never claims
+                           // I²S0, so SamplePlayer never has to stop/restart
+                           // it around DAC output.
     loadSongList();  // populate list from SD
 
     // Row advance — set dirty flag; main loop sends the ESP-NOW message

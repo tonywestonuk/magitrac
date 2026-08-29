@@ -13,9 +13,16 @@
 // boot from harmonic tables measured off a reference recording, so a new
 // sound is usually just two rows of numbers + a registry entry.
 
-#define PROC_SOUND_COUNT 2
+#define PROC_SOUND_COUNT 3
 #define PROC_MAX_PARAMS  5       // PROC mode has no drawbars → room for 5 sliders
 #define PROC_WT          1024    // wavetable length (10-bit phase index)
+
+// THX DEEP NOTE is a special PROC sound: instead of the shared two-oscillator
+// wavetable voice, each held note is a whole cluster of detuned sawtooths that
+// start as a random low "mumble" and glide/converge to a stacked-octave chord
+// rooted on the note (see thx code in proc_sounds.cpp + drawbar_organ.cpp).
+#define PROC_IDX_THX 2
+#define THX_OSC      16          // sub-oscillators per THX voice (the cluster)
 
 // Slider index semantics are partly fixed by the render loop: [0] scales the
 // generator's noise (live), [2] is the global BRIGHT low-pass (live), [4] is
@@ -51,6 +58,57 @@ struct ProcVoiceState {
     uint32_t lfoInc1, lfoInc2;  // per-BLOCK phase increments, randomised per note
     int32_t  lastBreath;        // BREATH value baked into scratch (CHOIR; -1 = none)
 };
+
+// ── THX DEEP NOTE cluster voice ───────────────────────────────────────────────
+// A bank of THX_OSC sawtooth oscillators per note.  Each starts at a random
+// absolute frequency (~200-400 Hz, the iconic mumble) and glides — on its own
+// randomised timing curve — to a target on a stacked-octave chord built from
+// the played note.  A fading random detune wobble gives the "living" cluster.
+// Stored by overlaying the (otherwise unused-in-THX) per-voice s_voiceScratch
+// buffer, so it costs no extra RAM.  Sliders: [0]SWEEP [1]SPREAD [2]BRIGHT
+// (the shared PROC low-pass) [3]STACK [4]DETUNE.
+struct ThxVoice {
+    uint32_t ph[THX_OSC];         // Q32 phase per oscillator
+    uint32_t incStart[THX_OSC];   // Q32 increment at note-on (random mumble)
+    uint32_t incTarget[THX_OSC];  // Q32 increment at the settled chord
+    uint32_t incCur[THX_OSC];     // live increment (glide + wobble), read per sample
+    int32_t  wob[THX_OSC];        // smoothed per-osc detune random-walk (Q16 cents-ish)
+    uint16_t rateQ8[THX_OSC];     // per-osc glide speed (256 = nominal)
+    uint16_t ampLQ8[THX_OSC];     // per-osc LEFT gain  (constant-power pan, recomputed per block)
+    uint16_t ampRQ8[THX_OSC];     // per-osc RIGHT gain
+    // Per-osc stereo WANDER: the pan position drifts (like the freq wobble) and
+    // L/R are read at a wandering inter-channel phase offset → each oscillator
+    // swims + breathes in width independently.  Gains recomputed per block.
+    uint16_t ampBaseQ8[THX_OSC];  // base amplitude weight (pan gains derived from it)
+    uint8_t  wanderWQ8[THX_OSC];  // pan-wander width by octave (bass narrow, highs wide)
+    int32_t  panWob[THX_OSC];     // smoothed random-walk stereo POSITION (±32768)
+    int32_t  phOffWob[THX_OSC];   // smoothed random-walk driving the L/R phase offset
+    uint32_t phOff[THX_OSC];      // current inter-channel phase offset (Q32) — the "wide"
+    uint32_t glidePos;            // Q16 master convergence 0..65536
+    uint32_t glideInc;            // Q16 per-block advance (from SWEEP)
+    uint32_t rng;
+};
+
+extern int16_t gThxSaw[PROC_WT];   // band-limited sawtooth table (built at init)
+
+// Start a THX cluster for a note (rootHz = the played pitch = chord root).
+void thxNoteOn(ThxVoice& tv, float rootHz, const volatile int* param);
+// Once per block per voice: advance the convergence glide + wobble increments.
+void thxBlockPrep(ThxVoice& tv);
+
+// One STEREO THX output sample (the oscillator bank panned across L/R), int16-ish
+// scaled — the organ envelope/master gain are applied after.
+static inline void thxSampleStereo(ThxVoice& tv, int32_t& outL, int32_t& outR) {
+    int32_t l = 0, r = 0;
+    for (int j = 0; j < THX_OSC; j++) {
+        tv.ph[j] += tv.incCur[j];
+        int32_t sL = gThxSaw[tv.ph[j] >> 22];                    // LEFT read
+        int32_t sR = gThxSaw[(tv.ph[j] + tv.phOff[j]) >> 22];    // RIGHT — wandering offset
+        l += (sL * (int32_t)tv.ampLQ8[j]) >> 8;
+        r += (sR * (int32_t)tv.ampRQ8[j]) >> 8;
+    }
+    outL = l; outR = r;
+}
 
 // Build the additive frames.  Called from organInit().
 void procSoundsInit();

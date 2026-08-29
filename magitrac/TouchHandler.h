@@ -22,7 +22,9 @@ enum class TouchAction {
     COLUMN_HEADER_HOLD,// 500ms hold on column header (any col incl. 0) → open note editor page
     EDIT_MODE_TAP,     // tap on [e] edit mode toggle
     STEP_ADVANCE_TAP,  // tap on [+N] step advance button → cycle 1→2→3→4→1
-    VEL_CAPTURE_TAP    // tap on [v] velocity capture toggle
+    VEL_CAPTURE_TAP,   // tap on [v] velocity capture toggle
+    GAP_TAP,           // quick tap in a column's right-edge gap → mark rows (row/col)
+    CELL_HOLD          // 500ms hold on a grid cell (with a selection) → paste (row/col)
 };
 
 struct TouchResult {
@@ -72,6 +74,8 @@ private:
     uint8_t _dragStartColOffset;
     bool    _wasDown;
     bool    _suppressTap;    // true if finger-down cancelled inertia — tap should not open editor
+    bool    _startInGap;     // grid press landed in a column's right-edge gap
+    bool    _cellHoldArmed;  // press eligible to become CELL_HOLD (selection active, stopped)
 
     // Column-header long-press: when finger goes down on a header, capture the
     // moment; if it stays down for 500ms, fire COLUMN_HEADER_HOLD and consume

@@ -22,8 +22,12 @@ static const int OR_HOME_W   = 125;
 static const int OR_BTN_Y    = 5;
 static const int OR_BTN_H    = 40;
 
-// Top-bar tap-to-cycle buttons: [TYPE] [VIB/CHORUS] [LESLIE] [DRIVE]  ...  [HOME]
-static const int OR_FX_N     = 5;
+// Top bar (6 tappable slots): [TYPE] [fx] [fx] [fx] [FX n/N page] [HOME].
+// Slot 0 is the voice TYPE (always shown); slots 1..3 show one PAGE of effects;
+// slot 4 cycles the effect page.  Effects are paged so the bar doesn't get
+// crowded as more are added.
+static const int OR_FX_N        = 5;   // tappable header slots left of HOME (0..4)
+static const int OR_FX_PER_PAGE = 3;   // effects shown per page (slots 1..3)
 static const int OR_FX_X0    = 12;
 static const int OR_FX_W     = 155;
 static const int OR_FX_GAP   = 6;
@@ -33,11 +37,12 @@ static const int OR_VC_N     = 7;     // off, V1-3, C1-3
 static const int OR_LES_N    = 3;     // stop, slow, fast
 static const int OR_DRV_N    = 2;     // off, on
 static const int OR_RVB_N    = 3;     // off, room, hall
+static const int OR_VOC_N    = 2;     // vocoder off, on
 static const int OR_TYPE_PROC = 4;    // the procedural-sounds type
 
 // PROC type — the sound list replaces presets + drawbars.  Count and order
 // must mirror PROC_SOUNDS in the server's proc_sounds.h.
-static const int OR_PROC_N     = 2;
+static const int OR_PROC_N     = 3;
 static const int OR_PROCBTN_W  = 420;
 
 // Preset buttons run down the left edge; the drawbar panel sits to their right.
@@ -66,6 +71,17 @@ static const int OR_KCOL_X0_PROC = 720;
 static const int OR_KCOL_W       = 40;
 static const int OR_KCOL_GAP     = 5;
 
+// Drag tooltip — the slider labels under the column are tiny (size 1, all the
+// width there is), so while a finger is down on a slider its name + value are
+// also shown big in a box to the LEFT of the whole slider column.  Transient:
+// wiped on release, and whatever it covered is redrawn.
+// Width is bounded by PROC mode: its slider column starts at 720 and the sound
+// list ends at OR_PRESET_X + OR_PROCBTN_W (435), so 270 is the widest that
+// still clears the buttons.
+static const int OR_TIP_W = 270;
+static const int OR_TIP_H = 62;
+static const int OR_TIP_Y = 264;      // roughly centred on the groove (120..470)
+
 class OrganPage {
 public:
     OrganPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song);
@@ -86,17 +102,22 @@ private:
     bool    _wasDown;
     int     _dragCol;      // drawbar column locked on finger-down (-1 = none)
     int     _dragKnob;     // knob locked on finger-down (-1 = none)
+    bool    _tipShown;     // drag tooltip is on screen (needs wiping on release)
     int     _activePreset; // index of the last-applied preset, -1 if hand-edited
     int     _type;         // organ voice model (0..OR_TYPE_N-1)
     int     _vibChorus;    // 0=off, 1-3 V1-3, 4-6 C1-3
     int     _leslie;       // 0=stop, 1=slow, 2=fast
     int     _drive;        // 0=off, 1=on
     int     _reverb;       // 0=off, 1=room, 2=hall
+    int     _vocoder;      // 0=off, 1=on (mic vocoder — organ carrier)
+    int     _fxPage;       // which page of effects the top bar shows
     uint8_t _knob[OR_TYPE_N][OR_NKNOB];   // per-type knob values 0..8
     int     _procSel;                     // selected procedural sound (PROC type)
     uint8_t _procKnob[OR_PROC_N][OR_NKNOB];   // per-sound slider values 0..8
 
     void drawHeader();
+    void drawFxButton(int slot, int id);   // one effect button on the top bar
+    void cycleFx(int id);                  // advance + push one effect
     void drawFooter();
     void drawBar(int i);
     void drawPresets();
@@ -105,6 +126,8 @@ private:
     int  hitProc(int sx, int sy) const;   // procedural-sound button index, or -1
     void drawKnobs();
     void drawKnob(int k);
+    void drawKnobTip(int k);   // big "NAME  v" box left of the slider column
+    void hideKnobTip();        // wipe it + repaint what it covered
     void syncKnobs();              // send the active type's knob values to the server
     uint8_t& knobRef(int k);       // active slider store (per-type, or per-proc-sound)
     void applyToSong();            // write voice + sliders into every ORGAN column + patch
@@ -113,6 +136,6 @@ private:
     void applyPreset(int idx);
     bool hitHome(int sx, int sy) const;
     int  hitPreset(int sx, int sy) const;   // returns preset index or -1
-    int  hitFx(int sx, int sy) const;       // top-bar control index 0..3, or -1
+    int  hitFx(int sx, int sy) const;       // top-bar slot index 0..OR_FX_N-1, or -1
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

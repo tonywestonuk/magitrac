@@ -17,6 +17,18 @@ static uart_dev_t* midiHw = UART_LL_GET_HW(MIDI_UART_NUM);
 // ── MIDI note offset ──────────────────────────────────────────────────────────
 #define TRACKER_TO_MIDI_OFFSET 11
 
+// ── Column routing ────────────────────────────────────────────────────────────
+// ColumnSettings::midiChannel doubles as a routing sentinel: 1–16 are real MIDI
+// channels, 0 is unset, and 17/18/19 mean SFX / pixel_post / organ.  ORGAN_CHANNEL
+// arrived with the CoreS3 build and has no synth here, so organ columns must be
+// treated as inert.  Letting one reach the MIDI path is not merely silent-wrong:
+// (cs.midiChannel - 1) = 18 emits 0x90|18 = 0xA2, a poly-aftertouch message on
+// channel 3, and indexes seqSendColumnSetup's chanDone[16] out of bounds.
+static inline bool seqIsMidiColumn(uint8_t ch) {
+    return ch != 0 && ch != SFX_CHANNEL &&
+           ch != PIXELPOST_CHANNEL && ch != ORGAN_CHANNEL;
+}
+
 // ── Sequencer state ───────────────────────────────────────────────────────────
 static bool     seqRunning       = false;
 static bool     seqPaused        = false;   // freeze-in-place; doesn't affect seqRunning
@@ -25,6 +37,11 @@ static uint8_t  seqRow           = 0;
 static uint32_t seqNextRowMs     = 0;
 static bool     seqWaiting       = false;
 static uint32_t seqWaitStartMs   = 0;    // millis() when WAIT began (for timeout)
+// Timeout for the WAIT currently armed.  The original WAIT is 500 ms; WAT1 and
+// WAT2 are the same gesture with 1 s / 2 s patience, for cues the performer
+// deliberately hangs on.  Set when the WAIT is armed, not read from the row —
+// by timeout time the playhead has already moved past it.
+static uint32_t seqWaitTimeoutMs = 500;
 static int8_t   seqTranspose     = 0;
 static uint16_t seqCurrentBPM    = 100;   // live BPM — derived from performer timing
 
@@ -237,8 +254,7 @@ static void seqPlayRow() {
             // after the OFF).  Note-ons themselves never send patch changes.
             // SFX columns don't use MIDI patch changes; the OFF already
             // stopped the sample above.
-            if (cs.midiChannel != 0 && cs.midiChannel != SFX_CHANNEL &&
-                cs.midiChannel != PIXELPOST_CHANNEL && !cs.mute) {
+            if (seqIsMidiColumn(cs.midiChannel) && !cs.mute) {
                 uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
                 uint8_t vol    = cs.volume > 0 ? cs.volume : 100;
                 if (seqChanBank[midiCh] != cs.bankMSB || seqChanProg[midiCh] != cs.program) {
@@ -263,6 +279,10 @@ static void seqPlayRow() {
 
             // Skip muted columns or columns with no MIDI channel
             if (cs.midiChannel == 0 || cs.mute) continue;
+
+            // ORGAN columns need no note-off bookkeeping — nothing was ever
+            // started for them — so bail before seqNoteOff rather than after.
+            if (cs.midiChannel == ORGAN_CHANNEL) continue;
 
             seqNoteOff(col);
 
@@ -619,8 +639,8 @@ static void seqSendColumnSetup(uint8_t pattern, bool force) {
     for (int col = 1; col < MAX_COLUMNS; col++) {
         const ColumnSettings& cs = s->columns[col];
         if (cs.midiChannel == 0 || cs.mute) continue;        // unset or muted — skip
-        if (cs.midiChannel == SFX_CHANNEL) continue;        // SFX has no MIDI patch
-        if (cs.midiChannel == PIXELPOST_CHANNEL) continue;  // pixel_post has no MIDI patch
+        if (!seqIsMidiColumn(cs.midiChannel)) continue;     // SFX / pixel_post /
+                                                            // organ have no MIDI patch
         uint8_t midiCh = (uint8_t)(cs.midiChannel - 1);
         if (chanDone[midiCh]) continue;                     // already set this pass
         chanDone[midiCh] = true;
@@ -667,6 +687,7 @@ static void seqPlayPreviewRow() {
     if (seqPreviewPat >= s->numPatterns) return;
     const ColumnSettings& cs = s->columns[seqPreviewCol];
     if (cs.midiChannel == 0 || cs.mute) return;
+    if (cs.midiChannel == ORGAN_CHANNEL) return;  // no organ synth in this build
 
     uint16_t head = s->patterns[seqPreviewPat].noteHead;
     if (head == NOTE_NULL) return;
@@ -854,6 +875,12 @@ void sequencerAuditionNote(uint8_t pat, uint8_t row, uint8_t col) {
         } while (idx != head);
     }
     if (nn.note == NOTE_EMPTY || nn.note == NOTE_OFF || nn.note == NOTE_ANY) return;
+
+    // Nothing to audition on organ (no synth here) or pixel_post (lights are
+    // compiled out).  Falling through would reach the note-on path and emit
+    // 0x90|18 / 0x90|17 — aftertouch garbage on channels 3 and 2.
+    if (cs.midiChannel == ORGAN_CHANNEL ||
+        cs.midiChannel == PIXELPOST_CHANNEL) return;
 
     // Cancel any prior audition (possibly on a different column).
     if (seqAuditionCol != 0xFF) seqNoteOff(seqAuditionCol);
@@ -1061,7 +1088,7 @@ void sequencerTick() {
 
     if (seqWaiting) {
         uint32_t elapsed = now - seqWaitStartMs;
-        if (elapsed > 500) {
+        if (elapsed > seqWaitTimeoutMs) {
             // Timeout — performer stopped.
             // If a block is queued, switch to it (the current block never
             // logically started if WAIT was on row 0).  Otherwise restart

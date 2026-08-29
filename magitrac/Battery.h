@@ -18,7 +18,24 @@ void battery_begin_bq25896(TwoWire* wire, uint8_t addr = 0x6B);
 // ── Runtime ───────────────────────────────────────────────────────────────────
 
 // Returns battery charge 0–100, or -1 if uninitialised / unavailable.
+// (Naive linear voltage→pct map — the BatteryGauge layer is the real gauge.)
 int  battery_read_pct();
 
 // Returns true when USB/charger is present (BQ25896, or ADC chg_stat_pin).
 bool battery_is_charging();
+
+// Raw terminal voltage in mV (both backends), or -1 if unavailable.
+int  battery_read_mv();
+
+// Coarse charge phase.  ADC backend only distinguishes DISCHARGING /
+// FAST_CHARGE via chg_stat_pin; BQ25896 reports all four from REG0B.
+enum BatteryChargePhase {
+    BATT_DISCHARGING = 0,   // no external power
+    BATT_PRECHARGE,         // trickle charge (BQ only)
+    BATT_FAST_CHARGE,       // actively charging
+    BATT_CHARGE_DONE        // charge terminated / full (BQ only)
+};
+BatteryChargePhase battery_charge_phase();
+
+// Measured charge current in mA (BQ25896 REG12), or -1 if not measurable.
+int  battery_charge_current_ma();

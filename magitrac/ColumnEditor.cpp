@@ -57,7 +57,7 @@ ColumnEditor::ColumnEditor(EPD_PainterAdafruit& display, GT911_Lite& touch,
     , _patIdx(0), _col(1), _wasDown(false), _patchPending(false)
     , _picking(false), _pickingSample(false), _naming(false), _pickPage(0)
     , _keyboard(display, touch)
-    , _action(Action::NONE), _actionDst(0), _resyncMask(0)
+    , _action(Action::NONE), _resyncMask(0)
     , _pressedOnName(false)
     , _sampleListSeenState(0)
 {}
@@ -76,8 +76,8 @@ void ColumnEditor::open(uint8_t patternIdx, uint8_t col) {
     _naming        = false;
     _pickPage      = 0;
     _action        = Action::NONE;
-    _actionDst     = 0;
     _resyncMask    = 0;
+    _pasteNotesPending = false;
     _pressedOnName = false;
     _importRequested = false;
     // If the column is on SFX, trigger a sample-list refresh now so the
@@ -368,107 +368,75 @@ void ColumnEditor::drawPickSampleList() {
     uiButton(_d, (CE_W - 200) / 2, navY + CE_BTN_H + 8, 200, CE_BTN_H, "CANCEL", COL_DKGREY, COL_WHITE, 3);
 }
 
-// ── Action bar (COPY / SWAP) ─────────────────────────────────────────────────
+// ── Action bar (COPY / PASTE) ────────────────────────────────────────────────
+
+// Column clipboard — one column's settings + one block's notes.  static so a
+// COPY survives closing/reopening the editor: paste into a different column
+// and/or a different block (even a different song — it holds values, not pool
+// indices).
+struct ColClip {
+    bool           has = false;
+    uint8_t        srcCol = 0;   // 0-based, for the confirm label
+    ColumnSettings settings;
+    Note           notes[MAX_ROWS];
+};
+static ColClip s_colClip;
 
 void ColumnEditor::drawActionBar() {
     int btnY = CE_ACT_Y + (CE_ACT_H - CE_ACT_BTN_H) / 2;
     _d.fillRect(0, CE_ACT_Y, CE_W, CE_ACT_H, COL_WHITE);
     _d.drawFastHLine(0, CE_ACT_Y, CE_W, COL_LTGREY);
 
-    char clearLabel[20], copyLabel[20], swapLabel[20];
+    char clearLabel[20];
     snprintf(clearLabel, sizeof(clearLabel), "CLEAR %d", _col + 1);
-    snprintf(copyLabel,  sizeof(copyLabel),  "COPY %d TO...", _col + 1);
-    snprintf(swapLabel,  sizeof(swapLabel),  "SWAP %d WITH...", _col + 1);
 
     uiButton(_d, CE_CLEAR_X,  btnY, CE_CLEAR_W,  CE_ACT_BTN_H,
              clearLabel,    COL_WHITE, COL_BLACK, 2);
     uiButton(_d, CE_COPY_X,   btnY, CE_COPY_W,   CE_ACT_BTN_H,
-             copyLabel,     COL_WHITE, COL_BLACK, 2);
-    uiButton(_d, CE_SWAP_X,   btnY, CE_SWAP_W,   CE_ACT_BTN_H,
-             swapLabel,     COL_WHITE, COL_BLACK, 2);
+             "COPY",        COL_WHITE, COL_BLACK, 2);
+    // PASTE greyed until something is copied.
+    if (s_colClip.has)
+        uiButton(_d, CE_SWAP_X, btnY, CE_SWAP_W, CE_ACT_BTN_H,
+                 "PASTE", COL_WHITE, COL_BLACK, 2);
+    else
+        uiButton(_d, CE_SWAP_X, btnY, CE_SWAP_W, CE_ACT_BTN_H,
+                 "PASTE", COL_WHITE, COL_DKGREY, 2);
     uiButton(_d, CE_IMPORT_X, btnY, CE_IMPORT_W, CE_ACT_BTN_H,
              "IMPORT DRUMS", COL_WHITE, COL_BLACK, 2);
 }
 
-// ── Column-picker overlay (COPY/SWAP destination) ────────────────────────────
+// ── Copy / paste ─────────────────────────────────────────────────────────────
 
-void ColumnEditor::drawColumnPicker() {
-    int y0 = CE_LBL_Y;
-    _d.fillRect(0, y0, CE_W, CE_H - y0, COL_WHITE);
-
-    // Title strip
-    const char* title = (_action == Action::PICK_COPY_DST)
-                        ? "COPY TO COLUMN..." : "SWAP WITH COLUMN...";
-    _d.fillRect(0, CE_PICKCOL_TITLE_Y, CE_W, CE_PICKCOL_TITLE_H, COL_LTGREY);
-    _d.setTextSize(3);
-    _d.setTextColor(COL_BLACK);
-    int tw = (int)strlen(title) * 18;
-    _d.setCursor((CE_W - tw) / 2, CE_PICKCOL_TITLE_Y + (CE_PICKCOL_TITLE_H - 24) / 2);
-    _d.print(title);
-
-    // Column buttons (cols 1..MAX_COLUMNS-1; col 0 is INPUT, excluded)
-    for (int c = 1; c < MAX_COLUMNS; c++) {
-        int slot = c - 1;
-        int row = slot / CE_PICKCOL_COLS;
-        int colInRow = slot % CE_PICKCOL_COLS;
-        int x = CE_PICKCOL_X0 + colInRow * (CE_PICKCOL_BTN_W + CE_PICKCOL_GAP);
-        int y = CE_PICKCOL_GRID_Y + row * (CE_PICKCOL_BTN_H + CE_PICKCOL_GAP);
-
-        bool isSelf = (c == _col);
-        char label[24];
-        const ColumnSettings& cs = _song.columns[c];
-        if (cs.name[0]) snprintf(label, sizeof(label), "COL %d: %s", c + 1, cs.name);
-        else            snprintf(label, sizeof(label), "COL %d", c + 1);
-
-        if (isSelf) {
-            // Disabled — current column
-            _d.fillRect(x, y, CE_PICKCOL_BTN_W, CE_PICKCOL_BTN_H, COL_WHITE);
-            _d.drawRect(x, y, CE_PICKCOL_BTN_W, CE_PICKCOL_BTN_H, COL_LTGREY);
-            _d.setTextSize(2);
-            _d.setTextColor(COL_DKGREY);
-            int lw = (int)strlen(label) * 12;
-            _d.setCursor(x + (CE_PICKCOL_BTN_W - lw) / 2,
-                         y + (CE_PICKCOL_BTN_H - 16) / 2 - 10);
-            _d.print(label);
-            _d.setCursor(x + (CE_PICKCOL_BTN_W - 9*12) / 2,
-                         y + (CE_PICKCOL_BTN_H - 16) / 2 + 14);
-            _d.print("(current)");
-        } else {
-            uiButton(_d, x, y, CE_PICKCOL_BTN_W, CE_PICKCOL_BTN_H,
-                     label, COL_WHITE, COL_BLACK, 2);
-        }
-    }
-
-    // CANCEL
-    uiButton(_d, (CE_W - CE_PICKCOL_CANCEL_W) / 2, CE_PICKCOL_CANCEL_Y,
-             CE_PICKCOL_CANCEL_W, CE_PICKCOL_CANCEL_H,
-             "CANCEL", COL_DKGREY, COL_WHITE, 3);
+void ColumnEditor::copyToClip() {
+    s_colClip.has      = true;
+    s_colClip.srcCol   = _col;
+    s_colClip.settings = _song.columns[_col];
+    Pattern& pat = _song.patterns[_patIdx];
+    NoteGrid g(_song.notePool, &_song.noteFreeHead, &pat.noteHead);
+    for (uint8_t r = 0; r < MAX_ROWS; r++) s_colClip.notes[r] = g.get(r, _col);
 }
 
-int ColumnEditor::hitColumnPicker(int sx, int sy) const {
-    for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (c == _col) continue;
-        int slot = c - 1;
-        int row = slot / CE_PICKCOL_COLS;
-        int colInRow = slot % CE_PICKCOL_COLS;
-        int x = CE_PICKCOL_X0 + colInRow * (CE_PICKCOL_BTN_W + CE_PICKCOL_GAP);
-        int y = CE_PICKCOL_GRID_Y + row * (CE_PICKCOL_BTN_H + CE_PICKCOL_GAP);
-        if (sx >= x && sx < x + CE_PICKCOL_BTN_W &&
-            sy >= y && sy < y + CE_PICKCOL_BTN_H) {
-            return c;
-        }
+void ColumnEditor::pasteFromClip() {
+    if (!s_colClip.has) return;
+    _song.columns[_col] = s_colClip.settings;
+    Pattern& pat = _song.patterns[_patIdx];
+    NoteGrid g(_song.notePool, &_song.noteFreeHead, &pat.noteHead);
+    for (uint8_t r = 0; r < MAX_ROWS; r++) {
+        if (s_colClip.notes[r].note == NOTE_EMPTY) g.clear(r, _col);
+        else                                       g.set(r, _col, s_colClip.notes[r]);
     }
-    return -1;
+    _patchPending      = true;   // settings → server (existing patch path)
+    _pasteNotesPending = true;   // this block's cells → server (targeted resync)
 }
 
-// ── Copy-confirm dialog ──────────────────────────────────────────────────────
+// ── Paste-confirm dialog ─────────────────────────────────────────────────────
 
-void ColumnEditor::drawCopyConfirm() {
+void ColumnEditor::drawPasteConfirm() {
     int y0 = CE_LBL_Y;
     _d.fillRect(0, y0, CE_W, CE_H - y0, COL_WHITE);
 
     char title[40];
-    snprintf(title, sizeof(title), "OVERWRITE COL %d?", _actionDst + 1);
+    snprintf(title, sizeof(title), "PASTE OVER COL %d?", _col + 1);
     _d.setTextSize(4);
     _d.setTextColor(COL_BLACK);
     int tw = (int)strlen(title) * 24;
@@ -476,8 +444,8 @@ void ColumnEditor::drawCopyConfirm() {
     _d.print(title);
 
     char body1[64], body2[64];
-    snprintf(body1, sizeof(body1), "Replaces all settings AND notes");
-    snprintf(body2, sizeof(body2), "in column %d (across every block).", _actionDst + 1);
+    snprintf(body1, sizeof(body1), "From copied column %d.", s_colClip.srcCol + 1);
+    snprintf(body2, sizeof(body2), "Replaces settings + notes in this block.");
     _d.setTextSize(2);
     _d.setTextColor(COL_DKGREY);
     int b1w = (int)strlen(body1) * 12;
@@ -524,54 +492,6 @@ void ColumnEditor::drawClearConfirm() {
 }
 
 // ── Apply COPY / SWAP / CLEAR ────────────────────────────────────────────────
-
-void ColumnEditor::doCopyColumn(uint8_t srcCol, uint8_t dstCol) {
-    if (srcCol == dstCol) return;
-    if (srcCol >= MAX_COLUMNS || dstCol >= MAX_COLUMNS) return;
-
-    // 1) ColumnSettings
-    _song.columns[dstCol] = _song.columns[srcCol];
-
-    // 2) Notes — for every pattern, every row: dst <- src
-    for (uint8_t p = 0; p < MAX_PATTERNS; p++) {
-        Pattern& pat = _song.patterns[p];
-        NoteGrid g(_song.notePool, &_song.noteFreeHead, &pat.noteHead);
-        for (uint8_t r = 0; r < MAX_ROWS; r++) {
-            Note srcN = g.get(r, srcCol);
-            if (srcN.note == NOTE_EMPTY) {
-                g.clear(r, dstCol);
-            } else {
-                g.set(r, dstCol, srcN);
-            }
-        }
-    }
-
-    _resyncMask |= (1u << dstCol);
-}
-
-void ColumnEditor::doSwapColumn(uint8_t a, uint8_t b) {
-    if (a == b) return;
-    if (a >= MAX_COLUMNS || b >= MAX_COLUMNS) return;
-
-    // 1) ColumnSettings swap
-    ColumnSettings tmp = _song.columns[a];
-    _song.columns[a]   = _song.columns[b];
-    _song.columns[b]   = tmp;
-
-    // 2) Notes — for every pattern, every row: swap a/b
-    for (uint8_t p = 0; p < MAX_PATTERNS; p++) {
-        Pattern& pat = _song.patterns[p];
-        NoteGrid g(_song.notePool, &_song.noteFreeHead, &pat.noteHead);
-        for (uint8_t r = 0; r < MAX_ROWS; r++) {
-            Note nA = g.get(r, a);
-            Note nB = g.get(r, b);
-            if (nB.note == NOTE_EMPTY) g.clear(r, a); else g.set(r, a, nB);
-            if (nA.note == NOTE_EMPTY) g.clear(r, b); else g.set(r, b, nA);
-        }
-    }
-
-    _resyncMask |= ((1u << a) | (1u << b));
-}
 
 void ColumnEditor::doClearColumn(uint8_t col) {
     if (col >= MAX_COLUMNS) return;
@@ -785,48 +705,15 @@ bool ColumnEditor::poll() {
 
     if (!rising && !falling) return false;
 
-    // ── COPY/SWAP destination picker ─────────────────────────────────────────
-    if (_action == Action::PICK_COPY_DST || _action == Action::PICK_SWAP_DST) {
-        _pressedOnName = false;
-        if (!rising) return false;
-
-        // CANCEL
-        int cancelX = (CE_W - CE_PICKCOL_CANCEL_W) / 2;
-        if (ty >= CE_PICKCOL_CANCEL_Y && ty < CE_PICKCOL_CANCEL_Y + CE_PICKCOL_CANCEL_H &&
-            tx >= cancelX && tx < cancelX + CE_PICKCOL_CANCEL_W) {
-            _action = Action::NONE;
-            draw();
-            _d.paint();
-            return false;
-        }
-
-        int dst = hitColumnPicker(tx, ty);
-        if (dst >= 1) {
-            if (_action == Action::PICK_SWAP_DST) {
-                doSwapColumn(_col, (uint8_t)dst);
-                _action = Action::NONE;
-                draw();
-                _d.paint();
-            } else {
-                // COPY needs confirm
-                _actionDst = (uint8_t)dst;
-                _action    = Action::CONFIRM_COPY;
-                drawCopyConfirm();
-                _d.paint();
-            }
-        }
-        return false;
-    }
-
-    // ── Copy / Clear confirm dialog ──────────────────────────────────────────
-    if (_action == Action::CONFIRM_COPY || _action == Action::CONFIRM_CLEAR) {
+    // ── Paste / Clear confirm dialog ─────────────────────────────────────────
+    if (_action == Action::CONFIRM_PASTE || _action == Action::CONFIRM_CLEAR) {
         _pressedOnName = false;
         if (!rising) return false;
 
         if (ty >= CE_CONF_BTN_Y && ty < CE_CONF_BTN_Y + CE_CONF_BTN_H) {
             if (tx >= CE_CONF_YES_X && tx < CE_CONF_YES_X + CE_CONF_BTN_W) {
-                if (_action == Action::CONFIRM_COPY) {
-                    doCopyColumn(_col, _actionDst);
+                if (_action == Action::CONFIRM_PASTE) {
+                    pasteFromClip();
                 } else {
                     doClearColumn(_col);
                 }
@@ -1042,7 +929,7 @@ bool ColumnEditor::poll() {
         return false;
     }
 
-    // Action bar (CLEAR / COPY / SWAP)
+    // Action bar (CLEAR / COPY / PASTE / IMPORT)
     if (ty >= CE_ACT_Y && ty < CE_ACT_Y + CE_ACT_H) {
         if (tx >= CE_CLEAR_X && tx < CE_CLEAR_X + CE_CLEAR_W) {
             _action = Action::CONFIRM_CLEAR;
@@ -1051,15 +938,31 @@ bool ColumnEditor::poll() {
             return false;
         }
         if (tx >= CE_COPY_X && tx < CE_COPY_X + CE_COPY_W) {
-            _action = Action::PICK_COPY_DST;
-            drawColumnPicker();
-            _d.paint();
+            // COPY is non-destructive — capture immediately, un-grey PASTE, and
+            // confirm with a banner in the free strip below the action bar (it
+            // lingers until the next full redraw — e-paper has no cheap timed
+            // clear, and lingering confirmation reads fine).
+            copyToClip();
+            drawActionBar();
+            int by = CE_ACT_Y + CE_ACT_H;             // 488
+            _d.fillRect(0, by, CE_W, CE_H - by, COL_WHITE);
+            const char* msg = "COLUMN COPIED";
+            int mw = (int)strlen(msg) * 18;           // size 3
+            int pill = mw + 40, px = (CE_W - pill) / 2, py = by + 6, ph = 40;
+            _d.fillRect(px, py, pill, ph, COL_LTGREY);
+            _d.setTextSize(3);
+            _d.setTextColor(COL_BLACK);
+            _d.setCursor((CE_W - mw) / 2, py + (ph - 24) / 2);
+            _d.print(msg);
+            _d.paintLater();
             return false;
         }
         if (tx >= CE_SWAP_X && tx < CE_SWAP_X + CE_SWAP_W) {
-            _action = Action::PICK_SWAP_DST;
-            drawColumnPicker();
-            _d.paint();
+            if (s_colClip.has) {          // PASTE — confirm the overwrite
+                _action = Action::CONFIRM_PASTE;
+                drawPasteConfirm();
+                _d.paint();
+            }
             return false;
         }
         if (tx >= CE_IMPORT_X && tx < CE_IMPORT_X + CE_IMPORT_W) {

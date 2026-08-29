@@ -203,8 +203,7 @@ void BackupRestorePage::drawBackupProgress() {
         // File name
         _d.setCursor(100, 180);
         _d.print("Backing up: ");
-        if (_bkFileCurrent < _bkFileTotal)
-            _d.print(_bkFileNames[_bkFileCurrent]);
+        _d.print(_bkCurName);
 
         // Counter
         char buf[32];
@@ -322,7 +321,7 @@ void BackupRestorePage::drawFileList() {
             _d.drawRect(BR_FL_X, y, BR_FL_W, BR_FL_ROW_H - 4, COL_BLACK);
 
             // Strip ".mgt" for display; show "instruments" as a special label.
-            char nameBuf[40];
+            char nameBuf[BK_FNAME_MAX];
             strncpy(nameBuf, _rsFileNames[idx], sizeof(nameBuf) - 1);
             nameBuf[sizeof(nameBuf) - 1] = '\0';
             int len = (int)strlen(nameBuf);
@@ -366,7 +365,7 @@ void BackupRestorePage::drawRestoreConfirm() {
     if (_rsConfirmIdx < 0) {
         snprintf(title, sizeof(title), "Restore All?");
     } else {
-        char nameBuf[40];
+        char nameBuf[BK_FNAME_MAX];
         strncpy(nameBuf, _rsFileNames[_rsConfirmIdx], sizeof(nameBuf) - 1);
         nameBuf[sizeof(nameBuf) - 1] = '\0';
         int len = (int)strlen(nameBuf);
@@ -463,17 +462,32 @@ void BackupRestorePage::startBackup() {
     }
 
     // Create the destination folder with a timestamp.
+    // The restore list sorts folders newest-first BY NAME, so an undated
+    // backup must not get a name that sorts as ancient.  A reset RTC reads
+    // year 2000 ("bk_000101_...") and the no-RTC fallback ("bk_<millis>")
+    // both sorted BELOW every dated folder and fell off the list once more
+    // than BR_MAX_FOLDERS dated ones existed.  Use a "bk_zz" prefix for any
+    // backup without a trustworthy date: 'z' > '0'..'9' so it sorts to the
+    // TOP — the right place, since an undated backup is almost certainly
+    // the one you just made.
+    bool dated = false;
     if (_rtc) {
         I2C_BM8563_TimeTypeDef t; I2C_BM8563_DateTypeDef d;
         _rtc->getTime(&t); _rtc->getDate(&d);
         int yr = d.year; if (yr > 2000) yr -= 2000;
+        if (yr >= 24 && yr < 100 && d.month >= 1 && d.month <= 12 &&
+            d.date >= 1 && d.date <= 31) {
+            snprintf(_bkFolder, sizeof(_bkFolder),
+                     "%s/bk_%02d%02d%02d_%02d%02d%02d",
+                     BR_BACKUPS_DIR, yr, d.month, d.date,
+                     t.hours, t.minutes, t.seconds);
+            dated = true;
+        }
+    }
+    if (!dated) {
+        Serial.println("[BACKUP] RTC date not trustworthy - using undated folder name");
         snprintf(_bkFolder, sizeof(_bkFolder),
-                 "%s/bk_%02d%02d%02d_%02d%02d%02d",
-                 BR_BACKUPS_DIR, yr, d.month, d.date,
-                 t.hours, t.minutes, t.seconds);
-    } else {
-        snprintf(_bkFolder, sizeof(_bkFolder),
-                 "%s/bk_%lu", BR_BACKUPS_DIR, millis());
+                 "%s/bk_zz%lu", BR_BACKUPS_DIR, millis());
     }
     if (!SD.exists(BR_BACKUPS_DIR)) SD.mkdir(BR_BACKUPS_DIR);
     SD.mkdir(_bkFolder);
@@ -483,6 +497,7 @@ void BackupRestorePage::startBackup() {
     _bkFileCurrent = 0;
     _bkCancelled   = false;
     _bkFilesSaved  = 0;
+    _bkCurName[0]  = '\0';
 
     // Show "backup in progress" — paintLater so the EPD work happens on
     // its own task and we proceed to the transaction immediately.
@@ -504,10 +519,28 @@ void BackupRestorePage::startBackup() {
     File     curFile;
     uint32_t curBytesWritten = 0;
     uint32_t curFileSize     = 0;
+    bool     curOpenOk       = false;
+    int      curIndex        = 0;
+    int      bkIncomplete    = 0;
+    int      bkOpenFail      = 0;
+    int      bkZeroSize      = 0;
     bool     done            = false;
     bool     readOk          = true;
     bool     touchWasDown    = _touch.isTouched;
     bool     cancelRepainted = false;
+
+    auto finishCurFile = [&]() {
+        if (curIndex <= 0 || _bkCancelled) return;
+        bool complete = curBytesWritten >= curFileSize && curOpenOk;
+        if (curFileSize == 0) bkZeroSize++;
+        if (!curOpenOk) bkOpenFail++;
+        else if (curBytesWritten < curFileSize) bkIncomplete++;
+        Serial.printf("[BK] file %d/%u %s '%s' expected=%u received=%u sdopen=%d\n",
+                      curIndex, (unsigned)_bkFileTotal,
+                      complete ? "OK" : "INCOMPLETE", _bkCurName,
+                      (unsigned)curFileSize, (unsigned)curBytesWritten,
+                      curOpenOk ? 1 : 0);
+    };
 
     while (!done) {
         // Poll touch for the Cancel button.  Edge-detect (down on this
@@ -549,6 +582,7 @@ void BackupRestorePage::startBackup() {
         // skip the SD writes / UI updates.
         if (id == MSG_BACKUP_HEADER) {
             const MsgBackupHeader* h = (const MsgBackupHeader*)m;
+            finishCurFile();
 
             // drawBackupProgress + the existing UI expect _bkFileCurrent
             // as a 0-based index; h->file_index is 1-based.  Translate.
@@ -556,9 +590,19 @@ void BackupRestorePage::startBackup() {
             _bkFileTotal    = h->file_total;
             curBytesWritten = 0;
             curFileSize     = h->file_size;
+            curIndex        = h->file_index;
+            curOpenOk       = false;
 
-            char nameStr[25] = {};
-            strncpy(nameStr, h->filename, 24);
+            char nameStr[BK_FNAME_MAX] = {};
+            strncpy(nameStr, h->filename, BK_FNAME_MAX - 1);
+            bool clean = nameStr[0] != '\0';
+            for (const char* c = nameStr; *c; c++)
+                if (*c < 0x20 || *c > 0x7E) { clean = false; break; }
+            if (!clean) {
+                Serial.printf("[BK] file %u NONPRINTABLE name hex=", (unsigned)h->file_index);
+                for (int i = 0; i < BK_FNAME_MAX; i++) Serial.printf("%02X", (uint8_t)h->filename[i]);
+                Serial.println();
+            }
 
             Serial.printf("[BK] header file=%u/%u name='%s' size=%u%s\n",
                           (unsigned)h->file_index, (unsigned)h->file_total,
@@ -568,18 +612,17 @@ void BackupRestorePage::startBackup() {
             if (!_bkCancelled) {
                 if (curFile) curFile.close();
 
-                // Populate _bkFileNames so drawBackupProgress can display
-                // the currently-streaming file's name.
-                if (_bkFileCurrent >= 0 && _bkFileCurrent < BR_MAX_FILES) {
-                    memset(_bkFileNames[_bkFileCurrent], 0, SRV_FNAME_MAX);
-                    strncpy(_bkFileNames[_bkFileCurrent], nameStr,
-                            SRV_FNAME_MAX - 1);
-                }
+                // Remember just the current file's name for the progress
+                // display — the backup streams straight to SD, so there is no
+                // per-file array to overflow no matter how many files arrive.
+                memset(_bkCurName, 0, sizeof(_bkCurName));
+                strncpy(_bkCurName, nameStr, sizeof(_bkCurName) - 1);
 
-                char path[80];
+                char path[BK_FNAME_MAX + 48];
                 snprintf(path, sizeof(path), "%s/%s", _bkFolder, nameStr);
                 if (SD.exists(path)) SD.remove(path);
                 curFile = SD.open(path, FILE_WRITE);
+                curOpenOk = (bool)curFile;
                 if (!curFile) {
                     Serial.printf("[BK] SD open failed '%s'\n", path);
                 }
@@ -594,20 +637,31 @@ void BackupRestorePage::startBackup() {
             uint16_t n = b->data_len;
             if (n > sizeof(b->data)) n = sizeof(b->data);
             if (!_bkCancelled) {
-                if (curFile) curFile.write(b->data, n);
-                curBytesWritten += n;
-                if (curBytesWritten >= curFileSize) {
-                    _bkFilesSaved++;
-                    Serial.printf("[BK] file %u/%u complete (%u bytes) saved=%d\n",
-                                  (unsigned)_bkFileCurrent, (unsigned)_bkFileTotal,
-                                  (unsigned)curBytesWritten, _bkFilesSaved);
+                if (curFile) {
+                    size_t w = curFile.write(b->data, n);
+                    if (w != n)
+                        Serial.printf("[BK] SD WRITE SHORT file %d want=%u wrote=%u at %u\n",
+                                      curIndex, (unsigned)n, (unsigned)w,
+                                      (unsigned)curBytesWritten);
                 }
+                uint32_t before = curBytesWritten;
+                curBytesWritten += n;
+                if (before < curFileSize && curBytesWritten >= curFileSize)
+                    _bkFilesSaved++;
+                if (curBytesWritten > curFileSize)
+                    Serial.printf("[BK] file %d OVERRUN received=%u expected=%u\n",
+                                  curIndex, (unsigned)curBytesWritten,
+                                  (unsigned)curFileSize);
             }
             // else: bytes already off the wire (gMagiLink.read), dropped here
         }
         else if (id == MSG_END_OF_DATA) {
-            Serial.printf("[BK] END_OF_DATA — backup %s\n",
-                          _bkCancelled ? "cancelled (drained)" : "complete");
+            finishCurFile();
+            Serial.printf("[BK] END_OF_DATA — backup %s: total=%u saved=%d "
+                          "incomplete=%d sdOpenFail=%d zeroSize=%d\n",
+                          _bkCancelled ? "cancelled (drained)" : "complete",
+                          (unsigned)_bkFileTotal, _bkFilesSaved,
+                          bkIncomplete, bkOpenFail, bkZeroSize);
             done = true;
         }
         else {
@@ -744,8 +798,8 @@ void BackupRestorePage::scanFolderFiles(const char* folder) {
                 if (strcasecmp(ext, "mgt") == 0 ||
                     strcasecmp(ext, "set") == 0 ||
                     strcasecmp(ext, "txt") == 0) {
-                    strncpy(_rsFileNames[_rsFileTotal], name, SRV_FNAME_MAX - 1);
-                    _rsFileNames[_rsFileTotal][SRV_FNAME_MAX - 1] = '\0';
+                    strncpy(_rsFileNames[_rsFileTotal], name, BK_FNAME_MAX - 1);
+                    _rsFileNames[_rsFileTotal][BK_FNAME_MAX - 1] = '\0';
                     _rsFileTotal++;
                 }
             }
@@ -757,14 +811,14 @@ void BackupRestorePage::scanFolderFiles(const char* folder) {
     // Sort alphabetically (case-insensitive) — keeps related songs together
     // and puts "instruments" wherever it falls naturally.
     for (int i = 1; i < _rsFileTotal; i++) {
-        char keyName[SRV_FNAME_MAX];
-        memcpy(keyName, _rsFileNames[i], SRV_FNAME_MAX);
+        char keyName[BK_FNAME_MAX];
+        memcpy(keyName, _rsFileNames[i], BK_FNAME_MAX);
         int j = i - 1;
         while (j >= 0 && strcasecmp(_rsFileNames[j], keyName) > 0) {
-            memcpy(_rsFileNames[j+1], _rsFileNames[j], SRV_FNAME_MAX);
+            memcpy(_rsFileNames[j+1], _rsFileNames[j], BK_FNAME_MAX);
             j--;
         }
-        memcpy(_rsFileNames[j+1], keyName, SRV_FNAME_MAX);
+        memcpy(_rsFileNames[j+1], keyName, BK_FNAME_MAX);
     }
 }
 
@@ -804,7 +858,7 @@ void BackupRestorePage::restoreTick() {
     const char* name = _rsFileNames[idx];
 
     // Read file from client SD
-    char path[80];
+    char path[BK_FNAME_MAX + 48];
     snprintf(path, sizeof(path), "%s/%s", _rsSelectedFolder, name);
     File f = SD.open(path);
     if (!f) {

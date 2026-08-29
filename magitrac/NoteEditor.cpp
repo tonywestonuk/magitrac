@@ -44,6 +44,7 @@ NoteEditor::NoteEditor(EPD_PainterAdafruit& display, GT911_Lite& touch)
     , _passVariant(0)
     , _hexpad(display, touch)
     , _picker(display, touch)
+    , _fxpicker(display, touch)
     , _pendingSync(false)
     , _syncPattern(0)
     , _syncRow(0)
@@ -195,11 +196,13 @@ void NoteEditor::drawOctaveButtons() {
 void NoteEditor::drawInstControl() {
     _d.fillRect(0, PE_IBTN_Y, PE_W, PE_IBTN_H, 0);
 
-    // [CLR](160) [OFF](160) [-](80) VV(160) [+](80) [EEPP-](320)
+    // [CLR](160) [OFF](160) [-](80) VV(160) [+](80) [ATTR](320)
+    // The ATTR cell shows the effect's text description (or raw hex); tapping it
+    // opens the hex editor, which carries the CHOOSE effect-picker button.
     popupBtn(0,   PE_IBTN_Y, 160, PE_IBTN_H, "CLR", false);
     popupBtn(160, PE_IBTN_Y, 160, PE_IBTN_H, "OFF", _offNote);
     drawVelocity();
-    drawAttrButton();
+    drawAttrButton(640, 320);
 }
 
 void NoteEditor::drawVelocity() {
@@ -233,17 +236,38 @@ void NoteEditor::drawVelocity() {
     popupBtn(vx + arrW + valW, y, arrW, h, "+", false);
 }
 
-void NoteEditor::drawAttrButton() {
-    // Attribute button at x=640, 320px wide — shows "EEPP" or "----"
-    const int ax = 640;
-    const int aw = 320;
+void NoteEditor::drawAttrButton(int ax, int aw) {
+    // Attribute cell.  If the effect is a known command it shows the text
+    // description (e.g. "Set Tempo") on top with the raw "EE:PP" below;
+    // otherwise it falls back to the plain "EEPP" hex.  Tapping it opens the
+    // hex editor for direct effect/param entry.
     int y = PE_IBTN_Y;
     int h = PE_IBTN_H;
 
-    char attrStr[5];
-    effectToString5(_effect, _param, attrStr);
+    _d.fillRect(ax, y, aw, h, 0);
+    _d.drawRect(ax, y, aw, h, 3);
+    _d.setTextColor(3);
 
-    popupBtn(ax, y, aw, h, attrStr, false);
+    const char* name = effectCatalogName(_effect, _param);
+    if (name) {
+        _d.setTextSize(2);
+        int nw = (int)strlen(name) * 12;
+        _d.setCursor(ax + (aw - nw) / 2, y + 8);
+        _d.print(name);
+
+        char hx[8];
+        snprintf(hx, sizeof(hx), "%02X:%02X", _effect, _param);
+        int hw = (int)strlen(hx) * 12;
+        _d.setCursor(ax + (aw - hw) / 2, y + h - 24);
+        _d.print(hx);
+    } else {
+        char attrStr[5];
+        effectToString5(_effect, _param, attrStr);
+        _d.setTextSize(3);
+        int lw = (int)strlen(attrStr) * 18;
+        _d.setCursor(ax + (aw - lw) / 2, y + (h - 24) / 2);
+        _d.print(attrStr);
+    }
 }
 
 void NoteEditor::drawInputOptions() {
@@ -385,20 +409,29 @@ bool NoteEditor::pollTouch() {
     // If hexpad is open, delegate to it
     if (_hexpad.isOpen()) {
         if (_hexpad.poll()) {
-            // Hexpad closed — apply result
-            if (_hexpad.isDone()) {
-                if (_hexpad.isCleared()) {
-                    _effect = 0;
-                    _param  = 0;
-                } else {
-                    _effect = _hexpad.effect();
-                    _param  = _hexpad.param();
+            if (_hexpad.chooseRequested()) {
+                // CHOOSE tapped on the hex screen — hand off to the scrollable
+                // effect picker, seeded with whatever is currently typed.
+                _d.clear();
+                _fxpicker.open(_hexpad.effect(), _hexpad.param(), /*fingerDown=*/false);
+                _fxpicker.draw();
+                _d.paint();
+            } else {
+                // Hexpad closed — apply result
+                if (_hexpad.isDone()) {
+                    if (_hexpad.isCleared()) {
+                        _effect = 0;
+                        _param  = 0;
+                    } else {
+                        _effect = _hexpad.effect();
+                        _param  = _hexpad.param();
+                    }
                 }
+                // Redraw note editor
+                _d.clear();
+                draw();
+                _d.paint();
             }
-            // Redraw note editor
-            _d.clear();
-            draw();
-            _d.paint();
         }
         return false;
     }
@@ -423,6 +456,27 @@ bool NoteEditor::pollTouch() {
             }
             _d.clear();
             draw();
+            _d.paint();
+        }
+        return false;
+    }
+
+    // If the effect picker is open, delegate to it.  Whether the user picked a
+    // command or backed out, return to the hex screen with the resulting value
+    // so they can enter/confirm the param and SET (or CANCEL).
+    if (_fxpicker.isOpen()) {
+        if (_fxpicker.poll()) {
+            uint8_t e = _effect, p = _param;
+            if (_fxpicker.tookChoice()) {
+                e = _fxpicker.chosenEffect();
+                p = _fxpicker.chosenParam();
+            }
+            uint8_t ch = _song->columns[_col].midiChannel;
+            bool isMidiCol = (ch >= 1 && ch <= 16);
+            _d.clear();
+            _hexpad.open(e, p, 4, "Set Effect",
+                         /*fingerDown=*/false, /*showChoose=*/isMidiCol);
+            _hexpad.draw();
             _d.paint();
         }
         return false;
@@ -578,9 +632,14 @@ bool NoteEditor::pollTouch() {
             }
             drawVelocity();
         } else {
-            // [attr] — open hex editor for effect/param
+            // [attr] — open hex editor for effect/param.  On MIDI output
+            // columns the hex screen carries a CHOOSE button that opens the
+            // scrollable effect-command picker.
+            uint8_t ch = _song->columns[_col].midiChannel;
+            bool isMidiCol = (ch >= 1 && ch <= 16);
             _d.clear();
-            _hexpad.open(_effect, _param, 4, "Set Effect");
+            _hexpad.open(_effect, _param, 4, "Set Effect",
+                         /*fingerDown=*/true, /*showChoose=*/isMidiCol);
             _hexpad.draw();
             _d.paint();
             return false;

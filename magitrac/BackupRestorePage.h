@@ -13,7 +13,7 @@
 //  y= 50  └─ Content area (490px) — varies by state
 
 #define BR_MAX_FILES    (SRV_MAX_FILES + 1)  // songs + instruments
-#define BR_MAX_FOLDERS  16
+#define BR_MAX_FOLDERS  128  // list scrolls; keep ~every backup rather than silently dropping (~4KB heap)
 #define BR_FOLDER_MAX   32  // max folder name length
 #define BR_BACKUPS_DIR  "/backups"
 
@@ -47,7 +47,7 @@ private:
 
     // Backup state
     char     _bkFolder[48];                        // full path e.g. "/backups/bk_20260425_103000"
-    char     _bkFileNames[BR_MAX_FILES][SRV_FNAME_MAX];
+    char     _bkCurName[BK_FNAME_MAX];             // name of the file currently streaming (display only)
     int      _bkFileTotal;
     int      _bkFileCurrent;
     // Set from UI task on Cancel tap, read from the v2 backup worker
@@ -67,7 +67,7 @@ private:
     int      _rsDragStartScroll;
     bool     _rsDragMoved;
     char     _rsSelectedFolder[48];
-    char     _rsFileNames[BR_MAX_FILES][SRV_FNAME_MAX];
+    char     _rsFileNames[BR_MAX_FILES][BK_FNAME_MAX];
     int      _rsFileTotal;
     int      _rsFileCurrent;
     int      _rsRestoreCount;

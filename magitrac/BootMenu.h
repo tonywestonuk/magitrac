@@ -10,15 +10,17 @@
 // Dismiss by tapping outside the box.
 //
 // Row 1: [SONG] [INSTRUMENTS] [SETTINGS]
-// Row 2: [BACKUP] [PERFORM] [POSTS] [PAIR]
+// Row 2: [BACKUP] [PERFORM] [POSTS]
 // Row 3: [        ORGAN        ]
+//
+// PAIR lives on SettingsPage (WIFI section) — it's a once-per-device action,
+// not worth a slot on the menu you hit mid-gig.
 
 enum class BootMenuResult : uint8_t {
     NONE,
     SONG,
     INSTRUMENTS,
     SETTINGS,
-    PAIR,
     BACKUP,
     PERFORM,
     PIXELPOST,
@@ -38,17 +40,14 @@ static const int BM_SONG_X  = BM_BOX_X + 20;                      // = 150
 static const int BM_INST_X  = BM_SONG_X + BM_BTN_W + BM_BTN_GAP; // = 375
 static const int BM_SETT_X  = BM_INST_X + BM_BTN_W + BM_BTN_GAP; // = 600
 
-// Row 2: BACKUP + PERFORM + PIXELPOST + PAIR side by side
+// Row 2: BACKUP + PERFORM + PIXELPOST, column-aligned under row 1
 static const int BM_BTN2_Y   = BM_BTN_Y + BM_BTN_H + 22;  // = 292
 static const int BM_BTN2_H   = 95;
-static const int BM_BTN2_W   = 160;
-static const int BM_BTN2_GAP = 15;
-// Total: 4*160 + 3*15 = 685, margin = (700-685)/2 = 7
-static const int BM_BACKUP_X    = BM_BOX_X + 8;                                // = 138
-static const int BM_PERFORM_X   = BM_BACKUP_X  + BM_BTN2_W + BM_BTN2_GAP;     // = 313
-static const int BM_PIXELPOST_X = BM_PERFORM_X + BM_BTN2_W + BM_BTN2_GAP;     // = 488
-static const int BM_PAIR_X      = BM_PIXELPOST_X + BM_BTN2_W + BM_BTN2_GAP;   // = 663
-static const int BM_PAIR_W      = BM_BTN2_W;
+static const int BM_BTN2_W   = BM_BTN_W;
+static const int BM_BTN2_GAP = BM_BTN_GAP;
+static const int BM_BACKUP_X    = BM_SONG_X;   // = 150
+static const int BM_PERFORM_X   = BM_INST_X;   // = 375
+static const int BM_PIXELPOST_X = BM_SETT_X;   // = 600
 
 // Row 3: ORGAN, centred (full additive drawbar organ on the server)
 static const int BM_BTN3_Y  = BM_BTN2_Y + BM_BTN2_H + 18;   // = 405
@@ -78,7 +77,6 @@ private:
     bool hitSong       (int sx, int sy) const;
     bool hitInstruments(int sx, int sy) const;
     bool hitSettings   (int sx, int sy) const;
-    bool hitPair       (int sx, int sy) const;
     bool hitPerform    (int sx, int sy) const;
     bool hitBackup     (int sx, int sy) const;
     bool hitPixelpost  (int sx, int sy) const;

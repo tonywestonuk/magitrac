@@ -372,7 +372,7 @@ private:
 
     // Sample list cache (SFX column picker)
     SampleListState  _sampleListState = SampleListState::IDLE;
-    SampleCacheEntry _sampleCache[SAMPLE_CACHE_MAX];
+    SampleCacheEntry* _sampleCache = nullptr;  // PSRAM (alloc in begin()); control-rate
     int              _sampleCount     = 0;
     int              _sampleTotal     = 0;
     uint8_t          _samplePage      = 0;
@@ -381,7 +381,7 @@ private:
     // Generic file-server list cache + per-file load buffer.
     FileListState _fileListState  = FileListState::IDLE;
     uint8_t       _fileListKind   = 0;
-    char          _fileListNames[FILE_LIST_CACHE_MAX][FILE_NAME_LEN];
+    char        (*_fileListNames)[FILE_NAME_LEN] = nullptr;  // PSRAM (alloc in begin())
     int           _fileListCount  = 0;
     uint8_t       _fileListPage   = 0;
     uint8_t       _fileListTotalPages = 0;
