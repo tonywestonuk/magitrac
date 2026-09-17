@@ -104,9 +104,6 @@ static const uint32_t PAIR_WINDOW_MS = 60000;
 // times out).  PROBE handler sets this; pairingLoop() sends.
 static bool     sChallengePending  = false;
 
-// ── Song push (set here on connect; consumed by commandsTick in commands_server.ino)
-bool sSongPushPending = false;
-
 static bool sCancelArmed = false;
 
 // ── Screen ────────────────────────────────────────────────────────────────────
@@ -200,7 +197,6 @@ bool pairingIsPaired()    { return sHasPairing; }
 void pairingOnMagiLinkConnected() {
     if (serverMode == SERVER_CONNECTED) return;
     serverMode       = SERVER_CONNECTED;
-    sSongPushPending = true;
     sCancelArmed     = false;
     needsFullRedraw  = true;
     Serial.println("[PAIR] MagiLink session established");

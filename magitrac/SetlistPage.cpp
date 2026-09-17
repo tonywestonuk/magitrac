@@ -112,6 +112,18 @@ void SetlistPage::draw() {
 }
 
 SetlistResult SetlistPage::poll() {
+    // A load that outlived the WAITING_SONG timeout is still in flight — the
+    // receive state was deliberately left intact.  Land it from wherever the
+    // user is now on this page.
+    if (_srvLoadLate && _state != State::WAITING_SONG &&
+        gServerPairing.browseState() == BrowseState::SONG_READY) {
+        _srvLoadLate = false;
+        SetlistResult r = takeReadySong();
+        if (r == SetlistResult::SONG_LOADED) {
+            Serial.println("[SetlistPage] late server load landed");
+            return r;
+        }
+    }
     switch (_state) {
         case State::NOT_CONNECTED: return pollNotConnected();
         case State::LIST:          return pollList();
@@ -604,6 +616,7 @@ SetlistResult SetlistPage::pollInfo() {
 
         gServerPairing.resetBrowse();
         _srvLoadStartMs = millis();
+        _srvLoadLate    = false;
         gServerPairing.requestSongLoadByName(bare);
         _state = State::WAITING_SONG;
         _d.fillScreen(COL_WHITE);
@@ -634,29 +647,38 @@ void SetlistPage::drawWaitingSong() {
     _d.print(msg);
 }
 
+SetlistResult SetlistPage::takeReadySong() {
+    if (gServerPairing.copySong(&_song)) {
+        const MasterEntry* m = resolveRow(_selectedIdx);
+        if (m) {
+            strncpy(_loadedFilename, m->file, sizeof(_loadedFilename) - 1);
+            _loadedFilename[sizeof(_loadedFilename) - 1] = '\0';
+            strncpy(_currentLoadedFile, m->file, sizeof(_currentLoadedFile) - 1);
+            _currentLoadedFile[sizeof(_currentLoadedFile) - 1] = '\0';
+        }
+        if (_selectedIdx >= 0 && _selectedIdx < (int)_list.count) {
+            strncpy(_loadedDisplayName, _list.names[_selectedIdx], sizeof(_loadedDisplayName) - 1);
+            _loadedDisplayName[sizeof(_loadedDisplayName) - 1] = '\0';
+        }
+        gServerPairing.resetBrowse();
+        return SetlistResult::SONG_LOADED;
+    }
+    gServerPairing.resetBrowse();
+    return SetlistResult::NONE;
+}
+
 SetlistResult SetlistPage::pollWaitingSong() {
     BrowseState bs = gServerPairing.browseState();
     if (bs == BrowseState::SONG_READY) {
-        if (gServerPairing.copySong(&_song)) {
-            const MasterEntry* m = resolveRow(_selectedIdx);
-            if (m) {
-                strncpy(_loadedFilename, m->file, sizeof(_loadedFilename) - 1);
-                _loadedFilename[sizeof(_loadedFilename) - 1] = '\0';
-                strncpy(_currentLoadedFile, m->file, sizeof(_currentLoadedFile) - 1);
-                _currentLoadedFile[sizeof(_currentLoadedFile) - 1] = '\0';
-            }
-            if (_selectedIdx >= 0 && _selectedIdx < (int)_list.count) {
-                strncpy(_loadedDisplayName, _list.names[_selectedIdx], sizeof(_loadedDisplayName) - 1);
-                _loadedDisplayName[sizeof(_loadedDisplayName) - 1] = '\0';
-            }
-            gServerPairing.resetBrowse();
-            return SetlistResult::SONG_LOADED;
-        }
-        gServerPairing.resetBrowse();
+        SetlistResult r = takeReadySong();
+        if (r == SetlistResult::SONG_LOADED) return r;
     }
     if (millis() - _srvLoadStartMs > 8000) {
-        Serial.println("[SetlistPage] server load timeout");
-        gServerPairing.resetBrowse();
+        // Slow, not dead: leave the receive state alone so the stream can
+        // still complete (resetBrowse() here would zero the byte count under
+        // it and the song could never finish).  poll() lands it later.
+        Serial.println("[SetlistPage] server load slow — back to list, stream kept");
+        _srvLoadLate = true;
         _state = State::INFO;
         _wasDown = _touch.isTouched;
         _d.fillScreen(COL_WHITE);

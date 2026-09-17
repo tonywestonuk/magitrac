@@ -349,8 +349,10 @@ void loadSong(int idx) {
     if (srvLoadSongLocal(listIdx)) {
         sequencerReset();
         sequencerSendPatchesNow();   // patches up before the first note
-        extern bool sSongPushPending;
-        if (pairingIsConnected()) sSongPushPending = true;
+        if (pairingIsConnected()) {
+            MsgActiveSongChanged ev;
+            gMagiLink.postToPeer(&ev, sizeof(ev));
+        }
     }
 }
 
@@ -1335,8 +1337,15 @@ void setup() {
                       (unsigned)apChannel, creds_ssid);
         // max_connection 8 (default 4): the client takes one slot and several
         // PixelPost units pile on at once during a field OTA pull.
+        // Hidden SSID: a visible AP must answer every phone's broadcast probe
+        // request with a unicast probe response (retried if the phone has
+        // already hopped channels).  At a gig that is hundreds of phones and
+        // a real slice of our single radio's airtime spent on devices that
+        // will never join.  Hidden, the AP only answers probes that name it.
+        // The client connects by stored SSID (directed probe), so nothing on
+        // its side changes; the field-flash posts do the same.
         bool apOk = WiFi.softAP(creds_ssid, creds_psk, apChannel,
-                                /*hidden=*/0, /*max_connection=*/8);
+                                /*hidden=*/1, /*max_connection=*/8);
         if (!apOk) {
             Serial.println("[SETUP] softAP FAILED — common causes: PSK < 8 chars, SSID empty, channel out of range");
         }
@@ -1369,7 +1378,7 @@ void setup() {
             }
         }
 
-        Serial.printf("[SETUP] AP IP: %s  SSID broadcast: %s  (11g/n, beacon 400ms)\n",
+        Serial.printf("[SETUP] AP IP: %s  SSID (hidden): %s  (11g/n, beacon 400ms)\n",
                       WiFi.softAPIP().toString().c_str(),
                       WiFi.softAPSSID().c_str());
     } else if (hasCreds && apMode == MAGI_AP_MODE_EXTERNAL) {
@@ -1438,6 +1447,7 @@ void setup() {
     gMagiLink.registerCallback(MSG_NOTE_SET,        controlCb, nullptr);
     gMagiLink.registerCallback(MSG_NOTE_AUDITION,   controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_LOAD_NAME,  controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_ACTIVE_SONG_REQ, controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_LIST_REQ,    controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_LOAD_REQ,    controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_DELETE,      controlCb, nullptr);

@@ -181,12 +181,35 @@ void pixelpostSetSlider(uint8_t value) {
 // no on-quiet refresh — when the mic is off the airwaves are silent.  Posts
 // drop these unless they're running a mic-reactive effect.
 //
+// Airtime budget: the FFT runs at ~31 Hz (32 kHz / 1024) and every frame
+// goes out at the forced 1 Mbps ESP-NOW rate — the slowest, longest way to
+// occupy the channel, and it shares the WiFi driver's TX buffer pool with
+// the MagiLink TCP stream (the `esp_now_send err=12391` seen under load is
+// that pool running dry).  On a crowded 2.4 GHz gig channel that was
+// enough to stall song loads.  So:
+//   1) rate-limit to ~15 Hz — the posts' LEDs can't show more anyway.  A
+//      beat is never lost: beatSeq is a sequence number, so a skipped
+//      frame just delays the beat edge to the next one (≤ 66 ms).
+//   2) hold entirely while the server is streaming a song to the client
+//      (pixelpostAudioHold) — sub-second, the posts hold their last bands.
+//
 // `bands` MUST point to PP_AUDIO_BANDS bytes — declared as a plain pointer
 // (not `bands[PP_AUDIO_BANDS]`) so Arduino-CLI's auto-prototype pass for
 // .ino files doesn't trip on PP_AUDIO_BANDS before <pixelpost_proto.h> is
 // included.
+static const uint32_t PP_AUDIO_MIN_INTERVAL_MS = 66;   // ~15 Hz
+static volatile bool  sAudioHold = false;
+
+void pixelpostAudioHold(bool hold) { sAudioHold = hold; }
+
 void pixelpostSendAudio(const uint8_t* bands,
                         uint32_t beatSeq, uint8_t beatStrength) {
+    if (sAudioHold) return;
+    static uint32_t sLastAudioMs = 0;
+    uint32_t now = millis();
+    if (now - sLastAudioMs < PP_AUDIO_MIN_INTERVAL_MS) return;
+    sLastAudioMs = now;
+
     PpAudioPacket pkt;
     memcpy(pkt.magic, PP_AUDIO_MAGIC, sizeof(pkt.magic));
     taskENTER_CRITICAL(&sLock);

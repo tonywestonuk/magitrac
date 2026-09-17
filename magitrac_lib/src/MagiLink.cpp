@@ -20,10 +20,17 @@ static const uint32_t LINK_POLL_MS      = 100;   // peer.connected() polling
 // Upper bound on a single send().  A half-open socket (peer alive at L2 but
 // not draining its window) makes write() return 0 forever while
 // peer.connected() stays true; without this the worker would spin here
-// holding the mutex until keepalive declares the socket dead (~10s), stalling
+// holding the mutex until keepalive declares the socket dead, stalling
 // the whole link.  Reset on every byte of progress, so it bounds stalls, not
 // total transfer time.
-static const uint32_t SEND_TIMEOUT_MS   = 3000;
+//
+// 12s, not 3s: RF noise spells (gig crowds, USB3 near the bench) corrupt
+// full-size data frames for tens of seconds while small frames still pass.
+// TCP's retransmission backoff has multi-second gaps, so a 3s cutoff fired
+// exactly between retries and killed transfers TCP would have completed.
+// The receiver is a dedicated always-draining task, so a genuinely dead
+// peer is keepalive's job (~10s) — this only needs to outlast RTO gaps.
+static const uint32_t SEND_TIMEOUT_MS   = 12000;
 // Force a fresh WiFi association if connect() keeps failing while
 // WiFi.status() still reports WL_CONNECTED — a stale association left behind
 // when the server's AP power-cycled.  See _runConnectLoop.
@@ -55,8 +62,9 @@ static void applyTcpKeepalive(WiFiClient& peer) {
 
 // ── Hidden state — keeps WiFi.h out of the public header ────────────────────
 struct MagiLink::Impl {
-    WiFiServer*       server     = nullptr;
     WiFiClient        peer;
+    int               kickFd     = -1;   // loopback UDP, Accept role only
+    uint16_t          kickPort   = 0;
     TaskHandle_t      task       = nullptr;
     SemaphoreHandle_t mutex      = nullptr;   // binary semaphore (any task can give)
     volatile TaskHandle_t txHolder = nullptr; // current owner of mutex, if any
@@ -127,79 +135,153 @@ void MagiLink::_runAcceptLoop() {
     while ((uint32_t)(local = firstLocalIp()) == 0) {
         vTaskDelay(pdMS_TO_TICKS(WIFI_WAIT_POLL_MS));
     }
-    Serial.printf("[LINK-ACC] listening on %s:%u\n",
-                  local.toString().c_str(), (unsigned)_port);
 
-    _impl->server = new WiFiServer(_port);
-    _impl->server->begin();
-    _impl->server->setNoDelay(true);
+    // Raw BSD listener — WiFiServer hides its fd, and select() needs it.
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    {
+        int yes = 1;
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        sockaddr_in a = {};
+        a.sin_family      = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
+        a.sin_port        = htons(_port);
+        bind(lfd, (sockaddr*)&a, sizeof(a));
+        listen(lfd, 1);
+    }
 
+    // Loopback kick socket: postToPeer() datagrams land here and get
+    // forwarded to the peer between transfers.  Bound to 127.0.0.1 so it
+    // is unreachable from the radio side — local tasks only, no auth
+    // needed.  Non-blocking so the drain loop below can never wedge.
+    int kfd = socket(AF_INET, SOCK_DGRAM, 0);
+    {
+        sockaddr_in a = {};
+        a.sin_family      = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port        = htons((uint16_t)(_port + 1));
+        bind(kfd, (sockaddr*)&a, sizeof(a));
+        fcntl(kfd, F_SETFL, O_NONBLOCK);
+        _impl->kickPort = (uint16_t)(_port + 1);
+        _impl->kickFd   = kfd;
+    }
+    Serial.printf("[LINK-ACC] listening on %s:%u (kick :%u)\n",
+                  local.toString().c_str(), (unsigned)_port,
+                  (unsigned)_impl->kickPort);
+
+    // Single select loop: listener + kick + (peer when connected).  One
+    // task owns all socket I/O; everything else reaches the wire either
+    // through the mutexed send() (direct command responses) or through
+    // the kick socket (server-initiated tiny events).  While the loop is
+    // busy with one transfer, further commands queue in the TCP receive
+    // buffer and further kicks queue in the UDP buffer — serialisation
+    // falls out of the single-threadedness, no extra locking.
     while (true) {
-        // Wait for a client to connect.
-        Serial.println("[LINK-ACC] waiting for peer...");
-        while (true) {
-            WiFiClient c = _impl->server->accept();
-            if (c) {
-                _impl->peer = c;
+        bool peerUp = _connected && _impl->peer.connected();
+        if (_connected && !peerUp) {
+            Serial.println("[LINK-ACC] peer disconnected");
+            _connected = false;
+            acquireMutex();
+            _impl->peer.stop();
+            releaseMutex();
+            continue;
+        }
+
+        // WiFiClient buffers reads in user space; select() only sees the
+        // socket.  Service buffered frames before blocking.
+        if (peerUp && _impl->peer.available() > 0) {
+            acquireMutex();
+            if (_impl->peer.available() > 0 && _readMessageRaw()) {
+                _dispatch(_recvBuf, /*len=*/ (size_t)
+                          ((uint16_t)_recvBuf[1] | ((uint16_t)_recvBuf[2] << 8)));
+            }
+            releaseMutex();
+            continue;
+        }
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lfd, &rfds);
+        FD_SET(kfd, &rfds);
+        int maxfd = lfd > kfd ? lfd : kfd;
+        int pfd = -1;
+        if (peerUp) {
+            pfd = _impl->peer.fd();
+            if (pfd >= 0) {
+                FD_SET(pfd, &rfds);
+                if (pfd > maxfd) maxfd = pfd;
+            }
+        }
+
+        // 1s ceiling so keepalive-detected peer death and any missed edge
+        // get noticed even in total silence.
+        timeval tv = { 1, 0 };
+        int n = select(maxfd + 1, &rfds, nullptr, nullptr, &tv);
+        if (n < 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (n == 0) continue;
+
+        // New TCP connection.  Accepted even while a peer is up: a fresh
+        // SYN is a perfect death signal for the current peer (the client
+        // only reconnects when its side is broken) — same preempt
+        // semantics as before, now event-driven instead of polled.
+        if (FD_ISSET(lfd, &rfds)) {
+            sockaddr_in ra;
+            socklen_t   rl  = sizeof(ra);
+            int         nfd = accept(lfd, (sockaddr*)&ra, &rl);
+            if (nfd >= 0) {
+                bool preempted = _connected;
+                if (preempted) {
+                    Serial.println("[LINK-ACC] preempted by new peer");
+                    _connected = false;   // falling edge for the session task
+                }
+                acquireMutex();
+                _impl->peer.stop();
+                _impl->peer = WiFiClient(nfd);
                 _impl->peer.setNoDelay(true);
                 applyTcpKeepalive(_impl->peer);
+                releaseMutex();
+                if (preempted) {
+                    vTaskDelay(pdMS_TO_TICKS(300));   // let session task see edge
+                }
                 _generation++;
                 _connected = true;
                 Serial.printf("[LINK-ACC] connected from %s\n",
                               _impl->peer.remoteIP().toString().c_str());
-                break;
+                // pfd (and any readiness flags) belong to the old peer —
+                // restart the loop so the new peer gets a fresh select().
+                continue;
             }
-            vTaskDelay(pdMS_TO_TICKS(ACCEPT_POLL_MS));
         }
 
-        // Main loop while peer is alive: take mutex, drain one message if
-        // there is one, release, yield.  Transactional senders compete on
-        // the same mutex — yield gives them a chance to grab it.
-        while (_impl->peer.connected()) {
-            acquireMutex();
-            if (_impl->peer.available() > 0) {
-                // Worker drains one message and dispatches via registered
-                // callback (if any).  Messages without a registered handler
-                // are silently dropped here — sender tasks that need them
-                // must be inside a transaction (which would have the mutex
-                // already, preventing the worker from running this code).
-                if (_readMessageRaw()) {
-                    _dispatch(_recvBuf, /*len=*/ (size_t)
-                              ((uint16_t)_recvBuf[1] | ((uint16_t)_recvBuf[2] << 8)));
+        // Kick datagrams: forward each one to the peer as-is.  Drain fully;
+        // with no peer connected they are read and dropped (events are
+        // idempotent — a client that connects later pulls current state).
+        if (FD_ISSET(kfd, &rfds)) {
+            uint8_t kb[KICK_MAX_BYTES];
+            while (true) {
+                int g = recvfrom(kfd, kb, sizeof(kb), 0, nullptr, nullptr);
+                if (g <= 0) break;
+                if (_connected && g >= 3) {
+                    // send() keeps the mutex on success (transactional
+                    // contract) — release explicitly or this task parks in
+                    // select() still holding it, starving every other sender.
+                    acquireMutex();
+                    send(kb, (size_t)g);
+                    releaseMutex();
                 }
             }
-            releaseMutex();
-
-            // Preempt-on-new-accept: a fresh client connecting is a perfect
-            // death signal for the current peer.  TCP keepalive would
-            // eventually notice (~14s+, masked by WiFi association hysteresis),
-            // but the new SYN tells us *now*.  Toggle _connected false→true
-            // around the swap so the upper-layer session task (polling
-            // isConnected() at 200ms) sees a falling edge (tears down old
-            // session) followed by a rising edge (does the MSG_CONNECT/ACK
-            // handshake on the new socket).
-            WiFiClient incoming = _impl->server->accept();
-            if (incoming) {
-                Serial.printf("[LINK-ACC] preempted by new peer %s\n",
-                              incoming.remoteIP().toString().c_str());
-                _connected = false;
-                acquireMutex();
-                _impl->peer.stop();
-                _impl->peer = incoming;
-                _impl->peer.setNoDelay(true);
-                applyTcpKeepalive(_impl->peer);
-                releaseMutex();
-                vTaskDelay(pdMS_TO_TICKS(300));   // let session task see edge
-                _generation++;
-                _connected = true;
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(1));
         }
 
-        Serial.println("[LINK-ACC] peer disconnected");
-        _connected = false;
-        _impl->peer.stop();
+        if (pfd >= 0 && FD_ISSET(pfd, &rfds)) {
+            acquireMutex();
+            if (_impl->peer.available() > 0 && _readMessageRaw()) {
+                _dispatch(_recvBuf, /*len=*/ (size_t)
+                          ((uint16_t)_recvBuf[1] | ((uint16_t)_recvBuf[2] << 8)));
+            }
+            releaseMutex();
+        }
     }
 }
 
@@ -269,6 +351,8 @@ void MagiLink::_runConnectLoop() {
         // dropping.  The WiFi check is the client's analog of the server's
         // preempt-on-accept: if the AP went down (e.g. server reset), L2
         // tells us instantly, where lwIP keepalive would take 10-30s.
+        uint32_t lastMsgMs  = millis();
+        uint32_t lastDiagMs = 0;
         while (_impl->peer.connected()) {
             if (WiFi.status() != WL_CONNECTED) {
                 Serial.println("[LINK-CON] WiFi disassociated");
@@ -279,9 +363,25 @@ void MagiLink::_runConnectLoop() {
                 if (_readMessageRaw()) {
                     _dispatch(_recvBuf, /*len=*/ (size_t)
                               ((uint16_t)_recvBuf[1] | ((uint16_t)_recvBuf[2] << 8)));
+                    lastMsgMs = millis();
                 }
             }
             releaseMutex();
+            // Stall diagnostic: quiet link + full server window has been seen
+            // in the field.  avail vs FIONREAD splits the suspects — data
+            // stuck below WiFiClient (avail=0 sock>0), or never reaching lwIP
+            // at all (both 0 while the server reports a stalled send).
+            uint32_t now = millis();
+            if (now - lastMsgMs > 1000 && now - lastDiagMs > 2000) {
+                lastDiagMs = now;
+                int av = _impl->peer.available();
+                int sockPend = -1;
+                int fd = _impl->peer.fd();
+                if (fd >= 0) lwip_ioctl(fd, FIONREAD, &sockPend);
+                Serial.printf("[LINK-CON] quiet %lums avail=%d sock=%d heap=%u\n",
+                              (unsigned long)(now - lastMsgMs), av, sockPend,
+                              (unsigned)ESP.getFreeHeap());
+            }
             vTaskDelay(pdMS_TO_TICKS(1));
         }
         Serial.println("[LINK-CON] peer disconnected");
@@ -307,6 +407,17 @@ void MagiLink::releaseMutex() {
         _impl->txHolder = nullptr;
         xSemaphoreGive(_impl->mutex);
     }
+}
+
+bool MagiLink::postToPeer(const void* msg, size_t len) {
+    if (!_impl || _impl->kickFd < 0) return false;
+    if (len < 3 || len > KICK_MAX_BYTES) return false;
+    sockaddr_in a = {};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port        = htons(_impl->kickPort);
+    return sendto(_impl->kickFd, msg, len, 0,
+                  (sockaddr*)&a, sizeof(a)) == (int)len;
 }
 
 bool MagiLink::send(const void* msg, size_t len) {

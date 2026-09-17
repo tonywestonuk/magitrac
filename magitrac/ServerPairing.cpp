@@ -95,6 +95,7 @@ void ServerPairing::begin() {
     };
     gMagiLink.registerCallback(MSG_SONG_PUSH_HEADER, songCb, this);
     gMagiLink.registerCallback(MSG_SONG_PUSH_BODY,   songCb, this);
+    gMagiLink.registerCallback(MSG_ACTIVE_SONG_CHANGED, songCb, this);
     gMagiLink.registerCallback(MSG_NO_SONG,          songCb, this);
     gMagiLink.registerCallback(MSG_SONG_LIST_RESP,   songCb, this);
 
@@ -704,12 +705,17 @@ bool ServerPairing::sendInstrumentPatch(const Instrument* instruments, int idx) 
     return ok;
 }
 
+// Same locking contract as copySong() — do not call with the mutex held.
 bool ServerPairing::copyInstruments(Instrument* out) const {
-    if (!_instReady) return false;
+    gMagiLink.acquireMutex();
+    bool ok = false;
     uint32_t needed = MAX_INSTRUMENTS * sizeof(Instrument);
-    if (_instBufLen < needed) return false;
-    memcpy(out, _instBuf, needed);
-    return true;
+    if (_instReady && _instBufLen >= needed) {
+        memcpy(out, _instBuf, needed);
+        ok = true;
+    }
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 void ServerPairing::resetInstruments() {
@@ -991,14 +997,24 @@ void ServerPairing::requestFileLoad(uint8_t kind, const char* name) {
     _fileLoadState = FileLoadState::WAITING_HEADER;
 }
 
+// Callers must NOT hold the link mutex (UI-poll helper; it takes and
+// releases the mutex itself).  The lock makes the state-check + copy atomic
+// against the worker task: with back-to-back song streams (connect pull +
+// changed-event pull), a second stream's HEADER/BODY could otherwise start
+// overwriting _songBuf mid-memcpy and hand the caller a torn song.
 bool ServerPairing::copySong(Song* out) const {
-    if (_browseState != BrowseState::SONG_READY) return false;
-    const SongFileHeader* hdr = (const SongFileHeader*)_songBuf;
-    if (hdr->magic != SONG_FILE_MAGIC) return false;
-    if (hdr->version != SONG_FILE_VERSION) return false;
-    if (_songBufLen < sizeof(SongFileHeader) + sizeof(Song)) return false;
-    memcpy(out, _songBuf + sizeof(SongFileHeader), sizeof(Song));
-    return true;
+    gMagiLink.acquireMutex();
+    bool ok = false;
+    if (_browseState == BrowseState::SONG_READY &&
+        _songBufLen >= sizeof(SongFileHeader) + sizeof(Song)) {
+        const SongFileHeader* hdr = (const SongFileHeader*)_songBuf;
+        if (hdr->magic == SONG_FILE_MAGIC && hdr->version == SONG_FILE_VERSION) {
+            memcpy(out, _songBuf + sizeof(SongFileHeader), sizeof(Song));
+            ok = true;
+        }
+    }
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 // ── Receive ───────────────────────────────────────────────────────────────────
@@ -1136,6 +1152,14 @@ void ServerPairing::_onMagiLinkConnect() {
     Serial.printf("[SP] MagiLink: got MSG_CONNECT, ack send=%s\n",
                   ok ? "OK" : "FAIL");
     _setPairState(PairClientState::SUCCESS);
+    // Pull the active song as our first command.  This replaces the old
+    // server push-on-connect: the server never volunteers the song stream,
+    // we ask for it — which also makes every reconnect recover the active
+    // song through the ordinary request path.
+    if (ok) {
+        MsgActiveSongReq req;
+        gMagiLink.send(&req, sizeof(req));
+    }
 }
 
 void ServerPairing::_onMagiLinkDisconnect() {
@@ -1179,9 +1203,13 @@ void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
 
         case MSG_SONG_PUSH_BODY: {
             if (_songRecvExpected == 0) return;       // stray body
-            if (len < sizeof(MsgSongPushBody))  return;
+            // Bodies arrive truncated to header + data_len bytes (server
+            // shrinks frames for RF robustness) — validate against
+            // data_len, not the full struct size.
+            if (len < offsetof(MsgSongPushBody, data)) return;
             const MsgSongPushBody* b = (const MsgSongPushBody*)msg;
-            if (b->data_len > 1024) return;
+            if (b->data_len > 1024 ||
+                len < offsetof(MsgSongPushBody, data) + b->data_len) return;
             if (_songBufLen + b->data_len > _songRecvExpected) {
                 Serial.println("[SP] song push: overshoot — dropping");
                 _songRecvExpected = 0;
@@ -1202,6 +1230,15 @@ void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
             _noSongPending = true;
             Serial.println("[SP] NO_SONG from server");
             break;
+
+        case MSG_ACTIVE_SONG_CHANGED: {
+            // Server-side event (song loaded on the server screen, restore
+            // reload).  Tiny notification — we pull the actual stream.
+            Serial.println("[SP] active song changed — pulling");
+            MsgActiveSongReq req;
+            gMagiLink.send(&req, sizeof(req));
+            break;
+        }
 
         case MSG_SONG_LIST_RESP: {
             if (_browseState != BrowseState::WAITING_LIST) return;
@@ -1376,9 +1413,11 @@ void ServerPairing::_onMagiLinkInstrumentsMessage(const uint8_t* msg, size_t len
         }
         case MSG_INSTRUMENTS_PUSH_BODY: {
             if (_instRecvExpected == 0) return;
-            if (len < sizeof(MsgInstrumentsPushBody)) return;
+            // Truncated frames — see MSG_SONG_PUSH_BODY.
+            if (len < offsetof(MsgInstrumentsPushBody, data)) return;
             const MsgInstrumentsPushBody* b = (const MsgInstrumentsPushBody*)msg;
-            if (b->data_len > 1024) return;
+            if (b->data_len > 1024 ||
+                len < offsetof(MsgInstrumentsPushBody, data) + b->data_len) return;
             if (_instBufLen + b->data_len > _instRecvExpected) {
                 Serial.println("[SP] inst push overshoot — dropping");
                 _instRecvExpected = 0;

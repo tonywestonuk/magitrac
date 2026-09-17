@@ -192,6 +192,8 @@ private:
     bool    _srvListDrawn;
 
     uint32_t _srvLoadStartMs;   // WAITING_SONG
+    bool     _srvLoadLate = false;   // timed out of WAITING_SONG; stream may still land
+    SetlistResult takeReadySong();   // SONG_READY → copy + SONG_LOADED, else NONE
 
     char    _loadedFilename[32];
     char    _loadedDisplayName[SETLIST_SONG_NAME_LEN];

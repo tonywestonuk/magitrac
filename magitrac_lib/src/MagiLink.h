@@ -18,8 +18,9 @@ class MagiLink {
 public:
     enum class Role : uint8_t { Unconfigured, Accept, Connect };
 
-    // Accept role: opens a WiFiServer on `port` and accepts the next
-    // client.  Spawns the worker task immediately; the worker waits
+    // Accept role: listens on `port` and serves one peer at a time from a
+    // single select() loop (listener + peer + loopback kick socket on
+    // port+1).  Spawns the worker task immediately; the worker waits
     // until a local IP is available (softAP or STA) before listening.
     void beginAccept(uint16_t port);
 
@@ -44,6 +45,17 @@ public:
     // connection" robustly, even if it polls too slowly to observe the
     // isConnected() false→true edge during a preempt.
     uint32_t generation() const { return _generation; }
+
+    // Post a small, complete message frame to the peer via the worker's
+    // loopback kick socket (Accept role only).  Safe from any task with no
+    // mutex involved: the datagram lands in the kick socket's buffer and the
+    // select loop forwards it over TCP when it is next idle — so a post can
+    // never collide with an in-progress transfer.  Fire-and-forget: posts
+    // made while no peer is connected are drained and dropped, and UDP may
+    // drop under buffer pressure, so post only idempotent "state changed"
+    // events the peer can recover by pulling — never must-not-lose data.
+    // Returns false if the frame is oversized or the kick socket is not up.
+    bool postToPeer(const void* msg, size_t len);
 
     // ── Transactional API ────────────────────────────────────────────────────
     //
@@ -107,9 +119,13 @@ private:
     // (full command set + the two streaming HEADER/BODY pairs); 48
     // leaves headroom for future additions without another overflow.
     struct RegisteredHandler { uint8_t msgType; MessageCb cb; void* ctx; };
-    static const int MAX_REGISTERED = 48;
+    static const int MAX_REGISTERED = 64;
     RegisteredHandler _registered[MAX_REGISTERED];
     int               _registeredCount = 0;
+
+    // Largest frame postToPeer accepts — kick messages are tiny events,
+    // never bulk (bulk flows only as direct responses to peer commands).
+    static const size_t KICK_MAX_BYTES = 64;
 
     // Buffer that read() returns a pointer into.  Single-slot — safe
     // because the mutex serialises all access.

@@ -201,6 +201,7 @@ static bool    srvLoadPending   = false;
 static uint8_t srvLoadPendingPage   = 0;
 static uint8_t srvLoadPendingIdx    = 0;
 static bool    srvLoadByNamePending = false;
+static bool    srvActiveSongReqPending = false;  // client pulled the active song
 static char    srvLoadByNameStr[SL_NAME_LEN] = {};
 static bool    srvListPending       = false;
 static uint8_t srvListPendingPage   = 0;
@@ -577,7 +578,8 @@ static void sendFile(uint8_t kind, const char* name) {
     gMagiLink.send(&hdr, sizeof(hdr));
 
     if (found) {
-        sStreamBody.id = MSG_FILE_LOAD_BODY;
+        sStreamBody.id     = MSG_FILE_LOAD_BODY;
+        sStreamBody.length = sizeof(sStreamBody);  // song/inst push leaves it short
         uint32_t sent = 0;
         bool ok = true;
         while (ok && sent < fsize) {
@@ -637,6 +639,30 @@ static void sendSampleList(uint8_t page) {
     gMagiLink.releaseMutex();
 }
 
+// Quiesce all sequencer reads of srvActiveBuf before rewriting it.  Same
+// hazard the save-push path guards against (see onMagiLinkSaveHeader): the
+// MIDI task on Core 1 walks the note pool concurrently, and a torn NoteNode
+// `next` mid-rebuild is a LoadProhibited crash or a broken-circularity
+// watchdog.  Stop + flag only block NEW walks; the bounded wait lets an
+// in-flight walk (which can park ms in a midiTx FIFO wait) finish first.
+static void quiesceSongReaders() {
+    sequencerStop();
+    srvHasActive    = false;
+    srvActiveBufLen = 0;
+    for (int i = 0; i < 100 && sequencerSongReaderBusy(); i++) delay(1);
+}
+
+// Failure reply for an explicit load: the client sits on its "loading" page
+// until song data (or this) arrives — without it a failed SD read leaves the
+// client hanging to its 8s timeout with no explanation.
+static void sendNoSongToClient() {
+    if (!pairingIsConnected()) return;
+    MsgNoSong msg;
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&msg, sizeof(msg));
+    gMagiLink.releaseMutex();
+}
+
 // ── Send song file in chunks ───────────────────────────────────────────────────
 // Loads/migrates the song into srvActiveBuf first, then sends from memory.
 // This handles legacy v7..v16 files transparently — the client always
@@ -671,8 +697,7 @@ static void sendSongDataFromPath(const char* path, const char* displayName) {
         }
     }
 
-    srvHasActive    = false;
-    srvActiveBufLen = 0;
+    quiesceSongReaders();
     bool loaded = false;
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
 
@@ -681,6 +706,7 @@ static void sendSongDataFromPath(const char* path, const char* displayName) {
         File f = SD.open(path);
         if (!f) {
             Serial.printf("[CMD] sendSongData: open failed '%s'\n", path);
+            sendNoSongToClient();
             return;
         }
         SongFileHeader hdr;
@@ -720,6 +746,7 @@ static void sendSongDataFromPath(const char* path, const char* displayName) {
 
     if (!loaded) {
         Serial.printf("[CMD] sendSongData: load failed '%s'\n", path);
+        sendNoSongToClient();
         return;
     }
 
@@ -1248,13 +1275,17 @@ static void sendInstrumentsData() {
 
     sStreamBody.id = MSG_INSTRUMENTS_PUSH_BODY;
 
+    // Truncated 512B-chunk frames, same RF rationale as sendActiveSongToClient
+    // (a 4.6KB instruments push has been seen stalling in the same spells).
     uint32_t sent = 0;
     while (ok && sent < total) {
         uint32_t remain = total - sent;
-        uint16_t chunk  = remain > 1024 ? 1024 : (uint16_t)remain;
+        uint16_t chunk  = remain > 512 ? 512 : (uint16_t)remain;
+        uint16_t wire   = (uint16_t)(offsetof(MsgBackupBody, data) + chunk);
         sStreamBody.data_len = chunk;
+        sStreamBody.length   = wire;
         memcpy(sStreamBody.data, raw + sent, chunk);
-        ok = gMagiLink.send(&sStreamBody, sizeof(sStreamBody));
+        ok = gMagiLink.send(&sStreamBody, wire);
         sent += chunk;
     }
 
@@ -1601,7 +1632,7 @@ void onMagiLinkSetNoSong(const uint8_t* msg, size_t len, void* /*ctx*/) {
 
 static void finaliseNewSong() {
     Serial.printf("[STOPSRC] finaliseNewSong t=%lu\n", millis());
-    sequencerStop();
+    quiesceSongReaders();
     // Stamp a fresh SongFileHeader at the front of srvActiveBuf, then
     // initSong() the Song body that follows.
     SongFileHeader hdr;
@@ -1765,7 +1796,8 @@ static bool backupStreamOne(const char* name, const char* fullPath,
         Serial.printf("[BK-SRV] file %u/%u SIZE MISMATCH dir=%u open=%u '%s'\n",
                       (unsigned)index, (unsigned)total, (unsigned)size,
                       (unsigned)openSize, fullPath);
-    sStreamBody.id = MSG_BACKUP_BODY;   // song push may have left another id
+    sStreamBody.id     = MSG_BACKUP_BODY;      // song push may have left another id
+    sStreamBody.length = sizeof(sStreamBody);  // …and a short wire length
     bool ok = true;
     uint32_t sent = 0;
     uint32_t t0 = millis();
@@ -1892,15 +1924,12 @@ void sendBackupToClient() {
                   (unsigned)sBkFileFailures, (unsigned)ESP.getFreeHeap());
 }
 
-// ── Reload the active song from SD into srvActiveBuf and push to client ──────
+// ── Reload the active song from SD into srvActiveBuf; notify client ─────────
 static void reloadActiveSongFromSD() {
-    extern bool sSongPushPending;
-
     char path[48];
     snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, srvActiveName);
 
-    srvHasActive    = false;
-    srvActiveBufLen = 0;
+    quiesceSongReaders();
     bool loaded = false;
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
 
@@ -1956,9 +1985,12 @@ static void reloadActiveSongFromSD() {
     srvHasActive = true;  gSamplePreloadDirty = true;
     Serial.printf("[CMD] reloaded active song '%s' %u bytes\n", path, srvActiveBufLen);
 
-    // Push to client
+    // Tiny changed-event via the kick socket; the client pulls the song
+    // with MSG_ACTIVE_SONG_REQ when it is ready.  Fire-and-forget: if the
+    // event is lost the client recovers by pulling on the next connect.
     if (pairingIsConnected()) {
-        sSongPushPending = true;
+        MsgActiveSongChanged ev;
+        gMagiLink.postToPeer(&ev, sizeof(ev));
     }
 }
 
@@ -2003,7 +2035,8 @@ static void finaliseRestore() {
 }
 
 // ── Send active song buffer to the connected client ───────────────────────────
-// Called from commandsTick() when sSongPushPending is set.  Streams from
+// Called from commandsTick() as the response to a client pull or an explicit
+// load command — never volunteered.  Streams from
 // srvActiveBuf over MagiLink as HEADER + N×BODY (no SD read needed).
 // Body is `static` because 1029 bytes is too big for any caller's stack.
 static void sendActiveSongToClient() {
@@ -2013,6 +2046,9 @@ static void sendActiveSongToClient() {
         return;
     }
 
+    // Quiet our own radio for the duration: the PixelPost audio broadcasts
+    // share the WiFi TX buffer pool and the channel with this stream.
+    pixelpostAudioHold(true);
     gMagiLink.acquireMutex();
 
     MsgSongPushHeader hdr;
@@ -2023,17 +2059,25 @@ static void sendActiveSongToClient() {
     // have left it as MSG_BACKUP_BODY.
     sStreamBody.id = MSG_SONG_PUSH_BODY;
 
+    // 512-byte chunks sent as truncated frames (~517B on air, not the full
+    // 1029B struct): during RF noise spells ~1KB frames were lost on air
+    // for 10s+ while sub-512B frames kept passing (with 11b disabled there
+    // is no slow DSSS fallback).  The wire `length` field must match the
+    // truncated size or the receiver's framing desyncs.
     uint32_t sent = 0;
     while (ok && sent < srvActiveBufLen) {
         uint32_t remain = srvActiveBufLen - sent;
-        uint16_t chunk  = remain > 1024 ? 1024 : (uint16_t)remain;
+        uint16_t chunk  = remain > 512 ? 512 : (uint16_t)remain;
+        uint16_t wire   = (uint16_t)(offsetof(MsgBackupBody, data) + chunk);
         sStreamBody.data_len = chunk;
+        sStreamBody.length   = wire;
         memcpy(sStreamBody.data, srvActiveBuf + sent, chunk);
-        ok = gMagiLink.send(&sStreamBody, sizeof(sStreamBody));
+        ok = gMagiLink.send(&sStreamBody, wire);
         sent += chunk;
     }
 
     gMagiLink.releaseMutex();
+    pixelpostAudioHold(false);
     Serial.printf("[CMD] song push: %u bytes (%s)\n",
                   (unsigned)srvActiveBufLen, ok ? "OK" : "FAIL");
 }
@@ -2086,10 +2130,14 @@ void commandsTick() {
         sendSampleSpectrum(sSampleSpecId);
     }
 
-    // Push active song to client on connect or song change (deferred from pairing/main)
-    extern bool sSongPushPending;
-    if (sSongPushPending) {
-        sSongPushPending = false;
+    // Client pulled the active song (MSG_ACTIVE_SONG_REQ — sent on its
+    // connect edge and whenever we post MSG_ACTIVE_SONG_CHANGED).  Deferred
+    // here so the ~750ms stream runs on the main task, which also owns all
+    // srvActiveBuf mutation — no torn reads.  This is the ONLY way the song
+    // stream leaves the server besides an explicit load command: bulk data
+    // flows solely as the response to something the client asked for.
+    if (srvActiveSongReqPending) {
+        srvActiveSongReqPending = false;
         if (srvHasActive) {
             sendActiveSongToClient();
         } else if (pairingIsConnected()) {
@@ -2303,6 +2351,10 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 srvLoadPendingIdx  = req->index;
                 srvLoadPending     = true;
             }
+            break;
+
+        case MSG_ACTIVE_SONG_REQ:
+            srvActiveSongReqPending = true;
             break;
 
         case MSG_SONG_LOAD_NAME:

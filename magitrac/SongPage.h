@@ -75,6 +75,7 @@ private:
     bool     _srvListDrawn;     // per-page latch: false = next list page not yet appended
     char     _srvPendingDeleteName[SRV_NAME_MAX];  // server song pending delete confirm
     uint32_t _srvLoadStartMs;   // millis() when requestSongLoad was last called
+    bool     _srvLoadSlow = false;   // slow-link notice already shown for this load
     int      _pendingLoadAbsIdx; // server-list index tapped, awaiting save-changes confirm
     bool     _pendingNew = false; // true = the save-changes confirm precedes a NEW song
 

@@ -229,6 +229,17 @@ enum MagiMsgType : uint8_t {
     // /samples/samples.txt manifest with stable IDs, returns paged list.
     MSG_SAMPLE_LIST_REQ  = 0x62,  // client → server: request page of sample list
     MSG_SAMPLE_LIST_RESP = 0x63,  // server → client: one page of (id, filename) entries
+
+    // Active-song pull.  The server never volunteers the ~34KB song stream:
+    // on any active-song change it didn't stream as a direct command response
+    // (server-screen load, restore reload) it sends the tiny CHANGED event,
+    // and the client pulls with REQ — answered by the usual
+    // MSG_SONG_PUSH_HEADER/BODY stream, or MSG_NO_SONG when nothing is
+    // loaded.  The client also pulls on the connect edge, which is what
+    // recovers the active song after any reconnect.  Bulk data therefore
+    // only ever flows as the response to a client command.
+    MSG_ACTIVE_SONG_REQ     = 0x64,  // client → server: send me the active song
+    MSG_ACTIVE_SONG_CHANGED = 0x65,  // server → client: active song changed — pull it
 };
 
 #pragma pack(push, 1)
@@ -251,6 +262,16 @@ struct MsgConnect {
 struct MsgConnectAck {
     uint8_t  id     = MSG_CONNECT_ACK;
     uint16_t length = sizeof(MsgConnectAck);
+};
+
+struct MsgActiveSongReq {
+    uint8_t  id     = MSG_ACTIVE_SONG_REQ;
+    uint16_t length = sizeof(MsgActiveSongReq);
+};
+
+struct MsgActiveSongChanged {
+    uint8_t  id     = MSG_ACTIVE_SONG_CHANGED;
+    uint16_t length = sizeof(MsgActiveSongChanged);
 };
 
 // ── Pairing ceremony messages ─────────────────────────────────────────────────

@@ -271,10 +271,17 @@ SongPageResult SongPage::poll() {
             }
         }
 
-        // Song load timeout — give up after 8 s and show list again
-        if (bs == BrowseState::WAITING_SONG && millis() - _srvLoadStartMs > 8000) {
-            gServerPairing.resetBrowse();
-            restartServerList("Loading...");
+        // Slow load (8 s) — bring the list back so the page stays usable, but
+        // do NOT resetBrowse(): that zeroes the receive counters under a
+        // stream that is still arriving, so a song that lands at 9 s could
+        // never complete.  On a crowded 2.4 GHz channel TCP finishes late,
+        // not never — the SONG_READY check above still loads it whenever it
+        // lands.  If the socket really died, the reconnect pull recovers.
+        if (bs == BrowseState::WAITING_SONG && !_srvLoadSlow &&
+            millis() - _srvLoadStartMs > 8000) {
+            _srvLoadSlow = true;
+            Serial.println("[SongPage] slow server load — keeping the stream, showing list");
+            restartServerList("Slow link - still receiving...");
         }
 
         FileBrowserResult r = _browser.poll();
@@ -391,6 +398,7 @@ void SongPage::startServerLoad(int absIdx) {
     gServerPairing.requestSongLoad((uint8_t)(absIdx / SL_PER_PKT),
                                    (uint8_t)(absIdx % SL_PER_PKT));
     _srvLoadStartMs = millis();
+    _srvLoadSlow    = false;
     _srvListDrawn   = false;
     _browser.clearItems();
     _browser.setStatusText("Receiving song...");
