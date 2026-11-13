@@ -10,9 +10,7 @@ enum class PairClientState : uint8_t {
     AUTO_CONNECTING,   // has stored pairing; silently retrying connection
     PAIRING_REQUEST,   // in pair mode; listening for MSG_PAIR_PROBE
     PAIRING_CONFIRM,   // got probe + generated PIN; waiting for user to tap Confirm
-    REQUESTING,        // sent MSG_CONNECT; waiting for MSG_CONNECT_ACK
     SUCCESS,           // connected — session active
-    TIMEOUT,
 };
 
 enum class BrowseState : uint8_t {
@@ -115,7 +113,6 @@ public:
     // ── Live song sync ────────────────────────────────────────────────────────
     bool sendSongPatch(const Song& song, const void* fieldPtr, uint8_t length);
     bool sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, uint8_t col);
-    bool sendNoteSetReliable(const Song& song, uint8_t pattern, uint8_t row, uint8_t col);
     bool sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col);
     // Fire a raw MIDI note-on (no note-off).  Used by DrumTrackImportPage to
     // audition drum blocks before import.
@@ -241,6 +238,14 @@ public:
     bool        noSongPending()    const { return _noSongPending; }
     void        clearNoSong()            { _noSongPending = false; }
 
+    // The server refused / failed our last requestSongLoad*() (MSG_SONG_LOAD_FAILED).
+    // It keeps its previous active song, so the client keeps its own too — the
+    // page that issued the load consumes this and shows loadFailText().
+    // Cleared by the next requestSongLoad*().
+    bool        loadFailPending()  const { return _loadFailPending; }
+    void        clearLoadFail()          { _loadFailPending = false; }
+    const char* loadFailText()     const;   // short, upper-case: "READ ERR", "NO FILE", …
+
     BrowseState browseState()      const { return _browseState; }
     int         listCount()        const { return _listCount; }
     uint8_t     listPage()         const { return _listPage; }
@@ -288,6 +293,7 @@ public:
     void _onMagiLinkFileLoad(const uint8_t* msg, size_t len);
 
 private:
+    bool _sendLocked(const void* msg, size_t len);   // mutex + one frame + release
     void _setPairState(PairClientState s);
     void _setBrowseState(BrowseState s);
     void _tryAutoConnect();
@@ -321,8 +327,6 @@ private:
     int         _listCount        = 0;
     uint8_t     _listPage         = 0;
     uint8_t     _listTotalPages   = 1;
-    uint8_t     _loadPage         = 0;
-    uint8_t     _loadIndex        = 0;
 
     // Remote sequencer position and play state
     uint8_t  _remotePattern  = 0;
@@ -330,6 +334,8 @@ private:
     bool     _remotePosDirty = false;
     bool     _serverPlaying  = false;
     bool     _noSongPending  = false;
+    volatile bool _loadFailPending = false;
+    uint8_t  _loadFailReason = 0;      // SongLoadFailReason
     uint8_t  _midiNoteIn     = 0;
     uint8_t  _midiVelocityIn = 0;
     bool     _midiNoteInPending = false;
@@ -354,8 +360,6 @@ private:
     // Song receive buffer
     uint8_t* _songBuf      = nullptr;
     uint32_t _songBufLen   = 0;
-    uint8_t  _chunksGot    = 0;
-    uint8_t  _chunksTotal  = 0;
     // Set by MSG_SONG_PUSH_HEADER, cleared when the body bytes drain.
     // 0 means "not currently receiving a push" — stray body messages are
     // dropped if this is 0.
@@ -366,8 +370,6 @@ private:
     // Instruments receive buffer
     uint8_t* _instBuf         = nullptr;
     uint32_t _instBufLen      = 0;
-    uint8_t  _instChunksGot   = 0;
-    uint8_t  _instChunksTotal = 0;
     bool     _instReady       = false;
 
     // Sample list cache (SFX column picker)
@@ -393,8 +395,6 @@ private:
     uint32_t      _fileLoadExpected = 0;
     char          _fileLoadName[FILE_NAME_LEN] = {};
 
-    static const uint32_t CONNECT_TIMEOUT_MS    = 10000;
-    static const uint32_t AUTO_CONNECT_RETRY_MS  = 5000;
     static const uint32_t PAIR_REQUEST_TIMEOUT_MS = 60000;   // match the server's 60 s window
 };
 

@@ -41,7 +41,6 @@ static uint16_t seqA0RowBpm      = 0;
 
 // Block-end navigation — legacy variable, kept for reset paths only.
 // -1 = BLK- (go to previous), 0 = loop current, 1 = BLK+ (go to next)
-static int8_t   seqEndNav        = 0;
 
 // Performance mode: queued block override — if >= 0, this block plays after the
 // current block ends (overrides blockEndNav). Reset to -1 after use.
@@ -131,7 +130,6 @@ static bool     seqPpPressed[MAX_COLUMNS] = {};
 // Per-column last-sent pixel_post effect index (0..95 = note - 1).
 // 0xFF = "never sent yet, fire SELECT_EFFECT on next note".  NOTE_OFF does
 // NOT touch this — effect choice persists across releases.
-static uint8_t  seqPpLastEffect[MAX_COLUMNS];   // initialised at sequencerStart
 // MIDI channel (0-based) for each column's active note — needed for correct note-off
 static uint8_t  seqActiveChan[MAX_COLUMNS] = {};
 // Retrigger (ratchet) state per output column.  A note with EFFECT_RTRG fires
@@ -191,9 +189,7 @@ static uint32_t seqAuditionEndMs = 0;
 
 // ── External references ───────────────────────────────────────────────────────
 extern uint8_t*       srvActiveBuf;    // PSRAM (commands_server allocates)
-extern uint32_t       srvActiveBufLen;
 extern bool           srvHasActive;
-extern Instrument     srvInstruments[];
 
 // Last MIDI status byte written — enables running status on output.  Reset
 // to 0 on sequencer stop (and after the SAM2695 SysEx burst / raw forwards)
@@ -731,7 +727,6 @@ static void seqPlayRow() {
                 seqPpPressed[col] = true;
                 uint8_t effectIdx = (uint8_t)(nn.note - 1);
                 pixelpostSetEffect(effectIdx);
-                seqPpLastEffect[col] = effectIdx;
                 uint8_t vel = (nn.velocity & 0x80) ? 100 : nn.velocity;
                 uint8_t slider = (vel <= 127) ? (uint8_t)(vel * 2) : 255;
                 pixelpostSetSlider(slider);
@@ -899,7 +894,6 @@ static void seqOnPerformerNote(uint8_t midiNote) {
             }
             if (seqPattern != fromPattern) seqReturnFrom = fromPattern;
             seqRow               = 0;
-            seqEndNav            = 0;
             seqWaiting           = false;
             seqSnapCooldownUntil = 0;
             seqSendColumnSetup(seqPattern);
@@ -1275,7 +1269,6 @@ static void seqPlayPreviewRow() {
                     extern void pixelpostSetTouchpad(uint8_t x, uint8_t y, bool touched);
                     uint8_t effectIdx = (uint8_t)(nn.note - 1);
                     pixelpostSetEffect(effectIdx);
-                    seqPpLastEffect[seqPreviewCol] = effectIdx;
                     uint8_t vel = (nn.velocity & 0x80) ? 100 : nn.velocity;
                     uint8_t slider = (vel <= 127) ? (uint8_t)(vel * 2) : 255;
                     pixelpostSetSlider(slider);
@@ -1311,7 +1304,6 @@ void sequencerStart() {
     memset(seqChanProg,     0xFF, sizeof(seqChanProg));
     memset(seqChanVol,      0xFF, sizeof(seqChanVol));
     memset(seqPpPressed,    0,    sizeof(seqPpPressed));
-    memset(seqPpLastEffect, 0xFF, sizeof(seqPpLastEffect));  // 0xFF = force first SELECT_EFFECT
 
     const Song* s = seqSong();
     uint8_t startPat = s->startPattern < s->numPatterns ? s->startPattern : 0;
@@ -1328,7 +1320,6 @@ void sequencerStart() {
     seqPattern       = startPat;   // Song::startPattern — setup above matches
     seqRow           = 0;
     seqWaiting       = false;
-    seqEndNav        = 0;
     seqQueuedPattern = -1;
     seqReturnFrom    = 0xFF;
     seqTranspose     = 0;
@@ -1703,7 +1694,6 @@ void sequencerReset() {
     }
     seqRow            = 0;
     seqWaiting        = false;
-    seqEndNav         = 0;
     seqQueuedPattern  = -1;
     seqReposition(0);
     debugPrintf("[SEQ] reset t=%lu pat=%u row=0\n", millis(), seqPattern);
@@ -1856,7 +1846,6 @@ static void sequencerTickBody() {
             seqSendColumnSetup(seqPattern);
             seqRow          = 0;
             seqWaiting      = false;
-            seqEndNav       = 0;
             seqNextRowMs    = now;
             seqHaveLastSnap = false;
             seqReposition(0);

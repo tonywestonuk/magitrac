@@ -240,6 +240,12 @@ enum MagiMsgType : uint8_t {
     // only ever flows as the response to a client command.
     MSG_ACTIVE_SONG_REQ     = 0x64,  // client → server: send me the active song
     MSG_ACTIVE_SONG_CHANGED = 0x65,  // server → client: active song changed — pull it
+
+    // Server → client: an explicit load (MSG_SONG_LOAD_REQ / _NAME) could not
+    // be served.  Sent instead of the push stream so the client stops waiting
+    // at once and can say why.  The server's active song is left as it was —
+    // this is NOT "server went OFF" (that is MSG_NO_SONG).
+    MSG_SONG_LOAD_FAILED    = 0x66,
 };
 
 #pragma pack(push, 1)
@@ -809,6 +815,21 @@ struct MsgSongPushBody {
 struct MsgNoSong {
     uint8_t  id     = MSG_NO_SONG;
     uint16_t length = sizeof(MsgNoSong);
+};
+
+// Server → client: reply to a load request that failed (see the id comment).
+enum SongLoadFailReason : uint8_t {
+    SONG_LOAD_FAIL_NOT_FOUND = 1,  // no such file, or list index out of range
+    SONG_LOAD_FAIL_READ      = 2,  // file opened but the SD read came up short,
+                                   //   or the body failed its sanity checks
+    SONG_LOAD_FAIL_BAD_FILE  = 3,  // bad magic / unknown version — not a song
+    SONG_LOAD_FAIL_NO_MEMORY = 4,  // server has no song buffer (see boot log)
+};
+
+struct MsgSongLoadFailed {
+    uint8_t  id     = MSG_SONG_LOAD_FAILED;
+    uint16_t length = sizeof(MsgSongLoadFailed);
+    uint8_t  reason;   // SongLoadFailReason
 };
 
 // ── Instruments push (server → client) ─────────────────────────────────────

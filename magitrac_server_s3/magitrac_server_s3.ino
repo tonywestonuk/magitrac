@@ -70,6 +70,7 @@ const uint16_t COL_SEL_BG_PLAY = lgfx::color565(144, 238, 144);
 const uint16_t COL_SEL_TEXT    = lgfx::color565( 0,   0, 139);
 const uint16_t COL_TEXT        = TFT_WHITE;
 const uint16_t COL_FOOTER      = lgfx::color565( 0,   0,  80);
+const uint16_t COL_ERR         = lgfx::color565(200,   0,   0);
 
 // ── Buttons (M5Unified touch zones on CoreS3) ─────────────────────────────────
 // Thin wasPressed()/isDown() wrapper over M5's bezel touch zones.  The main
@@ -313,8 +314,38 @@ void drawList() {
     }
 }
 
+// ── Load-failure banner (SONGS footer) ────────────────────────────────────────
+// A failed load on this screen has no other feedback — the tapped row just
+// loses its highlight again — so say so, and why, where the performer is
+// already looking.  Replaces the footer for LOAD_FAIL_BANNER_MS.
+static const uint32_t LOAD_FAIL_BANNER_MS = 5000;
+static bool     sLoadFailShown = false;
+static uint32_t sLoadFailAtMs  = 0;
+static char     sLoadFailMsg[20] = {};   // 19 chars fit the 240px footer at size 2
+
+static void showLoadFail(uint8_t reason) {
+    const char* why = "FAILED";
+    switch (reason) {
+        case SONG_LOAD_FAIL_NOT_FOUND: why = "NO FILE";  break;
+        case SONG_LOAD_FAIL_READ:      why = "READ ERR"; break;
+        case SONG_LOAD_FAIL_BAD_FILE:  why = "BAD FILE"; break;
+        case SONG_LOAD_FAIL_NO_MEMORY: why = "NO MEM";   break;
+    }
+    snprintf(sLoadFailMsg, sizeof(sLoadFailMsg), "LOAD FAIL: %s", why);
+    sLoadFailShown = true;
+    sLoadFailAtMs  = millis();
+}
+
 void drawFooter() {
     int y = UI_SCR_H - UI_FOOTER_H;
+    if (sLoadFailShown) {
+        lcd.fillRect(0, y, 240, UI_FOOTER_H, COL_ERR);
+        lcd.setTextColor(TFT_WHITE, COL_ERR);
+        lcd.setTextSize(2);
+        lcd.setCursor(4, y + (UI_FOOTER_H - 16) / 2);
+        lcd.print(sLoadFailMsg);
+        return;
+    }
     lcd.fillRect(0, y, 240, UI_FOOTER_H, COL_FOOTER);
     lcd.setTextColor(TFT_WHITE, COL_FOOTER);
     lcd.setTextSize(2);
@@ -330,30 +361,35 @@ void drawSongScreen() {
 }
 
 // ── Song loading ──────────────────────────────────────────────────────────────
-void loadSong(int idx) {
+// Returns 0 on success, else a SongLoadFailReason.  The sequencer is stopped
+// by a load that takes (the commit quiesces it); a load that fails leaves the
+// previous song active and playing.
+uint8_t loadSong(int idx) {
     Serial.printf("[STOPSRC] local loadSong idx=%d t=%lu\n", idx, millis());
-    sequencerStop();
 
     if (idx == 0) {
+        sequencerStop();
         srvHasActive = false;
-        if (pairingIsConnected()) {
-            MsgNoSong msg;
-            gMagiLink.acquireMutex();
-            gMagiLink.send(&msg, sizeof(msg));
-            gMagiLink.releaseMutex();
-        }
-        return;
+        sendNoSongToClient();
+        return 0;
     }
 
-    int listIdx = idx - SONG_IDX_OFFSET;
-    if (srvLoadSongLocal(listIdx)) {
+    bool    hadActive = srvHasActive;
+    int     listIdx   = idx - SONG_IDX_OFFSET;
+    uint8_t fail      = srvLoadSongLocal(listIdx);
+    if (fail == 0) {
         sequencerReset();
         sequencerSendPatchesNow();   // patches up before the first note
         if (pairingIsConnected()) {
             MsgActiveSongChanged ev;
             gMagiLink.postToPeer(&ev, sizeof(ev));
         }
+    } else if (hadActive && !srvHasActive) {
+        // No staging buffer: the failed read took the active song with it.
+        // The client still shows the old one — tell it we now have none.
+        sendNoSongToClient();
     }
+    return fail;
 }
 
 // ── USB file-transfer screen ──────────────────────────────────────────────────
@@ -920,6 +956,7 @@ static void selectSong(int idx) {
 
     int prev = cursor;
     cursor   = idx;
+    sLoadFailShown = false;          // a new attempt clears any earlier banner
     bool prevVis = (prev   >= scrollOffset && prev   < scrollOffset + UI_VISIBLE_ROWS);
     bool curVis  = (cursor >= scrollOffset && cursor < scrollOffset + UI_VISIBLE_ROWS);
     if (prevVis && curVis) {
@@ -929,7 +966,17 @@ static void selectSong(int idx) {
         drawList();
     }
     drawFooter();
-    loadSong(cursor);
+
+    uint8_t fail = loadSong(cursor);
+    if (fail) {
+        // The highlight means "this is what's loaded" (and a re-tap toggles
+        // its transport), so put it back on what actually is: the previous
+        // song if it survived, else OFF.
+        cursor = srvHasActive ? prev : 0;
+        showLoadFail(fail);
+        drawList();
+        drawFooter();
+    }
 }
 
 static void selectSample(int idx) {
@@ -1724,6 +1771,13 @@ void loop() {
             gBpmLastSampleMs = nowMs;
             bpmSamplePush(nowMs, sequencerCurrentBPM());
         }
+    }
+
+    // Load-failure banner runs out — give the footer back (drawFooter is the
+    // SONGS footer, so only repaint it when that is what's on screen).
+    if (sLoadFailShown && millis() - sLoadFailAtMs >= LOAD_FAIL_BANNER_MS) {
+        sLoadFailShown = false;
+        if (gScreen == SCR_SONGS && !gTempoMode && !pairingIsActive()) drawFooter();
     }
 
     if (needsFullRedraw) {

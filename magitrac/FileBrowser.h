@@ -46,7 +46,8 @@ static const int FB_SAVEAS_W = 320;
 
 // Max items the browser can hold at once.  Grid mode (SD) only shows one page
 // (≤ FB_PER_PAGE); list mode (server) accumulates the whole list, so this caps
-// it — sized above the server's SRV_MAX_FILES (32) with headroom.
+// it.  NOTE: the server can list up to SRV_MAX_SONGS (128); addItem() drops
+// anything past this cap, so songs beyond the 64th are not shown.
 static const int FB_MAX_ITEMS = 64;
 
 // Drag-scroll list mode (used for the server browser): single full-width rows

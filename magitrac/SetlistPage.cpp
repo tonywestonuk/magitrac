@@ -124,6 +124,32 @@ SetlistResult SetlistPage::poll() {
             return r;
         }
     }
+    // The server answered the load with a failure.  It kept its previous song
+    // and so do we — drop straight back to the INFO popup with the reason
+    // instead of sitting out the slow-link timeout.
+    if (gServerPairing.loadFailPending()) {
+        bool waiting = (_state == State::WAITING_SONG);
+        if (waiting || _state == State::INFO) {
+            snprintf(_loadFailNote, sizeof(_loadFailNote), "   (LOAD FAILED - %s)",
+                     gServerPairing.loadFailText());
+        }
+        gServerPairing.clearLoadFail();
+        _srvLoadLate = false;
+        if (waiting) {
+            Serial.println("[SetlistPage] server load failed — back to list");
+            _state   = State::INFO;
+            _wasDown = _touch.isTouched;
+            _d.fillScreen(COL_WHITE);
+            drawList();
+            drawInfo();
+            _d.paint();
+            return SetlistResult::NONE;
+        }
+        if (_state == State::INFO) {
+            drawInfo();
+            _d.paint();
+        }
+    }
     switch (_state) {
         case State::NOT_CONNECTED: return pollNotConnected();
         case State::LIST:          return pollList();
@@ -411,6 +437,7 @@ SetlistResult SetlistPage::pollList() {
         const MasterEntry* m = resolveRow(nameIdx);
         _selectedMissing = (m == nullptr) ||
                            (m->file[0] != '\0' && !fileExistsOnServer(m->file));
+        _loadFailNote[0] = '\0';
         _state = State::INFO;
         drawInfo();
         _d.paint();
@@ -499,8 +526,8 @@ void SetlistPage::drawInfo() {
     } else if (m->file[0] == '\0') {
         snprintf(src, sizeof(src), "Source: (none)");
     } else {
-        snprintf(src, sizeof(src), "Source: %s  [server]%s", m->file,
-                 _selectedMissing ? "   (FILE MISSING)" : "");
+        snprintf(src, sizeof(src), "Source: %s  [server]%s%s", m->file,
+                 _selectedMissing ? "   (FILE MISSING)" : "", _loadFailNote);
     }
     _d.setCursor(SL_INFO_X + 20, ty);
     _d.print(src);
@@ -617,6 +644,7 @@ SetlistResult SetlistPage::pollInfo() {
         gServerPairing.resetBrowse();
         _srvLoadStartMs = millis();
         _srvLoadLate    = false;
+        _loadFailNote[0] = '\0';
         gServerPairing.requestSongLoadByName(bare);
         _state = State::WAITING_SONG;
         _d.fillScreen(COL_WHITE);

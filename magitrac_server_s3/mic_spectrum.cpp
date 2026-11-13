@@ -359,8 +359,8 @@ void spectrumInit() {
 }
 
 void spectrumSetActive(bool active) {
-    Serial.printf("[MIC] setActive(%d) was=%d\n", (int)active, (int)sBandsActive);
-    if (active == sBandsActive) return;
+    if (active == sBandsActive) return;      // no-op calls arrive per packet / per row — stay silent
+    Serial.printf("[MIC] setActive(%d)\n", (int)active);
     sBandsActive = active;
     if (active) xSemaphoreGive(sActiveSem);
 }
@@ -368,8 +368,8 @@ void spectrumSetActive(bool active) {
 bool spectrumIsActive() { return sBandsActive; }
 
 void chordSetActive(bool active) {
-    Serial.printf("[MIC] chordSetActive(%d) was=%d\n", (int)active, (int)sChordActive);
-    if (active == sChordActive) return;
+    if (active == sChordActive) return;      // no-op calls arrive per packet / per row — stay silent
+    Serial.printf("[MIC] chordSetActive(%d)\n", (int)active);
     sChordActive = active;
     if (active) xSemaphoreGive(sActiveSem);
 }
@@ -387,8 +387,8 @@ ChordResult chordGetResult() {
 }
 
 void scopeSetActive(bool active) {
-    Serial.printf("[MIC] scopeSetActive(%d) was=%d\n", (int)active, (int)sScopeActive);
-    if (active == sScopeActive) return;
+    if (active == sScopeActive) return;      // no-op calls arrive per packet / per row — stay silent
+    Serial.printf("[MIC] scopeSetActive(%d)\n", (int)active);
     sScopeActive = active;
     if (active) xSemaphoreGive(sActiveSem);
 }

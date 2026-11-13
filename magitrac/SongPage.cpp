@@ -38,6 +38,7 @@ void SongPage::open() {
         // Connected to server — open server browser directly.  The server list
         // is a drag-scroll list that accumulates every page into one list.
         gServerPairing.resetBrowse();
+        gServerPairing.clearLoadFail();   // a stale failure isn't this page's
         gServerPairing.requestSongList(0);
         _srvPage      = 0;
         _srvListDrawn = false;
@@ -251,6 +252,24 @@ SongPageResult SongPage::poll() {
             restartServerList("Loading...");
         }
 
+        // The server answered the load with a failure (file missing, SD read
+        // error, not a song…).  It kept its previous song and so do we — just
+        // bring the list back straight away.  The reason goes in the header
+        // bar, which stays put once the list has redrawn over the status line.
+        if (gServerPairing.loadFailPending()) {
+            char title[24];
+            snprintf(title, sizeof(title), "LOAD FAILED - %s",
+                     gServerPairing.loadFailText());
+            gServerPairing.clearLoadFail();
+            Serial.printf("[SongPage] %s\n", title);
+            _browser.setTitle(title);
+            _srvLoadSlow = true;              // not a slow link — no second notice
+            restartServerList("Load failed on server");
+            _d.fillScreen(COL_WHITE);
+            _browser.draw();
+            _d.paintLater();
+        }
+
         // A list page arrived — append its entries, then request the next page
         // until the whole (server-sorted) list is accumulated, then draw.
         if (bs == BrowseState::LIST_READY && !_srvListDrawn) {
@@ -395,8 +414,20 @@ void SongPage::restartServerList(const char* status) {
 // Request the server song at absolute list index and show "Receiving...".
 // The flat list index maps to the server's page/index (same sorted order).
 void SongPage::startServerLoad(int absIdx) {
-    gServerPairing.requestSongLoad((uint8_t)(absIdx / SL_PER_PKT),
-                                   (uint8_t)(absIdx % SL_PER_PKT));
+    // Ask by name: an index only means something against the directory scan
+    // the server made for the list, and it rescans for the load — a scan that
+    // comes back different (or short) would fetch the wrong song, or none.
+    // A list entry carries 15 chars of "<name>.mgt", so names up to 11 chars
+    // are known to be whole; a longer one may be truncated, and only the
+    // index can still identify that file.
+    const char* nm = _browser.itemName(absIdx);
+    if (nm[0] != '\0' && strlen(nm) <= SL_NAME_LEN - 5) {
+        gServerPairing.requestSongLoadByName(nm);
+    } else {
+        gServerPairing.requestSongLoad((uint8_t)(absIdx / SL_PER_PKT),
+                                       (uint8_t)(absIdx % SL_PER_PKT));
+    }
+    _browser.setTitle("SERVER");       // drop any earlier LOAD FAILED banner
     _srvLoadStartMs = millis();
     _srvLoadSlow    = false;
     _srvListDrawn   = false;

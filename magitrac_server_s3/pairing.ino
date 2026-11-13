@@ -39,7 +39,6 @@ enum ServerMode {
 };
 
 static ServerMode  serverMode   = SERVER_STANDALONE;
-       uint8_t     clientMac[6] = {};   // exposed for commands_server.ino
 
 // ── NVS-stored pairing ────────────────────────────────────────────────────────
 #define SRV_NVS_NS      "magitrac_srv"
@@ -191,7 +190,6 @@ void enterPairingMode() {
 bool pairingIsActive()    { return serverMode == SERVER_PAIRING ||
                                    serverMode == SERVER_PAIRING_CONFIRM; }
 bool pairingIsConnected() { return serverMode == SERVER_CONNECTED; }
-bool pairingIsPaired()    { return sHasPairing; }
 
 // ── MagiLink session hooks ──────────────────────────────────────────────────
 void pairingOnMagiLinkConnected() {

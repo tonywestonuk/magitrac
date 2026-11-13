@@ -115,9 +115,9 @@ private:
     volatile uint32_t _generation = 0;   // ++ on each new established link
 
     // Registration table for per-id callbacks.  Worker task dispatches
-    // matching incoming messages here.  Server registers ~28 entries
-    // (full command set + the two streaming HEADER/BODY pairs); 48
-    // leaves headroom for future additions without another overflow.
+    // matching incoming messages here.  The server registers 48 (the client
+    // 18), so there are 16 slots left — registerCallback past the end only
+    // logs and returns false, and that message then silently never fires.
     struct RegisteredHandler { uint8_t msgType; MessageCb cb; void* ctx; };
     static const int MAX_REGISTERED = 64;
     RegisteredHandler _registered[MAX_REGISTERED];
@@ -136,9 +136,18 @@ private:
     void _runAcceptLoop();
     void _runConnectLoop();
 
+    // Receive progress for the frame currently being assembled in _recvBuf.
+    // A frame can arrive split across TCP segments, with seconds between the
+    // halves on a bad link — so the read is resumable: _rxHave bytes are in,
+    // and nobody has to sit on the mutex waiting for the rest.  Written under
+    // the mutex; the Connect worker also zeroes _rxHave when it drops a socket.
+    size_t   _rxHave       = 0;    // bytes of the current frame received so far
+    uint16_t _rxLen        = 0;    // its wire length (valid once _rxHave >= 3)
+    uint32_t _rxProgressMs = 0;    // millis() of the last byte received
+
     // Internal helpers (mutex-aware; caller must hold the mutex).
-    bool _readFully(uint8_t* dst, size_t n);   // blocking read of exactly n bytes
-    bool _readMessageRaw();                     // fills _recvBuf, NO dispatch
+    bool _pumpMessage();                        // non-blocking; true = whole frame in _recvBuf
+    bool _readMessageRaw();                     // blocking; fills _recvBuf, NO dispatch
     void _dispatch(const uint8_t* msg, size_t len);  // call registered handler if any
 };
 

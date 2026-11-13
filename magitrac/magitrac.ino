@@ -106,11 +106,6 @@ bool gSdAvailable = false;
 int  gSdCs        = -1;   // chip-select pin used for SD; set in setup()
 SongSource gSongSource = SongSource::NONE;
 
-// ── MIDI passthrough state (client → server) ──────────────────────────────────
-// Tracker note → MIDI note: midi = tracker + 11  (tracker C4=49, MIDI C4=60)
-#define TRACKER_TO_MIDI  11
-static uint8_t gMidiActiveNote[MAX_COLUMNS] = {};  // 0 = no note active on that channel
-
 // Paste the row-selection (source column ui.rsCol(), rows ui.rsLo()..rsHi())
 // into the current block starting at (targetRow, targetCol), one row down per
 // selected row.  Stops at the end of the block.  Source cells are snapshotted
@@ -143,34 +138,6 @@ static void applyRowPaste(int8_t targetRow, int8_t targetCol) {
         else       dst.set  ((uint8_t)tr, (uint8_t)targetCol, s);
         if (gServerPairing.isPaired())
             gServerPairing.sendNoteSet(song, dstPat, (uint8_t)tr, (uint8_t)targetCol);
-    }
-}
-
-static void sendMidiRow(uint8_t patIdx, uint8_t row) {
-    if (!gServerPairing.isPaired()) return;
-    NoteGrid grid(song.notePool, &song.noteFreeHead, &song.patterns[patIdx].noteHead);
-    grid.forRow(row, [](uint8_t col, const Note& n, void* /*ctx*/) {
-        if (col == INPUT_COLUMN) return;
-        if (n.note == NOTE_EMPTY) return;
-        if (gMidiActiveNote[col] != 0) {
-            uint8_t off[3] = { 0x80, gMidiActiveNote[col], 0 };
-            gServerPairing.sendMidi(off, 3);
-        }
-        uint8_t midiNote = (uint8_t)(n.note + TRACKER_TO_MIDI);
-        uint8_t on[3] = { 0x90, midiNote, 100 };
-        gServerPairing.sendMidi(on, 3);
-        gMidiActiveNote[col] = midiNote;
-    }, nullptr);
-}
-
-static void sendMidiAllOff() {
-    if (!gServerPairing.isPaired()) return;
-    for (int col = 0; col < MAX_COLUMNS; col++) {
-        if (gMidiActiveNote[col] != 0) {
-            uint8_t off[3] = { 0x80, gMidiActiveNote[col], 0 };  // NoteOff, channel 1
-            gServerPairing.sendMidi(off, 3);
-            gMidiActiveNote[col] = 0;
-        }
     }
 }
 
@@ -576,13 +543,7 @@ void loop() {
         static char sStatusBuf[32]     = {};
         static char sLastStatusBuf[32] = {};
 
-        PairClientState ps = gServerPairing.pairState();
-        BrowseState     bs = gServerPairing.browseState();
-
-        // Status reflects the MagiLink socket state.  The legacy pairState
-        // is still computed for the pairing-ceremony UI (PAIRING_REQUEST /
-        // PAIRING_CONFIRM); browse state isn't surfaced here.
-        (void)ps; (void)bs;
+        // Status reflects the MagiLink socket state only.
         if (gMagiLink.isConnected()) {
             strncpy(sStatusBuf, "Connected", 31);
         } else {
@@ -821,6 +782,15 @@ void loop() {
                 needsFullRedraw = true;
             }
         }
+    }
+
+    // ── Load failure nobody is waiting on ─────────────────────────────────────
+    // SongPage / SetlistPage consume MSG_SONG_LOAD_FAILED themselves.  If the
+    // page that asked has since closed, drop it — the song in hand is untouched.
+    if (!songPageOpen && !setlistPageOpen && gServerPairing.loadFailPending()) {
+        Serial.printf("[SONG] server load failed (%s) — no page waiting\n",
+                      gServerPairing.loadFailText());
+        gServerPairing.clearLoadFail();
     }
 
     // ── Unsolicited song push (server pushed song on connect or song change) ──

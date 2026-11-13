@@ -748,7 +748,7 @@ static inline uint32_t songCrc32(const Song* song) {
     return c;
 }
 
-// ── Compact format: read (v16) ──────────────────────────────────────────────
+// ── Compact format: read (current version) ──────────────────────────────────────────────
 // File must be seeked past the SongFileHeader.
 
 static inline bool songReadCompact(File& f, Song* out) {
@@ -819,4 +819,32 @@ static inline bool songReadCompact(File& f, Song* out) {
     }
 
     return true;
+}
+
+// ── Version dispatch ────────────────────────────────────────────────────────
+// Read the body of a song file whose SongFileHeader (already consumed by the
+// caller) carried `version`, upgrading legacy layouts on the way in.  Returns
+// true if the song loaded into *out.  *known (may be null) tells a false
+// return apart: true = a reader ran and gave up (short read / failed sanity
+// check), false = no reader exists for that version.
+//
+// This is the ONLY place the version ladder lives — when SONG_FILE_VERSION is
+// bumped, add the outgoing version's migrator here.  (Forgetting to makes the
+// two case labels collide, which will not compile.)
+static inline bool songReadAnyVersion(File& f, uint8_t version, Song* out, bool* known) {
+    if (known) *known = true;
+    switch (version) {
+        case SONG_FILE_VERSION: return songReadCompact(f, out);
+        case 19: return songMigrateV19FromFile(f, out);
+        case 18: return songMigrateV18FromFile(f, out);
+        case 17: return songMigrateV17FromFile(f, out);
+        case 16: return songMigrateV16FromFile(f, out);
+        case 15: return songMigrateV15FromFile(f, out);
+        case 14: return songMigrateV14FromFile(f, out);
+        case 13: return songMigrateV13FromFile(f, out);
+        case 11: return songMigrateV11FromFile(f, out);
+        default:
+            if (known) *known = false;
+            return false;
+    }
 }

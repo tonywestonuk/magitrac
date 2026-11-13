@@ -14,9 +14,7 @@
 static const uint32_t LINK_TASK_STACK   = 8192;
 static const UBaseType_t LINK_TASK_PRIO = 5;
 static const uint32_t WIFI_WAIT_POLL_MS = 250;   // wait-for-WiFi-ready spacing
-static const uint32_t ACCEPT_POLL_MS    = 50;    // accept() retry on AP
 static const uint32_t CONNECT_RETRY_MS  = 1000;  // connect() retry on STA
-static const uint32_t LINK_POLL_MS      = 100;   // peer.connected() polling
 // Upper bound on a single send().  A half-open socket (peer alive at L2 but
 // not draining its window) makes write() return 0 forever while
 // peer.connected() stays true; without this the worker would spin here
@@ -31,6 +29,14 @@ static const uint32_t LINK_POLL_MS      = 100;   // peer.connected() polling
 // The receiver is a dedicated always-draining task, so a genuinely dead
 // peer is keepalive's job (~10s) — this only needs to outlast RTO gaps.
 static const uint32_t SEND_TIMEOUT_MS   = 12000;
+// Receive-side backstop (Connect role): a frame that has started arriving but
+// made no progress for this long is abandoned by dropping the connection —
+// bare id+len+payload framing cannot resync from a half-frame.  Waiting costs
+// nothing (the mutex is not held while a frame is incomplete), so this sits
+// well past the sender's own cutoff: SEND_TIMEOUT_MS plus WiFiClient::write's
+// internal 10 x 1s retry is ~20s worst case, after which the sender closes the
+// socket itself.  It must never fire on a transfer the sender would finish.
+static const uint32_t RECV_STALL_MS     = 30000;
 // Force a fresh WiFi association if connect() keeps failing while
 // WiFi.status() still reports WL_CONNECTED — a stale association left behind
 // when the server's AP power-cycled.  See _runConnectLoop.
@@ -344,8 +350,15 @@ void MagiLink::_runConnectLoop() {
         Serial.printf("[LINK-CON] connected (local=%s)\n",
                       WiFi.localIP().toString().c_str());
 
-        // Main loop while peer is alive: take mutex, drain one message if
-        // there is one, release, yield.  Same shape as AP side.
+        // Main loop while peer is alive: take mutex, pull in whatever bytes
+        // have arrived, dispatch if that completed a frame, release, yield.
+        //
+        // The mutex is held only while bytes are actually being copied — never
+        // across a wait for the rest of a frame.  Push frames (517B) do not
+        // align with the sender's TCP send buffer, so on a slow link a frame
+        // arrives in two pieces with a retransmission gap between them.  A
+        // blocking read here used to sit on the mutex for that whole gap and
+        // freeze the UI task on its next send()/copySong().
         //
         // Exit on EITHER peer.connected() going false OR WiFi association
         // dropping.  The WiFi check is the client's analog of the server's
@@ -359,14 +372,19 @@ void MagiLink::_runConnectLoop() {
                 break;
             }
             acquireMutex();
-            if (_impl->peer.available() > 0) {
-                if (_readMessageRaw()) {
-                    _dispatch(_recvBuf, /*len=*/ (size_t)
-                              ((uint16_t)_recvBuf[1] | ((uint16_t)_recvBuf[2] << 8)));
-                    lastMsgMs = millis();
-                }
+            if (_pumpMessage()) {
+                _dispatch(_recvBuf, (size_t)_rxLen);
+                lastMsgMs = millis();
             }
+            size_t rxPartial = _rxHave;
+            bool   rxStalled = rxPartial > 0 &&
+                               (millis() - _rxProgressMs) > RECV_STALL_MS;
             releaseMutex();
+            if (rxStalled) {
+                Serial.printf("[LINK-CON] frame stalled at %u bytes for %us — dropping connection\n",
+                              (unsigned)rxPartial, (unsigned)(RECV_STALL_MS / 1000));
+                break;
+            }
             // Stall diagnostic: quiet link + full server window has been seen
             // in the field.  avail vs FIONREAD splits the suspects — data
             // stuck below WiFiClient (avail=0 sock>0), or never reaching lwIP
@@ -387,6 +405,7 @@ void MagiLink::_runConnectLoop() {
         Serial.println("[LINK-CON] peer disconnected");
         _connected = false;
         _impl->peer.stop();
+        _rxHave = 0;   // a half-frame from the dead socket must not prefix the next one
     }
 }
 
@@ -505,38 +524,50 @@ bool MagiLink::registerCallback(uint8_t msgType, MessageCb cb, void* ctx) {
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
-bool MagiLink::_readFully(uint8_t* dst, size_t n) {
-    size_t off = 0;
-    while (off < n) {
-        int got = _impl->peer.read(dst + off, n - off);
-        if (got > 0) {
-            off += got;
-            continue;
+// Pull whatever has arrived into _recvBuf without blocking.  Returns true
+// once a whole frame (id + uint16 LE length + payload) is in; false means
+// "not yet" and the progress is kept in _rxHave for the next call.  On a bad
+// length the socket is stopped (framing is unrecoverable) and false returned.
+bool MagiLink::_pumpMessage() {
+    for (;;) {
+        bool   inHeader = _rxHave < 3;
+        size_t want     = inHeader ? 3 : _rxLen;
+        if (_rxHave < want) {
+            int got = _impl->peer.read(_recvBuf + _rxHave, want - _rxHave);
+            if (got <= 0) return false;            // nothing more for now
+            _rxHave       += (size_t)got;
+            _rxProgressMs  = millis();
+            if (_rxHave < want) continue;          // short read — try once more
         }
-        if (!_impl->peer.connected()) return false;
+        if (inHeader) {
+            uint16_t length = (uint16_t)_recvBuf[1] | ((uint16_t)_recvBuf[2] << 8);
+            if (length < 3 || length > RECV_BUF_BYTES) {
+                Serial.printf("[LINK] bad length %u — dropping connection\n",
+                              (unsigned)length);
+                _rxHave = 0;
+                _impl->peer.stop();
+                return false;
+            }
+            _rxLen = length;
+            if (length > 3) continue;              // now the payload
+        }
+        _rxHave = 0;                               // next call starts a new frame
+        return true;                               // caller decides whether to dispatch
+    }
+}
+
+// Blocking read of one whole frame.  Resumes a frame the worker had already
+// started (a transactional read() must not treat the tail of a half-received
+// frame as a new one).
+bool MagiLink::_readMessageRaw() {
+    while (!_pumpMessage()) {
+        if (!_impl->peer.connected()) {
+            _rxHave = 0;
+            return false;
+        }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
     return true;
-}
-
-bool MagiLink::_readMessageRaw() {
-    // id
-    if (!_readFully(_recvBuf, 1)) return false;
-    // length (uint16 LE)
-    if (!_readFully(_recvBuf + 1, 2)) return false;
-    uint16_t length = (uint16_t)_recvBuf[1] | ((uint16_t)_recvBuf[2] << 8);
-    if (length < 3 || length > RECV_BUF_BYTES) {
-        Serial.printf("[LINK] bad length %u — dropping connection\n",
-                      (unsigned)length);
-        _impl->peer.stop();
-        return false;
-    }
-    // remaining payload
-    size_t remaining = length - 3;
-    if (remaining > 0) {
-        if (!_readFully(_recvBuf + 3, remaining)) return false;
-    }
-    return true;   // caller decides whether to dispatch
 }
 
 void MagiLink::_dispatch(const uint8_t* msg, size_t len) {
