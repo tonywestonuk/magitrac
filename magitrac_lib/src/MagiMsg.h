@@ -1,4 +1,5 @@
-// MagiMsg.h — shared ESP-NOW message definitions
+// MagiMsg.h — shared wire message definitions: MagiLink (TCP) messages,
+// MagiUdpLink datagrams, and the ESP-NOW pairing-ceremony frames.
 #pragma once
 #include <stdint.h>
 #include "TrackerData.h"
@@ -24,12 +25,14 @@
 
 // ── Network topology constants ──────────────────────────────────────────────
 //
-// Server and client always sit at these IPs regardless of who hosts the AP.
-// In SERVER_AP mode the server is also the AP (so the softAP IP == server IP).
-// In EXTERNAL_AP mode both devices are STAs against an external AP that must
-// live on the 192.168.0.0/24 subnet and avoid .1/.2.
+// SERVER_AP mode (the live setup): the server hosts the AP and sits at
+// MAGI_SERVER_IP with its softAP DHCP server stopped; the client joins as a
+// STA and gives itself MAGI_CLIENT_IP with WiFi.config().
+// EXTERNAL_AP mode: both devices boot as plain DHCP STAs on a third-party AP,
+// and the client learns the server's address from its MSG_SERVER_ANNOUNCE
+// beacon rather than from these constants.
 //
-// Octet arrays for use with PairNVS / WiFi.config (which take 4-byte arrays).
+// Given as separate octets so they drop straight into IPAddress(a, b, c, d).
 #define MAGI_SERVER_IP_0  192
 #define MAGI_SERVER_IP_1  168
 #define MAGI_SERVER_IP_2  0
@@ -42,8 +45,9 @@
 // ── AP topology mode ────────────────────────────────────────────────────────
 //
 // Lives in MsgPairOffer + per-device NVS.  Tells the server whether it
-// should host an AP itself or join an external one.  The client is
-// always a STA — it doesn't branch on this value at boot.
+// should host an AP itself or join an external one.  The client is always
+// a STA; at boot it uses this to choose between a static IP + immediate
+// connect (SERVER) and DHCP + wait for the announce beacon (EXTERNAL).
 enum MagiApMode : uint8_t {
     MAGI_AP_MODE_SERVER   = 0,  // server hosts the AP at MAGI_SERVER_IP
     MAGI_AP_MODE_EXTERNAL = 1,  // external AP; server joins as STA
@@ -64,12 +68,15 @@ enum MagiMsgType : uint8_t {
     MSG_SERVER_ANNOUNCE = 0x09,
 
     // Pairing ceremony (one-time setup, over ESP-NOW, always on ch1).
-    // The client owns the WiFi credentials (set via the WiFi settings
-    // page on the touch screen) and ships them to the server in OFFER.
+    // The OFFER carries the WiFi credentials both sides will use: in
+    // SERVER_AP mode the server's own Magitrac_XXXX softAP creds (which the
+    // client was handed in CHALLENGE and echoes back), in EXTERNAL_AP mode
+    // the network the user entered on the client's WiFi settings page.
     //
     //   1. Client (pair mode) sits on ch1, broadcasts MSG_PAIR_PROBE.
     //   2. Server (pair mode) sits on ch1 listening.  On PROBE: gen PIN,
-    //      unicast MSG_PAIR_CHALLENGE back, display PIN on LCD.
+    //      unicast MSG_PAIR_CHALLENGE {pin, its softAP ssid/psk} back,
+    //      display PIN on LCD.
     //   3. Client displays the received PIN on the touch screen.  User
     //      compares + taps Confirm on the client.
     //   4. Client unicasts MSG_PAIR_OFFER {apMode, apSsid, apPsk}.
@@ -229,14 +236,37 @@ enum MagiMsgType : uint8_t {
     // /samples/samples.txt manifest with stable IDs, returns paged list.
     MSG_SAMPLE_LIST_REQ  = 0x62,  // client → server: request page of sample list
     MSG_SAMPLE_LIST_RESP = 0x63,  // server → client: one page of (id, filename) entries
+
+    // Active-song pull.  The server never volunteers the ~34KB song stream:
+    // on any active-song change it didn't stream as a direct command response
+    // (server-screen load, restore reload) it sends the tiny CHANGED event,
+    // and the client pulls with REQ — answered by the usual
+    // MSG_SONG_PUSH_HEADER/BODY stream, or MSG_NO_SONG when nothing is
+    // loaded.  The client also pulls on the connect edge, which is what
+    // recovers the active song after any reconnect.  Bulk data therefore
+    // only ever flows as the response to a client command.
+    MSG_ACTIVE_SONG_REQ     = 0x64,  // client → server: send me the active song
+    MSG_ACTIVE_SONG_CHANGED = 0x65,  // server → client: active song changed — pull it
+
+    // Server → client: an explicit load (MSG_SONG_LOAD_REQ / _NAME) could not
+    // be served.  Sent instead of the push stream so the client stops waiting
+    // at once and can say why.  The server's active song is left as it was —
+    // this is NOT "server went OFF" (that is MSG_NO_SONG).
+    MSG_SONG_LOAD_FAILED    = 0x66,
+
+    // Server → client: outcome of a save the client asked for — the reply to
+    // MSG_SAVE_ACTIVE and to a NAMED full-song save (MSG_SAVE_SONG_HEADER with
+    // a non-empty name).  See MsgSaveResult.
+    MSG_SAVE_RESULT         = 0x67,
 };
 
 #pragma pack(push, 1)
 
-// MagiLink session handshake.  Server (STA) sends MsgConnect once TCP
-// is up; client (AP) replies with MsgConnectAck.  No payload — identity
-// is established by TCP itself, auth by the WPA2-PSK on the AP.  Both
-// structs follow the new {id, length} framing.
+// MagiLink session handshake.  The server (the TCP accept side) sends
+// MsgConnect as soon as a client's connection is up; the client (the TCP
+// connect side) replies with MsgConnectAck.  No payload — identity is
+// established by TCP itself, auth by the WPA2-PSK of the WiFi network.
+// Both structs follow the {id, length} framing.
 //
 // All MagiLink structs from here on use NSDMI for id and length so the
 // caller never needs to fill them in:
@@ -253,6 +283,16 @@ struct MsgConnectAck {
     uint16_t length = sizeof(MsgConnectAck);
 };
 
+struct MsgActiveSongReq {
+    uint8_t  id     = MSG_ACTIVE_SONG_REQ;
+    uint16_t length = sizeof(MsgActiveSongReq);
+};
+
+struct MsgActiveSongChanged {
+    uint8_t  id     = MSG_ACTIVE_SONG_CHANGED;
+    uint16_t length = sizeof(MsgActiveSongChanged);
+};
+
 // ── Pairing ceremony messages ─────────────────────────────────────────────────
 
 // 8-byte magic prefix on the PROBE broadcast to distinguish a real
@@ -261,9 +301,9 @@ struct MsgConnectAck {
 // against random traffic on shared channels.
 #define MAGI_PAIR_MAGIC  "MAGITRAC"   // 8 chars, no terminator
 
-// Client → broadcast (on channels 1, 6, 11 in turn): "magitrac server,
-// are you there?"  Server (if in pair mode) replies on its AP channel
-// with MSG_PAIR_CHALLENGE.
+// Client → broadcast on ch1, repeated while it is in pair mode: "magitrac
+// server, are you there?"  Server (if in pair mode, also parked on ch1)
+// replies with a unicast MSG_PAIR_CHALLENGE.
 struct MsgPairProbe {
     MagiMsgType type;         // MSG_PAIR_PROBE
     char        magic[8];     // must equal MAGI_PAIR_MAGIC
@@ -272,8 +312,8 @@ struct MsgPairProbe {
 
 // Server → client unicast: PIN to display on both screens + the server's
 // own softAP credentials.  Server generates a Magitrac_XXXX SSID + random
-// PSK on first pair-mode entry and stores them in NVS so the same pair of
-// strings comes back every challenge until factory-reset.  Client echoes
+// PSK the first time it needs them and stores them in NVS so the same pair
+// of strings comes back every challenge until factory-reset.  Client echoes
 // them in MsgPairOffer (so the server can write a single NVS record) AND
 // stores them in its own NVS so STA can join the softAP after reboot.
 #define MAGI_OFFER_SSID_LEN 33
@@ -322,8 +362,14 @@ struct MsgServerAnnounce {
 };
 
 // ── Fire-and-forget playback controls (MagiLink) ──────────────────────────
-// All client → server.  No payload — id alone is the instruction.  Server
-// registers one MagiLink callback per id.
+// Client → server commands.  No payload — id alone is the instruction.
+// Server registers one MagiLink callback per id.  MSG_PLAY / MSG_STOP also
+// travel server → client with the same 3-byte shape, as "my sequencer just
+// started / stopped" notifications.
+//
+// All four share one layout, and both ends actually build a MsgPlay and
+// overwrite its id (client: ServerPairing::sendControl) — MsgStop, MsgPause
+// and MsgUnpause are never instantiated; they document the wire shape.
 struct MsgPlay {
     uint8_t  id     = MSG_PLAY;
     uint16_t length = sizeof(MsgPlay);
@@ -452,7 +498,7 @@ struct MsgPixelpostOverride {
 };
 
 // Client → server: patch any bytes in the Song struct
-// Sent as 4 header bytes + length data bytes (not the full SONG_PATCH_MAX payload).
+// Sent as the 6 header bytes + dataLen data bytes (not the full SONG_PATCH_MAX payload).
 #define SONG_PATCH_MAX 64
 
 // Variable-length send: only the bytes actually carrying the patch are
@@ -469,7 +515,11 @@ struct MsgSetSongData {
 };
 
 // ── Song list ──────────────────────────────────────────────────────────────────
-#define SL_NAME_LEN  16   // max song name chars including null
+#define SL_NAME_LEN 24
+// Max song name chars in a list entry / load-by-name request, including the
+// null.  Same size as SRV_FNAME_MAX and SRV_NAME_MAX, so an entry carries the
+// whole stem (name without ".mgt") of any file name the server can hold — a
+// by-name request built from a list entry always names its file exactly.
 #define SL_PER_PKT    7   // song names per list-response packet
 
 // Client → Server: request page of song list
@@ -486,8 +536,9 @@ struct MsgSongListResp {
     uint8_t  page;
     uint8_t  totalPages;
     uint8_t  count;                            // entries in this packet (0..SL_PER_PKT)
-    char     names[SL_PER_PKT][SL_NAME_LEN];   // 7 × 16 = 112 bytes
+    char     names[SL_PER_PKT][SL_NAME_LEN];   // 7 × 24 = 168 bytes
 };
+// 1 + 2 + 1 + 1 + 1 + 168 = 174 bytes
 
 // Client → Server: request a specific song by page + index-within-page
 struct MsgSongLoadReq {
@@ -519,8 +570,8 @@ struct MsgSongDelete {
 
 // Client → Server: raw MIDI bytes to forward directly to MIDI out.
 // High-frequency, latency-sensitive — each note-on/off is one of these.
-// Payload field `len` (1..3) renamed from the legacy struct's same name
-// only because we now also have a wire `length`.
+// The byte count is called `midiLen` (it was `len` in the legacy struct)
+// only to keep it apart from the wire `length`.
 struct MsgMidiData {
     uint8_t  id     = MSG_MIDI_DATA;
     uint16_t length = sizeof(MsgMidiData);
@@ -603,7 +654,8 @@ struct MsgNoteSet {
     uint8_t  pattern;
     uint8_t  row;
     uint8_t  col;
-    Note     note;       // all-zero = clear the cell
+    Note     note;       // clear = note 0, effect 0, param 0, velocity VEL_DEFAULT
+                         //   (velocity 0 is an explicit value, NOT empty)
 };
 
 // Client → Server: audition the note at (pattern, row, col) for ~500ms.
@@ -767,13 +819,17 @@ struct MsgEndOfData {
 // BODY chunks (data_len ≤ 1024) until the total declared in HEADER has
 // been sent, then releases.  Receiver tracks bytes received and fires
 // the "song ready" transition when bytes_received == total_size.
+// total_size = total bytes that will follow across the BODY messages.  The
+// header also names the file the song came from, so the client knows which
+// file it is editing whichever way the load was started.
 
 struct MsgSongPushHeader {
     uint8_t  id     = MSG_SONG_PUSH_HEADER;
     uint16_t length = sizeof(MsgSongPushHeader);
-    uint32_t total_size;  // total bytes that will follow across BODY messages
+    uint32_t total_size;
+    char     name[SRV_FNAME_MAX];   // active song's file name WITH .mgt; empty if it has no file yet
 };
-// 7 bytes
+// 1 + 2 + 4 + 24 = 31 bytes
 
 struct MsgSongPushBody {
     uint8_t  id     = MSG_SONG_PUSH_BODY;
@@ -783,11 +839,28 @@ struct MsgSongPushBody {
 };
 // 1029 bytes (same shape as MsgBackupBody)
 
-// Server → client: "no song loaded".  Sent in lieu of a SONG_PUSH stream
-// when the server has nothing active on connect.
+// Server → client: "the server has no active song" — it was set to OFF,
+// nothing is loaded yet (the answer to MSG_ACTIVE_SONG_REQ in lieu of a
+// SONG_PUSH stream), or an in-place load failed and took the active song
+// with it.
 struct MsgNoSong {
     uint8_t  id     = MSG_NO_SONG;
     uint16_t length = sizeof(MsgNoSong);
+};
+
+// Server → client: reply to a load request that failed (see the id comment).
+enum SongLoadFailReason : uint8_t {
+    SONG_LOAD_FAIL_NOT_FOUND = 1,  // no such file, or list index out of range
+    SONG_LOAD_FAIL_READ      = 2,  // file opened but the SD read came up short,
+                                   //   or the body failed its sanity checks
+    SONG_LOAD_FAIL_BAD_FILE  = 3,  // bad magic / unknown version — not a song
+    SONG_LOAD_FAIL_NO_MEMORY = 4,  // server has no song buffer (see boot log)
+};
+
+struct MsgSongLoadFailed {
+    uint8_t  id     = MSG_SONG_LOAD_FAILED;
+    uint16_t length = sizeof(MsgSongLoadFailed);
+    uint8_t  reason;   // SongLoadFailReason
 };
 
 // ── Instruments push (server → client) ─────────────────────────────────────
@@ -875,6 +948,20 @@ struct MsgSaveActive {
 };
 // 1 + 2 + 24 + 1 = 28 bytes
 
+// ── Save result (server → client) ─────────────────────────────────────────
+// Reply to MSG_SAVE_ACTIVE and to a NAMED full-song save (MsgSongSaveHeader
+// with a non-empty name; an un-named push writes nothing and gets no reply).
+// Tells the client whether the file really reached the SD card.
+
+struct MsgSaveResult {
+    uint8_t  id     = MSG_SAVE_RESULT;
+    uint16_t length = sizeof(MsgSaveResult);
+    uint8_t  ok;           // 1 = written and verified, 0 = failed / nothing to save
+    uint8_t  is_autosave;  // echoes the request
+    char     name[SRV_NAME_MAX];   // as requested, no extension
+};
+// 1 + 2 + 1 + 1 + 24 = 29 bytes
+
 // ── New song (client → server) ────────────────────────────────────────────
 // Asks the server to call initSong() on srvActiveBuf so its in-memory
 // song matches the client's freshly-wiped copy.  No payload needed.
@@ -937,24 +1024,30 @@ struct MsgFileLoadReq {
 };
 
 // Server → client: header preceding the chunked body stream.  `found=0`
-// (file missing) means no BODY chunks will follow.  `kind` echoed.
+// (file missing) means no BODY chunks will follow.  `kind` and `name` are
+// echoed so the client can tell a late reply to a request it has given up on
+// from the reply to the one it is waiting for (same kind, different file).
 struct MsgFileLoadHeader {
     uint8_t  id     = MSG_FILE_LOAD_HEADER;
     uint16_t length = sizeof(MsgFileLoadHeader);
     uint8_t  kind;
     uint32_t total_size;
     uint8_t  found;
+    char     name[FILE_NAME_LEN];   // as requested, with extension
 };
 
 // Server → client: one chunk of raw file bytes.  Stream is closed by the
-// existing MsgEndOfData (id 0x83).
+// existing MsgEndOfData (id 0x83).  Like the song-push bodies, a frame may
+// arrive TRUNCATED to offsetof(MsgFileLoadBody, data) + data_len bytes (the
+// wire `length` says which) — receivers validate against data_len, not
+// sizeof(MsgFileLoadBody).
 struct MsgFileLoadBody {
     uint8_t  id     = MSG_FILE_LOAD_BODY;
     uint16_t length = sizeof(MsgFileLoadBody);
     uint16_t data_len;     // 0..1024
     uint8_t  data[1024];
 };
-// 1029 bytes
+// 1029 bytes at most (see above)
 
 // Client → server: begin a chunked file upload.  `kind` selects the dir via
 // the server's whitelist; `name` is the destination filename (with extension).
@@ -977,6 +1070,7 @@ struct MsgFileSaveBody {
 // 1029 bytes
 
 // Server → client: result of a file save (kind echoed).  ok=0 on any failure.
+// The client registers no handler for this yet, so today it is ignored.
 struct MsgFileSaveAck {
     uint8_t  id     = MSG_FILE_SAVE_ACK;
     uint16_t length = sizeof(MsgFileSaveAck);

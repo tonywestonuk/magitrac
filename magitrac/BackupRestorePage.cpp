@@ -123,7 +123,6 @@ BackupRestorePage::BackupRestorePage(EPD_PainterAdafruit& display,
     , _rsFileTotal(0)
     , _rsFileCurrent(0)
     , _rsRestoreCount(0)
-    , _rsCancelled(false)
     , _rsConfirmIdx(-1)
     , _rsFileScroll(0)
     , _rsFileDragStartY(0)
@@ -143,7 +142,6 @@ void BackupRestorePage::open() {
     _state   = BRState::MENU;
     _wasDown = _touch.isTouched;
     _bkCancelled = false;
-    _rsCancelled = false;
 }
 
 void BackupRestorePage::draw() {
@@ -229,12 +227,17 @@ void BackupRestorePage::drawBackupDone() {
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
     _d.setCursor(300, 180);
-    _d.print(_bkCancelled ? "Backup cancelled" : "Backup complete!");
+    _d.print(_bkCancelled       ? "Backup cancelled"
+           : _bkFilesFailed > 0 ? "Backup INCOMPLETE"
+                                : "Backup complete!");
 
     char buf[64];
     if (_bkCancelled) {
         snprintf(buf, sizeof(buf), "%d of %d files saved",
                  _bkFilesSaved, _bkFileTotal);
+    } else if (_bkFilesFailed > 0) {
+        snprintf(buf, sizeof(buf), "%d saved, %d FAILED",
+                 _bkFilesSaved, _bkFilesFailed);
     } else {
         snprintf(buf, sizeof(buf), "%d files saved", _bkFilesSaved);
     }
@@ -428,7 +431,13 @@ void BackupRestorePage::drawRestoreDone() {
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
     _d.setCursor(280, 200);
-    _d.print("Restore complete!");
+    _d.print(_rsFilesFailed > 0 ? "Restore INCOMPLETE" : "Restore complete!");
+    if (_rsFilesFailed > 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%d sent, %d FAILED", _rsFilesSent, _rsFilesFailed);
+        _d.setCursor(330, 250);
+        _d.print(buf);
+    }
 
     uiButton(_d, BR_BACK_X, BR_BACK_Y, BR_BACK_W, BR_BACK_H, "OK", COL_WHITE, COL_BLACK, 3);
 }
@@ -492,11 +501,20 @@ void BackupRestorePage::startBackup() {
     if (!SD.exists(BR_BACKUPS_DIR)) SD.mkdir(BR_BACKUPS_DIR);
     SD.mkdir(_bkFolder);
     Serial.printf("[BK] folder=%s\n", _bkFolder);
+    if (!SD.exists(_bkFolder)) {
+        // Nowhere to write: don't pull the whole stream just to drop it.
+        Serial.println("[BK] could not create the backup folder — SD card missing or full?");
+        strncpy(_errMsg, "Can't create backup folder (SD?)", sizeof(_errMsg));
+        _state = BRState::ERROR_SCREEN;
+        draw(); _d.paintLater();
+        return;
+    }
 
     _bkFileTotal   = 0;
     _bkFileCurrent = 0;
     _bkCancelled   = false;
     _bkFilesSaved  = 0;
+    _bkFilesFailed = 0;
     _bkCurName[0]  = '\0';
 
     // Show "backup in progress" — paintLater so the EPD work happens on
@@ -517,9 +535,11 @@ void BackupRestorePage::startBackup() {
 
     // Receive loop: header → bodies → header → bodies → ... → end_of_data.
     File     curFile;
+    char     curPath[BK_FNAME_MAX + 48] = {};   // SD path of curFile; "" = none open
     uint32_t curBytesWritten = 0;
     uint32_t curFileSize     = 0;
     bool     curOpenOk       = false;
+    bool     curWriteOk      = true;    // every write() for this file took all its bytes
     int      curIndex        = 0;
     int      bkIncomplete    = 0;
     int      bkOpenFail      = 0;
@@ -531,7 +551,9 @@ void BackupRestorePage::startBackup() {
 
     auto finishCurFile = [&]() {
         if (curIndex <= 0 || _bkCancelled) return;
-        bool complete = curBytesWritten >= curFileSize && curOpenOk;
+        bool complete = curBytesWritten >= curFileSize && curOpenOk && curWriteOk;
+        // "Saved" means it is on the card — not merely that its bytes arrived.
+        if (complete) _bkFilesSaved++; else _bkFilesFailed++;
         if (curFileSize == 0) bkZeroSize++;
         if (!curOpenOk) bkOpenFail++;
         else if (curBytesWritten < curFileSize) bkIncomplete++;
@@ -540,6 +562,30 @@ void BackupRestorePage::startBackup() {
                       complete ? "OK" : "INCOMPLETE", _bkCurName,
                       (unsigned)curFileSize, (unsigned)curBytesWritten,
                       curOpenOk ? 1 : 0);
+        // A failed file must not stay in the folder: it is listed for restore
+        // like any other, and a truncated .mgt would upload a corrupt song.
+        if (!complete) {
+            if (curFile) curFile.close();
+            if (curPath[0] != '\0') {
+                Serial.printf("[BK] removing failed file '%s'\n", curPath);
+                SD.remove(curPath);
+                curPath[0] = '\0';
+            }
+        }
+    };
+
+    // Close the file being written and, unless every byte of it made it to
+    // the card, remove it.  Used when the backup stops part-way (CANCEL or a
+    // dropped link): the folder still appears in the restore list like any
+    // other, and restoring a truncated .mgt would upload a corrupt song.
+    auto dropPartialFile = [&]() {
+        if (curFile) curFile.close();
+        if (curPath[0] != '\0' &&
+            !(curBytesWritten >= curFileSize && curWriteOk)) {
+            Serial.printf("[BK] removing partial file '%s'\n", curPath);
+            SD.remove(curPath);
+        }
+        curPath[0] = '\0';
     };
 
     while (!done) {
@@ -565,6 +611,14 @@ void BackupRestorePage::startBackup() {
         // changes to "CANCELLING..." — confirmation to the user.
         if (_bkCancelled && !cancelRepainted) {
             cancelRepainted = true;
+            // The file in hand may already be whole (its last body arrived and
+            // the next header has not).  finishCurFile() no longer counts once
+            // cancelled, and dropPartialFile() keeps a whole file — count it.
+            if (curIndex > 0 && curOpenOk && curWriteOk &&
+                curBytesWritten >= curFileSize) {
+                _bkFilesSaved++;
+            }
+            dropPartialFile();      // cur* still describe the file cut short
             draw(); _d.paintLater();
         }
 
@@ -592,6 +646,7 @@ void BackupRestorePage::startBackup() {
             curFileSize     = h->file_size;
             curIndex        = h->file_index;
             curOpenOk       = false;
+            curWriteOk      = true;
 
             char nameStr[BK_FNAME_MAX] = {};
             strncpy(nameStr, h->filename, BK_FNAME_MAX - 1);
@@ -618,13 +673,13 @@ void BackupRestorePage::startBackup() {
                 memset(_bkCurName, 0, sizeof(_bkCurName));
                 strncpy(_bkCurName, nameStr, sizeof(_bkCurName) - 1);
 
-                char path[BK_FNAME_MAX + 48];
-                snprintf(path, sizeof(path), "%s/%s", _bkFolder, nameStr);
-                if (SD.exists(path)) SD.remove(path);
-                curFile = SD.open(path, FILE_WRITE);
+                snprintf(curPath, sizeof(curPath), "%s/%s", _bkFolder, nameStr);
+                if (SD.exists(curPath)) SD.remove(curPath);
+                curFile = SD.open(curPath, FILE_WRITE);
                 curOpenOk = (bool)curFile;
                 if (!curFile) {
-                    Serial.printf("[BK] SD open failed '%s'\n", path);
+                    Serial.printf("[BK] SD open failed '%s'\n", curPath);
+                    curPath[0] = '\0';      // nothing on the card to clean up
                 }
 
                 // Per-file UI update — paintLater so the EPD repaint
@@ -639,15 +694,13 @@ void BackupRestorePage::startBackup() {
             if (!_bkCancelled) {
                 if (curFile) {
                     size_t w = curFile.write(b->data, n);
+                    if (w != n) curWriteOk = false;
                     if (w != n)
                         Serial.printf("[BK] SD WRITE SHORT file %d want=%u wrote=%u at %u\n",
                                       curIndex, (unsigned)n, (unsigned)w,
                                       (unsigned)curBytesWritten);
                 }
-                uint32_t before = curBytesWritten;
                 curBytesWritten += n;
-                if (before < curFileSize && curBytesWritten >= curFileSize)
-                    _bkFilesSaved++;
                 if (curBytesWritten > curFileSize)
                     Serial.printf("[BK] file %d OVERRUN received=%u expected=%u\n",
                                   curIndex, (unsigned)curBytesWritten,
@@ -669,6 +722,7 @@ void BackupRestorePage::startBackup() {
         }
     }
 
+    if (!readOk) dropPartialFile();     // link dropped mid-file
     if (curFile) curFile.close();
     gMagiLink.releaseMutex();
 
@@ -831,7 +885,8 @@ void BackupRestorePage::startRestore(int fileIdx) {
     }
     _rsRestoreCount = 0;
     _rsFileCurrent  = 0;
-    _rsCancelled    = false;
+    _rsFilesSent    = 0;
+    _rsFilesFailed  = 0;
 
     if (fileIdx < 0) {
         // Restore all
@@ -848,7 +903,20 @@ void BackupRestorePage::startRestore(int fileIdx) {
 }
 
 void BackupRestorePage::restoreTick() {
-    if (_rsFileCurrent >= _rsRestoreCount || _rsCancelled) {
+    if (_rsFileCurrent >= _rsRestoreCount) {
+        _state = BRState::RESTORE_DONE;
+        draw(); _d.paint();
+        return;
+    }
+
+    // One whole file is read into RAM before it is sent.  ~36 KB — PSRAM,
+    // allocated on the first restore and kept.
+    static uint8_t* restoreBuf = nullptr;
+    if (!restoreBuf) restoreBuf = (uint8_t*)ps_malloc(SONG_TRANSFER_MAX);
+    if (!restoreBuf) {
+        Serial.println("[RS] no PSRAM for the restore buffer — restore abandoned");
+        _rsFilesFailed += _rsRestoreCount - _rsFileCurrent;
+        _rsFileCurrent  = _rsRestoreCount;
         _state = BRState::RESTORE_DONE;
         draw(); _d.paint();
         return;
@@ -863,14 +931,16 @@ void BackupRestorePage::restoreTick() {
     File f = SD.open(path);
     if (!f) {
         Serial.printf("[RS] open failed '%s'\n", path);
+        _rsFilesFailed++;
         _rsFileCurrent++;
         restoreTick();
         return;
     }
     uint32_t fileSize = (uint32_t)f.size();
-    static uint8_t restoreBuf[SONG_TRANSFER_MAX];
     if (fileSize > SONG_TRANSFER_MAX) {
         f.close();
+        Serial.printf("[RS] too big to restore '%s' (%u bytes)\n", path, (unsigned)fileSize);
+        _rsFilesFailed++;
         _rsFileCurrent++;
         restoreTick();
         return;
@@ -878,14 +948,18 @@ void BackupRestorePage::restoreTick() {
     uint32_t got = (uint32_t)f.read(restoreBuf, fileSize);
     f.close();
     if (got != fileSize) {
+        Serial.printf("[RS] short read '%s' (%u of %u)\n", path, (unsigned)got, (unsigned)fileSize);
+        _rsFilesFailed++;
         _rsFileCurrent++;
         restoreTick();
         return;
     }
 
     bool isInstr = (strcmp(name, "instruments.mgt") == 0);
-    gServerPairing.sendRestoreFile(name, isInstr, restoreBuf, fileSize);
-    Serial.printf("[RS] sent '%s' %u bytes instr=%d\n", name, fileSize, isInstr);
+    bool sent = gServerPairing.sendRestoreFile(name, isInstr, restoreBuf, fileSize);
+    if (sent) _rsFilesSent++; else _rsFilesFailed++;
+    Serial.printf("[RS] %s '%s' %u bytes instr=%d\n", sent ? "sent" : "SEND FAILED",
+                  name, fileSize, isInstr);
 
     // Give server time to finalize (commandsTick writes to SD) before next file
     delay(100);

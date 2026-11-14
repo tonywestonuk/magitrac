@@ -10,9 +10,9 @@ extern ServerPairing gServerPairing;
 // Effect labels are pulled from the shared pixelpost_proto catalogue per
 // page/slot — single source of truth shared with pixel_post,
 // pixel_post_controller, and magitrac_server.  Layout: row-major,
-// 2-wide × 3-tall per page; effect_idx = page * 6 + slot.  Slots that
-// don't map to a catalogue entry render as "--" (still tappable; the
-// pixel_post just ignores unknown indices).
+// 2-wide × 3-tall per page; effect_idx = page * 6 + slot.  Slots past the
+// end of the catalogue render greyed as "--"; a tap on one is ignored
+// (nothing is sent or remembered).
 
 // Effect grid x/y per button index 0..5 (row-major)
 static int effectButtonX(int idx) { return (idx & 1) ? PPK_BTN_COL2_X : PPK_BTN_COL1_X; }
@@ -51,6 +51,7 @@ void PixelPostPicker::open(bool fingerDown) {
     _active         = ActiveWidget::NONE;
     _haveNote = _haveVel = _haveAttr = false;
     _lastPadX = _lastPadY = 0;
+    _padHeld  = false;
     // Refresh the server's flash-ctrl cache so live preview actually flashes
     // (covers a server reboot since last visit).
     gServerPairing.sendPixelpostFlashCtrl(gPixelPostFlashCtrl);
@@ -227,7 +228,10 @@ void PixelPostPicker::touchpadUpdateFromXY(int sx, int sy, bool touched) {
     if (py < 0)   py = 0;
     if (py > 255) py = 255;
     uint8_t bx = (uint8_t)px, by = (uint8_t)py;
-    if (_haveAttr && touched && bx == _lastPadX && by == _lastPadY) return;
+    // De-dup only within one press: a new press must send touched=true even
+    // if it lands on the same quantised spot the last one was released at.
+    if (_padHeld && touched && bx == _lastPadX && by == _lastPadY) return;
+    _padHeld  = touched;
     _lastPadX = bx;
     _lastPadY = by;
     _resultEffect = bx;
@@ -282,6 +286,7 @@ bool PixelPostPicker::poll() {
     if (was == ActiveWidget::TOUCHPAD) {
         // Release with last (x,y) so the post drops its finger but holds position.
         gServerPairing.sendPixelpostTouchpad(_lastPadX, _lastPadY, false);
+        _padHeld = false;
         return false;
     }
     if (was == ActiveWidget::SLIDER) return false;  // latest value already sent

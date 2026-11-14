@@ -4,9 +4,51 @@
 #include <stdio.h>
 
 // The master catalog is large (~20 KB) and only one SetlistPage exists, so it
-// lives as a file-scope static rather than bloating the page object.  Loaded
-// from the server in open(); the resolve/picker helpers read it directly.
-static MasterList sMaster;
+// lives at file scope rather than in the page object — and in PSRAM, because
+// internal RAM is the radios' budget.  Allocated by the first open() and kept;
+// every state except NOT_CONNECTED is reached only after that succeeded.
+static MasterList* sMaster = nullptr;
+
+// Serialise buffers and the scratch list used to patch the other slots — PSRAM
+// too, allocated on first use and kept.
+static char*    sMasterBuf  = nullptr;   // MASTER_SERIALIZE_MAX
+static char*    sSetlistBuf = nullptr;   // SETLIST_SERIALIZE_MAX
+static Setlist* sOtherList  = nullptr;
+
+static bool ensureMaster() {
+    if (sMaster) return true;
+    sMaster = (MasterList*)ps_malloc(sizeof(MasterList));
+    if (!sMaster) {
+        Serial.println("[SetlistPage] no PSRAM for the master catalog");
+        return false;
+    }
+    initMasterList(sMaster);
+    return true;
+}
+
+// Drop a trailing ".mgt" (any case), in place.
+static void stripMgt(char* s) {
+    size_t n = strlen(s);
+    if (n > 4 && strcasecmp(s + n - 4, ".mgt") == 0) s[n - 4] = '\0';
+}
+
+// Point every reference to oldName at newName, or drop it when newName is
+// null.  Returns true if the list changed.
+static bool patchSetlistName(Setlist* sl, const char* oldName, const char* newName) {
+    bool changed = false;
+    for (int i = 0; i < (int)sl->count; ) {
+        if (strcasecmp(sl->names[i], oldName) != 0) { i++; continue; }
+        changed = true;
+        if (newName) {
+            strncpy(sl->names[i], newName, SETLIST_SONG_NAME_LEN - 1);
+            sl->names[i][SETLIST_SONG_NAME_LEN - 1] = '\0';
+            i++;
+        } else {
+            setlistRemoveAt(sl, i);
+        }
+    }
+    return changed;
+}
 
 // Floor division that rounds toward negative infinity (offsets may be negative).
 static int floorDiv(int a, int b) {
@@ -43,7 +85,6 @@ SetlistPage::SetlistPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& 
     , _srvListDrawn(false)
     , _srvLoadStartMs(0)
 {
-    initMasterList(&sMaster);
     initSetlist(&_list);
     memset(&_draft, 0, sizeof(_draft));
     _kbdSnap[0]           = '\0';
@@ -65,9 +106,10 @@ SetlistPage::SetlistPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& 
 }
 
 const MasterEntry* SetlistPage::resolveRow(int setlistIdx) const {
+    if (!sMaster) return nullptr;
     if (setlistIdx < 0 || setlistIdx >= (int)_list.count) return nullptr;
-    int m = masterFindByName(&sMaster, _list.names[setlistIdx]);
-    return (m >= 0) ? &sMaster.entries[m] : nullptr;
+    int m = masterFindByName(sMaster, _list.names[setlistIdx]);
+    return (m >= 0) ? &sMaster->entries[m] : nullptr;
 }
 
 void SetlistPage::open() {
@@ -75,9 +117,19 @@ void SetlistPage::open() {
     _scrollOffset = 0;
     _dragMoved    = false;
     _moveSrcIdx   = -1;
+    _srvLoadLate  = false;      // a load from a previous visit is no longer ours
+    _srvSongCache = SongCache::NONE;    // songs may have changed since last visit
+    _srvSongCount = 0;
+    _dupNameNote  = false;
+    _noMemory     = false;
 
     if (!gServerPairing.isPaired()) {
         _state = State::NOT_CONNECTED;
+        return;
+    }
+    if (!ensureMaster()) {
+        _noMemory = true;
+        _state    = State::NOT_CONNECTED;
         return;
     }
 
@@ -99,7 +151,7 @@ void SetlistPage::draw() {
     _d.fillScreen(COL_WHITE);
     switch (_state) {
         case State::NOT_CONNECTED: drawNotConnected(); break;
-        case State::LIST:          drawList(); break;
+        case State::LIST:          drawList(); drawLoadWarning(); break;
         case State::INFO:          drawList(); drawInfo(); break;
         case State::WAITING_SONG:  drawWaitingSong(); break;
         case State::MASTER_SELECT: drawMasterChrome(); _msView.redraw(); break;
@@ -111,7 +163,61 @@ void SetlistPage::draw() {
     }
 }
 
+// A list that failed to load looks exactly like an empty one — say so, and
+// that nothing done here will be saved (see _listLoaded).
+void SetlistPage::drawLoadWarning() {
+    if (_listLoaded && _masterLoaded) return;
+    const char* msg = "COULD NOT LOAD FROM SERVER - CHANGES NOT SAVED";
+    _d.fillRect(0, SL_HDR_H, 960, 34, COL_BLACK);
+    _d.setTextSize(3);
+    _d.setTextColor(COL_WHITE);
+    _d.setCursor((960 - (int)strlen(msg) * 18) / 2, SL_HDR_H + 5);
+    _d.print(msg);
+}
+
 SetlistResult SetlistPage::poll() {
+    // A load that outlived the WAITING_SONG timeout is still in flight — the
+    // receive state was deliberately left intact.  Land it from wherever the
+    // user is now on this page.
+    if (_srvLoadLate && _state != State::WAITING_SONG &&
+        gServerPairing.browseState() == BrowseState::SONG_READY) {
+        _srvLoadLate = false;
+        const bool retriedBefore = _pendingRetried;
+        SetlistResult r = takeReadySong();
+        if (r == SetlistResult::SONG_LOADED) {
+            Serial.println("[SetlistPage] late server load landed");
+            return r;
+        }
+        // The wrong song landed and the right one was asked for again — that
+        // one is in flight now and still has to be landed from here.
+        if (_pendingRetried && !retriedBefore) _srvLoadLate = true;
+    }
+    // The server answered the load with a failure.  It kept its previous song
+    // and so do we — drop straight back to the INFO popup with the reason
+    // instead of sitting out the slow-link timeout.
+    if (gServerPairing.loadFailPending()) {
+        bool waiting = (_state == State::WAITING_SONG);
+        if (waiting || _state == State::INFO) {
+            snprintf(_loadFailNote, sizeof(_loadFailNote), "   (LOAD FAILED - %s)",
+                     gServerPairing.loadFailText());
+        }
+        gServerPairing.clearLoadFail();
+        _srvLoadLate = false;
+        if (waiting) {
+            Serial.println("[SetlistPage] server load failed — back to list");
+            _state   = State::INFO;
+            _wasDown = _touch.isTouched;
+            _d.fillScreen(COL_WHITE);
+            drawList();
+            drawInfo();
+            _d.paint();
+            return SetlistResult::NONE;
+        }
+        if (_state == State::INFO) {
+            drawInfo();
+            _d.paint();
+        }
+    }
     switch (_state) {
         case State::NOT_CONNECTED: return pollNotConnected();
         case State::LIST:          return pollList();
@@ -141,16 +247,18 @@ SetlistResult SetlistPage::poll() {
 
         case State::CONFIRM_DELETE:
             if (_dialog.poll()) {
-                if (_dialog.confirmed() && _editIdx >= 0 && _editIdx < (int)sMaster.count) {
+                if (_dialog.confirmed() && _editIdx >= 0 && _editIdx < (int)sMaster->count) {
                     char gone[SETLIST_SONG_NAME_LEN];
-                    strncpy(gone, sMaster.entries[_editIdx].name, sizeof(gone) - 1);
+                    strncpy(gone, sMaster->entries[_editIdx].name, sizeof(gone) - 1);
                     gone[sizeof(gone) - 1] = '\0';
-                    for (int i = _editIdx; i + 1 < (int)sMaster.count; i++)
-                        sMaster.entries[i] = sMaster.entries[i + 1];
-                    sMaster.count--;
+                    for (int i = _editIdx; i + 1 < (int)sMaster->count; i++)
+                        sMaster->entries[i] = sMaster->entries[i + 1];
+                    sMaster->count--;
                     saveMaster();
-                    int p = setlistFind(&_list, gone);
-                    if (p >= 0) { setlistRemoveAt(&_list, p); save(); }
+                    // (A hand-edited catalog can hold the name twice; the
+                    // references then still resolve, so leave them.)
+                    if (masterFindByName(sMaster, gone) < 0)
+                        propagateNameChange(gone, nullptr);
                     openMasterSelect();          // entry is gone — back to the list
                 } else {
                     _state = State::EDIT;        // cancelled — keep editing
@@ -170,8 +278,9 @@ SetlistResult SetlistPage::poll() {
 void SetlistPage::drawNotConnected() {
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
-    const char* l1 = "Not connected.";
-    const char* l2 = "Pair to a server to use setlists.";
+    const char* l1 = _noMemory ? "Out of memory." : "Not connected.";
+    const char* l2 = _noMemory ? "Could not allocate the setlist catalog."
+                               : "Pair to a server to use setlists.";
     _d.setCursor((960 - (int)strlen(l1) * 18) / 2, 210);
     _d.print(l1);
     _d.setCursor((960 - (int)strlen(l2) * 18) / 2, 260);
@@ -265,8 +374,9 @@ void SetlistPage::drawListRow(int rowOnPage) {
 
     char nameBuf[SETLIST_SONG_NAME_LEN + 8];
     snprintf(nameBuf, sizeof(nameBuf), "%s%s", _list.names[abs], missing ? "  (?)" : "");
-    int maxChars = SL_NAME_W / 18;
     char trunc[SETLIST_SONG_NAME_LEN + 8];
+    int maxChars = SL_NAME_W / 18;
+    if (maxChars > (int)sizeof(trunc) - 1) maxChars = (int)sizeof(trunc) - 1;
     if ((int)strlen(nameBuf) > maxChars) {
         strncpy(trunc, nameBuf, maxChars);
         trunc[maxChars] = '\0';
@@ -397,8 +507,12 @@ SetlistResult SetlistPage::pollList() {
         if (_moveSrcIdx >= 0) return SetlistResult::NONE;
         _selectedIdx = nameIdx;
         const MasterEntry* m = resolveRow(nameIdx);
+        // Answered from the per-visit song-name cache (see fileExistsOnServer).
+        // A file that really is missing is in any case still reported, by the
+        // server's LOAD FAILED reply.
         _selectedMissing = (m == nullptr) ||
                            (m->file[0] != '\0' && !fileExistsOnServer(m->file));
+        _loadFailNote[0] = '\0';
         _state = State::INFO;
         drawInfo();
         _d.paint();
@@ -487,8 +601,8 @@ void SetlistPage::drawInfo() {
     } else if (m->file[0] == '\0') {
         snprintf(src, sizeof(src), "Source: (none)");
     } else {
-        snprintf(src, sizeof(src), "Source: %s  [server]%s", m->file,
-                 _selectedMissing ? "   (FILE MISSING)" : "");
+        snprintf(src, sizeof(src), "Source: %s  [server]%s%s", m->file,
+                 _selectedMissing ? "   (FILE MISSING)" : "", _loadFailNote);
     }
     _d.setCursor(SL_INFO_X + 20, ty);
     _d.print(src);
@@ -585,8 +699,9 @@ SetlistResult SetlistPage::pollInfo() {
         const MasterEntry* m = resolveRow(_selectedIdx);
         if (!m) return SetlistResult::NONE;                // name not in catalog — greyed
 
-        // No file attached → title-only: return to Performance with the title,
-        // leaving the currently-loaded song alone (manual-play song / break).
+        // No file attached → title-only (manual-play song / break): return to
+        // Performance with just the title.  The caller drops to OFF / No Song
+        // for this result — it sends sendSetOff() and clears the local song.
         if (m->file[0] == '\0') {
             _loadedFilename[0] = '\0';
             strncpy(_loadedDisplayName, _list.names[_selectedIdx], sizeof(_loadedDisplayName) - 1);
@@ -602,8 +717,16 @@ SetlistResult SetlistPage::pollInfo() {
         if (blen > 4 && bare[blen - 4] == '.' &&
             (bare[blen - 3] == 'm' || bare[blen - 3] == 'M')) bare[blen - 4] = '\0';
 
+        strncpy(_pendingFile, m->file, sizeof(_pendingFile) - 1);
+        _pendingFile[sizeof(_pendingFile) - 1] = '\0';
+        strncpy(_pendingName, _list.names[_selectedIdx], sizeof(_pendingName) - 1);
+        _pendingName[sizeof(_pendingName) - 1] = '\0';
+
         gServerPairing.resetBrowse();
         _srvLoadStartMs = millis();
+        _srvLoadLate    = false;
+        _pendingRetried = false;
+        _loadFailNote[0] = '\0';
         gServerPairing.requestSongLoadByName(bare);
         _state = State::WAITING_SONG;
         _d.fillScreen(COL_WHITE);
@@ -634,29 +757,80 @@ void SetlistPage::drawWaitingSong() {
     _d.print(msg);
 }
 
+SetlistResult SetlistPage::takeReadySong() {
+    // The song that landed is not necessarily the one this page asked for:
+    // the pull of the previously active song (sent on a reconnect) can arrive
+    // ahead of the reply to the load request.  Compare file stems.
+    const char* pushed = gServerPairing.pushedSongFile();   // "" = unknown
+    char got[32];
+    strncpy(got, pushed ? pushed : "", sizeof(got) - 1);
+    got[sizeof(got) - 1] = '\0';
+    stripMgt(got);
+    char want[SETLIST_FILE_LEN];
+    strncpy(want, _pendingFile, sizeof(want) - 1);
+    want[sizeof(want) - 1] = '\0';
+    stripMgt(want);
+    const bool other = (got[0] != '\0' && strcasecmp(got, want) != 0);
+
+    if (other && !_pendingRetried) {
+        // Not ours — leave it, ask again (once) and keep waiting.
+        _pendingRetried = true;
+        Serial.printf("[SetlistPage] '%s' landed, wanted '%s' — asking again\n", got, want);
+        gServerPairing.resetBrowse();
+        _srvLoadStartMs = millis();
+        gServerPairing.requestSongLoadByName(want);
+        return SetlistResult::NONE;
+    }
+
+    if (gServerPairing.copySong(&_song)) {
+        // Name the song from what was requested, not from the current
+        // selection — a late load may land after the selection has moved.
+        const char* file = _pendingFile;
+        const char* name = _pendingName;
+        if (other) {
+            // Still not the requested song after asking twice: take it, but
+            // name it as what it is — its catalog entry if it has one.
+            Serial.printf("[SetlistPage] '%s' landed again, wanted '%s' — taking it as itself\n",
+                          got, want);
+            file = got;
+            name = got;
+            for (int i = 0; sMaster && i < (int)sMaster->count; i++) {
+                char f[SETLIST_FILE_LEN];
+                strncpy(f, sMaster->entries[i].file, sizeof(f) - 1);
+                f[sizeof(f) - 1] = '\0';
+                stripMgt(f);
+                if (f[0] != '\0' && strcasecmp(f, got) == 0) {
+                    file = sMaster->entries[i].file;
+                    name = sMaster->entries[i].name;
+                    break;
+                }
+            }
+        }
+        strncpy(_loadedFilename, file, sizeof(_loadedFilename) - 1);
+        _loadedFilename[sizeof(_loadedFilename) - 1] = '\0';
+        strncpy(_currentLoadedFile, file, sizeof(_currentLoadedFile) - 1);
+        _currentLoadedFile[sizeof(_currentLoadedFile) - 1] = '\0';
+        strncpy(_loadedDisplayName, name, sizeof(_loadedDisplayName) - 1);
+        _loadedDisplayName[sizeof(_loadedDisplayName) - 1] = '\0';
+        gServerPairing.resetBrowse();
+        return SetlistResult::SONG_LOADED;
+    }
+    gServerPairing.resetBrowse();
+    return SetlistResult::NONE;
+}
+
 SetlistResult SetlistPage::pollWaitingSong() {
     BrowseState bs = gServerPairing.browseState();
     if (bs == BrowseState::SONG_READY) {
-        if (gServerPairing.copySong(&_song)) {
-            const MasterEntry* m = resolveRow(_selectedIdx);
-            if (m) {
-                strncpy(_loadedFilename, m->file, sizeof(_loadedFilename) - 1);
-                _loadedFilename[sizeof(_loadedFilename) - 1] = '\0';
-                strncpy(_currentLoadedFile, m->file, sizeof(_currentLoadedFile) - 1);
-                _currentLoadedFile[sizeof(_currentLoadedFile) - 1] = '\0';
-            }
-            if (_selectedIdx >= 0 && _selectedIdx < (int)_list.count) {
-                strncpy(_loadedDisplayName, _list.names[_selectedIdx], sizeof(_loadedDisplayName) - 1);
-                _loadedDisplayName[sizeof(_loadedDisplayName) - 1] = '\0';
-            }
-            gServerPairing.resetBrowse();
-            return SetlistResult::SONG_LOADED;
-        }
-        gServerPairing.resetBrowse();
+        SetlistResult r = takeReadySong();
+        if (r == SetlistResult::SONG_LOADED) return r;
     }
     if (millis() - _srvLoadStartMs > 8000) {
-        Serial.println("[SetlistPage] server load timeout");
-        gServerPairing.resetBrowse();
+        // Slow, not dead: leave the receive state alone so the stream can
+        // still complete (resetBrowse() here would zero the byte count under
+        // it and the song could never finish).  poll() lands it later.
+        Serial.println("[SetlistPage] server load slow — back to list, stream kept");
+        _srvLoadLate = true;
         _state = State::INFO;
         _wasDown = _touch.isTouched;
         _d.fillScreen(COL_WHITE);
@@ -698,7 +872,7 @@ void SetlistPage::drawMasterHeader() {
 
     uiButton(_d, SL_MEDIT_X, SL_BTN_Y, SL_MEDIT_W, SL_BTN_H, "EDIT",
              _msEditMode ? COL_WHITE : COL_BLACK, _msEditMode ? COL_BLACK : COL_WHITE, 3);
-    bool full = (sMaster.count >= MASTER_MAX_ENTRIES);
+    bool full = (sMaster->count >= MASTER_MAX_ENTRIES);
     uiButton(_d, SL_ADD_X, SL_BTN_Y, SL_ADD_W, SL_BTN_H, "NEW",
              COL_BLACK, full ? COL_DKGREY : COL_WHITE, 3);
 }
@@ -721,7 +895,7 @@ void SetlistPage::drawMasterHint() {
 bool SetlistPage::paintMasterBand(int x, int y, int w, int h, int offsetY) {
     _d.fillRect(x, y, w, h, COL_WHITE);
     int rowH = SL_PICK_ROW_H;
-    int count = (int)sMaster.count;
+    int count = (int)sMaster->count;
 
     if (count == 0) {
         _d.setTextSize(3);
@@ -746,7 +920,7 @@ bool SetlistPage::paintMasterBand(int x, int y, int w, int h, int offsetY) {
 
 void SetlistPage::drawMasterRow(int idx, int py, int rowH) {
     _d.drawFastHLine(20, py + rowH - 1, 920, COL_LTGREY);
-    const MasterEntry& e = sMaster.entries[idx];
+    const MasterEntry& e = sMaster->entries[idx];
 
     int bs = 32, bx = 20, by = py + (rowH - bs) / 2;
     int pos = setlistFind(&_list, e.name);
@@ -780,12 +954,13 @@ void SetlistPage::tapMaster(int tx, int ty) {
     (void)tx;
     if (ty < 0) return;
     int idx = ty / SL_PICK_ROW_H;
-    if (idx < 0 || idx >= (int)sMaster.count) return;
+    if (idx < 0 || idx >= (int)sMaster->count) return;
 
     if (_msEditMode) {
         _editIdx    = idx;
-        _draft      = sMaster.entries[idx];
+        _draft      = sMaster->entries[idx];
         _draftIsNew = false;
+        _dupNameNote = false;
         _state = State::EDIT;
         _wasDown = _touch.isTouched;
         _d.fillScreen(COL_WHITE);
@@ -794,7 +969,7 @@ void SetlistPage::tapMaster(int tx, int ty) {
         return;
     }
 
-    const char* name = sMaster.entries[idx].name;
+    const char* name = sMaster->entries[idx].name;
     int p = setlistFind(&_list, name);
     if (p >= 0) {
         setlistRemoveAt(&_list, p);
@@ -835,10 +1010,11 @@ SetlistResult SetlistPage::pollMasterSelect() {
             return SetlistResult::NONE;
         }
         if (hitMasterNew(sx, sy)) {
-            if (sMaster.count < MASTER_MAX_ENTRIES) {
+            if (sMaster->count < MASTER_MAX_ENTRIES) {
                 memset(&_draft, 0, sizeof(_draft));
                 _draftIsNew = true;
                 _editIdx    = -1;
+                _dupNameNote = false;
                 _state = State::EDIT;
                 _wasDown = _touch.isTouched;
                 _d.fillScreen(COL_WHITE);
@@ -875,7 +1051,24 @@ void SetlistPage::drawEdit() {
     drawEditFieldRow(SL_ED_NAME_Y, "Song Name:", _draft.name, SL_ED_FIELD_VAL_W, "EDIT");
     drawEditFileRow();
     drawEditNotesRow();
+    drawEditNote();
     drawEditActionBar();
+}
+
+// Same black strip as drawLoadWarning(), in the gap between the notes box and
+// the action bar.
+void SetlistPage::drawEditNote() {
+    const int y = SL_ED_NOTES_Y + SL_ED_NOTES_H + 20;
+    if (!_dupNameNote) {
+        _d.fillRect(0, y, 960, 34, COL_WHITE);
+        return;
+    }
+    const char* msg = "NAME ALREADY IN MASTER LIST";
+    _d.fillRect(0, y, 960, 34, COL_BLACK);
+    _d.setTextSize(3);
+    _d.setTextColor(COL_WHITE);
+    _d.setCursor((960 - (int)strlen(msg) * 18) / 2, y + 5);
+    _d.print(msg);
 }
 
 void SetlistPage::drawEditFileRow() {
@@ -986,6 +1179,7 @@ bool SetlistPage::pollEdit() {
     if (!falling) return false;
 
     if (hitEditFieldBtn(SL_ED_NAME_Y, sx, sy)) {
+        _dupNameNote = false;       // the name is being changed
         openKeyboardFor(_draft.name, SETLIST_SONG_NAME_LEN - 1, State::KBD_NAME);
         return true;
     }
@@ -1006,8 +1200,12 @@ bool SetlistPage::pollEdit() {
     }
 
     if (hitEditOk(sx, sy)) {
-        commitDraft();
-        openMasterSelect();
+        if (commitDraft()) {
+            openMasterSelect();
+        } else {
+            drawEditNote();         // refused — stay here and say why
+            _d.paintLater();
+        }
         return true;
     }
     if (hitEditCancel(sx, sy)) {
@@ -1048,33 +1246,41 @@ bool SetlistPage::hitEditDelete(int sx, int sy) const {
     return sx >= SL_ED_DEL_X && sx < SL_ED_DEL_X + SL_ED_DEL_W && sy >= SL_ED_ACT_Y && sy < SL_ED_ACT_Y + SL_ED_ACT_H;
 }
 
-void SetlistPage::commitDraft() {
-    if (_draft.name[0] == '\0') return;   // a nameless entry can't be referenced
+bool SetlistPage::commitDraft() {
+    // ':' is the master.txt field separator — a name containing one would
+    // split into name + file on the next load.
+    for (char* c = _draft.name; *c; c++) { if (*c == ':') *c = '-'; }
+    if (_draft.name[0] == '\0') return true;   // a nameless entry can't be referenced
 
-    if (_draftIsNew) {
-        if (sMaster.count >= MASTER_MAX_ENTRIES) return;
-        sMaster.entries[sMaster.count] = _draft;
-        sMaster.count++;
-        saveMaster();
-    } else if (_editIdx >= 0 && _editIdx < (int)sMaster.count) {
-        char oldName[SETLIST_SONG_NAME_LEN];
-        strncpy(oldName, sMaster.entries[_editIdx].name, sizeof(oldName) - 1);
-        oldName[sizeof(oldName) - 1] = '\0';
-        sMaster.entries[_editIdx] = _draft;
-        saveMaster();
-        // Keep the current setlist's references in step if the name changed.
-        if (strcasecmp(oldName, _draft.name) != 0) {
-            bool changed = false;
-            for (int i = 0; i < (int)_list.count; i++) {
-                if (strcasecmp(_list.names[i], oldName) == 0) {
-                    strncpy(_list.names[i], _draft.name, SETLIST_SONG_NAME_LEN - 1);
-                    _list.names[i][SETLIST_SONG_NAME_LEN - 1] = '\0';
-                    changed = true;
-                }
-            }
-            if (changed) save();
+    // Setlists refer to entries by name (case-insensitively), so a second
+    // entry with the same name could never be reached.
+    for (int i = 0; i < (int)sMaster->count; i++) {
+        if (!_draftIsNew && i == _editIdx) continue;
+        if (strcasecmp(sMaster->entries[i].name, _draft.name) == 0) {
+            _dupNameNote = true;
+            return false;
         }
     }
+    _dupNameNote = false;
+
+    if (_draftIsNew) {
+        if (sMaster->count >= MASTER_MAX_ENTRIES) return true;
+        sMaster->entries[sMaster->count] = _draft;
+        sMaster->count++;
+        saveMaster();
+    } else if (_editIdx >= 0 && _editIdx < (int)sMaster->count) {
+        char oldName[SETLIST_SONG_NAME_LEN];
+        strncpy(oldName, sMaster->entries[_editIdx].name, sizeof(oldName) - 1);
+        oldName[sizeof(oldName) - 1] = '\0';
+        sMaster->entries[_editIdx] = _draft;
+        saveMaster();
+        // Keep every setlist's references in step if the name changed.
+        // (Unless a hand-edited catalog still holds the old name elsewhere.)
+        if (strcasecmp(oldName, _draft.name) != 0 &&
+            masterFindByName(sMaster, oldName) < 0)
+            propagateNameChange(oldName, _draft.name);
+    }
+    return true;
 }
 
 void SetlistPage::openKeyboardFor(char* target, uint8_t maxLen, State afterState) {
@@ -1094,6 +1300,14 @@ void SetlistPage::openKeyboardFor(char* target, uint8_t maxLen, State afterState
 // ═════════════════════════════════════════════════════════════════════════════
 
 void SetlistPage::startServerPick() {
+    if (!_srvPickNames) {
+        _srvPickNames = (char (*)[SETLIST_FILE_LEN])
+                        ps_malloc((size_t)SRV_PICK_MAX * SETLIST_FILE_LEN);
+        if (!_srvPickNames) {
+            Serial.println("[SetlistPage] no PSRAM for the song picker");
+            return;                 // stay on the edit screen
+        }
+    }
     gServerPairing.resetBrowse();
     gServerPairing.requestSongList(0);
     _srvPickCount   = 0;
@@ -1186,7 +1400,7 @@ void SetlistPage::tapPick(int tx, int ty) {
 }
 
 void SetlistPage::pumpServerPickPages() {
-    if (_srvPickLoaded) return;
+    if (_srvPickLoaded || !_srvPickNames) return;
     BrowseState bs = gServerPairing.browseState();
     if (bs != BrowseState::LIST_READY || _srvListDrawn) return;
 
@@ -1253,21 +1467,105 @@ void SetlistPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
 
 void SetlistPage::save() {
     if (!gServerPairing.isPaired()) return;
-    static char buf[SETLIST_SERIALIZE_MAX];
-    size_t n = serializeSetlist(&_list, buf, sizeof(buf));
+    if (!_listLoaded) {
+        Serial.println("[SetlistPage] setlist never loaded — NOT saving over it");
+        return;
+    }
+    saveSlot(_slot, &_list);
+}
+
+bool SetlistPage::saveSlot(uint8_t slot, const Setlist* sl) {
+    if (!sSetlistBuf) {
+        sSetlistBuf = (char*)ps_malloc(SETLIST_SERIALIZE_MAX);
+        if (!sSetlistBuf) {
+            Serial.println("[SetlistPage] no PSRAM for the setlist buffer — NOT saved");
+            return false;
+        }
+    }
+    size_t n = serializeSetlist(sl, sSetlistBuf, SETLIST_SERIALIZE_MAX);
+    // An upload with no body never completes on the server (it finishes a
+    // file when the last body byte arrives), so the old contents would stay.
+    // A lone newline parses back as an empty list.
+    if (n == 0) { sSetlistBuf[0] = '\n'; n = 1; }
     char fname[24];
-    buildSetlistFilename(_slot, fname, sizeof(fname));
-    gServerPairing.sendFileSave(FK_SETLISTS, fname, (const uint8_t*)buf, n);
+    buildSetlistFilename(slot, fname, sizeof(fname));
+    return gServerPairing.sendFileSave(FK_SETLISTS, fname, (const uint8_t*)sSetlistBuf, n);
+}
+
+void SetlistPage::propagateNameChange(const char* oldName, const char* newName) {
+    const bool curChanged = patchSetlistName(&_list, oldName, newName);
+    if (curChanged) {
+        int max = maxScrollOffset();
+        if (_scrollOffset > max) _scrollOffset = max;
+    }
+    if (!gServerPairing.isPaired()) return;
+
+    if (!sOtherList) {
+        sOtherList = (Setlist*)ps_malloc(sizeof(Setlist));
+        if (!sOtherList)
+            Serial.println("[SetlistPage] no PSRAM — other setlists NOT updated");
+    }
+
+    // The server finishes an upload (temp file → rename) on its main loop,
+    // and the header of a following upload discards one not yet finished.  A
+    // file-load reply comes from that same loop, after the finish — so a
+    // completed load between two saves keeps them apart.  Each other slot's
+    // load does that job for the save before it.
+    const bool curLoaded = _listLoaded;     // loadSlotFromServer() overwrites it
+    bool saveInFlight = true;               // the caller has just sent master.txt
+    bool linkOk       = (sOtherList != nullptr);
+
+    for (uint8_t slot = 1; slot <= SETLIST_COUNT && linkOk; slot++) {
+        if (slot == _slot) continue;
+        bool ok       = loadSlotFromServer(slot, sOtherList);
+        bool answered = _listLoaded;        // contents, or "no such file"
+        _listLoaded   = curLoaded;
+        if (!answered) {
+            // No reply — don't sit out a timeout per remaining slot.  Those
+            // setlists keep the old name and show it as "(?)".
+            Serial.printf("[SetlistPage] setlist %u did not load — references not updated\n",
+                          (unsigned)slot);
+            linkOk = false;
+            break;
+        }
+        saveInFlight = false;
+        if (ok && patchSetlistName(sOtherList, oldName, newName)) {
+            saveSlot(slot, sOtherList);
+            saveInFlight = true;
+        }
+    }
+
+    if (curChanged) {
+        if (saveInFlight && linkOk) {       // load only for the ordering above
+            loadSlotFromServer(_slot, sOtherList);
+            _listLoaded = curLoaded;
+        }
+        save();
+    }
 }
 
 void SetlistPage::saveMaster() {
     if (!gServerPairing.isPaired()) return;
-    static char buf[MASTER_SERIALIZE_MAX];
-    size_t n = serializeMasterList(&sMaster, buf, sizeof(buf));
-    gServerPairing.sendFileSave(FK_SETLISTS, masterListFilename(), (const uint8_t*)buf, n);
+    if (!_masterLoaded) {
+        Serial.println("[SetlistPage] master catalog never loaded — NOT saving over it");
+        return;
+    }
+    if (!sMaster) return;
+    if (!sMasterBuf) {
+        sMasterBuf = (char*)ps_malloc(MASTER_SERIALIZE_MAX);
+        if (!sMasterBuf) {
+            Serial.println("[SetlistPage] no PSRAM for the catalog buffer — NOT saved");
+            return;
+        }
+    }
+    size_t n = serializeMasterList(sMaster, sMasterBuf, MASTER_SERIALIZE_MAX);
+    if (n == 0) { sMasterBuf[0] = '\n'; n = 1; }   // see saveSlot(): no empty uploads
+    gServerPairing.sendFileSave(FK_SETLISTS, masterListFilename(),
+                                (const uint8_t*)sMasterBuf, n);
 }
 
 bool SetlistPage::loadSlotFromServer(uint8_t slot, Setlist* sl) {
+    _listLoaded = false;
     if (!gServerPairing.isPaired()) { initSetlist(sl); return false; }
     char fname[24];
     buildSetlistFilename(slot, fname, sizeof(fname));
@@ -1280,22 +1578,28 @@ bool SetlistPage::loadSlotFromServer(uint8_t slot, Setlist* sl) {
             bool ok = parseSetlist((const char*)gServerPairing.fileLoadData(),
                                    gServerPairing.fileLoadLen(), sl);
             gServerPairing.resetFileLoad();
+            _listLoaded = ok;           // unparseable → leave the file alone
             return ok;
         }
-        if (st == FileLoadState::NOT_FOUND || st == FileLoadState::ERROR) {
+        if (st == FileLoadState::NOT_FOUND) {      // no file yet: a new, empty list
             gServerPairing.resetFileLoad();
             initSetlist(sl);
+            _listLoaded = true;
             return false;
         }
+        if (st == FileLoadState::ERROR) break;
         delay(5);
     }
+    Serial.printf("[SetlistPage] '%s' did not load — saving disabled for it\n", fname);
     gServerPairing.resetFileLoad();
     initSetlist(sl);
     return false;
 }
 
 bool SetlistPage::loadMasterFromServer() {
-    if (!gServerPairing.isPaired()) { initMasterList(&sMaster); return false; }
+    _masterLoaded = false;
+    if (!sMaster) return false;
+    if (!gServerPairing.isPaired()) { initMasterList(sMaster); return false; }
     gServerPairing.requestFileLoad(FK_SETLISTS, masterListFilename());
 
     uint32_t start = millis();
@@ -1303,34 +1607,42 @@ bool SetlistPage::loadMasterFromServer() {
         FileLoadState st = gServerPairing.fileLoadState();
         if (st == FileLoadState::READY) {
             parseMasterList((const char*)gServerPairing.fileLoadData(),
-                            gServerPairing.fileLoadLen(), &sMaster);
+                            gServerPairing.fileLoadLen(), sMaster);
             gServerPairing.resetFileLoad();
+            _masterLoaded = true;
             return true;
         }
-        if (st == FileLoadState::NOT_FOUND || st == FileLoadState::ERROR) {
+        if (st == FileLoadState::NOT_FOUND) {      // no catalog yet: start one
             gServerPairing.resetFileLoad();
-            initMasterList(&sMaster);
+            initMasterList(sMaster);
+            _masterLoaded = true;
             return false;
         }
+        if (st == FileLoadState::ERROR) break;
         delay(5);
     }
+    Serial.println("[SetlistPage] master catalog did not load — saving disabled for it");
     gServerPairing.resetFileLoad();
-    initMasterList(&sMaster);
+    initMasterList(sMaster);
     return false;
 }
 
-bool SetlistPage::fileExistsOnServer(const char* file) {
-    if (!file || file[0] == '\0') return false;
-    if (!gServerPairing.isPaired())  return false;
-
-    char want[SL_NAME_LEN];
-    strncpy(want, file, sizeof(want) - 1);
-    want[sizeof(want) - 1] = '\0';
-    int wl = (int)strlen(want);
-    if (wl > 4 && want[wl - 4] == '.' && (want[wl - 3] == 'm' || want[wl - 3] == 'M')) want[wl - 4] = '\0';
+// Pull the server's whole song-name list into the PSRAM cache.  Blocking — a
+// request per 7-name page — which is why it runs once per open() and not on
+// every row tap.  False if the list could not be had.
+bool SetlistPage::fetchServerSongNames() {
+    if (!_srvSongNames) {
+        _srvSongNames = (char (*)[SL_NAME_LEN])
+                        ps_malloc((size_t)SRV_MAX_SONGS * SL_NAME_LEN);
+        if (!_srvSongNames) {
+            Serial.println("[SetlistPage] no PSRAM for the song-name cache");
+            return false;
+        }
+    }
+    _srvSongCount = 0;
 
     int totalPages = 1;
-    for (int page = 0; page < totalPages && page < 64; page++) {
+    for (int page = 0; page < totalPages && page < 64 && _srvSongCount < SRV_MAX_SONGS; page++) {
         gServerPairing.resetBrowse();
         gServerPairing.requestSongList((uint8_t)page);
         uint32_t start = millis();
@@ -1339,16 +1651,45 @@ bool SetlistPage::fileExistsOnServer(const char* file) {
             if (gServerPairing.browseState() == BrowseState::LIST_READY) { got = true; break; }
             delay(5);
         }
-        if (!got) { gServerPairing.resetBrowse(); return true; }   // couldn't ask
+        if (!got) { gServerPairing.resetBrowse(); return false; }
         totalPages = gServerPairing.listTotalPages();
         int n = gServerPairing.listCount();
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < n && _srvSongCount < SRV_MAX_SONGS; i++) {
             const char* nm = gServerPairing.listName(i);
-            if (nm && strcasecmp(nm, want) == 0) { gServerPairing.resetBrowse(); return true; }
+            if (!nm || nm[0] == '\0') continue;
+            strncpy(_srvSongNames[_srvSongCount], nm, SL_NAME_LEN - 1);
+            _srvSongNames[_srvSongCount][SL_NAME_LEN - 1] = '\0';
+            _srvSongCount++;
         }
     }
     gServerPairing.resetBrowse();
-    return false;
+    return true;
+}
+
+bool SetlistPage::fileExistsOnServer(const char* file) {
+    if (!file || file[0] == '\0') return false;
+    if (!gServerPairing.isPaired())  return false;
+
+    if (_srvSongCache == SongCache::NONE) {
+        // The fetch calls resetBrowse(), which would zero the receive count
+        // under a slow load still streaming in, so that song could never
+        // land.  Leave it for a later tap.
+        if (_srvLoadLate) return true;
+        _srvSongCache = fetchServerSongNames() ? SongCache::VALID : SongCache::FAILED;
+    }
+    if (_srvSongCache != SongCache::VALID) return true;     // couldn't ask
+
+    char want[SETLIST_FILE_LEN];
+    strncpy(want, file, sizeof(want) - 1);
+    want[sizeof(want) - 1] = '\0';
+    stripMgt(want);
+
+    // Listed names carry at most SL_NAME_LEN - 1 characters.
+    for (int i = 0; i < _srvSongCount; i++) {
+        if (strncasecmp(_srvSongNames[i], want, SL_NAME_LEN - 1) == 0) return true;
+    }
+    // A full cache may not be the whole card — don't call a song missing then.
+    return _srvSongCount >= SRV_MAX_SONGS;
 }
 
 void SetlistPage::wrapText(const char* in, int maxChars, char line1[], char line2[], int line1Cap, int line2Cap) {

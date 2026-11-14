@@ -7,7 +7,8 @@ class TwoWire;
 
 // ADC voltage-divider backend (M5PaperS3 — BAT_ADC on GPIO 3, 2:1 divider;
 // charge status on GPIO 4, low = charging).  chg_stat_pin < 0 = no charge
-// detection.
+// detection.  mv_full / mv_empty are no longer used (BatteryGauge maps
+// voltage to percent); they remain only for existing callers.
 void battery_begin_adc(uint8_t pin, float div_ratio,
                        int mv_full = 4200, int mv_empty = 3000,
                        int chg_stat_pin = -1, bool chg_active_low = true);
@@ -17,9 +18,7 @@ void battery_begin_bq25896(TwoWire* wire, uint8_t addr = 0x6B);
 
 // ── Runtime ───────────────────────────────────────────────────────────────────
 
-// Returns battery charge 0–100, or -1 if uninitialised / unavailable.
-// (Naive linear voltage→pct map — the BatteryGauge layer is the real gauge.)
-int  battery_read_pct();
+// (State of charge lives in the BatteryGauge layer, built on the readings below.)
 
 // Returns true when USB/charger is present (BQ25896, or ADC chg_stat_pin).
 bool battery_is_charging();

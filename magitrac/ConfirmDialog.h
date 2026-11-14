@@ -10,7 +10,7 @@
 // Call draw() once after open(), then poll() each loop until poll() returns true.
 //
 //   y=160  ┌─ dialog box (700×220) centred at x=130 ────────────────────────┐
-//          │  [message — up to two lines of textSize 3]                       │
+//          │  [message — one centred line of textSize 3]                      │
 //          │                                                                   │
 //          │  [YES  x=210,w=200,h=60]        [NO  x=550,w=200,h=60]          │
 //   y=380  └───────────────────────────────────────────────────────────────────┘
@@ -31,6 +31,9 @@ public:
     ConfirmDialog(EPD_PainterAdafruit& display, GT911_Lite& touch);
 
     // Show dialog with a short message (keep it under ~28 chars for textSize 3).
+    // If a finger is still on the glass when this is called (e.g. opened from
+    // a long-press), that finger's lift is swallowed — only a fresh tap can
+    // answer the dialog.
     void open(const char* message);
 
     bool isOpen()     const { return _open; }
@@ -50,6 +53,7 @@ private:
     bool _open;
     bool _confirmed;
     bool _wasDown;
+    bool _swallowLift;   // ignore the first lift: it belongs to the opening press
 
     bool hitYes(int sx, int sy) const;
     bool hitNo (int sx, int sy) const;

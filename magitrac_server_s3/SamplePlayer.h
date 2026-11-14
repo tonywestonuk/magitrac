@@ -6,11 +6,12 @@
 // CoreS3 + Module Audio v2.2.  Runs a FreeRTOS task on Core 0 so the MIDI
 // sequencer (Core 1) is never blocked.
 //
-// Both play() and stop() are fire-and-forget: triggering a new sample while
-// one is playing interrupts the first (single-voice polyphony).
+// Both play() and stop() are fire-and-forget.  The SD stream is single-voice:
+// a new samplePlayerPlay() interrupts the one playing.  Samples preloaded into
+// PSRAM play as up to 4 polyphonic RAM voices mixed on top (see below).
 //
-// WAVs are mono 16-bit PCM at any sample rate; linear-interp resampled to
-// the codec's 32 kHz fixed rate, mono → stereo (same value on L+R).
+// WAVs are 16-bit PCM, mono or stereo, 8–48 kHz; linear-interp resampled to
+// the codec's fixed 32 kHz (mono is duplicated to L+R).
 //
 // Codec is shared full-duplex with mic_spectrum — no mutex needed, both
 // directions stream concurrently on the same I²S peripheral.
@@ -28,9 +29,10 @@ void samplePlayerStopStream();              // stop only the SD stream; RAM voic
 bool samplePlayerIsPlaying();
 
 // ── PSRAM sample cache + polyphonic RAM voices ────────────────────────────────
-// SFX samples under 200 KB are preloaded into PSRAM when the song loads and
-// play from RAM with polyphony (mixed with each other AND with a concurrently
-// streaming big sample).  Larger files keep streaming from SD, single-voice.
+// SFX samples whose WAV file is under 200 KB are preloaded into PSRAM when the
+// song loads and play from RAM with polyphony (mixed with each other AND with
+// a concurrently streaming big sample).  Larger files keep streaming from SD,
+// single-voice.
 //
 // samplePreloadSync: diff the cache against the song's SFX columns — evict
 // what's no longer referenced, load what's new.  Does SD reads: call from the

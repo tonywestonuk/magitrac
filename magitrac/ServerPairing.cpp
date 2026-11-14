@@ -7,9 +7,6 @@
 #include "MagiLink.h"
 #include "MagiMsg.h"
 #include <WiFi.h>
-#include <esp_random.h>
-#include <esp_mac.h>
-#include <esp_netif.h>
 #include <esp_wifi.h>
 #include <string.h>
 
@@ -20,10 +17,12 @@
 static const uint32_t PAIR_SCAN_DWELL_MS = 250;
 
 // ── Global instances ─────────────────────────────────────────────────────────
-// Three links running on the magitrac client (AP/STA roles inverted
-// 2026-05-27 — the server is now the AP):
-//   • gMagiLink (TCP)          — reliable data path; STA role.  Connects
-//                                to the server at 192.168.0.1:MAGI_PORT.
+// Three links running on the magitrac client.  The client is always a WiFi
+// STA — of the server's own softAP (SERVER_AP mode) or of a third-party AP
+// that both devices join (EXTERNAL_AP mode):
+//   • gMagiLink (TCP)          — reliable data path; we are the connecting
+//                                side, the server listens on MAGI_PORT.
+//                                Started from magitrac.ino, not here.
 //   • gPairTransport (ESP-NOW) — pairing ceremony only; coexist mode.
 //   • gUdpLink (UDP)           — best-effort datagrams for loss-tolerant
 //                                updates (row position, preview playhead,
@@ -55,6 +54,12 @@ void ServerPairing::begin() {
         _sampleCache = (SampleCacheEntry*)ps_malloc(SAMPLE_CACHE_MAX * sizeof(SampleCacheEntry));
     if (!_fileListNames)
         _fileListNames = (char(*)[FILE_NAME_LEN])ps_malloc(FILE_LIST_CACHE_MAX * FILE_NAME_LEN);
+    // File-load buffer too (24 KB) — inside the global object it sat in the
+    // internal RAM the radios need.  If this fails, a file load ends in ERROR.
+    if (!_fileLoadBuf)
+        _fileLoadBuf = (uint8_t*)ps_malloc(FILE_LOAD_BUF_MAX);
+    if (!_fileLoadBuf)
+        Serial.println("[SP] no PSRAM for the file-load buffer — file loads will fail");
     if (_ready) return;
 
     // Load existing pairing (server MAC + secret).
@@ -67,14 +72,15 @@ void ServerPairing::begin() {
     gPairTransport.begin();
 
     // UDP listener — bound to MAGI_PORT for SEQ_POS / MIDI_NOTE_IN /
-    // PREVIEW_ROW updates from the server.
+    // PREVIEW_ROW updates and the SERVER_ANNOUNCE discovery beacon.
     gUdpLink.setOnReceive(onUdpRecv);
     gUdpLink.beginListener(MAGI_PORT);
 
-    // MagiLink: register MSG_CONNECT handler.  Server (STA) initiates the
-    // session handshake the moment its TCP connect succeeds; we reply
-    // with ACK and transition to SUCCESS.  The session ends when
-    // gMagiLink.isConnected() flips false — handled in tick().
+    // MagiLink: register MSG_CONNECT handler.  We open the TCP connection;
+    // the server starts the session handshake by sending MSG_CONNECT as
+    // soon as it has accepted it.  We reply with ACK and transition to
+    // SUCCESS.  The session ends when gMagiLink.isConnected() flips false —
+    // handled in tick().
     gMagiLink.registerCallback(MSG_CONNECT,
         [](const uint8_t* /*msg*/, size_t /*len*/, void* ctx) {
             static_cast<ServerPairing*>(ctx)->_onMagiLinkConnect();
@@ -95,8 +101,11 @@ void ServerPairing::begin() {
     };
     gMagiLink.registerCallback(MSG_SONG_PUSH_HEADER, songCb, this);
     gMagiLink.registerCallback(MSG_SONG_PUSH_BODY,   songCb, this);
+    gMagiLink.registerCallback(MSG_ACTIVE_SONG_CHANGED, songCb, this);
     gMagiLink.registerCallback(MSG_NO_SONG,          songCb, this);
+    gMagiLink.registerCallback(MSG_SONG_LOAD_FAILED, songCb, this);
     gMagiLink.registerCallback(MSG_SONG_LIST_RESP,   songCb, this);
+    gMagiLink.registerCallback(MSG_SAVE_RESULT,      songCb, this);
 
     // MagiLink: server → client play/stop notification.  Same id as the
     // outbound request controls — receivers know by direction.  Updates
@@ -169,10 +178,10 @@ void ServerPairing::begin() {
 
 // ── Auto-connect ─────────────────────────────────────────────────────────────
 //
-// Post-MagiLink: the server (STA) is the one that initiates the session
-// handshake — it sends MSG_CONNECT the moment its TCP connect succeeds,
-// and our registered callback (set up in begin()) replies with ACK and
-// transitions to SUCCESS.  So _tryAutoConnect just parks us in the
+// Nothing is actually "tried" here.  MagiLink's worker makes (and remakes)
+// the TCP connection on its own; the server then sends MSG_CONNECT on the
+// new socket, and our registered callback (set up in begin()) replies with
+// ACK and transitions to SUCCESS.  So _tryAutoConnect just parks us in the
 // AUTO_CONNECTING state and waits for that to happen.
 void ServerPairing::_tryAutoConnect() {
     _setPairState(PairClientState::AUTO_CONNECTING);
@@ -180,19 +189,28 @@ void ServerPairing::_tryAutoConnect() {
 
 // ── Pairing ceremony (over ESP-NOW; always on ch1) ──────────────────────────
 //
-// Client owns the WiFi credentials (via WiFiSettingsPage → magitrac_cli
-// NVS).  Pairing's job is to deliver them to the server.
+// Pairing's job is to get both devices onto the same WiFi network.  In
+// SERVER_AP mode (the default) that network is the server's own softAP: its
+// SSID/PSK arrive in the CHALLENGE and we echo them back.  In EXTERNAL_AP
+// mode it is the network the user entered on WiFiSettingsPage (magitrac_cli
+// NVS), which we deliver to the server.
 //
 //   1. User enters pair mode → force radio to ch1, broadcast PROBE every
 //      PAIR_SCAN_DWELL_MS.
 //   2. Server (in its own pair mode, also on ch1) replies with CHALLENGE
-//      carrying a 4-digit PIN.
-//   3. _onPairReceive captures PIN + server MAC → PAIRING_CONFIRM.
+//      carrying a 4-digit PIN + its softAP SSID/PSK.
+//   3. _onPairReceive captures PIN + creds + server MAC → PAIRING_CONFIRM.
 //   4. User taps Confirm on the touch screen → confirmPairCode() unicasts
-//      MSG_PAIR_OFFER { apMode, apSsid, apPsk } and persists the server
-//      MAC + the creds we just shipped.
-//   5. Server saves + reboots.  We stay up; in-place WiFi reconnect to
-//      the (possibly new) AP picks the session back up via MagiLink.
+//      MSG_PAIR_OFFER { apMode, apSsid, apPsk } and, only once that send has
+//      succeeded, persists the server MAC (and, in SERVER_AP mode, the creds
+//      we just adopted).  If the send fails we stay in PAIRING_CONFIRM with
+//      nothing saved, and the user can tap Confirm again.
+//   5. Server saves + reboots.  We stay up and re-join WiFi in place; the
+//      session comes back via MagiLink once the server is listening again.
+//      NB: MagiLink::beginConnect() is one-shot, so this only works if the
+//      link was never started (magitrac.ino starts it from the server's
+//      announce beacon) or was already aimed at the address the server
+//      comes back on.  A changed server address needs a client reboot.
 void ServerPairing::startPairCeremony() {
     Serial.println("[SP] entering pair mode on ch1");
     // STA may be in a tight retry loop trying to associate with a
@@ -218,7 +236,8 @@ void ServerPairing::startPairCeremony() {
 void ServerPairing::confirmPairCode() {
     if (_pairState != PairClientState::PAIRING_CONFIRM) return;
 
-    // Load the user-configured WiFi creds + apMode.  If unset, refuse.
+    // Load the user-configured WiFi creds + apMode.  If unset, fall back to
+    // the SERVER_AP default below.
     char    ssid[33] = {};
     char    psk[64]  = {};
     uint8_t apMode   = 0;
@@ -234,17 +253,15 @@ void ServerPairing::confirmPairCode() {
 
     // SERVER_AP: the server owns its Magitrac_XXXX SSID/PSK — we use what
     // came in MSG_PAIR_CHALLENGE, not what the user typed on the WiFi page.
-    // Re-persist into client NVS so STA can find/join the AP after reboot.
+    // (They are written to client NVS further down, once the OFFER is out.)
     if (apMode == MAGI_AP_MODE_SERVER) {
         if (_pairOfferedSsid[0] == '\0') {
             Serial.println("[SP] confirmPairCode: no SERVER_AP creds in challenge — abort");
-            _setPairState(PairClientState::IDLE);
+            _leavePairMode();
             return;
         }
         strncpy(ssid, _pairOfferedSsid, sizeof(ssid) - 1); ssid[sizeof(ssid) - 1] = '\0';
         strncpy(psk,  _pairOfferedPsk,  sizeof(psk)  - 1); psk [sizeof(psk)  - 1] = '\0';
-        pairNvsSaveCreds(CLI_NVS_NS, ssid, psk, apMode);
-        Serial.printf("[SP] adopted server-supplied SERVER_AP creds ssid='%s'\n", ssid);
     }
 
     MsgPairOffer offer;
@@ -268,6 +285,22 @@ void ServerPairing::confirmPairCode() {
                   (unsigned)apMode, (unsigned)sizeof(offer),
                   ok ? "OK" : "FAIL_ALL_RETRIES");
 
+    // The server never got the offer, so it is not going to switch networks.
+    // Commit nothing — no NVS write, no WiFi change — and stay in
+    // PAIRING_CONFIRM (peer still registered, pair-window clock still running
+    // from the CHALLENGE) so the user can tap Confirm again.
+    if (!ok) {
+        Serial.println("[SP] OFFER not delivered — nothing saved, still waiting for Confirm");
+        return;
+    }
+
+    // Offer is out: now commit.  SERVER_AP creds go to client NVS so the STA
+    // can find/join the server's AP after a reboot.
+    if (apMode == MAGI_AP_MODE_SERVER) {
+        pairNvsSaveCreds(CLI_NVS_NS, ssid, psk, apMode);
+        Serial.printf("[SP] adopted server-supplied SERVER_AP creds ssid='%s'\n", ssid);
+    }
+
     // Persist server MAC for our own NVS records.
     uint8_t zeroSecret[16] = {};
     pairNvsSave(CLI_NVS_NS, _serverMac, zeroSecret);
@@ -278,6 +311,10 @@ void ServerPairing::confirmPairCode() {
     // Server is rebooting; reconnect our STA on top of the (possibly
     // new) AP creds.  WiFi.disconnect + WiFi.begin handles both
     // "same network as before" and "switched networks" cases.
+    // NB (review note, behaviour unchanged): the static MAGI_CLIENT_IP
+    // config below is applied whatever apMode is, whereas setup() in
+    // magitrac.ino leaves an EXTERNAL_AP client on DHCP — so an EXTERNAL_AP
+    // pairing runs on the static address until the next reboot.
     WiFi.disconnect(false, false);
     WiFi.config(IPAddress(MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1,
                           MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3),
@@ -291,6 +328,13 @@ void ServerPairing::confirmPairCode() {
 }
 
 void ServerPairing::cancelPairing() {
+    _leavePairMode();
+}
+
+// Every way out of pair mode that did not produce a new pairing comes through
+// here.  startPairCeremony() switched WiFi auto-reconnect off; put it back, and
+// return to the stored pairing if there is one.
+void ServerPairing::_leavePairMode() {
     WiFi.setAutoReconnect(true);
     if (_hasPairing) {
         memcpy(_serverMac, _storedServerMac, 6);
@@ -300,21 +344,22 @@ void ServerPairing::cancelPairing() {
     }
 }
 
-void ServerPairing::clearPairing() {
-    pairNvsClear(CLI_NVS_NS);
-    _hasPairing = false;
-    memset(_storedServerMac, 0, 6);
-    memset(_storedSecret,    0, 16);
+// ── One complete message, sent under the link mutex ──────────────────────────
+// The common case: take the mutex, send one frame, give it back.  Multi-frame
+// streams (song / restore / file save) hold the mutex across the whole stream
+// themselves and do not use this.
+bool ServerPairing::_sendLocked(const void* msg, size_t len) {
+    gMagiLink.acquireMutex();
+    bool ok = gMagiLink.send(msg, len);
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 // ── disconnect() ──────────────────────────────────────────────────────────────
 void ServerPairing::disconnect() {
     if (_pairState != PairClientState::SUCCESS) return;
     MsgDisconnect msg;
-    gMagiLink.acquireMutex();
-    gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    _serverName[0] = '\0';
+    _sendLocked(&msg, sizeof(msg));
     _setBrowseState(BrowseState::IDLE);
     if (_hasPairing) _tryAutoConnect();
     else             _setPairState(PairClientState::IDLE);
@@ -324,16 +369,12 @@ void ServerPairing::disconnect() {
 //
 // sendControl is for the empty-payload controls PLAY/STOP/PAUSE/UNPAUSE — all
 // share the 3-byte {id, length} wire layout, so a single MsgPlay-shaped
-// buffer carries any of them.  CANCEL_QUEUE and friends still go through
-// the legacy path (Phase 3 of the migration).
+// buffer carries any of them.
 bool ServerPairing::sendControl(MagiMsgType type) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPlay msg;          // any 3-byte control type shares this layout
     msg.id = (uint8_t)type;   // override NSDMI default — could be any of PLAY/STOP/PAUSE/UNPAUSE
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendSeek(uint8_t pattern, uint8_t row) {
@@ -341,10 +382,7 @@ bool ServerPairing::sendSeek(uint8_t pattern, uint8_t row) {
     MsgSeek msg;
     msg.pattern = pattern;
     msg.row     = row;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendGoto(uint8_t pattern, uint8_t row) {
@@ -352,40 +390,28 @@ bool ServerPairing::sendGoto(uint8_t pattern, uint8_t row) {
     MsgGoto msg;
     msg.pattern = pattern;
     msg.row     = row;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendQueueBlock(uint8_t pattern) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgQueueBlock msg;
     msg.pattern = pattern;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendPixelpostEffect(uint8_t effectIdx) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPixelpostSetEffect msg;
     msg.effectIdx = effectIdx;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendPixelpostSlider(uint8_t value) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPixelpostSetSlider msg;
     msg.value = value;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendPixelpostTouchpad(uint8_t x, uint8_t y, bool touched) {
@@ -394,30 +420,21 @@ bool ServerPairing::sendPixelpostTouchpad(uint8_t x, uint8_t y, bool touched) {
     msg.x       = x;
     msg.y       = y;
     msg.touched = touched ? 1 : 0;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendPixelpostPowerOff(bool off) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPixelpostPowerOff msg;
     msg.off = off ? 1 : 0;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendPixelpostOverride(uint8_t op) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPixelpostOverride msg;
     msg.op = op;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendOrgan(uint8_t op, uint8_t index, uint8_t value) {
@@ -426,48 +443,26 @@ bool ServerPairing::sendOrgan(uint8_t op, uint8_t index, uint8_t value) {
     msg.op    = op;
     msg.index = index;
     msg.value = value;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
-}
-
-bool ServerPairing::sendPixelpostPostCount(uint8_t count) {
-    if (_pairState != PairClientState::SUCCESS) return false;
-    MsgPixelpostSetPostCount msg;
-    msg.count = count;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendPixelpostFirmwareUpdate() {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPixelpostFirmwareUpdate msg;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendPixelpostFlashCtrl(uint8_t value) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPixelpostSetFlashCtrl msg;
     msg.flashCtrl = value;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendCancelQueue() {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgCancelQueue msg;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendPreviewStart(uint8_t pattern, uint8_t col) {
@@ -475,19 +470,13 @@ bool ServerPairing::sendPreviewStart(uint8_t pattern, uint8_t col) {
     MsgPreviewStart msg;
     msg.pattern = pattern;
     msg.col     = col;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendPreviewStop() {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgPreviewStop msg;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::pollPreviewRow(uint8_t* row) {
@@ -503,10 +492,7 @@ bool ServerPairing::sendMidi(const uint8_t* bytes, uint8_t len) {
     MsgMidiData msg;
     msg.midiLen = len;
     memcpy(msg.data, bytes, len);
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendSongPatch(const Song& song, const void* fieldPtr, uint8_t length) {
@@ -522,10 +508,7 @@ bool ServerPairing::sendSongPatch(const Song& song, const void* fieldPtr, uint8_
     // carrying meaningful payload (6-byte header + dataLen bytes).
     uint16_t wireLen = (uint16_t)(6 + length);
     msg.length = wireLen;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, wireLen);
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, wireLen);
 }
 
 bool ServerPairing::sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, uint8_t col) {
@@ -538,10 +521,12 @@ bool ServerPairing::sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, 
     msg.col     = col;
     NoteGrid grid(song.notePool, &song.patterns[pattern].noteHead);
     msg.note = grid.get(row, col);
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    // get() hands back all-zero for a cell that isn't there, but all-zero is
+    // not "empty" to NoteGrid::set on the far side (velocity 0 is an explicit
+    // value — a PixelPost "slider 0" row).  Send the real empty encoding, or
+    // every cleared cell is stored on the server as a phantom note.
+    if (!grid.has(row, col)) msg.note.velocity = VEL_DEFAULT;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col) {
@@ -550,10 +535,7 @@ bool ServerPairing::sendAuditionNote(uint8_t pattern, uint8_t row, uint8_t col) 
     msg.pattern = pattern;
     msg.row     = row;
     msg.col     = col;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
@@ -564,10 +546,7 @@ bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t v
     msg.note     = note;
     msg.velocity = velocity;
     msg.col      = col;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendSampleEdit(uint8_t op, uint8_t sampleId,
@@ -580,10 +559,7 @@ bool ServerPairing::sendSampleEdit(uint8_t op, uint8_t sampleId,
     msg.startFrame = startFrame;
     msg.endFrame   = endFrame;
     msg.loop       = loop;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendAuditionProgram(uint8_t channel, uint8_t program) {
@@ -591,17 +567,7 @@ bool ServerPairing::sendAuditionProgram(uint8_t channel, uint8_t program) {
     MsgAuditionProgram msg;
     msg.channel = channel;
     msg.program = program;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
-}
-
-bool ServerPairing::sendNoteSetReliable(const Song& song, uint8_t pattern, uint8_t row, uint8_t col) {
-    // TCP delivery is already reliable, so this is identical to sendNoteSet now.
-    // The legacy "sendReliable" had a row-keyed retransmit ring on top of
-    // ESP-NOW; with MagiLink it's a no-op distinction.
-    return sendNoteSet(song, pattern, row, col);
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendSaveActive(const char* name, bool isAutosave) {
@@ -612,7 +578,10 @@ bool ServerPairing::sendSaveActive(const char* name, bool isAutosave) {
     memset(msg.name, 0, sizeof(msg.name));
     strncpy(msg.name, name, sizeof(msg.name) - 1);
     msg.is_autosave = isAutosave ? 1 : 0;
+    // Drop any stale result under the mutex, before the frame goes out: the
+    // worker cannot dispatch the server's MSG_SAVE_RESULT until we release.
     gMagiLink.acquireMutex();
+    _saveResultPending = false;
     bool ok = gMagiLink.send(&msg, sizeof(msg));
     gMagiLink.releaseMutex();
     return ok;
@@ -622,20 +591,14 @@ bool ServerPairing::sendNewSong() {
     if (_pairState != PairClientState::SUCCESS) return false;
     if (!gMagiLink.isConnected()) return false;
     MsgNewSong msg;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendSetOff() {
     if (_pairState != PairClientState::SUCCESS) return false;
     if (!gMagiLink.isConnected()) return false;
     MsgSetNoSong msg;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 bool ServerPairing::sendSongToServer(const char* name, const Song* song) {
@@ -654,6 +617,10 @@ bool ServerPairing::sendSongToServer(const char* name, const Song* song) {
     memset(hdr.song_file_header._pad, 0, sizeof(hdr.song_file_header._pad));
 
     gMagiLink.acquireMutex();
+    // A named save is answered with MSG_SAVE_RESULT — drop any stale result
+    // first (see sendSaveActive).  An un-named push gets no reply, so it must
+    // not wipe a result the UI has not read yet.
+    if (hdr.name[0] != '\0') _saveResultPending = false;
     bool ok = gMagiLink.send(&hdr, sizeof(hdr));
 
     // Stream Song bytes in 1024-byte chunks.  Body is 1029 bytes — fits
@@ -681,12 +648,8 @@ void ServerPairing::requestInstruments() {
     if (_pairState != PairClientState::SUCCESS) return;
     _instReady       = false;
     _instBufLen      = 0;
-    _instChunksGot   = 0;
-    _instChunksTotal = 0;
     MsgInstrumentsReq req;
-    gMagiLink.acquireMutex();
-    gMagiLink.send(&req, sizeof(req));
-    gMagiLink.releaseMutex();
+    _sendLocked(&req, sizeof(req));
 }
 
 bool ServerPairing::sendInstrumentPatch(const Instrument* instruments, int idx) {
@@ -698,25 +661,25 @@ bool ServerPairing::sendInstrumentPatch(const Instrument* instruments, int idx) 
     memcpy(msg.data, &instruments[idx], sizeof(Instrument));
     uint16_t wireLen = (uint16_t)(6 + sizeof(Instrument));
     msg.length = wireLen;
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, wireLen);
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, wireLen);
 }
 
+// Same locking contract as copySong() — do not call with the mutex held.
 bool ServerPairing::copyInstruments(Instrument* out) const {
-    if (!_instReady) return false;
+    gMagiLink.acquireMutex();
+    bool ok = false;
     uint32_t needed = MAX_INSTRUMENTS * sizeof(Instrument);
-    if (_instBufLen < needed) return false;
-    memcpy(out, _instBuf, needed);
-    return true;
+    if (_instReady && _instBufLen >= needed) {
+        memcpy(out, _instBuf, needed);
+        ok = true;
+    }
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 void ServerPairing::resetInstruments() {
     _instReady       = false;
     _instBufLen      = 0;
-    _instChunksGot   = 0;
-    _instChunksTotal = 0;
 }
 
 // ── Backup / Restore ─────────────────────────────────────────────────────────
@@ -791,10 +754,7 @@ bool ServerPairing::deleteSongOnServer(const char* name) {
     MsgSongDelete msg;
     memset(msg.name, 0, sizeof(msg.name));
     if (name) strncpy(msg.name, name, sizeof(msg.name) - 1);
-    gMagiLink.acquireMutex();
-    bool ok = gMagiLink.send(&msg, sizeof(msg));
-    gMagiLink.releaseMutex();
-    return ok;
+    return _sendLocked(&msg, sizeof(msg));
 }
 
 // ── tick() ────────────────────────────────────────────────────────────────────
@@ -812,16 +772,6 @@ void ServerPairing::tick() {
             // registered MSG_CONNECT callback to fire.
             break;
 
-        case PairClientState::REQUESTING:
-            if (now - _pairStateMs >= CONNECT_TIMEOUT_MS) {
-                Serial.println("[SP] connect timeout");
-                if (_hasPairing)
-                    _tryAutoConnect();
-                else
-                    _setPairState(PairClientState::IDLE);
-            }
-            break;
-
         case PairClientState::PAIRING_REQUEST: {
             // Both sides are on ch1.  Broadcast PROBE every PAIR_SCAN_DWELL_MS
             // until the server (in pair mode) replies with CHALLENGE.
@@ -835,7 +785,7 @@ void ServerPairing::tick() {
             }
             if (now - _pairStateMs >= PAIR_REQUEST_TIMEOUT_MS) {
                 Serial.println("[SP] pair window timeout");
-                _setPairState(PairClientState::IDLE);
+                _leavePairMode();
             }
             break;
         }
@@ -843,7 +793,7 @@ void ServerPairing::tick() {
         case PairClientState::PAIRING_CONFIRM:
             if (now - _pairStateMs >= PAIR_REQUEST_TIMEOUT_MS) {
                 Serial.println("[SP] pair window timeout");
-                _setPairState(PairClientState::IDLE);
+                _leavePairMode();
             }
             break;
 
@@ -853,7 +803,6 @@ void ServerPairing::tick() {
             // for the server to re-initiate the handshake.
             if (!gMagiLink.isConnected()) {
                 Serial.println("[SP] MagiLink disconnected — back to AUTO_CONNECTING");
-                _serverName[0] = '\0';
                 _serverPlaying = false;
                 _setBrowseState(BrowseState::IDLE);
                 if (_hasPairing) _tryAutoConnect();
@@ -866,75 +815,112 @@ void ServerPairing::tick() {
     }
 }
 
+// ── Requests that wait for a reply ─────────────────────────────────────────────
+//
+// The reply is handled on the MagiLink worker task, and each handler drops it
+// unless the matching WAITING state is already set.  So every request below
+// resets its counters and sets WAITING *before* the frame goes out, all under
+// the link mutex: the worker cannot dispatch anything until we release, by
+// which time the state is in place however fast the server answers.  (As
+// before, the state is set whether or not the send succeeds.)
+
 // ── Server browse ──────────────────────────────────────────────────────────────
 void ServerPairing::requestSongList(uint8_t page) {
     if (_pairState != PairClientState::SUCCESS) return;
-    _listCount = 0;
-    _listPage  = page;
     MsgSongListReq req;
     req.page = page;
     gMagiLink.acquireMutex();
+    _listCount = 0;
+    _listPage  = page;
+    _setBrowseState(BrowseState::WAITING_LIST);
     gMagiLink.send(&req, sizeof(req));
     gMagiLink.releaseMutex();
-    _setBrowseState(BrowseState::WAITING_LIST);
 }
 
 void ServerPairing::requestSongLoad(uint8_t page, uint8_t index) {
     if (_pairState != PairClientState::SUCCESS) return;
-    _loadPage     = page;
-    _loadIndex    = index;
-    _songBufLen   = 0;
-    _chunksGot    = 0;
-    _chunksTotal  = 0;
     MsgSongLoadReq req;
     req.page  = page;
     req.index = index;
     gMagiLink.acquireMutex();
+    _songBufLen      = 0;
+    _loadFailPending = false;
+    _setBrowseState(BrowseState::WAITING_SONG);
     gMagiLink.send(&req, sizeof(req));
     gMagiLink.releaseMutex();
-    _setBrowseState(BrowseState::WAITING_SONG);
 }
 
 void ServerPairing::requestSongLoadByName(const char* name) {
     if (_pairState != PairClientState::SUCCESS) return;
-    _songBufLen   = 0;
-    _chunksGot    = 0;
-    _chunksTotal  = 0;
     MsgSongLoadNameReq req;
     memset(req.name, 0, sizeof(req.name));
     if (name) strncpy(req.name, name, sizeof(req.name) - 1);
     gMagiLink.acquireMutex();
+    _songBufLen      = 0;
+    _loadFailPending = false;
+    _setBrowseState(BrowseState::WAITING_SONG);
     gMagiLink.send(&req, sizeof(req));
     gMagiLink.releaseMutex();
-    _setBrowseState(BrowseState::WAITING_SONG);
+}
+
+const char* ServerPairing::loadFailText() const {
+    switch (_loadFailReason) {
+        case SONG_LOAD_FAIL_NOT_FOUND: return "NO FILE";
+        case SONG_LOAD_FAIL_READ:      return "READ ERR";
+        case SONG_LOAD_FAIL_BAD_FILE:  return "BAD FILE";
+        case SONG_LOAD_FAIL_NO_MEMORY: return "NO MEMORY";
+        default:                       return "UNKNOWN";
+    }
+}
+
+// ── Save result (MSG_SAVE_RESULT) ────────────────────────────────────────────
+bool ServerPairing::saveResultPending() const {
+    return _saveResultPending;
+}
+
+bool ServerPairing::saveResultOk() const {
+    return _saveResultOk;
+}
+
+bool ServerPairing::saveResultIsAutosave() const {
+    return _saveResultIsAutosave;
+}
+
+const char* ServerPairing::saveResultName() const {
+    return _saveResultName;
+}
+
+void ServerPairing::clearSaveResult() {
+    _saveResultPending = false;
+}
+
+const char* ServerPairing::pushedSongFile() const {
+    return _pushedSongFile;
 }
 
 void ServerPairing::resetBrowse() {
     _setBrowseState(BrowseState::IDLE);
     _listCount   = 0;
     _songBufLen  = 0;
-    _chunksGot   = 0;
-    _chunksTotal = 0;
 }
 
 // ── Sample list ────────────────────────────────────────────────────────────
 void ServerPairing::resetSampleList() {
     _sampleListState  = SampleListState::IDLE;
     _sampleCount      = 0;
-    _sampleTotal      = 0;
     _samplePage       = 0;
     _sampleTotalPages = 0;
 }
 
 void ServerPairing::requestSampleList() {
     if (_pairState != PairClientState::SUCCESS) return;
-    resetSampleList();
     MsgSampleListReq req;
     req.page = 0;
     gMagiLink.acquireMutex();
+    resetSampleList();
+    _sampleListState = SampleListState::WAITING;
     gMagiLink.send(&req, sizeof(req));
     gMagiLink.releaseMutex();
-    _sampleListState = SampleListState::WAITING;
 }
 
 const char* ServerPairing::sampleListNameFor(uint8_t id) const {
@@ -956,15 +942,15 @@ void ServerPairing::resetFileList() {
 
 void ServerPairing::requestFileList(uint8_t kind, uint8_t page) {
     if (_pairState != PairClientState::SUCCESS) return;
-    if (page == 0) resetFileList();
-    _fileListKind = kind;
     MsgFileListReq req;
     req.kind = kind;
     req.page = page;
     gMagiLink.acquireMutex();
+    if (page == 0) resetFileList();
+    _fileListKind  = kind;
+    _fileListState = FileListState::WAITING;
     gMagiLink.send(&req, sizeof(req));
     gMagiLink.releaseMutex();
-    _fileListState = FileListState::WAITING;
 }
 
 void ServerPairing::resetFileLoad() {
@@ -977,28 +963,38 @@ void ServerPairing::resetFileLoad() {
 
 void ServerPairing::requestFileLoad(uint8_t kind, const char* name) {
     if (_pairState != PairClientState::SUCCESS || !name) return;
-    resetFileLoad();
-    _fileLoadKind = kind;
-    strncpy(_fileLoadName, name, FILE_NAME_LEN - 1);
-    _fileLoadName[FILE_NAME_LEN - 1] = '\0';
     MsgFileLoadReq req;
     req.kind = kind;
     memset(req.name, 0, sizeof(req.name));
-    strncpy(req.name, _fileLoadName, FILE_NAME_LEN - 1);
+    strncpy(req.name, name, FILE_NAME_LEN - 1);
     gMagiLink.acquireMutex();
+    resetFileLoad();
+    _fileLoadKind = kind;
+    strncpy(_fileLoadName, req.name, FILE_NAME_LEN - 1);
+    _fileLoadName[FILE_NAME_LEN - 1] = '\0';
+    _fileLoadState = FileLoadState::WAITING_HEADER;
     gMagiLink.send(&req, sizeof(req));
     gMagiLink.releaseMutex();
-    _fileLoadState = FileLoadState::WAITING_HEADER;
 }
 
+// Callers must NOT hold the link mutex (UI-poll helper; it takes and
+// releases the mutex itself).  The lock makes the state-check + copy atomic
+// against the worker task: with back-to-back song streams (connect pull +
+// changed-event pull), a second stream's HEADER/BODY could otherwise start
+// overwriting _songBuf mid-memcpy and hand the caller a torn song.
 bool ServerPairing::copySong(Song* out) const {
-    if (_browseState != BrowseState::SONG_READY) return false;
-    const SongFileHeader* hdr = (const SongFileHeader*)_songBuf;
-    if (hdr->magic != SONG_FILE_MAGIC) return false;
-    if (hdr->version != SONG_FILE_VERSION) return false;
-    if (_songBufLen < sizeof(SongFileHeader) + sizeof(Song)) return false;
-    memcpy(out, _songBuf + sizeof(SongFileHeader), sizeof(Song));
-    return true;
+    gMagiLink.acquireMutex();
+    bool ok = false;
+    if (_browseState == BrowseState::SONG_READY &&
+        _songBufLen >= sizeof(SongFileHeader) + sizeof(Song)) {
+        const SongFileHeader* hdr = (const SongFileHeader*)_songBuf;
+        if (hdr->magic == SONG_FILE_MAGIC && hdr->version == SONG_FILE_VERSION) {
+            memcpy(out, _songBuf + sizeof(SongFileHeader), sizeof(Song));
+            ok = true;
+        }
+    }
+    gMagiLink.releaseMutex();
+    return ok;
 }
 
 // ── Receive ───────────────────────────────────────────────────────────────────
@@ -1128,19 +1124,26 @@ void ServerPairing::_onPairReceive(const uint8_t* data, int len) {
 //
 // Called from the worker task with the transaction mutex held — handler is
 // re-entrant-safe to call gMagiLink.send() (same task → mutex re-take is a
-// no-op).  Server has already established TCP and just sent MsgConnect;
-// we reply with MsgConnectAck and flip state to SUCCESS.
+// no-op).  Our TCP connection is up and the server has just sent MsgConnect
+// on it; we reply with MsgConnectAck and flip state to SUCCESS.
 void ServerPairing::_onMagiLinkConnect() {
     MsgConnectAck ack;
     bool ok = gMagiLink.send(&ack, sizeof(ack));
     Serial.printf("[SP] MagiLink: got MSG_CONNECT, ack send=%s\n",
                   ok ? "OK" : "FAIL");
     _setPairState(PairClientState::SUCCESS);
+    // Pull the active song as our first command.  This replaces the old
+    // server push-on-connect: the server never volunteers the song stream,
+    // we ask for it — which also makes every reconnect recover the active
+    // song through the ordinary request path.
+    if (ok) {
+        MsgActiveSongReq req;
+        gMagiLink.send(&req, sizeof(req));
+    }
 }
 
 void ServerPairing::_onMagiLinkDisconnect() {
     Serial.println("[SP] MagiLink: MSG_DISCONNECT from server");
-    _serverName[0] = '\0';
     _serverPlaying = false;
     _setBrowseState(BrowseState::IDLE);
     if (_hasPairing) _tryAutoConnect();
@@ -1171,17 +1174,23 @@ void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
             }
             _songBufLen       = 0;
             _songRecvExpected = h->total_size;
+            memcpy(_pushIncomingFile, h->name, sizeof(_pushIncomingFile));
+            _pushIncomingFile[sizeof(_pushIncomingFile) - 1] = '\0';
             _setBrowseState(BrowseState::WAITING_SONG);
-            Serial.printf("[SP] song push start: %u bytes\n",
-                          (unsigned)_songRecvExpected);
+            Serial.printf("[SP] song push start: %u bytes, file '%s'\n",
+                          (unsigned)_songRecvExpected, _pushIncomingFile);
             break;
         }
 
         case MSG_SONG_PUSH_BODY: {
             if (_songRecvExpected == 0) return;       // stray body
-            if (len < sizeof(MsgSongPushBody))  return;
+            // Bodies arrive truncated to header + data_len bytes (server
+            // shrinks frames for RF robustness) — validate against
+            // data_len, not the full struct size.
+            if (len < offsetof(MsgSongPushBody, data)) return;
             const MsgSongPushBody* b = (const MsgSongPushBody*)msg;
-            if (b->data_len > 1024) return;
+            if (b->data_len > 1024 ||
+                len < offsetof(MsgSongPushBody, data) + b->data_len) return;
             if (_songBufLen + b->data_len > _songRecvExpected) {
                 Serial.println("[SP] song push: overshoot — dropping");
                 _songRecvExpected = 0;
@@ -1192,6 +1201,9 @@ void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
             if (_songBufLen == _songRecvExpected) {
                 Serial.printf("[SP] song push done: %u bytes\n",
                               (unsigned)_songBufLen);
+                // Name first, then SONG_READY — the UI reads it on that edge.
+                memcpy(_pushedSongFile, _pushIncomingFile, sizeof(_pushedSongFile));
+                _pushedSongFile[sizeof(_pushedSongFile) - 1] = '\0';
                 _setBrowseState(BrowseState::SONG_READY);
                 _songRecvExpected = 0;
             }
@@ -1202,6 +1214,46 @@ void ServerPairing::_onMagiLinkSongMessage(const uint8_t* msg, size_t len) {
             _noSongPending = true;
             Serial.println("[SP] NO_SONG from server");
             break;
+
+        case MSG_SONG_LOAD_FAILED: {
+            // The server could not serve our load and has kept whatever it
+            // had active — so nothing here touches the current song.  Stop
+            // waiting; the page that asked picks the flag up and says why.
+            if (len < sizeof(MsgSongLoadFailed)) return;
+            _loadFailReason   = ((const MsgSongLoadFailed*)msg)->reason;
+            _loadFailPending  = true;
+            _songRecvExpected = 0;
+            if (_browseState == BrowseState::WAITING_SONG)
+                _setBrowseState(BrowseState::IDLE);
+            Serial.printf("[SP] load failed on server: %s (reason %u)\n",
+                          loadFailText(), (unsigned)_loadFailReason);
+            break;
+        }
+
+        case MSG_ACTIVE_SONG_CHANGED: {
+            // Server-side event (song loaded on the server screen, restore
+            // reload).  Tiny notification — we pull the actual stream.
+            Serial.println("[SP] active song changed — pulling");
+            MsgActiveSongReq req;
+            gMagiLink.send(&req, sizeof(req));
+            break;
+        }
+
+        case MSG_SAVE_RESULT: {
+            // Fields first, flag last — the UI task reads them once it sees
+            // the flag (see ServerPairing.h).
+            if (len < sizeof(MsgSaveResult)) return;
+            const MsgSaveResult* r = (const MsgSaveResult*)msg;
+            _saveResultOk         = (r->ok != 0);
+            _saveResultIsAutosave = (r->is_autosave != 0);
+            memcpy(_saveResultName, r->name, sizeof(_saveResultName));
+            _saveResultName[sizeof(_saveResultName) - 1] = '\0';
+            _saveResultPending    = true;
+            Serial.printf("[SP] save result: '%s' %s%s\n", _saveResultName,
+                          _saveResultOk ? "OK" : "FAILED",
+                          _saveResultIsAutosave ? " (autosave)" : "");
+            break;
+        }
 
         case MSG_SONG_LIST_RESP: {
             if (_browseState != BrowseState::WAITING_LIST) return;
@@ -1240,7 +1292,6 @@ void ServerPairing::_onMagiLinkSampleList(const uint8_t* msg, size_t len) {
     const MsgSampleListResp* r = (const MsgSampleListResp*)msg;
     _samplePage       = r->page;
     _sampleTotalPages = r->totalPages > 0 ? r->totalPages : 1;
-    _sampleTotal      = r->totalEntries;
 
     int n = r->count <= SAMPLES_PER_PKT ? r->count : SAMPLES_PER_PKT;
     for (int i = 0; i < n && _sampleCount < SAMPLE_CACHE_MAX && _sampleCache; i++) {
@@ -1308,8 +1359,21 @@ void ServerPairing::_onMagiLinkFileLoad(const uint8_t* msg, size_t len) {
         }
         const MsgFileLoadHeader* h = (const MsgFileLoadHeader*)msg;
         if (h->kind != _fileLoadKind) return;
+        // A reply for a different file is the late answer to a request we
+        // already timed out of — its body must not be taken for this one.
+        // (State stays WAITING_HEADER, so its BODY / EndOfData are ignored.)
+        if (strncmp(h->name, _fileLoadName, FILE_NAME_LEN) != 0) {
+            Serial.printf("[SP] ignoring late file reply '%.47s' (waiting for '%s')\n",
+                          h->name, _fileLoadName);
+            return;
+        }
         if (!h->found) {
             _fileLoadState = FileLoadState::NOT_FOUND;
+            return;
+        }
+        if (!_fileLoadBuf) {
+            Serial.println("[SP] file load: no buffer (PSRAM alloc failed at boot)");
+            _fileLoadState = FileLoadState::ERROR;
             return;
         }
         if (h->total_size > FILE_LOAD_BUF_MAX) {
@@ -1325,9 +1389,19 @@ void ServerPairing::_onMagiLinkFileLoad(const uint8_t* msg, size_t len) {
     }
     else if (id == MSG_FILE_LOAD_BODY) {
         if (_fileLoadState != FileLoadState::WAITING_BODY) return;
-        if (len < sizeof(MsgFileLoadBody)) return;
+        if (!_fileLoadBuf) {
+            _fileLoadState = FileLoadState::ERROR;
+            return;
+        }
+        // Bodies may arrive truncated to header + data_len bytes (as the
+        // song-push bodies do) or full-size — validate against data_len, not
+        // the full struct size.  A frame that fails is dropped, and the byte
+        // count check at EndOfData then ends the load in ERROR.
+        if (len < offsetof(MsgFileLoadBody, data)) return;
         const MsgFileLoadBody* b = (const MsgFileLoadBody*)msg;
-        uint16_t n = b->data_len > 1024 ? 1024 : b->data_len;
+        if (b->data_len > sizeof(b->data) ||
+            len < offsetof(MsgFileLoadBody, data) + b->data_len) return;
+        uint16_t n = b->data_len;
         if (_fileLoadBufLen + n > FILE_LOAD_BUF_MAX) {
             _fileLoadState = FileLoadState::ERROR;
             return;
@@ -1376,9 +1450,11 @@ void ServerPairing::_onMagiLinkInstrumentsMessage(const uint8_t* msg, size_t len
         }
         case MSG_INSTRUMENTS_PUSH_BODY: {
             if (_instRecvExpected == 0) return;
-            if (len < sizeof(MsgInstrumentsPushBody)) return;
+            // Truncated frames — see MSG_SONG_PUSH_BODY.
+            if (len < offsetof(MsgInstrumentsPushBody, data)) return;
             const MsgInstrumentsPushBody* b = (const MsgInstrumentsPushBody*)msg;
-            if (b->data_len > 1024) return;
+            if (b->data_len > 1024 ||
+                len < offsetof(MsgInstrumentsPushBody, data) + b->data_len) return;
             if (_instBufLen + b->data_len > _instRecvExpected) {
                 Serial.println("[SP] inst push overshoot — dropping");
                 _instRecvExpected = 0;

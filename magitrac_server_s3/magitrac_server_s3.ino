@@ -1,6 +1,6 @@
 // MagiTrac Server — M5Stack CoreS3 + Module Audio v2.2 + Module MIDI (Port A)
 // Requires: M5Unified (display + touch buttons), M5Module-Audio (ES8388),
-//           arduinoFFT, magitrac_lib, pixelpost_proto.
+//           magitrac_lib, pixelpost_proto.
 
 // SD must precede M5Unified — M5GFX rebinds File I/O if it appears first.
 #include <SD.h>
@@ -29,11 +29,17 @@
 #include "esp_wifi.h"
 
 // ── Communications ───────────────────────────────────────────────────────────
-// Same architecture as the Core Basic server: MagiLink AP, MagiUdpLink for
-// loss-tolerant updates, ESP-NOW for pairing.  See magitrac_server.ino for
-// the full prose.
+// MagiLink (TCP, accept role on MAGI_PORT) carries commands and the bulk
+// transfers; MagiUdpLink carries the loss-tolerant updates (playhead, MIDI
+// note-in, preview row); ESP-NOW carries the pairing ceremony and the
+// PixelPost broadcasts.
 MagiCommsEspNow gTransportEspNow;
 static MagiUdpLink gUdpLink;
+
+// NVS namespace holding the pairing record and the WiFi creds + apMode.
+// Defined here — the main .ino comes first in the concatenated sketch — so
+// serverWifiBringUp() below and pairing.ino use the one name.
+#define SRV_NVS_NS "magitrac_srv"
 
 // Discovery broadcast — periodic UDP MSG_SERVER_ANNOUNCE so clients
 // (iOS app, future C-client EXTERNAL_AP support) can find this server's
@@ -70,6 +76,7 @@ const uint16_t COL_SEL_BG_PLAY = lgfx::color565(144, 238, 144);
 const uint16_t COL_SEL_TEXT    = lgfx::color565( 0,   0, 139);
 const uint16_t COL_TEXT        = TFT_WHITE;
 const uint16_t COL_FOOTER      = lgfx::color565( 0,   0,  80);
+const uint16_t COL_ERR         = lgfx::color565(200,   0,   0);
 
 // ── Buttons (M5Unified touch zones on CoreS3) ─────────────────────────────────
 // Thin wasPressed()/isDown() wrapper over M5's bezel touch zones.  The main
@@ -118,6 +125,7 @@ static bool _touchDown    = false;
 static bool _dragMoved    = false;
 static int  _dragStartY   = 0;
 static int  _dragStartOff = 0;
+static int  _pressX       = 0;   // USB screen: x of the press (button hit-test)
 
 // ── Sample browser ────────────────────────────────────────────────────────────
 #define SRV_SAMPLES_DIR   "/samples"
@@ -295,7 +303,7 @@ void drawRow(int visIdx) {
     if (listIdx == 0) {
         lcd.print("-- OFF --");
     } else {
-        char buf[14];
+        char buf[UI_MAX_CHARS + 1];
         strncpy(buf, songNames[listIdx - SONG_IDX_OFFSET], UI_MAX_CHARS);
         buf[UI_MAX_CHARS] = '\0';
         lcd.print(buf);
@@ -313,8 +321,38 @@ void drawList() {
     }
 }
 
+// ── Load-failure banner (SONGS footer) ────────────────────────────────────────
+// A failed load on this screen has no other feedback — the tapped row just
+// loses its highlight again — so say so, and why, where the performer is
+// already looking.  Replaces the footer for LOAD_FAIL_BANNER_MS.
+static const uint32_t LOAD_FAIL_BANNER_MS = 5000;
+static bool     sLoadFailShown = false;
+static uint32_t sLoadFailAtMs  = 0;
+static char     sLoadFailMsg[20] = {};   // 19 chars fit the 240px footer at size 2
+
+static void showLoadFail(uint8_t reason) {
+    const char* why = "FAILED";
+    switch (reason) {
+        case SONG_LOAD_FAIL_NOT_FOUND: why = "NO FILE";  break;
+        case SONG_LOAD_FAIL_READ:      why = "READ ERR"; break;
+        case SONG_LOAD_FAIL_BAD_FILE:  why = "BAD FILE"; break;
+        case SONG_LOAD_FAIL_NO_MEMORY: why = "NO MEM";   break;
+    }
+    snprintf(sLoadFailMsg, sizeof(sLoadFailMsg), "LOAD FAIL: %s", why);
+    sLoadFailShown = true;
+    sLoadFailAtMs  = millis();
+}
+
 void drawFooter() {
     int y = UI_SCR_H - UI_FOOTER_H;
+    if (sLoadFailShown) {
+        lcd.fillRect(0, y, 240, UI_FOOTER_H, COL_ERR);
+        lcd.setTextColor(TFT_WHITE, COL_ERR);
+        lcd.setTextSize(2);
+        lcd.setCursor(4, y + (UI_FOOTER_H - 16) / 2);
+        lcd.print(sLoadFailMsg);
+        return;
+    }
     lcd.fillRect(0, y, 240, UI_FOOTER_H, COL_FOOTER);
     lcd.setTextColor(TFT_WHITE, COL_FOOTER);
     lcd.setTextSize(2);
@@ -330,28 +368,35 @@ void drawSongScreen() {
 }
 
 // ── Song loading ──────────────────────────────────────────────────────────────
-void loadSong(int idx) {
+// Returns 0 on success, else a SongLoadFailReason.  The sequencer is stopped
+// by a load that takes (the commit quiesces it); a load that fails leaves the
+// previous song active and playing.
+uint8_t loadSong(int idx) {
     Serial.printf("[STOPSRC] local loadSong idx=%d t=%lu\n", idx, millis());
-    sequencerStop();
 
     if (idx == 0) {
-        srvHasActive = false;
-        if (pairingIsConnected()) {
-            MsgNoSong msg;
-            gMagiLink.acquireMutex();
-            gMagiLink.send(&msg, sizeof(msg));
-            gMagiLink.releaseMutex();
-        }
-        return;
+        srvSetOff();   // stop, drop the active song AND its name, tell the client
+        return 0;
     }
 
-    int listIdx = idx - SONG_IDX_OFFSET;
-    if (srvLoadSongLocal(listIdx)) {
+    bool    hadActive = srvHasActive;
+    int     listIdx   = idx - SONG_IDX_OFFSET;
+    uint8_t fail      = (listIdx >= 0 && listIdx < numSongs)
+                      ? srvLoadSongLocal(songNames[listIdx])
+                      : (uint8_t)SONG_LOAD_FAIL_NOT_FOUND;
+    if (fail == 0) {
         sequencerReset();
         sequencerSendPatchesNow();   // patches up before the first note
-        extern bool sSongPushPending;
-        if (pairingIsConnected()) sSongPushPending = true;
+        if (pairingIsConnected()) {
+            MsgActiveSongChanged ev;
+            gMagiLink.postToPeer(&ev, sizeof(ev));
+        }
+    } else if (hadActive && !srvHasActive) {
+        // No staging buffer: the failed read took the active song with it.
+        // The client still shows the old one — tell it we now have none.
+        sendNoSongToClient();
     }
+    return fail;
 }
 
 // ── USB file-transfer screen ──────────────────────────────────────────────────
@@ -418,7 +463,7 @@ void drawUsbScreen() {
 // Called once at the end of setup().  If a fresh pixel_post.ino.bin is sitting
 // on the SD card (copied via USB-MSC), this dedicated screen owns the device:
 //   FLASH  — (re)broadcast the OTA packet; press again to catch stragglers.
-//   SKIP   — rename the firmware to *.done and REBOOT (clean teardown → music).
+//   DONE   — rename the firmware to *.done and REBOOT (clean teardown → music).
 // The HTTP server + DHCP run ONLY while this screen is up, so they never touch
 // the music path.  We serve posts in this foreground loop.  See field_flash.ino.
 void fieldFlashScreen() {
@@ -432,7 +477,7 @@ void fieldFlashScreen() {
     if (fsize == 0) return;
 
     const int FB_X = 20, FB_W = 200, FB_H = 56;
-    const int FLASH_Y = 196, SKIP_Y = 256;
+    const int FLASH_Y = 196, DONE_Y = 256;
     const bool canFlash = (WiFi.softAPIP() != IPAddress(0, 0, 0, 0));
 
     int  served = 0;            // full pulls since the last FLASH press
@@ -467,10 +512,10 @@ void fieldFlashScreen() {
         lcd.print("FLASH");
 
         uint16_t gr = lgfx::color565(110, 60, 0);
-        lcd.fillRoundRect(FB_X, SKIP_Y, FB_W, FB_H, 8, gr);
+        lcd.fillRoundRect(FB_X, DONE_Y, FB_W, FB_H, 8, gr);
         lcd.setTextColor(TFT_WHITE, gr);
         lcd.setTextSize(3);
-        lcd.setCursor(FB_X + 28, SKIP_Y + (FB_H - 24) / 2);
+        lcd.setCursor(FB_X + 28, DONE_Y + (FB_H - 24) / 2);
         lcd.print("DONE");
     };
 
@@ -494,8 +539,8 @@ void fieldFlashScreen() {
         if (!down && pressX >= 0) {
             bool inFlash = (pressX >= FB_X && pressX < FB_X + FB_W &&
                             pressY >= FLASH_Y && pressY < FLASH_Y + FB_H);
-            bool inSkip  = (pressX >= FB_X && pressX < FB_X + FB_W &&
-                            pressY >= SKIP_Y && pressY < SKIP_Y + FB_H);
+            bool inDone  = (pressX >= FB_X && pressX < FB_X + FB_W &&
+                            pressY >= DONE_Y && pressY < DONE_Y + FB_H);
             pressX = pressY = -1;
             if (inFlash && canFlash) {
                 served = 0;
@@ -504,7 +549,7 @@ void fieldFlashScreen() {
                         sizeof(status));
                 status[sizeof(status) - 1] = 0;
                 draw();
-            } else if (inSkip) {
+            } else if (inDone) {
                 // Tidy up by rebooting — kills the HTTP server + DHCP cleanly
                 // and brings the server back up making music.
                 fieldFlashMarkDone();
@@ -639,11 +684,12 @@ static void pollChordTouch() {
 }
 
 // ── Oscilloscope screen ─────────────────────────────────────────────────────────
-// Free-running time-domain view of the onboard (right) mic — the same source
-// the chord recogniser and pixelpost bands read.  Each captured frame (~32 ms)
-// is reduced by the mic task to one DC-blocked sample per column; we draw a
-// connected line.  Redraw is per-column erase-then-draw (no full clear) so the
-// trace stays flicker-free.  Tap freezes / unfreezes the trace.
+// Free-running time-domain view of the Module Audio mic (LEFT input) — the
+// same source the chord recogniser and pixelpost bands read.  Each captured
+// frame (~32 ms) is reduced by the mic task to one DC-blocked sample per
+// column; we draw a connected line.  Redraw is per-column erase-then-draw (no
+// full clear) so the trace stays flicker-free.  Tap freezes / unfreezes the
+// trace.
 static uint32_t gScopeLastSeq  = 0xFFFFFFFF;
 static int16_t  gScopePrevTop[SCOPE_COLS];
 static int16_t  gScopePrevBot[SCOPE_COLS];
@@ -918,6 +964,7 @@ static void selectSong(int idx) {
 
     int prev = cursor;
     cursor   = idx;
+    sLoadFailShown = false;          // a new attempt clears any earlier banner
     bool prevVis = (prev   >= scrollOffset && prev   < scrollOffset + UI_VISIBLE_ROWS);
     bool curVis  = (cursor >= scrollOffset && cursor < scrollOffset + UI_VISIBLE_ROWS);
     if (prevVis && curVis) {
@@ -927,7 +974,17 @@ static void selectSong(int idx) {
         drawList();
     }
     drawFooter();
-    loadSong(cursor);
+
+    uint8_t fail = loadSong(cursor);
+    if (fail) {
+        // The highlight means "this is what's loaded" (and a re-tap toggles
+        // its transport), so put it back on what actually is: the previous
+        // song if it survived, else OFF.
+        cursor = srvHasActive ? prev : 0;
+        showLoadFail(fail);
+        drawList();
+        drawFooter();
+    }
 }
 
 static void selectSample(int idx) {
@@ -1012,11 +1069,11 @@ static void pollUsbTouch() {
     if (down && !_touchDown) {
         _touchDown   = true;
         _dragStartY  = t.y;
-        _dragStartOff = t.x;          // reuse to remember the press x
+        _pressX      = t.x;
     } else if (!down && _touchDown) {
         _touchDown = false;
-        bool inBtn = (_dragStartOff >= USB_BTN_X && _dragStartOff < USB_BTN_X + USB_BTN_W &&
-                      _dragStartY  >= USB_BTN_Y && _dragStartY  < USB_BTN_Y + USB_BTN_H);
+        bool inBtn = (_pressX     >= USB_BTN_X && _pressX     < USB_BTN_X + USB_BTN_W &&
+                      _dragStartY >= USB_BTN_Y && _dragStartY < USB_BTN_Y + USB_BTN_H);
         if (inBtn) {
             requestUsbMscReboot();   // sets the NVS flag and resets into USB mode
         }
@@ -1182,7 +1239,9 @@ static volatile struct {
 
 // ── MIDI task — Core 1, high priority ─────────────────────────────────────────
 static void midiTaskFn(void* /*pv*/) {
+    sequencerBindMidiTask();          // this task now owns MIDI out + playhead
     for (;;) {
+        sequencerServiceRequests();   // control calls handed over from other tasks
         sequencerPollMidiIn();
         sequencerTick();
         sequencerMidiClockTick();
@@ -1204,6 +1263,90 @@ static bool consumeUsbMscBootFlag() {
 }
 
 // ── Setup / Loop ──────────────────────────────────────────────────────────────
+// ── Radio bring-up for the paired mode ────────────────────────────────────────
+// Brings WiFi up as stored at pairing: our own hidden softAP (SERVER_AP), a
+// station on someone else's AP (EXTERNAL_AP), or nothing if unpaired.  Called
+// from setup(), and again when pairing mode is cancelled or times out —
+// entering pairing mode tears the softAP down and parks the radio on ch1, and
+// without this the client could not reconnect until a power cycle.
+// Returns the MAGI_AP_MODE_* now in effect, or -1 if unpaired.  (Not 0 for
+// "unpaired": MAGI_AP_MODE_SERVER is itself 0.)
+int serverWifiBringUp() {
+    extern uint8_t wifiChannelLoad();
+    char    creds_ssid[33] = {};
+    char    creds_psk[64]  = {};
+    uint8_t apMode         = 0;
+    bool hasCreds = pairNvsLoadCreds(SRV_NVS_NS, creds_ssid, creds_psk, &apMode);
+
+    if (hasCreds && apMode == MAGI_AP_MODE_SERVER) {
+        const uint8_t apChannel = magiWifiChannelFromIdx(wifiChannelLoad());
+        Serial.printf("[SETUP] branch=SERVER_AP ch=%u ssid='%s'\n",
+                      (unsigned)apChannel, creds_ssid);
+        // max_connection 8 (default 4): the client takes one slot and several
+        // PixelPost units pile on at once during a field OTA pull.
+        // Hidden SSID: a visible AP must answer every phone's broadcast probe
+        // request with a unicast probe response (retried if the phone has
+        // already hopped channels).  At a gig that is hundreds of phones and
+        // a real slice of our single radio's airtime spent on devices that
+        // will never join.  Hidden, the AP only answers probes that name it.
+        // The client connects by stored SSID (directed probe), so nothing on
+        // its side changes; the field-flash posts do the same.
+        bool apOk = WiFi.softAP(creds_ssid, creds_psk, apChannel,
+                                /*hidden=*/1, /*max_connection=*/8);
+        if (!apOk) {
+            Serial.println("[SETUP] softAP FAILED — common causes: PSK < 8 chars, SSID empty, channel out of range");
+        }
+        // Remember the LIVE AP creds — the field-flash OTA must hand the posts
+        // exactly these, not the magitrac_srv_self NVS (which can drift).
+        strncpy(gApSsid, creds_ssid, sizeof(gApSsid)); gApSsid[sizeof(gApSsid) - 1] = 0;
+        strncpy(gApPsk,  creds_psk,  sizeof(gApPsk));  gApPsk [sizeof(gApPsk)  - 1] = 0;
+        WiFi.softAPConfig(IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                          IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                          IPAddress(255, 255, 255, 0));
+        if (esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
+            esp_netif_dhcps_stop(ap_netif);
+        }
+
+        // RF-interference mitigation for the audio path (chord/scope/monitor):
+        // each WiFi TX burst couples ~10 Hz hum into the ES8388 analog input.
+        //  1) Drop 802.11b — its lowest basic rate (1 Mbps DSSS) makes the
+        //     beacon sit on-air ~1 ms; 11g/n forces 6 Mbps OFDM, ~6× shorter
+        //     burst → far less coupled energy.  No reconnect-timing change.
+        //  2) Beacon interval 100 → 400 ms (10 → 2.5 Hz): fewer bursts/sec.
+        //     Modest, so STA keepalive/discovery stays comfortable.
+        esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+        {
+            wifi_config_t apCfg = {};
+            if (esp_wifi_get_config(WIFI_IF_AP, &apCfg) == ESP_OK) {
+                apCfg.ap.beacon_interval = 400;          // ms (valid 100..60000)
+                esp_wifi_set_config(WIFI_IF_AP, &apCfg);
+            }
+        }
+
+        Serial.printf("[SETUP] AP IP: %s  SSID (hidden): %s  (11g/n, beacon 400ms)\n",
+                      WiFi.softAPIP().toString().c_str(),
+                      WiFi.softAPSSID().c_str());
+    } else if (hasCreds && apMode == MAGI_AP_MODE_EXTERNAL) {
+        Serial.printf("[SETUP] branch=EXTERNAL_AP ssid='%s' — STA join (DHCP)\n", creds_ssid);
+        // No WiFi.config(): let the external AP's DHCP server assign an IP.
+        // Clients find us via the periodic MSG_SERVER_ANNOUNCE broadcast
+        // (see gAnnounceNextMs in loop()), so the address doesn't need to
+        // be predictable from the client's side any more.
+        WiFi.begin(creds_ssid, creds_psk);
+        WiFi.mode(WIFI_STA);
+        // Match the AP path: drop 11b so our own TX bursts use shorter 11g/n
+        // OFDM frames (less RF coupling into the audio path).  The external
+        // AP owns the beacon interval here, so we can't change that.
+        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    } else {
+        Serial.printf("[SETUP] branch=NONE (hasCreds=%d apMode=%u) — hold the bezel 2 s to pair\n",
+                      hasCreds ? 1 : 0, (unsigned)apMode);
+    }
+    return hasCreds ? (int)apMode : -1;
+}
+
 void setup() {
     auto cfg = M5.config();
     cfg.serial_baudrate = 115200;
@@ -1324,70 +1467,9 @@ void setup() {
     WiFi.persistent(false);
     WiFi.mode(WIFI_AP_STA);
 
-    char    creds_ssid[33] = {};
-    char    creds_psk[64]  = {};
-    uint8_t apMode         = 0;
-    bool hasCreds = pairNvsLoadCreds("magitrac_srv", creds_ssid, creds_psk, &apMode);
-
-    if (hasCreds && apMode == MAGI_AP_MODE_SERVER) {
-        const uint8_t apChannel = magiWifiChannelFromIdx(wifiChannelLoad());
-        Serial.printf("[SETUP] branch=SERVER_AP ch=%u ssid='%s'\n",
-                      (unsigned)apChannel, creds_ssid);
-        // max_connection 8 (default 4): the client takes one slot and several
-        // PixelPost units pile on at once during a field OTA pull.
-        bool apOk = WiFi.softAP(creds_ssid, creds_psk, apChannel,
-                                /*hidden=*/0, /*max_connection=*/8);
-        if (!apOk) {
-            Serial.println("[SETUP] softAP FAILED — common causes: PSK < 8 chars, SSID empty, channel out of range");
-        }
-        // Remember the LIVE AP creds — the field-flash OTA must hand the posts
-        // exactly these, not the magitrac_srv_self NVS (which can drift).
-        strncpy(gApSsid, creds_ssid, sizeof(gApSsid)); gApSsid[sizeof(gApSsid) - 1] = 0;
-        strncpy(gApPsk,  creds_psk,  sizeof(gApPsk));  gApPsk [sizeof(gApPsk)  - 1] = 0;
-        WiFi.softAPConfig(IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
-                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
-                          IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
-                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
-                          IPAddress(255, 255, 255, 0));
-        if (esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
-            esp_netif_dhcps_stop(ap_netif);
-        }
-
-        // RF-interference mitigation for the audio path (chord/scope/monitor):
-        // each WiFi TX burst couples ~10 Hz hum into the ES8388 analog input.
-        //  1) Drop 802.11b — its lowest basic rate (1 Mbps DSSS) makes the
-        //     beacon sit on-air ~1 ms; 11g/n forces 6 Mbps OFDM, ~6× shorter
-        //     burst → far less coupled energy.  No reconnect-timing change.
-        //  2) Beacon interval 100 → 400 ms (10 → 2.5 Hz): fewer bursts/sec.
-        //     Modest, so STA keepalive/discovery stays comfortable.
-        esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-        {
-            wifi_config_t apCfg = {};
-            if (esp_wifi_get_config(WIFI_IF_AP, &apCfg) == ESP_OK) {
-                apCfg.ap.beacon_interval = 400;          // ms (valid 100..60000)
-                esp_wifi_set_config(WIFI_IF_AP, &apCfg);
-            }
-        }
-
-        Serial.printf("[SETUP] AP IP: %s  SSID broadcast: %s  (11g/n, beacon 400ms)\n",
-                      WiFi.softAPIP().toString().c_str(),
-                      WiFi.softAPSSID().c_str());
-    } else if (hasCreds && apMode == MAGI_AP_MODE_EXTERNAL) {
-        Serial.printf("[SETUP] branch=EXTERNAL_AP ssid='%s' — STA join (DHCP)\n", creds_ssid);
-        // No WiFi.config(): let the external AP's DHCP server assign an IP.
-        // Clients find us via the periodic MSG_SERVER_ANNOUNCE broadcast
-        // (see sBroadcastNextMs in loop()), so the address doesn't need to
-        // be predictable from the client's side any more.
-        WiFi.begin(creds_ssid, creds_psk);
-        WiFi.mode(WIFI_STA);
-        // Match the AP path: drop 11b so our own TX bursts use shorter 11g/n
-        // OFDM frames (less RF coupling into the audio path).  The external
-        // AP owns the beacon interval here, so we can't change that.
-        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-    } else {
-        Serial.printf("[SETUP] branch=NONE (hasCreds=%d apMode=%u) — pair via BtnC long-press\n",
-                      hasCreds ? 1 : 0, (unsigned)apMode);
-    }
+    int     wifiMode = serverWifiBringUp();
+    bool    hasCreds = (wifiMode >= 0);
+    uint8_t apMode   = hasCreds ? (uint8_t)wifiMode : 0;
 
     // Pick the broadcast destination once we know which mode we're in.
     // softAP-hosted networks need the subnet broadcast (192.168.0.255)
@@ -1438,6 +1520,7 @@ void setup() {
     gMagiLink.registerCallback(MSG_NOTE_SET,        controlCb, nullptr);
     gMagiLink.registerCallback(MSG_NOTE_AUDITION,   controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_LOAD_NAME,  controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_ACTIVE_SONG_REQ, controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_LIST_REQ,    controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_LOAD_REQ,    controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SONG_DELETE,      controlCb, nullptr);
@@ -1618,6 +1701,7 @@ void setup() {
     drawScreen();
     loadSong(cursor);
     crashSetBootStep(BS_DONE);
+    crashSetPhase(CP_IDLE);   // main-context breadcrumb: out of boot, nothing in progress
 }
 
 void loop() {
@@ -1669,7 +1753,8 @@ void loop() {
     }
 
     // ── Discovery broadcast ───────────────────────────────────────────
-    // Fire MSG_SERVER_ANNOUNCE to 255.255.255.255:MAGI_PORT every
+    // Fire MSG_SERVER_ANNOUNCE to gBroadcastIp:MAGI_PORT (the softAP subnet
+    // broadcast on SERVER_AP, 255.255.255.255 on EXTERNAL_AP) every
     // ANNOUNCE_INTERVAL_MS so clients on the same L2 can discover us
     // without a fixed-IP convention.  Only when WiFi link is up.
     if (millis() >= gAnnounceNextMs) {
@@ -1714,6 +1799,13 @@ void loop() {
             gBpmLastSampleMs = nowMs;
             bpmSamplePush(nowMs, sequencerCurrentBPM());
         }
+    }
+
+    // Load-failure banner runs out — give the footer back (drawFooter is the
+    // SONGS footer, so only repaint it when that is what's on screen).
+    if (sLoadFailShown && millis() - sLoadFailAtMs >= LOAD_FAIL_BANNER_MS) {
+        sLoadFailShown = false;
+        if (gScreen == SCR_SONGS && !gTempoMode && !pairingIsActive()) drawFooter();
     }
 
     if (needsFullRedraw) {
@@ -1778,6 +1870,9 @@ void loop() {
                 drawTempoBPMArea(big, avg);
             }
         }
+        // The battery icon is part of the tempo chrome, and the normal poll
+        // further down is never reached while the screensaver is up.
+        if (batteryPoll()) batteryDrawIcon(240 - BATT_ICON_W - 4, 14, TFT_BLACK);
         return;
     }
 
@@ -1806,21 +1901,22 @@ void loop() {
         }
     }
 
-    if (batteryPoll()) {
+    // Poll every pass (it rate-limits itself), but leave the LCD alone while a
+    // pairing screen is up — a header drawn now would land on top of it.  The
+    // icon catches up with the full redraw when pairing ends.
+    if (batteryPoll() && !pairingIsActive()) {
         switch (gScreen) {
             case SCR_SONGS:   drawHeader();         break;
             case SCR_SAMPLES: drawSampleHeader();   break;
             case SCR_CHORD:   drawChordHeader();     break;
             case SCR_SCOPE:   drawScopeHeader();     break;
+            case SCR_ORGAN:   drawOrganHeader();     break;
             case SCR_USB:     /* whole-screen draw is heavy; just patch icon */ {
                 batteryDrawIcon(240 - BATT_ICON_W - 4,
                                 (UI_HEADER_H - BATT_ICON_H) / 2, COL_HDR);
                 break;
             }
             default: break;
-        }
-        if (gTempoMode) {
-            batteryDrawIcon(240 - BATT_ICON_W - 4, 14, TFT_BLACK);
         }
     }
 
@@ -1858,7 +1954,7 @@ void loop() {
     }
 
     // Scope screen: redraw each new captured frame (throttled to ~30 fps),
-    // and refresh the pk-pk / dropped-frame readout a few times a second.
+    // and refresh the pk-pk readout in the footer a few times a second.
     if (gScreen == SCR_SCOPE) {
         static uint32_t lastDrawMs = 0, lastFootMs = 0;
         uint32_t seq = scopeResultSeq();

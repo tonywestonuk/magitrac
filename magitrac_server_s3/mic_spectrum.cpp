@@ -1,7 +1,7 @@
 // mic_spectrum.cpp — ES8388 mic capture + FFT + beat detect for CoreS3.
 //
-// Reads 16-bit stereo from the shared audio codec (32 kHz), down-mixes to
-// mono, runs an FFT, broadcasts the 5 per-band magnitudes + beat info on
+// Reads 16-bit stereo from the shared audio codec (32 kHz), takes the LEFT
+// channel only, runs an FFT, broadcasts the 5 per-band magnitudes + beat info on
 // each FFT cycle via PPOSB (pixelpostSendAudio).  No heartbeat — when the
 // mic isn't active no packets go out.  Posts not running a mic-reactive
 // effect drop PPOSB silently.
@@ -21,7 +21,7 @@ extern void pixelpostSendAudio(const uint8_t* bands,
                                uint32_t beatSeq, uint8_t beatStrength);
 
 #define SAMPLE_RATE      AUDIO_CODEC_RATE_HZ
-#define SAMPLES_PER_READ 1024     // mono samples; reads 2048 stereo bytes from codec
+#define SAMPLES_PER_READ 1024     // frames per read (4096 bytes of 16-bit stereo from the codec)
 
 // vReal stays as the public-facing "FFT magnitudes" buffer for
 // bandMagnitude(); vImag is gone (esp_dsp returns magnitudes directly).
@@ -39,7 +39,7 @@ static volatile bool     sScopeActive = false;   // oscilloscope screen gate
 static bool              sBuffersUp   = false;
 static inline bool wantActive() { return sBandsActive || sChordActive || sScopeActive; }
 
-static float gain[5] = { 60.0f, 60.0f, 60.0f, 60.0f, 60.0f };
+static float gain[PP_AUDIO_BANDS];   // per-band AGC; seeded to 60 in spectrumInit()
 
 // ── Chord path ────────────────────────────────────────────────────────────
 // A second, larger FFT (4096-pt ≈ 7.8 Hz/bin at 32 kHz) over a sliding window
@@ -226,7 +226,7 @@ static void processBands() {
 static void processChord() {
     // Slide the window: drop the oldest read, append the newest.  Reads the
     // LEFT channel (LINPUT1, the new mic) — the same source the pixelpost
-    // bands and the scope use.  This is monoBuf, already downmixed.
+    // bands and the scope use.  This is monoBuf (LEFT only, scaled to ±1).
     memmove(chordWin, chordWin + SAMPLES_PER_READ,
             (CHORD_FFT_SIZE - SAMPLES_PER_READ) * sizeof(float));
     float* dst = chordWin + (CHORD_FFT_SIZE - SAMPLES_PER_READ);
@@ -271,7 +271,7 @@ static void processChord() {
 }
 
 // Reduce the freshly captured frame to one sample per display column for the
-// oscilloscope: the mean of each column's raw mic (R) samples (a mild
+// oscilloscope: the mean of each column's raw mic (LEFT) samples (a mild
 // low-pass that tames per-sample noise and dilutes single-sample glitches),
 // with a slow running DC estimate subtracted so the trace stays centred on the
 // zero line.  Computed into a local, then published under the spinlock.
@@ -310,7 +310,13 @@ static void spectrumTask(void*) {
             freeChord();
             xSemaphoreTake(sActiveSem, portMAX_DELAY);
             if (!wantActive()) continue;
-            if (!allocBuffers()) { sBandsActive = false; sChordActive = false; continue; }
+        }
+        // Buffers are down on a fresh wake — or because a setter re-raised a
+        // flag right after a failed alloc.  Either way, never capture into a
+        // null buffer: on failure drop every consumer and go back to sleep.
+        if (!sBuffersUp && !allocBuffers()) {
+            sBandsActive = false; sChordActive = false; sScopeActive = false;
+            continue;
         }
 
         // Chord buffers come and go with the chord screen, independent of the
@@ -342,6 +348,7 @@ static void spectrumTask(void*) {
 
 void spectrumInit() {
     if (sActiveSem) return;
+    for (int i = 0; i < (int)PP_AUDIO_BANDS; i++) gain[i] = 60.0f;
     // The ESP-DSP FFT twiddle table is GLOBAL and shared by every ESP32S3_FFT
     // instance; dsps_fft2r_init_fc32() sizes it on the first call and ignores
     // later ones.  We now run two sizes (1024 band + 4096 chord), so size the
@@ -358,23 +365,22 @@ void spectrumInit() {
     xTaskCreatePinnedToCore(spectrumTask, "mic", 8192, NULL, 10, NULL, 0);
 }
 
+// The three setters may run before spectrumInit() (pixelpostInit() registers
+// its receive callback first), when sActiveSem is still null: just latch the
+// flag — the task checks it before its first wait.
 void spectrumSetActive(bool active) {
-    Serial.printf("[MIC] setActive(%d) was=%d\n", (int)active, (int)sBandsActive);
-    if (active == sBandsActive) return;
+    if (active == sBandsActive) return;      // no-op calls arrive per packet / per row — stay silent
+    Serial.printf("[MIC] setActive(%d)\n", (int)active);
     sBandsActive = active;
-    if (active) xSemaphoreGive(sActiveSem);
+    if (active && sActiveSem) xSemaphoreGive(sActiveSem);
 }
-
-bool spectrumIsActive() { return sBandsActive; }
 
 void chordSetActive(bool active) {
-    Serial.printf("[MIC] chordSetActive(%d) was=%d\n", (int)active, (int)sChordActive);
-    if (active == sChordActive) return;
+    if (active == sChordActive) return;      // no-op calls arrive per packet / per row — stay silent
+    Serial.printf("[MIC] chordSetActive(%d)\n", (int)active);
     sChordActive = active;
-    if (active) xSemaphoreGive(sActiveSem);
+    if (active && sActiveSem) xSemaphoreGive(sActiveSem);
 }
-
-bool chordIsActive() { return sChordActive; }
 
 uint32_t chordResultSeq() { return chordSeq; }
 
@@ -387,13 +393,11 @@ ChordResult chordGetResult() {
 }
 
 void scopeSetActive(bool active) {
-    Serial.printf("[MIC] scopeSetActive(%d) was=%d\n", (int)active, (int)sScopeActive);
-    if (active == sScopeActive) return;
+    if (active == sScopeActive) return;      // no-op calls arrive per packet / per row — stay silent
+    Serial.printf("[MIC] scopeSetActive(%d)\n", (int)active);
     sScopeActive = active;
-    if (active) xSemaphoreGive(sActiveSem);
+    if (active && sActiveSem) xSemaphoreGive(sActiveSem);
 }
-
-bool scopeIsActive() { return sScopeActive; }
 
 uint32_t scopeResultSeq() { return scopeSeq; }
 

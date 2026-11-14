@@ -110,14 +110,15 @@ bool InstrumentsPage::poll() {
         if (_state == State::LIST) {
 
             if (hitListHome(sx, sy)) {
-                if (_anyEditMade) {
-                    _state = State::CONFIRM;
-                    _d.fillScreen(COL_WHITE);
-                    drawConfirm();
-                    _d.paintLater();
-                } else {
+                if (!_anyEditMade) {
+                    _saveOnExit = false;    // nothing changed — nothing to push
                     return true;
                 }
+                _state = State::CONFIRM;
+                _d.fillScreen(COL_WHITE);
+                drawConfirm();
+                _d.paintLater();
+                return false;
             }
 
             if (hitPrev(sx, sy) && _listPage > 0) {
@@ -125,8 +126,7 @@ bool InstrumentsPage::poll() {
                 _d.fillScreen(COL_WHITE);
                 drawList();
                 _d.paintLater();
-            } else if (hitNext(sx, sy) &&
-                       (_listPage + 1) * IP_PER_PAGE < MAX_INSTRUMENTS) {
+            } else if (hitNext(sx, sy) && hasNextPage()) {
                 _listPage++;
                 _d.fillScreen(COL_WHITE);
                 drawList();
@@ -146,14 +146,15 @@ bool InstrumentsPage::poll() {
         } else if (_state == State::EDIT) {
 
             if (hitEditHome(sx, sy)) {
-                if (_anyEditMade) {
-                    _state = State::CONFIRM;
-                    _d.fillScreen(COL_WHITE);
-                    drawConfirm();
-                    _d.paintLater();
-                } else {
+                if (!_anyEditMade) {
+                    _saveOnExit = false;    // nothing changed — nothing to push
                     return true;
                 }
+                _state = State::CONFIRM;
+                _d.fillScreen(COL_WHITE);
+                drawConfirm();
+                _d.paintLater();
+                return false;
             }
 
             if (hitBack(sx, sy)) {
@@ -197,7 +198,7 @@ void InstrumentsPage::drawList() {
     // Toolbar — pagination only
     _d.fillRect(0, IP_HDR_H, 960, IP_TOOL_H, COL_WHITE);
     bool hasPrev = (_listPage > 0);
-    bool hasNext = ((_listPage + 1) * IP_PER_PAGE < MAX_INSTRUMENTS - 1);
+    bool hasNext = hasNextPage();
     uiButton(_d, IP_PREV_X, IP_BTN_Y, IP_PREV_W, IP_BTN_H,
              "PREV", COL_WHITE, hasPrev ? COL_BLACK : COL_DKGREY, 3);
     uiButton(_d, IP_NEXT_X, IP_BTN_Y, IP_NEXT_W, IP_BTN_H,
@@ -216,6 +217,7 @@ void InstrumentsPage::drawList() {
 void InstrumentsPage::drawListRow(int idx, int y) {
     _d.fillRect(0, y, 960, IP_ROW_H, COL_WHITE);
     _d.drawFastHLine(0, y + IP_ROW_H - 1, 960, COL_BLACK);
+    if (idx < 0 || idx >= MAX_INSTRUMENTS) return;   // last page runs one past the bank
 
     // ID box — 2-digit hex
     char id[4];
@@ -341,6 +343,12 @@ void InstrumentsPage::adjustField(int field, int delta) {
 }
 
 // ── Hit tests — list ──────────────────────────────────────────────────────────
+
+// Rows start at index 1 (0 is reserved), so page p shows p*PER_PAGE + 1 onward
+// and a next page exists while its first row is still inside the bank.
+bool InstrumentsPage::hasNextPage() const {
+    return (_listPage + 1) * IP_PER_PAGE + 1 < MAX_INSTRUMENTS;
+}
 
 int InstrumentsPage::hitRow(int sx, int sy) const {
     if (sy < IP_LIST_Y || sy >= IP_LIST_Y + IP_PER_PAGE * IP_ROW_H) return -1;

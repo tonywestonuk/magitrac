@@ -60,6 +60,8 @@ static const int WP_LABEL_X    = 40;
 // Scan results overlay
 static const int WP_SR_ROW_H   = 50;
 static const int WP_SR_LIST_Y  = WP_HDR_H + 20;   // below "SCAN RESULTS" header strip
+// The list does not scroll, so only as many results as fit on screen are kept.
+static const int WP_SR_ROWS    = (WP_H - WP_SR_LIST_Y) / WP_SR_ROW_H;   // 9
 
 // ── ctor ─────────────────────────────────────────────────────────────────────
 WiFiSettingsPage::WiFiSettingsPage(EPD_PainterAdafruit& display, GT911_Lite& touch)
@@ -321,6 +323,7 @@ void WiFiSettingsPage::runScan() {
     int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
     if (n < 0) n = 0;
     if (n > WP_SCAN_MAX) n = WP_SCAN_MAX;
+    if (n > WP_SR_ROWS)  n = WP_SR_ROWS;    // rows past this would be off-screen
     _scanCount = n;
     for (int i = 0; i < n; i++) {
         String s = WiFi.SSID(i);

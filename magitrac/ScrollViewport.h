@@ -51,9 +51,6 @@ public:
     // changes (e.g. a streamed page arrived, an item was added/removed).
     void redraw();
 
-    int  offsetY()    const { return _drawnOffset; }
-    bool isDragging() const { return _down && _dragMoved; }
-
 private:
     EPD_PainterAdafruit& _d;
     PaintFn _paint;

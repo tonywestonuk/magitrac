@@ -61,9 +61,11 @@ struct ProcVoiceState {
 
 // ── THX DEEP NOTE cluster voice ───────────────────────────────────────────────
 // A bank of THX_OSC sawtooth oscillators per note.  Each starts at a random
-// absolute frequency (~200-400 Hz, the iconic mumble) and glides — on its own
-// randomised timing curve — to a target on a stacked-octave chord built from
-// the played note.  A fading random detune wobble gives the "living" cluster.
+// absolute frequency (centred ~280 Hz, width set by SPREAD — the iconic
+// mumble) and glides to a target on a stacked-octave chord built from the
+// played note.  All oscillators share one eased glide curve (rateQ8 is set to
+// 256 for every osc), so they arrive together.  A fading random detune wobble
+// gives the "living" cluster.
 // Stored by overlaying the (otherwise unused-in-THX) per-voice s_voiceScratch
 // buffer, so it costs no extra RAM.  Sliders: [0]SWEEP [1]SPREAD [2]BRIGHT
 // (the shared PROC low-pass) [3]STACK [4]DETUNE.
@@ -73,7 +75,7 @@ struct ThxVoice {
     uint32_t incTarget[THX_OSC];  // Q32 increment at the settled chord
     uint32_t incCur[THX_OSC];     // live increment (glide + wobble), read per sample
     int32_t  wob[THX_OSC];        // smoothed per-osc detune random-walk (Q16 cents-ish)
-    uint16_t rateQ8[THX_OSC];     // per-osc glide speed (256 = nominal)
+    uint16_t rateQ8[THX_OSC];     // per-osc glide speed (256 = nominal; thxNoteOn sets all to 256)
     uint16_t ampLQ8[THX_OSC];     // per-osc LEFT gain  (constant-power pan, recomputed per block)
     uint16_t ampRQ8[THX_OSC];     // per-osc RIGHT gain
     // Per-osc stereo WANDER: the pan position drifts (like the freq wobble) and
@@ -120,6 +122,8 @@ void procNoteOn(int sound, ProcVoiceState& ps, float f0, const volatile int* par
 // Once per rendered block (NOT per voice): advance global per-sound modulation.
 // CHOIR: the transport wow/flutter — one disc motor, so the whole ensemble
 // drifts together (measured off the discs: ~1 Hz ±20 cents + ~14 Hz ±5 cents).
+// NOTE: nothing calls this at present (renderBlock in drawbar_organ.cpp has no
+// call), so the wow/flutter offset stays 0 and is not in the sound.
 void procBlockTick(int sound);
 
 // Once per block per voice: advance the frame morph and rebuild the voice's
@@ -136,7 +140,7 @@ extern int16_t* gProcTabS[PROC_SOUND_COUNT];   // SUSTAIN frame
 
 // Per-sound formant stack — up to 3 global peaking biquads on the PROC output
 // (pitch-INDEPENDENT, like a vocal tract; a wavetable bump would move with the
-// note).  TWO TRIBES: one stage at 900 Hz ("throat"); CHOIR: 520/1050/2800 Hz
+// note).  TWO TRIBES: one stage at 900 Hz ("throat"); CHOIR: 590/1050/2800 Hz
 // (the "ahh" vowel + singer's formant).  Slider [4] 0..8 scales the stage
 // gains via a coefficient table built at init.  Caller must clamp after this —
 // the boost can exceed int16.

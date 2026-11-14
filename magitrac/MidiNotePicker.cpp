@@ -9,10 +9,8 @@ static const char* MNP_NAMES[12] = {
 };
 
 static const int MNP_W = 960;
-static const int MNP_H = 540;
 
 static const int MNP_HDR_H      = 60;
-static const int MNP_HDR_BTN_W  = 180;
 
 static const int MNP_VAL_Y      = MNP_HDR_H;
 static const int MNP_VAL_H      = 80;

@@ -1,4 +1,5 @@
 #include "DrumTrackParser.h"
+#include <Arduino.h>     // ps_malloc, Serial
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -6,12 +7,6 @@
 bool DrumPatternInstr::isActive() const {
     for (int i = 0; i < DRUM_PATTERN_STEPS; i++) if (hits[i]) return true;
     return false;
-}
-
-int DrumPatternBlock::activeCount() const {
-    int n = 0;
-    for (int i = 0; i < numInstrs; i++) if (instrs[i].isActive()) n++;
-    return n;
 }
 
 int DrumPatternBlock::activeIndices(int* out, int cap) const {
@@ -57,12 +52,21 @@ static void copyLine(const char* text, uint32_t len, uint32_t p, char* out, int 
     while (n > 0 && (out[n-1] == ' ' || out[n-1] == '\t')) out[--n] = '\0';
 }
 
+DrumPatternFile::~DrumPatternFile() {
+    free(_blocks);
+}
+
 bool DrumPatternFile::parse(const char* text, uint32_t len) {
     _blockCount = 0;
     _tempo      = 0;
-    _time[0]    = '\0';
-    _swing      = 0;
     if (!text || len == 0) return false;
+    if (!_blocks) {
+        _blocks = (DrumPatternBlock*)ps_malloc(sizeof(DrumPatternBlock) * DRUM_PATTERN_MAX_BLOCKS);
+        if (!_blocks) {
+            Serial.println("[DrumTrack] no PSRAM for the pattern blocks");
+            return false;
+        }
+    }
 
     uint32_t p = 0;
     DrumPatternBlock* cur = nullptr;
@@ -79,23 +83,10 @@ bool DrumPatternFile::parse(const char* text, uint32_t len) {
             p = skipLine(text, len, p);
             continue;
         }
-        if (startsWith(text, len, p, "Time:")) {
-            copyLine(text, len, p + 5, _time, sizeof(_time));
-            // Strip leading spaces in _time.
-            char* s = _time;
-            while (*s == ' ' || *s == '\t') s++;
-            if (s != _time) memmove(_time, s, strlen(s) + 1);
-            p = skipLine(text, len, p);
-            continue;
-        }
-        if (startsWith(text, len, p, "Swing:")) {
-            char buf[16]; copyLine(text, len, p + 6, buf, sizeof(buf));
-            _swing = atoi(buf);
-            p = skipLine(text, len, p);
-            continue;
-        }
-        if (startsWith(text, len, p, "Order:")) {
-            // Skip — kept for compat with the file format but not used.
+        if (startsWith(text, len, p, "Time:") ||
+            startsWith(text, len, p, "Swing:") ||
+            startsWith(text, len, p, "Order:")) {
+            // Part of the file format but not used by the import — skip.
             p = skipLine(text, len, p);
             continue;
         }

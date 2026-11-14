@@ -8,10 +8,10 @@
 
 // ── Layout (960×540 EPD) ─────────────────────────────────────────────────────
 //
-//   y= 0  ┌─ "Column Note Editor"  [HOME x=830..960] ────────────────────────┐
-//   y=40  │  ┌─ selector strip (28 high) ───────┐  ┌─ Right info panel ──┐  │
-//   y=72  │  ├─ 13 pitch rows × 16 row-cells     │  │ [<] 02.1 / 3 [>]    │  │
-//         │  │   each cell = CNE_CELL × CNE_CELL │  │ COL: {name}         │  │
+//   y= 0  ┌─ "Col Note Editor  {col} - {name}"  [HOME x=830..960] ────────────┐
+//   y=54  │  ┌─ selector strip (18 high) ───────┐  ┌─ Right info panel ──┐  │
+//   y=76  │  ├─ 13 pitch rows × 16 row-cells     │  │ [<] 02.1 / 03 [>]   │  │
+//         │  │   each cell = CNE_CELL × CNE_CELL │  │ [PREVIEW]           │  │
 //         │  │                                    │  │ ROW: 07             │  │
 //         │  │                                    │  │ VEL: [6A]           │  │
 //         │  │                                    │  │ ATTR: [E01C]  *     │  │
@@ -20,8 +20,12 @@
 //   y=531 │  └────────────────────────────────────┘  └─────────────────────┘  │
 //         └────────────────────────────────────────────────────────────────────┘
 //
-// * ATTR button only shown for output cols (1..8).  Col 0 swaps the OFF
-//   action button for ANY/WAIT/SYNC, and hides ATTR (param=0 always).
+// The selector strip's touch zone is taller than it looks: it runs from the
+// bottom of the header (y=40) to the bottom of the strip (y=72).
+// Nav label = block.segment / block count (segment is 0-based).
+//
+// * ATTR button only shown for output cols (1..MAX_COLUMNS-1).  Col 0 swaps
+//   the OFF action button for ANY/WAIT/SYNC, and hides ATTR (param=0 always).
 
 static const int CNE_W           = 960;
 static const int CNE_H           = 540;
@@ -84,8 +88,14 @@ public:
     uint8_t pendingCol() const  { return _col; }
     void    clearPending()      { _dirtyRow = 0xFF; }
 
-    bool    bulkPending() const { return _dirtyAll; }
-    void    clearBulkPending()  { _dirtyAll = false; }
+    // PASTE wrote a run of rows in one column of one block — the caller
+    // sends a note-set for each of pasteRowLo()..pasteRowHi() (inclusive).
+    bool    pastePending() const { return _pasteRowLo != 0xFF; }
+    uint8_t pastePat()     const { return _pastePat; }
+    uint8_t pasteCol()     const { return _col; }
+    uint8_t pasteRowLo()   const { return _pasteRowLo; }
+    uint8_t pasteRowHi()   const { return _pasteRowHi; }
+    void    clearPastePending()  { _pasteRowLo = 0xFF; }
 
     // Audition pending — set when a freshly entered note should be played
     // through MIDI for ~500ms.  Drained by main sketch.
@@ -115,11 +125,13 @@ private:
     HexpadPopup          _hexpad;
 
     uint8_t  _patIdx;
-    uint8_t  _col;          // 0 = input track, 1..8 = MIDI out
-    uint8_t  _segment;      // 0..3 — which 16-row window of the pattern
+    uint8_t  _col;          // 0 = input track, 1..MAX_COLUMNS-1 = output columns
+    uint8_t  _segment;      // 0..numSegments()-1 — which 16-row window of the pattern
     uint8_t  _selRow;       // currently selected pattern row (0..63)
     uint8_t  _topPitch;     // pitch at the TOP of the visible grid (high pitch first)
     bool     _wasDown;
+    bool     _swallowLift;  // opened under a held finger (the long-press that
+                            // opens the page): ignore it until it lifts
 
     // Selection / clipboard
     uint8_t  _selStartCol;
@@ -129,7 +141,7 @@ private:
 
     // Drag state
     CneDrag  _drag;
-    int      _dragStartX, _dragStartY;
+    int      _dragStartY;
     uint8_t  _dragStartTopPitch;
     int8_t   _dragStartCellCol;     // initial selector or grid cell column
     int8_t   _dragStartCellPitchIdx;// row index within visible pitches at touch-down
@@ -139,7 +151,9 @@ private:
 
     // Server-sync flags
     uint8_t  _dirtyRow;     // 0xFF = clean; else last edited row in _patIdx, col=_col
-    bool     _dirtyAll;     // bulk edit (paste) — caller does full song resync
+    uint8_t  _pastePat;     // block the pasted rows are in
+    uint8_t  _pasteRowLo;   // 0xFF = no paste pending; else first pasted row
+    uint8_t  _pasteRowHi;   // last pasted row (inclusive)
     uint8_t  _auditionRow;  // 0xFF = no audition; else row to audition (col=_col)
 
     // Preview state
@@ -186,7 +200,7 @@ private:
     void applyAction(uint8_t which);    // index into action button group
     void applyCopy();
     void applyPaste();
-    void stepSegment(int delta);        // +1 / -1 with pattern wrap
-    void clampTopPitch();
+    void stepSegment(int delta);        // +1 / -1; steps into the neighbouring
+                                        // block at a block edge, stops at song ends
     void markDirty(uint8_t row);
 };

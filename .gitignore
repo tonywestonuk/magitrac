@@ -73,3 +73,6 @@ wifi_secrets.h
 
 # macOS junk
 .DS_Store
+
+# Sequencer host-test binary (see magitrac_server_s3/test_seq.cpp)
+magitrac_server_s3/test_seq

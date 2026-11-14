@@ -11,10 +11,19 @@ static const char* KBD_ROW1 = "QWERTYUIOP";   // 10 chars
 static const char* KBD_ROW2 = "ASDFGHJKL";    //  9 chars  (starts at x=48)
 static const char* KBD_ROW3 = "ZXCVBNM";      //  7 chars  (starts at x=96)
 
-// Symbol / number layer (boot button toggles)
+// Symbol / number layer ("123" button in the text field toggles)
 static const char* KBD_ROW1_SYM = "1234567890";  // 10
 static const char* KBD_ROW2_SYM = "-_.:;!?@#";   //  9
 static const char* KBD_ROW3_SYM = "()[]{}+";     //  7
+
+// Text the caller's buffer held at open(), restored on CANCEL.  One shared
+// snapshot is enough — the keyboard is modal, so only one is ever being typed
+// into — and it avoids repeating 256 bytes of internal RAM in every instance.
+// The owner/buffer pair guards against restoring a snapshot another instance
+// took.
+static char                 s_kbdSnap[256];
+static const KeyboardPopup* s_kbdSnapOwner = nullptr;
+static const char*          s_kbdSnapBuf   = nullptr;
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -40,6 +49,16 @@ void KeyboardPopup::open(char* buf, uint8_t maxLen) {
     _symLayer  = false;
     _upperCase = true;
     _wasDown   = _touch.isTouched;  // swallow any lingering touch
+
+    // Snapshot for CANCEL.  A string too long to snapshot (never the case for
+    // the name-sized buffers in use) simply isn't restored.
+    s_kbdSnapOwner = nullptr;
+    s_kbdSnapBuf   = nullptr;
+    if (buf && strlen(buf) < sizeof(s_kbdSnap)) {
+        strcpy(s_kbdSnap, buf);
+        s_kbdSnapOwner = this;
+        s_kbdSnapBuf   = buf;
+    }
 }
 
 void KeyboardPopup::draw() {
@@ -95,6 +114,10 @@ bool KeyboardPopup::poll() {
         char ch = hitKey(sx, sy, bksp, done, cancel, shift);
 
         if (cancel) {
+            // Put the caller's text back — the buffer was edited in place.
+            // The snapshot is no longer than what the buffer held at open().
+            if (s_kbdSnapOwner == this && s_kbdSnapBuf == _buf && _buf)
+                strcpy(_buf, s_kbdSnap);
             _open = false;
             _done = false;
             return true;
@@ -198,12 +221,16 @@ char KeyboardPopup::hitKey(int sx, int sy,
         if (slot >= 0 && slot < 10) return caseOf(r1[slot]);
 
     } else if (sy < KBD_ROW3_Y) {
+        if (sx < KBD_SLOT_W / 2) return 0;   // left margin (int division would give slot 0)
         int slot = (sx - KBD_SLOT_W / 2) / KBD_SLOT_W;
         if (slot >= 0 && slot < 9) return caseOf(r2[slot]);
 
     } else if (sy < KBD_ROW4_Y) {
         if (sx >= KBD_SLOT_W * 8) { bksp = true; return 0; }
-        if (!_symLayer && sx < KBD_SLOT_W) { shift = true; return 0; }
+        if (sx < KBD_SLOT_W) {               // slot 0: SHIFT (alpha) / blank (symbols)
+            shift = !_symLayer;
+            return 0;
+        }
         int slot = (sx - KBD_SLOT_W) / KBD_SLOT_W;
         if (slot >= 0 && slot < 7) return caseOf(r3[slot]);
 

@@ -1,7 +1,8 @@
 // MagiTrac — ProTracker-style MIDI sequencer for LilyGo T5 S3
 // Display: 960×540 e-paper via EPD_Painter (Adafruit GFX binding)
 // Touch:   GT911_Lite (polling, no interrupts)
-// Audio:   MIDI over WiFi (future) — UI only for now
+// Audio:   none here — this is the UI/editing client.  Sequencing and MIDI
+//          run on the server, reached over WiFi (MagiLink TCP + UDP updates).
 
 
 //#define EPD_PAINTER_PRESET_LILYGO_T5_S3_GPS
@@ -22,7 +23,6 @@
 #include "SongStorage.h"
 #include "SongPage.h"
 #include "ServerPairing.h"
-#include "SongSource.h"
 #include "BootMenu.h"
 #include "InstrumentsPage.h"
 #include "SongConfigPage.h"
@@ -51,6 +51,10 @@
 #define BOOT_BTN_PIN   0   // GPIO 0 = BOOT button (active LOW, internal pull-up)
 static bool gBacklightOn    = false;   // off by default — boot button turns it on
 static bool gBootBtnWasDown = false;
+static bool gHasBacklight   = false;   // set in setup(): LilyGo only (see there)
+
+// Tracker note numbers start at 1 = C-0; MIDI note = tracker note + this.
+static const int TRACKER_TO_MIDI_OFFSET = 11;
 
 // ── SD card pins ──────────────────────────────────────────────────────────────
 // LilyGo T5 4.7" S3
@@ -81,7 +85,7 @@ TrackerEngine engine(&song);
 TrackerUI     ui(display, song, engine);
 TouchHandler  handler(touch, ui, engine, song);
 NoteEditor         noteEditor(display, touch);
-PageManager        pageManager(display, touch, song);
+PageManager        pageManager;
 BlockSettingsPage  blockSettings(display, touch, song);
 DrumEditorPage     drumEditor   (display, touch, song);
 ColumnNoteEditorPage noteEditorPage(display, touch, song);
@@ -104,12 +108,6 @@ BackupRestorePage* backupRestorePage = nullptr;
 
 bool gSdAvailable = false;
 int  gSdCs        = -1;   // chip-select pin used for SD; set in setup()
-SongSource gSongSource = SongSource::NONE;
-
-// ── MIDI passthrough state (client → server) ──────────────────────────────────
-// Tracker note → MIDI note: midi = tracker + 11  (tracker C4=49, MIDI C4=60)
-#define TRACKER_TO_MIDI  11
-static uint8_t gMidiActiveNote[MAX_COLUMNS] = {};  // 0 = no note active on that channel
 
 // Paste the row-selection (source column ui.rsCol(), rows ui.rsLo()..rsHi())
 // into the current block starting at (targetRow, targetCol), one row down per
@@ -128,8 +126,14 @@ static void applyRowPaste(int8_t targetRow, int8_t targetCol) {
     Note buf[MAX_ROWS];
     {   // snapshot source first — a same-block overlapping paste mustn't read its writes
         NoteGrid src(song.notePool, &song.noteFreeHead, &song.patterns[srcPat].noteHead);
-        for (int i = 0; i < n && i < MAX_ROWS; i++)
-            buf[i] = src.get((uint8_t)(lo + i), (uint8_t)srcCol);
+        // get() reads a missing cell as {0,0,0,0}, and velocity 0 is an
+        // EXPLICIT velocity — indistinguishable from a real velocity-only row.
+        // Record missing cells as all-default so set() below clears them.
+        for (int i = 0; i < n && i < MAX_ROWS; i++) {
+            uint8_t r = (uint8_t)(lo + i);
+            if (src.has(r, (uint8_t)srcCol)) buf[i] = src.get(r, (uint8_t)srcCol);
+            else buf[i] = Note{ NOTE_EMPTY, VEL_DEFAULT, 0, 0 };
+        }
     }
 
     int patLen = song.patterns[dstPat].length;
@@ -137,40 +141,11 @@ static void applyRowPaste(int8_t targetRow, int8_t targetCol) {
     for (int i = 0; i < n && i < MAX_ROWS; i++) {
         int tr = (int)targetRow + i;
         if (tr >= patLen) break;                       // don't spill past the block
-        const Note& s = buf[i];
-        bool empty = (s.note == 0 && s.effect == 0 && s.param == 0);
-        if (empty) dst.clear((uint8_t)tr, (uint8_t)targetCol);
-        else       dst.set  ((uint8_t)tr, (uint8_t)targetCol, s);
+        // set() clears the cell itself for an all-default note and keeps
+        // velocity-only / attr-only rows (PXL slider + move rows).
+        dst.set((uint8_t)tr, (uint8_t)targetCol, buf[i]);
         if (gServerPairing.isPaired())
             gServerPairing.sendNoteSet(song, dstPat, (uint8_t)tr, (uint8_t)targetCol);
-    }
-}
-
-static void sendMidiRow(uint8_t patIdx, uint8_t row) {
-    if (!gServerPairing.isPaired()) return;
-    NoteGrid grid(song.notePool, &song.noteFreeHead, &song.patterns[patIdx].noteHead);
-    grid.forRow(row, [](uint8_t col, const Note& n, void* /*ctx*/) {
-        if (col == INPUT_COLUMN) return;
-        if (n.note == NOTE_EMPTY) return;
-        if (gMidiActiveNote[col] != 0) {
-            uint8_t off[3] = { 0x80, gMidiActiveNote[col], 0 };
-            gServerPairing.sendMidi(off, 3);
-        }
-        uint8_t midiNote = (uint8_t)(n.note + TRACKER_TO_MIDI);
-        uint8_t on[3] = { 0x90, midiNote, 100 };
-        gServerPairing.sendMidi(on, 3);
-        gMidiActiveNote[col] = midiNote;
-    }, nullptr);
-}
-
-static void sendMidiAllOff() {
-    if (!gServerPairing.isPaired()) return;
-    for (int col = 0; col < MAX_COLUMNS; col++) {
-        if (gMidiActiveNote[col] != 0) {
-            uint8_t off[3] = { 0x80, gMidiActiveNote[col], 0 };  // NoteOff, channel 1
-            gServerPairing.sendMidi(off, 3);
-            gMidiActiveNote[col] = 0;
-        }
     }
 }
 
@@ -250,7 +225,7 @@ static bool pollPairingUi() {
         if (state == PairClientState::PAIRING_CONFIRM &&
             sx >= 280 && sx < 680 && sy >= 390 && sy < 490) {
             gServerPairing.confirmPairCode();
-            drawPairingScreen();   // redraw to show "Completing..." state
+            drawPairingScreen();   // repaint for the state confirmPairCode() left us in
         }
     }
     if (down && !gPairingUiWasDown) gPairingUiWasDown = true;
@@ -284,11 +259,35 @@ static bool     pixelpostManualPageOpen = false;
 static bool     setlistPageOpen       = false;
 static bool     organPageOpen         = false;
 
+// ── Temporary header note ─────────────────────────────────────────────────────
+// A short message in the tracker header's status slot (where "Connected" /
+// "Connecting..." normally sits).  It holds for STATUS_NOTE_MS, then the
+// connection-status block in loop() puts the connection text back.
+static bool     gStatusNoteActive = false;
+static uint32_t gStatusNoteMs     = 0;
+static const uint32_t STATUS_NOTE_MS = 8000;
+
+static void showStatusNote(const char* msg) {
+    ui.setStatus(msg);
+    gStatusNoteActive = true;
+    gStatusNoteMs     = millis();
+    needsHeaderRedraw = true;
+}
+
+// An explicit save was reported failed while SongPage was showing (it put up
+// its SAVE FAILED banner).  If the page then closes on a song load within
+// moments — "save changes? YES" followed by the load it was guarding — the
+// banner was barely on screen, so the tracker header repeats the note.
+static bool     gSongPageSaveFail   = false;
+static uint32_t gSongPageSaveFailMs = 0;
+static const uint32_t SAVE_FAIL_CARRY_MS = 3000;
+
 // ── Autosave state ───────────────────────────────────────────────────────
 // markSongDirty() is called from ServerPairing::sendSongPatch / sendNoteSet,
 // which sit on every song-mutation path.  30 s after the last edit, if we're
-// idle on the tracker page and there's a loaded SD filename, loop() shows a
-// "Saving..." indicator and writes the song to SD.
+// idle on the tracker page, linked, and the song has a server filename
+// (songPage.srvLoadedName()), loop() shows a "Saving..." indicator and asks
+// the server to write its copy to /autosave (sendSaveActive, isAutosave).
 static bool     gSongDirty = false;
 static uint32_t gLastEditMs = 0;
 static const uint32_t AUTOSAVE_DELAY_MS = 30000;
@@ -416,6 +415,7 @@ void setup() {
     // Backlight — only available on LilyGo T5 boards (BOARD_BL_EN conflicts
     // with display pins on M5PaperS3)
     if (display.getPreset() != &EPD_M5PAPER_S3_PRESET) {
+        gHasBacklight = true;
         pinMode(BOARD_BL_EN,  OUTPUT);
         // Off by default (gBacklightOn=false); boot button toggles it on at
         // half brightness.  Respect the flag rather than forcing it on.
@@ -458,16 +458,12 @@ void setup() {
     gSdAvailable = SD.begin(gSdCs);
     Serial.printf("[SD] %s\n", gSdAvailable ? "OK" : "not found / no card?");
 
-    // gServerPairing.begin() was moved up — must run before display.begin()
-    // (EPD_Painter Core-0 + GDMA + LCD_CAM grab breaks WiFi softAP attach
-    // under m5stack:esp32 if it runs first).  See the note next to its
-    // current call site at the top of setup().
+    // gServerPairing.begin() and loadWifiChannel() (which only reads the saved
+    // channel index for the settings UI) already ran above, once the display
+    // was up.  The one WiFi step that has to precede display.begin() is the
+    // driver pre-init at the top of setup().
     loadMidiLimits();
     loadPixelPostFlashCtrl();
-    // loadWifiChannel() moved up — now runs before gServerPairing.begin()
-    // so the SoftAP starts on the right channel.  Don't call WiFi.setChannel()
-    // here: with the AP already up, changing channel from STA would either
-    // be ignored or tear down the AP.
 
     // Battery — LilyGo T5 S3 has BQ25896 PMIC on I2C with ADC fallback;
     // M5PaperS3 senses via ADC: BAT_ADC on GPIO 3 (2:1 divider), charge
@@ -506,7 +502,9 @@ void setup() {
 void loop() {
     uint32_t now = millis();
 
-    // ── Debug tick (2 s) — paired/link/STA snapshot, drop when connection is fine
+    // ── Debug tick (2 s) — paired/link/STA snapshot + EPD engine state.
+    // Compiled in only with MAGITRAC_DEBUG=1 (Constants.h).
+#if MAGITRAC_DEBUG
     {
         static uint32_t sDbgMs = 0;
         if (now - sDbgMs >= 2000) {
@@ -539,6 +537,7 @@ void loop() {
             display.driver().debugState();
         }
     }
+#endif
 
     // ── Discovery-driven late connect (EXTERNAL_AP only) ──────────────────────
     //
@@ -564,7 +563,7 @@ void loop() {
     // ── Boot button — toggle backlight ────────────────────────────────────────
     {
         bool down = (digitalRead(BOOT_BTN_PIN) == LOW);
-        if (down && !gBootBtnWasDown) {
+        if (down && !gBootBtnWasDown && gHasBacklight) {
             gBacklightOn = !gBacklightOn;
             analogWrite(BOARD_BL_EN, gBacklightOn ? BL_ON_LEVEL : 0);
         }
@@ -576,13 +575,7 @@ void loop() {
         static char sStatusBuf[32]     = {};
         static char sLastStatusBuf[32] = {};
 
-        PairClientState ps = gServerPairing.pairState();
-        BrowseState     bs = gServerPairing.browseState();
-
-        // Status reflects the MagiLink socket state.  The legacy pairState
-        // is still computed for the pairing-ceremony UI (PAIRING_REQUEST /
-        // PAIRING_CONFIRM); browse state isn't surfaced here.
-        (void)ps; (void)bs;
+        // Status reflects the MagiLink socket state only.
         if (gMagiLink.isConnected()) {
             strncpy(sStatusBuf, "Connected", 31);
         } else {
@@ -590,7 +583,14 @@ void loop() {
         }
         sStatusBuf[31] = '\0';
 
-        if (strcmp(sStatusBuf, sLastStatusBuf) != 0) {
+        // A temporary note (showStatusNote) owns the slot until it expires;
+        // blanking the remembered text then forces the connection text back.
+        if (gStatusNoteActive && millis() - gStatusNoteMs >= STATUS_NOTE_MS) {
+            gStatusNoteActive = false;
+            sLastStatusBuf[0] = '\0';
+        }
+
+        if (!gStatusNoteActive && strcmp(sStatusBuf, sLastStatusBuf) != 0) {
             strncpy(sLastStatusBuf, sStatusBuf, 31);
             sLastStatusBuf[31] = '\0';
             ui.setStatus(sStatusBuf);
@@ -647,9 +647,7 @@ void loop() {
         }
     }
 
-    // ── Page manager — stub page HOME button ─────────────────────────────────
-    pageManager.poll();
-
+    // ── Tracker redraw requested by PageManager::goHome() ────────────────────
     if (pageManager.trackerRedrawNeeded()) {
         ui.drawAll();
         display.paintLater();
@@ -678,7 +676,7 @@ void loop() {
         !wifiSettingsPageOpen && !backupRestorePageOpen &&
         !drumTrackImportOpen && !drumEditorOpen &&
         !performancePageOpen && !pixelpostManualPageOpen && !setlistPageOpen &&
-        !organPageOpen &&
+        !organPageOpen && !pasteConfirmOpen &&
         !noteEditor.isOpen() &&
         pageManager.currentPage() == Page::TRACKER) {
         const char* srvName = songPage.srvLoadedName();
@@ -716,6 +714,36 @@ void loop() {
             gAutosaveRepaintAtMs = millis() + AUTOSAVE_BANNER_MS;
         }
         // No server filename: leave dirty; user can Save As to give it one.
+    }
+
+    // ── Save result from the server ──────────────────────────────────────────
+    // sendSaveActive() returning true only means the request was sent; this is
+    // the server's answer (SD write + verify).  Handled up here, ahead of every
+    // page's early return, so it is never left pending.  A failed save puts
+    // the dirty flag back — the sender cleared it on "sent" — so autosave
+    // retries; a failed EXPLICIT save is also shown: on SongPage's header bar
+    // if that page is open, otherwise as a note in the tracker header.
+    if (gServerPairing.saveResultPending()) {
+        bool ok       = gServerPairing.saveResultOk();
+        bool autosave = gServerPairing.saveResultIsAutosave();
+        if (!ok) {
+            Serial.printf("[SAVE] server reports %s FAILED for '%s'\n",
+                          autosave ? "autosave" : "save",
+                          gServerPairing.saveResultName());
+            markSongDirty();
+            if (!autosave) {
+                if (songPageOpen) {
+                    songPage.showSaveFailed();
+                    gSongPageSaveFail   = true;
+                    gSongPageSaveFailMs = millis();
+                } else {
+                    showStatusNote("SAVE FAILED");
+                }
+            }
+        } else if (!autosave) {
+            gSongPageSaveFail = false;     // a later explicit save went through
+        }
+        gServerPairing.clearSaveResult();
     }
 
     // ── Boot menu overlay ─────────────────────────────────────────────────────
@@ -801,13 +829,12 @@ void loop() {
     // ── Server set to OFF — clear song and show message ──────────────────────
     if (gServerPairing.noSongPending()) {
         gServerPairing.clearNoSong();
-        bool wasOff = (gSongSource == SongSource::NONE);
+        bool wasOff = ui.noSong();       // already showing No Song → this is an echo
         engine.stop();
         initSong(&song);
         song.numPatterns = 0;            // OFF = no blocks → perform pads all grey
         ui.setSelected(0, 0);
         ui.setNoSong(true);
-        gSongSource = SongSource::NONE;
         // If the server went OFF on its own (its own "-- OFF --"), reflect it
         // now.  When we already drove OFF locally (setlist no-file entry), this
         // is the echo and we skip the redundant redraw.
@@ -823,6 +850,15 @@ void loop() {
         }
     }
 
+    // ── Load failure nobody is waiting on ─────────────────────────────────────
+    // SongPage / SetlistPage consume MSG_SONG_LOAD_FAILED themselves.  If the
+    // page that asked has since closed, drop it — the song in hand is untouched.
+    if (!songPageOpen && !setlistPageOpen && gServerPairing.loadFailPending()) {
+        Serial.printf("[SONG] server load failed (%s) — no page waiting\n",
+                      gServerPairing.loadFailText());
+        gServerPairing.clearLoadFail();
+    }
+
     // ── Unsolicited song push (server pushed song on connect or song change) ──
     // Skip when SongPage or SetlistPage is open — those pages own the SONG_READY
     // handling themselves and will copy the song into place.
@@ -832,8 +868,9 @@ void loop() {
             engine.stop();
             ui.setSelected(0, 0);
             ui.setNoSong(false);
-            gSongSource = SongSource::SERVER;
-            songPage.setServerLoadedName(song.name);
+            // The loaded song is the FILE the server pushed (what SAVE and
+            // autosave must write back to) — not the name field inside it.
+            songPage.adoptPushedSongName();
             Serial.println("[SONG] applied server-pushed song");
         }
         gServerPairing.resetBrowse();
@@ -865,7 +902,6 @@ void loop() {
             ui.setSelected(0, 0);
             ui.setNoSong(false);
             if (gServerPairing.isPaired()) {
-                gSongSource = SongSource::SERVER;
                 // Identify the loaded song by the setlist's FILENAME — it's the
                 // exact server file we loaded, so it always matches the Songs
                 // browser list and the autosave target.  (Relying on the song's
@@ -886,7 +922,6 @@ void loop() {
                 strncpy(song.name, bare, sizeof(song.name) - 1);
                 song.name[sizeof(song.name) - 1] = '\0';
             } else {
-                gSongSource = SongSource::SD;
                 songPage.clearLoadedFile();
             }
             // Stay on PerformancePage with the freshly-loaded song.  Server-
@@ -910,7 +945,6 @@ void loop() {
             song.numPatterns = 0;            // no blocks → all perform pads grey
             ui.setSelected(0, 0);
             ui.setNoSong(true);
-            gSongSource = SongSource::NONE;
             performancePage.open(engine.currentPattern(), /*stopped=*/true);
             performancePage.setTitleOverride(setlistPage.loadedDisplayName());
             display.clear();
@@ -1010,7 +1044,9 @@ void loop() {
     if (instrumentsPageOpen) {
         if (instrumentsPage.poll()) {
             instrumentsPageOpen = false;
-            if (instrumentsPage.saveOnExit()) {
+            if (!instrumentsPage.anyEditMade()) {
+                // Nothing was edited — nothing to push, nothing to reload.
+            } else if (instrumentsPage.saveOnExit()) {
                 // Instruments are server-owned — push edits up.  When unpaired
                 // there's nowhere to persist; edits stay in memory and the
                 // server bank reloads on the next connect.
@@ -1115,8 +1151,8 @@ void loop() {
             columnEditor.clearPasteNotes();
         }
         if (gServerPairing.isPaired() && columnEditor.resyncMask()) {
-            // After COPY / SWAP / CLEAR: push settings + every cell of every
-            // affected column across all patterns up to its used length.
+            // After CLEAR: push settings + every cell of every affected
+            // column across all patterns up to its used length.
             uint32_t mask = columnEditor.resyncMask();
             for (uint8_t c = 0; c < MAX_COLUMNS; c++) {
                 if (!(mask & (1u << c))) continue;
@@ -1199,11 +1235,13 @@ void loop() {
                 return;
             }
 
-            // Column-editor mode (original behaviour).
-            if (gServerPairing.isPaired() && drumTrackImportPage.importDidComplete()) {
-                uint32_t mask = drumTrackImportPage.resyncMask();
+            // Column-editor mode (original behaviour).  Resync on the mask,
+            // not on importDidComplete(): an import that failed part-way has
+            // still written / cleared the columns it got to, and the mask
+            // carries a bit for each of them.
+            uint32_t mask = drumTrackImportPage.resyncMask();
+            if (gServerPairing.isPaired() && mask != 0) {
                 uint8_t pat = columnEditor.editPattern();
-                uint8_t len = song.patterns[pat].length;
                 for (uint8_t c = 0; c < MAX_COLUMNS; c++) {
                     if (!(mask & (1u << c))) continue;
                     const uint8_t* colStart = (const uint8_t*)&song.columns[c];
@@ -1215,7 +1253,10 @@ void loop() {
                         gServerPairing.sendSongPatch(song, colStart + off, chunk);
                         off += chunk;
                     }
-                    for (uint8_t r = 0; r < len; r++) {
+                    // Every row, not just the block's length: the import
+                    // clears the whole column, and rows past the length that
+                    // stay un-synced are client/server drift.
+                    for (uint8_t r = 0; r < MAX_ROWS; r++) {
                         gServerPairing.sendNoteSet(song, pat, r, c);
                     }
                 }
@@ -1245,9 +1286,19 @@ void loop() {
                                             noteEditorPage.auditionCol());
             noteEditorPage.clearAuditionPending();
         }
-        if (gServerPairing.isPaired() && noteEditorPage.bulkPending()) {
-            gServerPairing.sendSongToServer("", &song);
-            noteEditorPage.clearBulkPending();
+        if (noteEditorPage.pastePending()) {
+            // PASTE wrote a run of rows in one column — send just those cells.
+            // (A full-song push would stop the server's sequencer.)  Unpaired,
+            // the run is dropped like any other unsent edit: the server's
+            // copy replaces ours on the next connect.
+            if (gServerPairing.isPaired()) {
+                uint8_t p  = noteEditorPage.pastePat();
+                uint8_t c  = noteEditorPage.pasteCol();
+                uint8_t hi = noteEditorPage.pasteRowHi();
+                for (uint8_t r = noteEditorPage.pasteRowLo(); r <= hi && r < MAX_ROWS; r++)
+                    gServerPairing.sendNoteSet(song, p, r, c);
+            }
+            noteEditorPage.clearPastePending();
         }
         uint8_t prevRow;
         if (gServerPairing.pollPreviewRow(&prevRow)) {
@@ -1346,7 +1397,7 @@ void loop() {
                 blockSettings.clearStructuralChange();
             }
             // A delete may have removed the pattern the engine was sitting on.
-            // Clamp before any TrackerPage code touches song.patterns[idx].
+            // Clamp before any tracker (TrackerUI) code touches song.patterns[idx].
             if (engine.currentPattern() >= song.numPatterns) {
                 engine.setPattern(song.numPatterns - 1);
             }
@@ -1365,11 +1416,17 @@ void loop() {
         SongPageResult res = songPage.poll();
         if (res == SongPageResult::HOME) {
             songPageOpen = false;
+            gSongPageSaveFail = false;   // the banner was on screen until now
             display.clear();
             ui.drawAll();
             display.paintLater();
         } else if (res == SongPageResult::SONG_LOADED) {
             songPageOpen = false;
+            if (gSongPageSaveFail &&
+                millis() - gSongPageSaveFailMs < SAVE_FAIL_CARRY_MS) {
+                showStatusNote("SAVE FAILED");
+            }
+            gSongPageSaveFail = false;
             engine.stop();
             ui.setSelected(0, 0);
             ui.setNoSong(false);
@@ -1530,6 +1587,7 @@ void loop() {
 
         case TouchAction::SONG_NAME_TAP:
             songPageOpen = true;
+            gSongPageSaveFail = false;
             songPage.open();
             display.clear();
             display.fillScreen(COL_WHITE);
@@ -1622,7 +1680,7 @@ void loop() {
             }
             // Open note editor — clear first (page change)
             display.clear();
-            noteEditor.open(&song, engine.currentPattern(), t.row, t.col, nullptr, gInstruments);
+            noteEditor.open(&song, engine.currentPattern(), t.row, t.col);
             noteEditor.draw();
             display.paintLater();
             return;  // skip redraw logic below
@@ -1683,7 +1741,7 @@ void loop() {
                     handled = true;
                 } else {
                     // Normal note — convert MIDI to tracker note
-                    int trackerNote = (int)midiNote - 11;
+                    int trackerNote = (int)midiNote - TRACKER_TO_MIDI_OFFSET;
                     if (trackerNote >= 1 && trackerNote <= NOTE_MAX) {
                         Note existing = grid.get(row, col);
                         Note n;

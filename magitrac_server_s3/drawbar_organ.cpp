@@ -8,8 +8,6 @@
 #include "freertos/queue.h"
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
-#define ORGAN_SINGLE_SINE 0      // DEBUG: 1 = one pure 8' sine per note (level
-                                 // from the 8' drawbar); 0 = full additive mix
 #define ORGAN_VOICES   12        // max simultaneous notes
 #define SINE_BITS      10        // table size = 1 << SINE_BITS
 #define SINE_SIZE      (1 << SINE_BITS)
@@ -17,7 +15,6 @@
 
 // Tonewheel model tuning.
 static const float   TW_TOP_HZ   = 6000.0f;  // highest tonewheel; partials above fold down an octave
-static const int     CLICK_GAIN  = 4;        // key-click loudness (tonewheel only)
 static const int32_t CLICK_DECAY = 170;      // Q15 per sample → ~6 ms click decay
 
 // ── Effects (global — apply to whichever organ type) ──────────────────────────
@@ -190,8 +187,6 @@ static const int32_t ENV_RELEASE_DEC = 32767 / (12 * AUDIO_CODEC_RATE_HZ / 1000)
 enum OrganType { ORGAN_DRAWBAR = 0, ORGAN_TONEWHEEL = 1, ORGAN_CLAUDE = 2, ORGAN_NEBULA = 3,
                  ORGAN_PROC = 4 };
 static volatile int s_type = ORGAN_DRAWBAR;
-static const char* const ORGAN_TYPE_NAMES[ORGAN_TYPE_COUNT] =
-    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "PROC" };
 
 // PROC type: hand-written procedural generators (see proc_sounds.cpp) — no
 // drawbars; the client picks a sound from a list and its param sliders map to
@@ -210,8 +205,6 @@ static volatile int s_procSel = 0;    // selected procedural sound
 // (extra harmonics → sparkle up high), and every note GLIDES up to pitch on
 // attack (the cinematic whoosh).  ~18 osc/voice.
 static int16_t   nebTab[SINE_SIZE];
-static const float NEB_DETUNE     = 16.0f;   // cents — half-spread of the twin pair
-static const float NEB_GLIDE_CENTS= -55.0f;  // start pitch offset, bends up to 0
 
 // CLAUDE: a deep, lush, evolving pad.  Pure sines, but each partial is seeded
 // slightly off-pitch (static micro-detune) so one note shimmers and chords form
@@ -492,13 +485,6 @@ static void renderBlock(int16_t* out) {
 
             int32_t acc = 0, accR = 0;   // accR + vStereo used only by THX (stereo pan)
             bool    vStereo = false;
-#if ORGAN_SINGLE_SINE
-            // DEBUG: one pure sine per note — the 8' fundamental only, its
-            // level set by the 8' drawbar (index 2).  Flip ORGAN_SINGLE_SINE
-            // to 0 to restore the full 9-partial additive mix.
-            v.phase[2] += v.inc[2];
-            acc = (int32_t)wtab[v.phase[2] >> (32 - SINE_BITS)] * db[2];
-#else
             if (neb) {
                 // Advance the attack glide once per block (creep up to settled).
                 if (n == 0 && v.glideQ16 < 65536) {
@@ -543,7 +529,6 @@ static void renderBlock(int16_t* out) {
                     acc += (int32_t)s * db[h];
                 }
             }
-#endif
 
             // Per-voice envelope (Q15), advanced once per sample.
             switch (v.stage) {
@@ -708,7 +693,8 @@ static void organTaskFn(void*) {
         // Full-duplex: grab the mic block as the vocoder modulator before render.
         if (s_vocoder) audioCodecRecord((uint8_t*)s_micBlock, sizeof(s_micBlock));
         renderBlock(block);
-        audioCodecPlay((const uint8_t*)block, sizeof(block));  // blocks → paces us
+        if (!audioCodecPlay((const uint8_t*)block, sizeof(block)))  // blocks → paces us
+            vTaskDelay(1);                  // no codec / reconfiguring — don't spin
     }
 }
 
@@ -817,10 +803,6 @@ void organSetType(int t) {
 }
 
 int organGetType() { return s_type; }
-
-const char* organTypeName(int t) {
-    return (t >= 0 && t < ORGAN_TYPE_COUNT) ? ORGAN_TYPE_NAMES[t] : "?";
-}
 
 void organSetVibChorus(int v) { if (v >= 0 && v <= 6) s_vibChorus = v; }
 void organSetLeslie(int v)    { if (v >= 0 && v <= 2) s_leslie    = v; }

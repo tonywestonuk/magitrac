@@ -9,11 +9,11 @@
 
 FileBrowser::FileBrowser(EPD_PainterAdafruit& d, GT911_Lite& touch)
     : _d(d), _touch(touch)
-    , _hasPrev(false), _hasNext(false)
-    , _altMode(false), _wasDown(false)
+    , _wasDown(false)
     , _itemCount(0)
-    , _listMode(false), _scroll(0)
-    , _dragStartY(0), _dragStartScroll(0), _dragMoved(false)
+    , _hiddenCount(0), _hiddenScroll(0)
+    , _scroll(0)
+    , _dragStartY(0), _dragStartScroll(0)
     , _scrollF(0.0f), _inertiaVel(0.0f), _inertiaActive(false), _inertiaMs(0)
     , _velSampleY(0), _velSampleMs(0), _suppressTap(false)
     , _dragStartX(0), _gestureDir(0), _pressRow(-1), _swipeItem(-1)
@@ -26,24 +26,18 @@ FileBrowser::FileBrowser(EPD_PainterAdafruit& d, GT911_Lite& touch)
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 void FileBrowser::open() {
-    _altMode   = false;
+    if (!_items) {
+        size_t bytes = (size_t)FB_MAX_ITEMS * STORAGE_FILENAME_MAX;
+        _items = (char (*)[STORAGE_FILENAME_MAX])ps_malloc(bytes);
+        if (!_items) _items = (char (*)[STORAGE_FILENAME_MAX])malloc(bytes);
+        if (!_items) Serial.println("[FB] item list alloc FAILED — list will be empty");
+    }
     _wasDown   = _touch.isTouched;
     _scroll    = 0;
-    _dragMoved = false;
     _scrollF   = 0.0f;
     _inertiaVel = 0.0f;
     _inertiaActive = false;
     _suppressTap = false;
-    _gestureDir = 0;
-    _swipeItem  = -1;
-}
-
-void FileBrowser::setListMode(bool v) {
-    _listMode = v;
-    _scroll   = 0;
-    _scrollF  = 0.0f;
-    _inertiaVel = 0.0f;
-    _inertiaActive = false;
     _gestureDir = 0;
     _swipeItem  = -1;
 }
@@ -58,114 +52,56 @@ void FileBrowser::setLoadedName(const char* name) {
     _loadedName[sizeof(_loadedName) - 1] = '\0';
 }
 
-void FileBrowser::setHasPrev(bool v) { _hasPrev = v; }
-void FileBrowser::setHasNext(bool v) { _hasNext = v; }
-
 void FileBrowser::setStatusText(const char* text) {
     strncpy(_statusText, text, sizeof(_statusText) - 1);
     _statusText[sizeof(_statusText) - 1] = '\0';
 }
 
 void FileBrowser::clearItems() {
-    _itemCount = 0;
+    _itemCount   = 0;
+    _hiddenCount = 0;
+}
+
+void FileBrowser::hideItems() {
+    if (_itemCount > 0) {
+        _hiddenCount  = _itemCount;
+        _hiddenScroll = _scroll;
+        _itemCount    = 0;
+    }
+    _swipeItem     = -1;
+    _inertiaActive = false;
+}
+
+void FileBrowser::restoreItems() {
+    if (_hiddenCount <= 0) return;
+    _itemCount     = _hiddenCount;
+    _hiddenCount   = 0;
+    _scroll        = _hiddenScroll;
+    _scrollF       = (float)_scroll;
+    _inertiaActive = false;
+    _swipeItem     = -1;
 }
 
 void FileBrowser::addItem(const char* name) {
-    if (_itemCount >= FB_MAX_ITEMS) return;
+    if (!_items || _itemCount >= FB_MAX_ITEMS) return;
+    _hiddenCount = 0;   // a new list replaces whatever hideItems() set aside
     strncpy(_items[_itemCount], name, STORAGE_FILENAME_MAX - 1);
     _items[_itemCount][STORAGE_FILENAME_MAX - 1] = '\0';
     _itemCount++;
 }
 
-void FileBrowser::onBootPress() {
-    if (_listMode) return;   // list uses swipe-to-delete; no DEL mode here
-    _altMode = !_altMode;
-    _d.fillScreen(COL_WHITE);
-    draw();
-    _d.paintLater();
-}
-
 // ── Draw ──────────────────────────────────────────────────────────────────────
 
 void FileBrowser::drawHeader() {
-    const char* title = _altMode ? "DELETE MODE" : _title;
     _d.fillRect(0, 0, 960, FB_HDR_H, COL_BLACK);
     _d.setTextSize(3);
     _d.setTextColor(COL_WHITE);
-    int tw = (int)strlen(title) * 18;
+    int tw = (int)strlen(_title) * 18;
     _d.setCursor((960 - tw) / 2, (FB_HDR_H - 24) / 2);
-    _d.print(title);
+    _d.print(_title);
 
-    // Right: HOME (exit).  Left: DEL delete-mode toggle — GRID mode only; the
-    // list uses per-row swipe-to-delete instead.
+    // Right: HOME (exit).  Deleting is a per-row swipe — no header DEL button.
     uiButton(_d, FB_HOME_X, 0, FB_HOME_W, FB_HDR_H, "HOME", COL_BLACK, COL_WHITE, 3);
-    if (!_listMode)
-        uiButton(_d, FB_DEL_X, 0, FB_DEL_W, FB_HDR_H, "DEL", COL_BLACK, COL_WHITE, 3);
-}
-
-void FileBrowser::drawToolbar() {
-    _d.fillRect(0, FB_HDR_H, 960, FB_TOOL_H, COL_WHITE);
-    _d.drawFastHLine(0, FB_HDR_H + FB_TOOL_H - 1, 960, COL_BLACK);
-    uiButton(_d, FB_PREV_X, FB_BTN_Y, FB_PREV_W, FB_BTN_H,
-             "PREV", COL_WHITE, _hasPrev ? COL_BLACK : COL_DKGREY, 3);
-    uiButton(_d, FB_NEXT_X, FB_BTN_Y, FB_NEXT_W, FB_BTN_H,
-             "NEXT", COL_WHITE, _hasNext ? COL_BLACK : COL_DKGREY, 3);
-}
-
-void FileBrowser::drawGrid() {
-    if (_itemCount == 0 && _statusText[0] != '\0') {
-        _d.fillRect(0, FB_LIST_Y, 960, FB_ROWS * FB_ROW_H, COL_WHITE);
-        int y = FB_LIST_Y + (FB_ROWS / 2) * FB_ROW_H;
-        _d.setTextSize(3);
-        _d.setTextColor(COL_BLACK);
-        _d.setCursor(20, y + (FB_ROW_H - 24) / 2);
-        _d.print(_statusText);
-        return;
-    }
-
-    for (int vi = 0; vi < FB_ROWS; vi++) {
-        int rowY = FB_LIST_Y + vi * FB_ROW_H;
-        for (int ci = 0; ci < FB_COLS; ci++) {
-            int idx = vi * FB_COLS + ci;
-            if (idx < _itemCount) {
-                bool isLoaded = (_loadedName[0] != '\0' &&
-                                 strcmp(_items[idx], _loadedName) == 0);
-                drawItem(ci, rowY, _items[idx], isLoaded);
-            } else {
-                _d.fillRect(ci * FB_COL_W, rowY, FB_COL_W, FB_ROW_H, COL_WHITE);
-            }
-        }
-    }
-}
-
-void FileBrowser::drawItem(int col, int rowY, const char* name, bool isLoaded) {
-    uint8_t cellBg = _altMode ? COL_BLACK : COL_WHITE;
-    uint8_t border = _altMode ? COL_WHITE : COL_BLACK;
-    uint8_t fg     = _altMode ? COL_WHITE : COL_BLACK;
-
-    int cx = col * FB_COL_W;
-    int bx = cx + 4;
-    int by = rowY + 4;
-    int bw = FB_COL_W - 8;
-    int bh = FB_ROW_H - 8;
-
-    _d.fillRect(cx, rowY, FB_COL_W, FB_ROW_H, cellBg);
-    _d.fillRect(bx, by, bw, bh, cellBg);
-    _d.drawRect(bx, by, bw, bh, border);
-
-    int labelW = (int)strlen(name) * 18;   // textSize 3: 6*3 = 18px/char
-    int tx = bx + (bw - labelW) / 2;
-    int ty = by + (bh - 24) / 2;           // textSize 3: 8*3 = 24px/char
-
-    _d.setTextSize(3);
-    _d.setTextColor(fg);
-    _d.setCursor(tx, ty);
-    _d.print(name);
-
-    if (isLoaded) {
-        _d.setCursor(tx + 1, ty);           // bold simulation: offset second pass
-        _d.print(name);
-    }
 }
 
 void FileBrowser::drawFooter() {
@@ -186,17 +122,12 @@ void FileBrowser::drawFooter() {
 
 void FileBrowser::draw() {
     drawHeader();
-    if (_listMode) {
-        drawListToolbar();
-        drawList();
-    } else {
-        drawToolbar();
-        drawGrid();
-    }
+    drawListToolbar();
+    drawList();
     drawFooter();
 }
 
-// ── List mode (drag-scroll, single column) ──────────────────────────────────
+// ── Item list (drag-scroll, single column) ──────────────────────────────────
 
 int FileBrowser::maxScroll() const {
     int m = _itemCount - FB_LIST_ROWS;
@@ -309,7 +240,7 @@ void FileBrowser::coastInertia() {
     if (fabsf(_inertiaVel) < INERTIA_MIN_VEL) _inertiaActive = false;
 }
 
-FileBrowserResult FileBrowser::pollList() {
+FileBrowserResult FileBrowser::poll() {
     FileBrowserResult r { FileBrowserEvent::NONE, -1 };
 
     bool ev   = _touch.read();
@@ -329,7 +260,6 @@ FileBrowserResult FileBrowser::pollList() {
         _dragStartX      = sx;
         _dragStartY      = sy;
         _dragStartScroll = _scroll;
-        _dragMoved       = false;
         _gestureDir      = 0;
         _pressRow        = hitListItem(sx, sy);
         _velSampleY      = sy;
@@ -349,7 +279,6 @@ FileBrowserResult FileBrowser::pollList() {
         if (_gestureDir == 0) {
             if (abs(dy) >= FB_LIST_DRAG_THRESH && abs(dy) >= abs(dx)) {
                 _gestureDir = 1;                          // vertical scroll
-                _dragMoved  = true;
                 if (_swipeItem >= 0) { _swipeItem = -1; drawList(); _d.paintLater(); }
             } else if (abs(dx) >= FB_SWIPE_THRESH && abs(dx) > abs(dy)) {
                 _gestureDir = 2;                          // horizontal swipe
@@ -395,7 +324,6 @@ FileBrowserResult FileBrowser::pollList() {
     _wasDown = false;
 
     if (_gestureDir == 1) {                       // end of a scroll → maybe fling
-        _dragMoved  = false;
         _gestureDir = 0;
         if (fabsf(_inertiaVel) >= INERTIA_MIN_VEL) {
             _inertiaActive = true;
@@ -434,71 +362,11 @@ FileBrowserResult FileBrowser::pollList() {
     return r;
 }
 
-FileBrowserResult FileBrowser::poll() {
-    if (_listMode) return pollList();
-
-    FileBrowserResult r { FileBrowserEvent::NONE, -1 };
-
-    if (!_touch.read()) return r;
-    bool down = _touch.isTouched;
-    int sx, sy;
-    rawToScreen(_touch.x, _touch.y, sx, sy);
-
-    if (!down && _wasDown) {
-        _wasDown = false;
-
-        if (hitHome(sx, sy)) {
-            r.event = FileBrowserEvent::HOME;
-        } else if (hitDel(sx, sy)) {
-            onBootPress();   // toggles delete mode
-        } else if (hitPrev(sx, sy) && _hasPrev) {
-            r.event = FileBrowserEvent::PREV_PAGE;
-        } else if (hitNext(sx, sy) && _hasNext) {
-            r.event = FileBrowserEvent::NEXT_PAGE;
-        } else if (hitNew(sx, sy)) {
-            r.event = FileBrowserEvent::NEW;
-        } else if (hitSave(sx, sy)) {
-            r.event = FileBrowserEvent::SAVE;
-        } else if (hitSaveAs(sx, sy)) {
-            r.event = FileBrowserEvent::SAVE_AS;
-        } else {
-            int idx = hitItem(sx, sy);
-            if (idx >= 0 && idx < _itemCount) {
-                r.event = _altMode ? FileBrowserEvent::ITEM_DELETE
-                                   : FileBrowserEvent::ITEM_TAP;
-                r.index = idx;
-            }
-        }
-    }
-
-    if (down && !_wasDown) _wasDown = true;
-    return r;
-}
-
 // ── Hit tests ─────────────────────────────────────────────────────────────────
 
 bool FileBrowser::hitHome(int sx, int sy) const {
     return sx >= FB_HOME_X && sx < FB_HOME_X + FB_HOME_W &&
            sy >= 0         && sy < FB_HDR_H;
-}
-bool FileBrowser::hitDel(int sx, int sy) const {
-    return sx >= FB_DEL_X && sx < FB_DEL_X + FB_DEL_W &&
-           sy >= 0        && sy < FB_HDR_H;
-}
-bool FileBrowser::hitPrev(int sx, int sy) const {
-    return sx >= FB_PREV_X && sx < FB_PREV_X + FB_PREV_W &&
-           sy >= FB_BTN_Y  && sy < FB_BTN_Y  + FB_BTN_H;
-}
-bool FileBrowser::hitNext(int sx, int sy) const {
-    return sx >= FB_NEXT_X && sx < FB_NEXT_X + FB_NEXT_W &&
-           sy >= FB_BTN_Y  && sy < FB_BTN_Y  + FB_BTN_H;
-}
-int FileBrowser::hitItem(int sx, int sy) const {
-    if (sy < FB_LIST_Y || sy >= FB_FOOT_Y) return -1;
-    int vi = (sy - FB_LIST_Y) / FB_ROW_H;
-    int ci = sx / FB_COL_W;
-    if (vi < 0 || vi >= FB_ROWS || ci < 0 || ci >= FB_COLS) return -1;
-    return vi * FB_COLS + ci;
 }
 bool FileBrowser::hitNew(int sx, int sy) const {
     return sx >= FB_NEW_X   && sx < FB_NEW_X   + FB_NEW_W &&

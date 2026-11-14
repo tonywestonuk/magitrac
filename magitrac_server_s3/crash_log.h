@@ -12,16 +12,14 @@
 //   - "audio" : the WAV task on Core 0 (sample read + codec)
 // A single breadcrumb would be ambiguous about which context died.
 
+// Values are stored (RTC breadcrumb, NVS fault ring) — don't renumber.
 enum CrashPhase : uint8_t {
     CP_BOOT = 0,
     CP_IDLE,
-    CP_SEQ_TICK,
+    CP_SEQ_TICK,      // never set at present; kept so the values below don't shift
     CP_SAMPLE_READ,   // WAV task: sample playback active (SD read + resample + codec)
-    CP_SONG_PUSH,     // receiving a full song into srvActiveBuf
-    CP_AUTOSAVE,      // writing the active song to SD
-    CP_SD_OP,         // other SD access (load / list / backup)
-    CP_MIDI,
-    CP_COUNT
+    CP_SONG_PUSH,     // a full-song push from the client is streaming in or being committed
+    CP_AUTOSAVE,      // writing the active song to SD (autosave or explicit save)
 };
 
 // Boot-step breadcrumb — finer-grained than CrashPhase, scoped to setup().
@@ -46,7 +44,6 @@ enum CrashBootStep : uint8_t {
     BS_TASKS,         // xTaskCreate (MIDI / link session)
     BS_UI,            // fieldFlashScreen + drawScreen + loadSong
     BS_DONE,          // reached the main loop
-    BS_STEP_COUNT
 };
 
 // Call once, early in setup(), after Serial is up.  Reads the reset reason +

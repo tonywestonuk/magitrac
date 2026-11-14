@@ -41,8 +41,6 @@ enum class TouchState {
     BUTTON_PENDING   // finger down on a button — fires on release
 };
 
-enum class DragAxis { UNDECIDED, VERTICAL, HORIZONTAL };
-
 class TouchHandler {
 public:
     TouchHandler(GT911_Lite& touch, TrackerUI& ui, TrackerEngine& engine, Song& song);
@@ -77,11 +75,12 @@ private:
     bool    _startInGap;     // grid press landed in a column's right-edge gap
     bool    _cellHoldArmed;  // press eligible to become CELL_HOLD (selection active, stopped)
 
-    // Column-header long-press: when finger goes down on a header, capture the
-    // moment; if it stays down for 500ms, fire COLUMN_HEADER_HOLD and consume
-    // the press so the falling edge does not also fire COLUMN_HEADER_TAP.
+    // Long-press timer: millis() at the press on a column header or (when
+    // armed) a grid cell.  If the press is still pending 500 ms later, poll()
+    // fires COLUMN_HEADER_HOLD / CELL_HOLD and resets _state to IDLE, which is
+    // what stops the release from also firing a tap — the page that opens
+    // takes over the finger.
     uint32_t _holdStart;
-    bool     _holdFired;
 
     // Velocity sampling for inertia launch
     int      _lastDragY;

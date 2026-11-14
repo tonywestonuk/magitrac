@@ -1,7 +1,7 @@
 #pragma once
 
 // Umbrella header for magitrac_lib — the shared core between
-// the magitrac client (UI) and magitrac_server (MIDI player).
+// the magitrac client (UI) and magitrac_server_s3 (MIDI player).
 // Including this in the .ino entry point triggers Arduino's
 // library discovery and puts magitrac_lib/src on the include path.
 

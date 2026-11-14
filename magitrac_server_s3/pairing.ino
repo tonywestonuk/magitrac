@@ -1,19 +1,27 @@
 // pairing.ino — server-side pairing state machine.
 //
-// Client owns the WiFi credentials (set via its WiFi settings page).
+// WiFi credentials: for SERVER_AP the server generates its own Magitrac_XXXX
+// SSID + random PSK and ships them to the client in the CHALLENGE; for
+// EXTERNAL_AP the client supplies the creds of the network to join (from its
+// WiFi settings page).  Either way the server stores whatever the client's
+// OFFER carries.
 // Pairing ceremony (over ESP-NOW, always on channel 1):
-//   1. User long-presses BtnC on server → enterPairingMode → server
-//      forces ch1 and listens for MSG_PAIR_PROBE.
+//   1. User holds the bezel strip for 2 s on the server → enterPairingMode →
+//      server forces ch1 and listens for MSG_PAIR_PROBE.
 //   2. Client (in its own pair mode) sits on ch1 broadcasting probes.
 //      Server receives a probe, generates a 4-digit PIN, unicasts
-//      MSG_PAIR_CHALLENGE back, displays PIN on LCD → SERVER_PAIRING_CONFIRM.
+//      MSG_PAIR_CHALLENGE { pin, apSsid, apPsk } back, displays PIN on LCD
+//      → SERVER_PAIRING_CONFIRM.
 //   3. User compares PIN on both screens; if matched, taps Confirm on
 //      the magitrac touch screen → client unicasts MSG_PAIR_OFFER
 //      { apMode, apSsid, apPsk }.
 //   4. Server persists creds + apMode + paired-client MAC to NVS, then
-//      ESP.restart()s.  Next boot brings WiFi up per apMode:
-//        SERVER_AP   → softAP at MAGI_SERVER_IP
-//        EXTERNAL_AP → STA, config(MAGI_SERVER_IP, ...) + begin(ssid, psk)
+//      ESP.restart()s.  Next boot brings WiFi up per apMode
+//      (serverWifiBringUp in magitrac_server_s3.ino):
+//        SERVER_AP   → hidden softAP at MAGI_SERVER_IP
+//        EXTERNAL_AP → STA, begin(ssid, psk), address from that AP's DHCP
+//   A bezel tap or the 60 s window running out abandons the ceremony and
+//   brings WiFi back up from the stored pairing (pairingAbandon).
 //
 // In SERVER_STANDALONE the server always plays; MSG_CONNECT from the
 // paired client (over TCP, once WiFi is up) transitions to SERVER_CONNECTED.
@@ -23,7 +31,7 @@
 #include <esp_random.h>
 #include <esp_wifi.h>
 
-extern bool needsFullRedraw;   // defined in magitrac_server.ino
+extern bool needsFullRedraw;   // defined in magitrac_server_s3.ino
 
 // The bezel is one logical strip (BtnA/B/C share the capacitive zone); cancel
 // should respond to a tap anywhere on it, not just the BtnC sub-zone.
@@ -39,10 +47,10 @@ enum ServerMode {
 };
 
 static ServerMode  serverMode   = SERVER_STANDALONE;
-       uint8_t     clientMac[6] = {};   // exposed for commands_server.ino
 
 // ── NVS-stored pairing ────────────────────────────────────────────────────────
-#define SRV_NVS_NS      "magitrac_srv"
+// SRV_NVS_NS ("magitrac_srv": pairing record + WiFi creds) is defined in
+// magitrac_server_s3.ino, which also reads it.
 #define SRV_SELF_NVS_NS "magitrac_srv_self"   // server-owned Magitrac_XXXX creds
 
 static bool    sHasPairing         = false;
@@ -85,14 +93,6 @@ static void srvSelfCredsLoadOrGenerate(char ssid_out[MAGI_OFFER_SSID_LEN],
                   ssid_out, psk_out);
 }
 
-// Exposed for field_flash.ino — the in-the-field OTA path serves firmware off
-// the server's OWN softAP, so it hands the posts the same self-creds the
-// pairing CHALLENGE does.
-void srvSelfCredsGet(char ssid_out[MAGI_OFFER_SSID_LEN],
-                     char psk_out [MAGI_OFFER_PSK_LEN]) {
-    srvSelfCredsLoadOrGenerate(ssid_out, psk_out);
-}
-
 // ── Pairing ceremony ──────────────────────────────────────────────────────────
 static uint8_t  sPairPendingMac[6] = {};   // MAC of the client we sent CHALLENGE to
 static uint8_t  sPairCode[4]       = {};   // PIN we generated
@@ -104,8 +104,15 @@ static const uint32_t PAIR_WINDOW_MS = 60000;
 // times out).  PROBE handler sets this; pairingLoop() sends.
 static bool     sChallengePending  = false;
 
-// ── Song push (set here on connect; consumed by commandsTick in commands_server.ino)
-bool sSongPushPending = false;
+// Latched OFFER.  The ESP-NOW recv callback runs on the WiFi task — no place
+// for NVS writes, LCD drawing, a delay and a restart.  The OFFER handler
+// checks the frame and copies its fields here; pairingLoop() does the work.
+// sOfferPending is written last in the callback, so the loop task never sees
+// half-copied fields.
+static volatile bool sOfferPending = false;
+static uint8_t       sOfferApMode  = 0;
+static char          sOfferSsid[MAGI_OFFER_SSID_LEN] = {};
+static char          sOfferPsk [MAGI_OFFER_PSK_LEN]  = {};
 
 static bool sCancelArmed = false;
 
@@ -153,7 +160,7 @@ void pairingInit() {
             sStoredClientMac[0], sStoredClientMac[1], sStoredClientMac[2],
             sStoredClientMac[3], sStoredClientMac[4], sStoredClientMac[5]);
     } else {
-        Serial.println("[PAIR] no stored pairing — long-press BtnC to pair");
+        Serial.println("[PAIR] no stored pairing — hold the bezel 2 s to pair");
     }
 }
 
@@ -163,6 +170,7 @@ void enterPairingMode() {
     serverMode         = SERVER_PAIRING;
     sPairingWindowMs   = millis();
     sChallengePending  = false;
+    sOfferPending      = false;
     BtnA.wasPressed(); BtnB.wasPressed(); BtnC.wasPressed();
     sCancelArmed       = false;
 
@@ -183,7 +191,7 @@ void enterPairingMode() {
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     delay(50);
 
-    drawClientServerScreen("PAIR MODE", "Listening", "C: Cancel");
+    drawClientServerScreen("PAIR MODE", "Listening", "Bezel tap: cancel");
     uint8_t mac[6];
     gTransportEspNow.localAddr(mac);
     Serial.printf("[PAIR] pair window open (60 s) on ch1; my MAC=%02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -194,13 +202,11 @@ void enterPairingMode() {
 bool pairingIsActive()    { return serverMode == SERVER_PAIRING ||
                                    serverMode == SERVER_PAIRING_CONFIRM; }
 bool pairingIsConnected() { return serverMode == SERVER_CONNECTED; }
-bool pairingIsPaired()    { return sHasPairing; }
 
 // ── MagiLink session hooks ──────────────────────────────────────────────────
 void pairingOnMagiLinkConnected() {
     if (serverMode == SERVER_CONNECTED) return;
     serverMode       = SERVER_CONNECTED;
-    sSongPushPending = true;
     sCancelArmed     = false;
     needsFullRedraw  = true;
     Serial.println("[PAIR] MagiLink session established");
@@ -243,36 +249,39 @@ void pairingHandleMessage(const uint8_t* data, int len) {
             break;
 
         case MSG_PAIR_OFFER:
-            // Client confirmed.  Persist creds + apMode + paired-client
-            // MAC, then reboot into the chosen WiFi mode.
+            // Client confirmed.  Check the frame here, latch its contents,
+            // and let pairingLoop() persist them and reboot (see
+            // sOfferPending) — none of that belongs in this callback.
             if (serverMode != SERVER_PAIRING_CONFIRM) return;
             if (memcmp(senderMac, sPairPendingMac, 6) != 0) return;
             if (len < (int)sizeof(MsgPairOffer)) return;
+            if (sOfferPending) return;   // already latched from an earlier copy
             {
                 const MsgPairOffer* o = (const MsgPairOffer*)data;
-                if (o->apMode == MAGI_AP_MODE_SERVER) {
-                    size_t pl = strlen(o->apPsk);
-                    if (pl > 0 && pl < 8) {
-                        Serial.printf("[PAIR] WARNING: PSK length %u — WPA2 needs 8+ chars; softAP will fail\n",
-                            (unsigned)pl);
-                    }
-                }
-
-                uint8_t zeroSecret[16] = {};
-                pairNvsSave(SRV_NVS_NS, sPairPendingMac, zeroSecret);
-                pairNvsSaveCreds(SRV_NVS_NS, o->apSsid, o->apPsk, o->apMode);
-
-                drawClientServerScreen("Paired!", "Restarting", "");
-                Serial.println("[PAIR] restarting into configured WiFi mode");
-                Serial.flush();
-                delay(200);
-                ESP.restart();
+                sOfferApMode = o->apMode;
+                memcpy(sOfferSsid, o->apSsid, sizeof(sOfferSsid));
+                memcpy(sOfferPsk,  o->apPsk,  sizeof(sOfferPsk));
+                sOfferSsid[sizeof(sOfferSsid) - 1] = '\0';
+                sOfferPsk [sizeof(sOfferPsk)  - 1] = '\0';
+                sOfferPending = true;
             }
             break;
 
         default:
             break;
     }
+}
+
+// Leave pairing mode without a completed pairing.  enterPairingMode() took
+// the softAP down, turned auto-reconnect off and parked the radio on ch1 — put
+// all of that back, or the already-paired client can never reconnect.
+static void pairingAbandon(const char* why) {
+    Serial.printf("[PAIR] %s — restoring WiFi\n", why);
+    serverMode      = SERVER_STANDALONE;
+    sOfferPending   = false;   // an OFFER that raced the cancel is void
+    needsFullRedraw = true;
+    WiFi.setAutoReconnect(true);
+    serverWifiBringUp();
 }
 
 // ── Main loop tick ────────────────────────────────────────────────────────────
@@ -287,14 +296,11 @@ void pairingLoop() {
         case SERVER_PAIRING: {
             if (!sCancelArmed && !bezelDownAny()) sCancelArmed = true;
             if (sCancelArmed && bezelTappedAny()) {
-                serverMode = SERVER_STANDALONE;
-                needsFullRedraw = true;
+                pairingAbandon("cancelled");
                 return;
             }
             if (now - sPairingWindowMs >= PAIR_WINDOW_MS) {
-                Serial.println("[PAIR] pair window timed out");
-                serverMode = SERVER_STANDALONE;
-                needsFullRedraw = true;
+                pairingAbandon("pair window timed out");
                 return;
             }
 
@@ -313,23 +319,45 @@ void pairingLoop() {
                 char codeStr[6];
                 snprintf(codeStr, sizeof(codeStr), "%c%c%c%c",
                     sPairCode[0], sPairCode[1], sPairCode[2], sPairCode[3]);
-                drawClientServerScreen("Confirm code:", codeStr, "C: Cancel");
+                drawClientServerScreen("Confirm code:", codeStr, "Bezel tap: cancel");
                 serverMode = SERVER_PAIRING_CONFIRM;
             }
             break;
         }
 
         case SERVER_PAIRING_CONFIRM: {
+            // Deferred OFFER (latched by the recv callback, which has already
+            // checked mode, sender and length).  First in this state: the
+            // client has confirmed, so a cancel tap or the window running out
+            // in the same pass no longer applies.  Persist creds + apMode +
+            // paired-client MAC, then reboot into the chosen WiFi mode.
+            if (sOfferPending) {
+                sOfferPending = false;
+                if (sOfferApMode == MAGI_AP_MODE_SERVER) {
+                    size_t pl = strlen(sOfferPsk);
+                    if (pl > 0 && pl < 8) {
+                        Serial.printf("[PAIR] WARNING: PSK length %u — WPA2 needs 8+ chars; softAP will fail\n",
+                            (unsigned)pl);
+                    }
+                }
+
+                uint8_t zeroSecret[16] = {};
+                pairNvsSave(SRV_NVS_NS, sPairPendingMac, zeroSecret);
+                pairNvsSaveCreds(SRV_NVS_NS, sOfferSsid, sOfferPsk, sOfferApMode);
+
+                drawClientServerScreen("Paired!", "Restarting", "");
+                Serial.println("[PAIR] restarting into configured WiFi mode");
+                Serial.flush();
+                delay(200);
+                ESP.restart();
+            }
             if (!sCancelArmed && !bezelDownAny()) sCancelArmed = true;
             if (sCancelArmed && bezelTappedAny()) {
-                serverMode = SERVER_STANDALONE;
-                needsFullRedraw = true;
+                pairingAbandon("cancelled");
                 return;
             }
             if (now - sPairingWindowMs >= PAIR_WINDOW_MS) {
-                Serial.println("[PAIR] pair window timed out (after CHALLENGE)");
-                serverMode = SERVER_STANDALONE;
-                needsFullRedraw = true;
+                pairingAbandon("pair window timed out (after CHALLENGE)");
             }
             break;
         }

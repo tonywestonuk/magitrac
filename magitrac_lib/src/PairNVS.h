@@ -1,19 +1,23 @@
 // PairNVS.h — persistent pairing storage
 //
-// Three things land in NVS once a pairing has happened:
+// Two things land in NVS once a pairing has happened:
 //
-//   • The paired-peer identity (mac + secret) — same for both devices.
-//     Secret is currently zeros (no per-frame signing); slot kept so
-//     signing can be re-added later without re-pairing.
+//   • The paired-peer identity (mac + secret) — each device stores the
+//     other's MAC.  Secret is currently zeros (no per-frame signing); slot
+//     kept so signing can be re-added later without re-pairing.
 //
 //   • The WiFi credentials (ssid + psk) + apMode (server hosts AP, or
-//     external AP).  The magitrac client owns these via the WiFi settings
-//     page; pairing delivers them to the server in MsgPairOffer.  Both
-//     sides write them to their own NVS so each can come up correctly on
-//     reboot without the other present.
+//     external AP).  In SERVER_AP mode they are the server's own
+//     Magitrac_XXXX softAP creds, handed to the client in MsgPairChallenge;
+//     in EXTERNAL_AP mode they are what the user typed on the client's WiFi
+//     settings page.  Either way the client sends them (back) in
+//     MsgPairOffer and both sides write them to their own NVS, so each can
+//     come up correctly on reboot without the other present.
 //
-// No IP fields stored — both devices' static IPs are constants in
-// MagiMsg.h (MAGI_SERVER_IP, MAGI_CLIENT_IP).
+// No IP fields stored.  In SERVER_AP mode both devices use the fixed
+// addresses in MagiMsg.h (MAGI_SERVER_IP_*, MAGI_CLIENT_IP_*); in EXTERNAL_AP
+// mode both take DHCP and the client finds the server from its
+// MSG_SERVER_ANNOUNCE beacon.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -32,6 +36,7 @@ void pairNvsSave(const char* ns, const uint8_t* mac6, const uint8_t* secret16);
 
 // Forget pairing (clear paired flag).  Leaves the WiFi creds intact so a
 // re-pair attempt can default to the last-known network in the WiFi page.
+// (No sketch calls this at present — there is no "forget pairing" UI.)
 void pairNvsClear(const char* ns);
 
 // ── WiFi credentials ─────────────────────────────────────────────────────────
@@ -50,11 +55,8 @@ void pairNvsSaveCreds(const char* ns,
                       const char* psk,
                       uint8_t     ap_mode);
 
-// Drop the creds flag.  Next boot falls back to ESP-NOW-only (pair-ready)
-// mode.  Does not touch the {mac, secret} pairing — call pairNvsClear
-// separately if you also want to forget the paired peer's identity.
-void pairNvsClearCreds(const char* ns);
-
 // ── DEBUG: dump every known key in `ns` to Serial ────────────────────────────
-// Safe to call at any time; opens the namespace read-only.
+// Safe to call at any time; opens the namespace read-only.  The PSK is
+// printed as a length only.  Not called from any sketch — drop a call in
+// by hand when chasing a pairing / creds problem.
 void pairNvsDump(const char* ns);

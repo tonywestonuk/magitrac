@@ -20,7 +20,7 @@ PixelPostManualPage::PixelPostManualPage(EPD_PainterAdafruit& display, GT911_Lit
     , _lastPadXSent(0)
     , _lastPadYSent(0)
     , _settings(display, touch)
-    , _confirmPwr(display, touch)
+    , _confirm(display, touch)
 {}
 
 void PixelPostManualPage::open(bool fingerDown) {
@@ -30,6 +30,10 @@ void PixelPostManualPage::open(bool fingerDown) {
     _page           = 0;
     _selectedEffect = 0xFF;
     _active         = ActiveWidget::NONE;
+    // Forget what the last visit sent, so the first slider / touchpad touch
+    // of this one always goes out.
+    _sliderSent     = false;
+    _padHeld        = false;
     // Refresh server cache with the persisted flashCtrl — covers server reboot
     // since last time we visited.
     gServerPairing.sendPixelpostFlashCtrl(gPixelPostFlashCtrl);
@@ -60,10 +64,15 @@ bool PixelPostManualPage::poll() {
         return false;
     }
 
-    // While the PWR OFF confirm dialog is up it owns touch.
-    if (_confirmPwr.isOpen()) {
-        if (_confirmPwr.poll()) {
-            if (_confirmPwr.confirmed()) gServerPairing.sendPixelpostPowerOff(true);
+    // While the PWR OFF / FW confirm dialog is up it owns touch.
+    if (_confirm.isOpen()) {
+        if (_confirm.poll()) {
+            if (_confirm.confirmed()) {
+                if (_confirmAction == ConfirmAction::FW_UPDATE)
+                    gServerPairing.sendPixelpostFirmwareUpdate();
+                else
+                    gServerPairing.sendPixelpostPowerOff(true);
+            }
             // Dialog closed — repaint the manual page underneath the overlay.
             _d.clear();
             draw();
@@ -125,6 +134,7 @@ bool PixelPostManualPage::poll() {
             // Send a final touched=false with the last (x,y) so the post
             // releases its finger but holds last position.
             gServerPairing.sendPixelpostTouchpad(_lastPadXSent, _lastPadYSent, false);
+            _padHeld = false;
             return false;
         }
 
@@ -142,13 +152,18 @@ bool PixelPostManualPage::poll() {
             // Big red button — turning every post off by accident is a pain to
             // undo, so confirm first.  The dialog draws as an overlay on top of
             // the page (no clear), and is handled by the modal block above.
-            _confirmPwr.open("Power OFF all posts?");
-            _confirmPwr.draw();
+            _confirmAction = ConfirmAction::PWR_OFF;
+            _confirm.open("Power OFF all posts?");
+            _confirm.draw();
             _d.paintLater();
             return false;
         }
         if (hitFw(sx, sy)) {
-            gServerPairing.sendPixelpostFirmwareUpdate();
+            // Sits right next to PWR OFF and reflashes every post — same guard.
+            _confirmAction = ConfirmAction::FW_UPDATE;
+            _confirm.open("Update firmware on all posts?");
+            _confirm.draw();
+            _d.paintLater();
             return false;
         }
         if (hitSet(sx, sy)) {
@@ -173,12 +188,10 @@ bool PixelPostManualPage::poll() {
             uint8_t global = (uint8_t)(_page * 6 + effIdx);
             if (global < PIXELPOST_EFFECT_COUNT) {
                 gServerPairing.sendPixelpostEffect(global);
-                uint8_t prev = _selectedEffect;
                 _selectedEffect = global;
-                // Repaint just the affected buttons to flip the highlight.
+                // Repaint the effect grid to flip the highlight.
                 drawEffectButtons();
                 _d.paintLater();
-                (void)prev;
             }
             return false;
         }
@@ -197,7 +210,8 @@ void PixelPostManualPage::sliderUpdateFromY(int sy) {
     if (v < 0)   v = 0;
     if (v > 255) v = 255;
     uint8_t value = (uint8_t)v;
-    if (value == _lastSliderSent) return;
+    if (_sliderSent && value == _lastSliderSent) return;
+    _sliderSent     = true;
     _lastSliderSent = value;
     gServerPairing.sendPixelpostSlider(value);
 }
@@ -211,7 +225,10 @@ void PixelPostManualPage::touchpadUpdateFromXY(int sx, int sy, bool touched) {
     if (y > PPM_PAD_H - 1) y = PPM_PAD_H - 1;
     uint8_t bx = (uint8_t)((x * 255) / (PPM_PAD_W - 1));
     uint8_t by = (uint8_t)((y * 255) / (PPM_PAD_H - 1));
-    if (bx == _lastPadXSent && by == _lastPadYSent) return;
+    // De-dup only within one press: a new press must send touched=true even
+    // if it lands on the same quantised spot the last one was released at.
+    if (_padHeld && touched && bx == _lastPadXSent && by == _lastPadYSent) return;
+    _padHeld      = touched;
     _lastPadXSent = bx;
     _lastPadYSent = by;
     gServerPairing.sendPixelpostTouchpad(bx, by, touched);

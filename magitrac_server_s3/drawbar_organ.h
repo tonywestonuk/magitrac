@@ -7,8 +7,10 @@
 // (16' 5 1/3' 8' 4' 2 2/3' 2' 1 3/5' 1 1/3' 1'), each weighted by its
 // drawbar setting 0..8.  A dedicated FreeRTOS task renders 16-bit stereo
 // blocks straight into the shared ES8388 codec via audioCodecPlay() — it
-// only touches the codec while organActive() is true, so it never fights
-// SamplePlayer's WAV task (that runs on a different screen).
+// only touches the codec while organActive() is true.  There is no mixer, so
+// whoever activates it (the organ screen / client organ page, or the sequencer
+// for a song with an ORGAN column) stops SamplePlayer first, and SFX columns
+// stay silent while the organ is active.
 //
 // Live MIDI drives it through a lock-free queue: the MIDI task (Core 1)
 // calls organNoteOn/organNoteOff, the synth task (Core 0) drains the queue
@@ -47,7 +49,6 @@ int  organVoiceCount();
 // change applies to notes played after it.
 void organSetType(int t);
 int  organGetType();
-const char* organTypeName(int t);
 
 // Global effects (apply to either type).
 // vibChorus: 0=off, 1..3 = V1/V2/V3 (vibrato), 4..6 = C1/C2/C3 (chorus)

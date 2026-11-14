@@ -6,7 +6,8 @@
 static const char* const OR_FOOTAGE[OR_N] =
     { "16", "5 1/3", "8", "4", "2 2/3", "2", "1 3/5", "1 1/3", "1" };
 
-// Organ voice models — must line up with the server's ORGAN_TYPE_NAMES order.
+// Organ voice models — must line up with the server's organ type numbering
+// (see ORGAN_TYPE_COUNT in the server's drawbar_organ.h).
 static const char* const OR_TYPE_NAMES[OR_TYPE_N] =
     { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "PROC" };
 static const char* const OR_VC_NAMES[OR_VC_N]   = { "OFF", "V1", "V2", "V3", "C1", "C2", "C3" };
@@ -153,8 +154,10 @@ void OrganPage::adoptFromSong() {
 void OrganPage::open() {
     _open    = true;
     _wasDown = _touch.isTouched;
-    _dragCol = -1;
-    adoptFromSong();   // song's ORGAN columns (if any) override the page state
+    _dragCol  = -1;
+    _dragKnob = -1;      // a drag cut short by leaving the page must not resume
+    _tipShown = false;
+    adoptFromSong();   // the song's OrganPatch (if present) overrides the page state
     _d.clear();
     draw();
     _d.paint();

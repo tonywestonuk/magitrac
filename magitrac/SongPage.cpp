@@ -1,12 +1,31 @@
 #include "SongPage.h"
 #include "ServerPairing.h"
-#include "SongSource.h"
 #include "Autosave.h"
 #include <Arduino.h>
 #include <string.h>
 #include <stdio.h>
 
-extern void initSong(Song*);
+// Size passed to the name keyboard (it counts the terminator): song names are
+// typed up to 8 characters — well inside what a song-list entry carries whole
+// (SL_NAME_LEN - 5, see startServerLoad()).
+static const uint8_t SONG_NAME_INPUT_MAX = 9;
+
+// Header-bar banners.  SAVE FAILED: the save never left (sendSaveActive()
+// false), or the server answered that it could not write it.  NOT CONNECTED:
+// a load was asked for with no link, or the link dropped while it was awaited.
+static const char* const SAVE_FAILED_TITLE   = "SAVE FAILED";
+static const char* const NOT_CONNECTED_TITLE = "NOT CONNECTED";
+
+// File stem ("<name>", no ".mgt") of the song push the server last completed;
+// "" when it reports no file.  Copied out at once — the pairing layer rewrites
+// its buffer on the link task when the next push lands.
+static void pushedSongStem(char* out, size_t outSize) {
+    const char* f = gServerPairing.pushedSongFile();
+    strncpy(out, f ? f : "", outSize - 1);
+    out[outSize - 1] = '\0';
+    size_t n = strlen(out);
+    if (n >= 4 && strcasecmp(out + n - 4, ".mgt") == 0) out[n - 4] = '\0';
+}
 
 // ── Constructor ───────────────────────────────────────────────────────────────
 
@@ -26,6 +45,7 @@ SongPage::SongPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song)
     _srvLoadedName[0]        = '\0';
     _pendingSaveName[0]      = '\0';
     _srvPendingDeleteName[0] = '\0';
+    _srvRequestedName[0]     = '\0';
 }
 
 // ── open() ────────────────────────────────────────────────────────────────────
@@ -33,17 +53,21 @@ SongPage::SongPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song)
 void SongPage::open() {
     _wasDown = _touch.isTouched;
     // Do NOT clear _loadedFilename — preserves current file across opens.
+    _srvAwaitingSong     = false;     // no load of this page's is in flight
+    _srvReceivingShown   = false;
+    _srvRerequested      = false;
+    _srvRequestedName[0] = '\0';
 
     if (gServerPairing.isPaired()) {
         // Connected to server — open server browser directly.  The server list
         // is a drag-scroll list that accumulates every page into one list.
         gServerPairing.resetBrowse();
+        gServerPairing.clearLoadFail();   // a stale failure isn't this page's
         gServerPairing.requestSongList(0);
         _srvPage      = 0;
         _srvListDrawn = false;
         _state = State::SERVER_BROWSE;
         _browser.open();
-        _browser.setListMode(true);
         _browser.setTitle("SERVER");
         _browser.setLoadedName(_srvLoadedName);
         _browser.clearItems();
@@ -117,7 +141,6 @@ SongPageResult SongPage::poll() {
                 gServerPairing.deleteSongOnServer(name);
                 if (_srvLoadedName[0] != '\0' && strcmp(name, _srvLoadedName) == 0) {
                     _srvLoadedName[0] = '\0';
-                    gSongSource = SongSource::NONE;
                 }
                 _srvPendingDeleteName[0] = '\0';
                 restartServerList("Loading...");
@@ -139,8 +162,27 @@ SongPageResult SongPage::poll() {
     // a new one).
     if (_state == State::CONFIRM_SAVE_LOAD) {
         if (_dialog.poll()) {
-            if (_dialog.confirmed())
-                gServerPairing.sendSaveActive(_srvLoadedName);
+            if (_dialog.confirmed() &&
+                !gServerPairing.sendSaveActive(_srvLoadedName)) {
+                // YES, but the save never left (link down).  Keep the edits
+                // and the dirty flag, and abandon the pending load / NEW
+                // rather than replace a song that was not saved.
+                _pendingNew = false;
+                _state = State::SERVER_BROWSE;
+                _browser.setTitle(SAVE_FAILED_TITLE);
+                _d.fillScreen(COL_WHITE);
+                _browser.draw();
+                _d.paintLater();
+                return SongPageResult::NONE;
+            }
+            if (!_pendingNew && !gServerPairing.isPaired()) {
+                // NO, but the link has gone: the load cannot happen, so the
+                // edits are not discarded either (startServerLoad() would only
+                // say NOT CONNECTED — say it here, before marking clean).
+                _state = State::SERVER_BROWSE;
+                showListBanner(NOT_CONNECTED_TITLE);
+                return SongPageResult::NONE;
+            }
             markSongClean();                 // saved, or edits discarded
             if (_pendingNew) {
                 _pendingNew = false;
@@ -157,6 +199,8 @@ SongPageResult SongPage::poll() {
     if (_state == State::SAVING_AS_SRV) {
         if (_keyboard.poll()) {
             if (_keyboard.isDone() && _pendingSaveName[0] != '\0') {
+                char prevName[sizeof(_song.name)];
+                memcpy(prevName, _song.name, sizeof(prevName));
                 strncpy(_song.name, _pendingSaveName, sizeof(_song.name) - 1);
                 _song.name[sizeof(_song.name) - 1] = '\0';
                 // Patch the server's in-memory song.name to match (so the
@@ -164,12 +208,24 @@ SongPageResult SongPage::poll() {
                 // write to SD.  No full-song stream needed — server already
                 // has every edit via the patch / note-set stream.
                 gServerPairing.sendSongPatch(_song, _song.name, sizeof(_song.name));
-                gServerPairing.sendSaveActive(_pendingSaveName);
-                markSongClean();
-                strncpy(_srvLoadedName, _pendingSaveName, sizeof(_srvLoadedName) - 1);
-                _srvLoadedName[sizeof(_srvLoadedName) - 1] = '\0';
-                // Refresh list so the newly saved file appears
-                restartServerList("Saving...");
+                // "Sent" is all a true return means; the server's verdict
+                // arrives later (saveResult*, handled by the main loop, which
+                // re-marks the song dirty and calls showSaveFailed()).
+                if (gServerPairing.sendSaveActive(_pendingSaveName)) {
+                    markSongClean();
+                    setServerLoadedName(_pendingSaveName);
+                    _browser.setTitle("SERVER");
+                    // Refresh list so the newly saved file appears
+                    restartServerList("Saving...");
+                } else {
+                    // Never left (link down).  The song is still the file it
+                    // was loaded from: keep that as the SAVE / autosave target
+                    // and put its name back, so a later save cannot write the
+                    // old file under the new name.  Stays dirty; list stays.
+                    memcpy(_song.name, prevName, sizeof(prevName));
+                    gServerPairing.sendSongPatch(_song, _song.name, sizeof(_song.name));
+                    _browser.setTitle(SAVE_FAILED_TITLE);
+                }
             }
             _state = State::SERVER_BROWSE;
             _d.fillScreen(COL_WHITE);
@@ -201,11 +257,18 @@ SongPageResult SongPage::poll() {
                 _song.name[sizeof(_song.name) - 1] = '\0';
                 gServerPairing.sendNewSong();   // wipe server's in-memory copy
                 gServerPairing.sendSongPatch(_song, _song.name, sizeof(_song.name));
-                gServerPairing.sendSaveActive(_pendingSaveName);
-                markSongClean();
-                strncpy(_srvLoadedName, _pendingSaveName, sizeof(_srvLoadedName) - 1);
-                _srvLoadedName[sizeof(_srvLoadedName) - 1] = '\0';
-                gSongSource = SongSource::SERVER;
+                _srvAwaitingSong   = false;     // any load in flight is moot now
+                _srvReceivingShown = false;
+                if (gServerPairing.sendSaveActive(_pendingSaveName)) {
+                    markSongClean();
+                    setServerLoadedName(_pendingSaveName);
+                } else {
+                    // The save never left, so no server file has this name —
+                    // and the blank song must not keep the PREVIOUS song's
+                    // file as its SAVE / autosave target either.  Unnamed and
+                    // dirty until a SAVE AS goes through.
+                    _srvLoadedName[0] = '\0';
+                }
                 return SongPageResult::SONG_LOADED;
             }
             // Cancelled / empty name — abandon NEW, back to the server list.
@@ -237,18 +300,74 @@ SongPageResult SongPage::poll() {
     if (_state == State::SERVER_BROWSE) {
         BrowseState bs = gServerPairing.browseState();
 
-        // Song received — load it and return
+        // A song push completed.
         if (bs == BrowseState::SONG_READY) {
-            if (gServerPairing.copySong(&_song)) {
+            char stem[SRV_NAME_MAX];
+            pushedSongStem(stem, sizeof(stem));
+            if (_srvAwaitingSong && !_srvRerequested &&
+                _srvRequestedName[0] != '\0' &&
+                strcasecmp(stem, _srvRequestedName) != 0) {
+                // Not the song this page asked for — e.g. the reconnect pull
+                // of the previous song landing ahead of our reply.  Take
+                // nothing from it; ask again and keep waiting.  Once only:
+                // whatever arrives after the re-request is accepted, so two
+                // sides that disagree about a name cannot loop.
+                Serial.printf("[SongPage] got '%s' while waiting for '%s' — re-requesting\n",
+                              stem, _srvRequestedName);
+                _srvRerequested = true;
+                gServerPairing.requestSongLoadByName(_srvRequestedName);
+                _srvLoadStartMs = millis();
+            } else if (gServerPairing.copySong(&_song)) {
                 _loadedFilename[0] = '\0';
-                strncpy(_srvLoadedName, _song.name, sizeof(_srvLoadedName) - 1);
-                _srvLoadedName[sizeof(_srvLoadedName) - 1] = '\0';
-                gSongSource = SongSource::SERVER;
+                // Identity is the FILE the server read, not the name field
+                // inside it (which can be blank or out of step with the file).
+                setServerLoadedName(stem[0] != '\0' ? stem : _song.name);
+                _srvAwaitingSong   = false;
+                _srvReceivingShown = false;
                 gServerPairing.resetBrowse();
                 return SongPageResult::SONG_LOADED;
+            } else {
+                // Corrupt data — show the list again
+                _srvAwaitingSong = false;
+                restartServerList("Loading...");
             }
-            // Corrupt data — show the list again
-            restartServerList("Loading...");
+        }
+
+        // The server answered the load with a failure (file missing, SD read
+        // error, not a song…).  It kept its previous song and so do we — just
+        // bring the list back straight away.  The reason goes in the header
+        // bar, which stays put once the list has redrawn over the status line.
+        if (gServerPairing.loadFailPending()) {
+            char title[24];
+            snprintf(title, sizeof(title), "LOAD FAILED - %s",
+                     gServerPairing.loadFailText());
+            gServerPairing.clearLoadFail();
+            Serial.printf("[SongPage] %s\n", title);
+            _browser.setTitle(title);
+            _srvAwaitingSong = false;         // that was the answer
+            _srvLoadSlow = true;              // not a slow link — no second notice
+            restartServerList("Load failed on server");
+            _d.fillScreen(COL_WHITE);
+            _browser.draw();
+            _d.paintLater();
+        }
+
+        // The load in flight ended with neither a song nor a failure report:
+        // the link dropped (the pairing layer resets the browse state when it
+        // does).  Nothing more will arrive for that request, so give up on it
+        // and bring the list back rather than sit on "Receiving song...".
+        if (_srvAwaitingSong &&
+            (!gServerPairing.isPaired() ||
+             (_srvReceivingShown && bs != BrowseState::WAITING_SONG &&
+                                    bs != BrowseState::SONG_READY))) {
+            Serial.println("[SongPage] link dropped while waiting for a song");
+            _srvAwaitingSong = false;
+            if (_srvReceivingShown) {
+                _srvReceivingShown = false;
+                _browser.restoreItems();
+            }
+            if (_browser.itemCount() == 0) _browser.setStatusText("Not connected");
+            showListBanner(NOT_CONNECTED_TITLE);
         }
 
         // A list page arrived — append its entries, then request the next page
@@ -271,10 +390,17 @@ SongPageResult SongPage::poll() {
             }
         }
 
-        // Song load timeout — give up after 8 s and show list again
-        if (bs == BrowseState::WAITING_SONG && millis() - _srvLoadStartMs > 8000) {
-            gServerPairing.resetBrowse();
-            restartServerList("Loading...");
+        // Slow load (8 s) — bring the list back so the page stays usable, but
+        // do NOT resetBrowse(): that zeroes the receive counters under a
+        // stream that is still arriving, so a song that lands at 9 s could
+        // never complete.  On a crowded 2.4 GHz channel TCP finishes late,
+        // not never — the SONG_READY check above still loads it whenever it
+        // lands.  If the socket really died, the reconnect pull recovers.
+        if (_srvAwaitingSong && bs == BrowseState::WAITING_SONG && !_srvLoadSlow &&
+            millis() - _srvLoadStartMs > 8000) {
+            _srvLoadSlow = true;
+            Serial.println("[SongPage] slow server load — keeping the stream, showing list");
+            restartServerList("Slow link - still receiving...");
         }
 
         FileBrowserResult r = _browser.poll();
@@ -283,8 +409,6 @@ SongPageResult SongPage::poll() {
         case FileBrowserEvent::HOME:
             gServerPairing.resetBrowse();
             return SongPageResult::HOME;
-
-        // PREV_PAGE / NEXT_PAGE are never emitted in list mode (drag-scroll).
 
         case FileBrowserEvent::NEW:
             // Same guard as loading a different song: offer to save edits first.
@@ -306,9 +430,15 @@ SongPageResult SongPage::poll() {
         case FileBrowserEvent::SAVE:
             // Server already has every edit via the patch / note-set stream;
             // ask it to write its own in-memory copy to SD under this name.
-            gServerPairing.sendSaveActive(_srvLoadedName);
-            markSongClean();
-            restartServerList("Saving...");
+            if (gServerPairing.sendSaveActive(_srvLoadedName)) {
+                markSongClean();
+                _browser.setTitle("SERVER");   // drop any earlier failure banner
+                restartServerList("Saving...");
+            } else {
+                // Never left (link down): keep the list and the dirty flag,
+                // and say so in the header bar.
+                _browser.setTitle(SAVE_FAILED_TITLE);
+            }
             _d.fillScreen(COL_WHITE);
             _browser.draw();
             _d.paintLater();
@@ -317,7 +447,7 @@ SongPageResult SongPage::poll() {
         case FileBrowserEvent::SAVE_AS:
             strncpy(_pendingSaveName, _song.name, sizeof(_pendingSaveName) - 1);
             _pendingSaveName[sizeof(_pendingSaveName) - 1] = '\0';
-            _keyboard.open(_pendingSaveName, 9);
+            _keyboard.open(_pendingSaveName, SONG_NAME_INPUT_MAX);
             _state = State::SAVING_AS_SRV;
             _d.fillScreen(COL_WHITE);
             _browser.draw();
@@ -380,20 +510,58 @@ void SongPage::drawHeader(const char* title, int h) {
 void SongPage::restartServerList(const char* status) {
     _srvPage      = 0;
     _srvListDrawn = false;
+    _srvReceivingShown = false;   // the list is on its way back in
     _browser.clearItems();
     _browser.setStatusText(status);
     gServerPairing.requestSongList(0);
 }
 
-// Request the server song at absolute list index and show "Receiving...".
-// The flat list index maps to the server's page/index (same sorted order).
+// Request the server song at absolute list index and show "Receiving song...".
+// Asked for by name where the list entry is known to be whole; otherwise by
+// the flat list index mapped to the server's page/index (same sorted order).
 void SongPage::startServerLoad(int absIdx) {
-    gServerPairing.requestSongLoad((uint8_t)(absIdx / SL_PER_PKT),
-                                   (uint8_t)(absIdx % SL_PER_PKT));
+    if (!gServerPairing.isPaired()) {
+        // No link: the request would go nowhere and "Receiving song..." would
+        // never end.  Keep the list and say why nothing happened.
+        showListBanner(NOT_CONNECTED_TITLE);
+        return;
+    }
+    // Ask by name: an index only means something against the directory scan
+    // the server made for the list, and it rescans for the load — a scan that
+    // comes back different (or short) would fetch the wrong song, or none.
+    // A list entry carries SL_NAME_LEN - 1 chars of "<name>.mgt", so a name of
+    // up to SL_NAME_LEN - 5 chars is known to be whole; a longer one may be
+    // truncated, and only the index can still identify that file.
+    const char* nm = _browser.itemName(absIdx);
+    _srvRequestedName[0] = '\0';
+    if (nm[0] != '\0' && strlen(nm) <= SL_NAME_LEN - 5) {
+        // Remembered so a different song landing first is not taken for it.
+        strncpy(_srvRequestedName, nm, sizeof(_srvRequestedName) - 1);
+        _srvRequestedName[sizeof(_srvRequestedName) - 1] = '\0';
+        gServerPairing.requestSongLoadByName(_srvRequestedName);
+    } else {
+        // By index: no name to check the reply against — accept what comes.
+        gServerPairing.requestSongLoad((uint8_t)(absIdx / SL_PER_PKT),
+                                       (uint8_t)(absIdx % SL_PER_PKT));
+    }
+    _srvAwaitingSong   = true;
+    _srvReceivingShown = true;
+    _srvRerequested    = false;
+    _browser.setTitle("SERVER");       // drop any earlier banner
     _srvLoadStartMs = millis();
+    _srvLoadSlow    = false;
     _srvListDrawn   = false;
-    _browser.clearItems();
+    // Set the list aside rather than clear it: if the link drops, it comes
+    // straight back (there would be no way to fetch it again).
+    _browser.hideItems();
     _browser.setStatusText("Receiving song...");
+    _d.fillScreen(COL_WHITE);
+    _browser.draw();
+    _d.paintLater();
+}
+
+void SongPage::showListBanner(const char* title) {
+    _browser.setTitle(title);
     _d.fillScreen(COL_WHITE);
     _browser.draw();
     _d.paintLater();
@@ -403,7 +571,7 @@ void SongPage::startServerLoad(int absIdx) {
 // non-empty name is confirmed (see the NAMING_NEW poll branch).
 void SongPage::beginNewSong() {
     _pendingSaveName[0] = '\0';
-    _keyboard.open(_pendingSaveName, 9);
+    _keyboard.open(_pendingSaveName, SONG_NAME_INPUT_MAX);
     _state = State::NAMING_NEW;
     _d.fillScreen(COL_WHITE);
     _browser.draw();
@@ -431,18 +599,24 @@ void SongPage::setServerLoadedName(const char* name) {
     }
 }
 
+void SongPage::adoptPushedSongName() {
+    char stem[SRV_NAME_MAX];
+    pushedSongStem(stem, sizeof(stem));
+    setServerLoadedName(stem[0] != '\0' ? stem : _song.name);
+}
+
+void SongPage::showSaveFailed() {
+    _browser.setTitle(SAVE_FAILED_TITLE);
+    // Under a keyboard / dialog (or the not-connected notice) the banner
+    // waits for the next browser draw.
+    if (_state == State::SERVER_BROWSE) {
+        _d.fillScreen(COL_WHITE);
+        _browser.draw();
+        _d.paintLater();
+    }
+}
+
 void SongPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
     sx = ry;
     sy = 540 - rx;
-}
-
-// ── Boot button alt mode ───────────────────────────────────────────────────────
-
-void SongPage::onBootPress() {
-    if (_state == State::SAVING_AS_SRV || _state == State::NAMING_NEW) {
-        _keyboard.toggleSymbolLayer();
-    } else if (_state == State::SERVER_BROWSE) {
-        _browser.onBootPress();
-    }
-    // Ignore on CONFIRM_* / NOT_CONNECTED states
 }

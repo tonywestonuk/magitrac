@@ -7,17 +7,18 @@ static enum { NONE, ADC_DIV, BQ25896_I2C } _backend = NONE;
 
 static uint8_t _adc_pin;
 static float   _adc_div;
-static int     _adc_mv_full;
-static int     _adc_mv_empty;
 static int     _adc_chg_pin = -1;
 static bool    _adc_chg_low = true;
 
 void battery_begin_adc(uint8_t pin, float div_ratio, int mv_full, int mv_empty,
                        int chg_stat_pin, bool chg_active_low) {
+    // mv_full / mv_empty fed the old linear voltage→percent map, which is
+    // gone (BatteryGauge's OCV curve does that job).  The parameters stay only
+    // so existing callers keep compiling.
+    (void)mv_full;
+    (void)mv_empty;
     _adc_pin      = pin;
     _adc_div      = div_ratio;
-    _adc_mv_full  = mv_full;
-    _adc_mv_empty = mv_empty;
     _adc_chg_pin  = chg_stat_pin;
     _adc_chg_low  = chg_active_low;
     analogSetPinAttenuation(pin, ADC_11db);
@@ -29,11 +30,6 @@ static int _read_adc_mv() {
     uint32_t sum = 0;
     for (int i = 0; i < 4; i++) sum += analogReadMilliVolts(_adc_pin);
     return (int)(sum / 4 * _adc_div);
-}
-
-static int _read_adc() {
-    int bat_mv = _read_adc_mv();
-    return constrain((bat_mv - _adc_mv_empty) * 100 / (_adc_mv_full - _adc_mv_empty), 0, 100);
 }
 
 // ── BQ25896 backend ───────────────────────────────────────────────────────────
@@ -70,13 +66,28 @@ static bool _bq_write_reg(uint8_t reg, uint8_t val) {
 // mode CONV_START never fires on its own, so a cold read returns the reset
 // value (2304 mV → 0 %) and the meter looks frozen.  Kick a one-shot
 // conversion (REG02 bit 7) and wait for it to auto-clear before reading.
+//
+// One conversion refreshes every ADC register (BATV 0x0E and ICHGR 0x12
+// alike), and the wait blocks the caller, so readers called back-to-back —
+// the gauge reads voltage then charge current in one update — share a
+// conversion instead of each paying for its own.
+static const uint32_t BQ_CONV_FRESH_MS = 500;
+static bool     _bq_conv_done    = false;   // a conversion has completed
+static uint32_t _bq_conv_done_ms = 0;       // millis() when it did
+
 static void _bq_kick_adc() {
+    if (_bq_conv_done && millis() - _bq_conv_done_ms < BQ_CONV_FRESH_MS) return;
+    _bq_conv_done = false;
     uint8_t reg02;
     if (!_bq_read_reg(0x02, reg02)) return;
     if (!_bq_write_reg(0x02, reg02 | 0x80)) return;   // CONV_START
     for (int i = 0; i < 40; i++) {                    // ≤ ~120 ms guard
         if (!_bq_read_reg(0x02, reg02)) return;
-        if (!(reg02 & 0x80)) return;                  // conversion complete
+        if (!(reg02 & 0x80)) {                        // conversion complete
+            _bq_conv_done    = true;
+            _bq_conv_done_ms = millis();
+            return;
+        }
         delay(3);
     }
 }
@@ -89,12 +100,6 @@ static int _read_bq25896_mv() {
     return 2304 + (int)(reg0e & 0x7F) * 20;
 }
 
-static int _read_bq25896_pct() {
-    int bat_mv = _read_bq25896_mv();
-    if (bat_mv < 0) return -1;
-    return constrain((bat_mv - 3000) * 100 / (4200 - 3000), 0, 100);
-}
-
 static bool _bq25896_usb_present() {
     if (!_wire) return false;
     uint8_t reg0b;
@@ -103,14 +108,6 @@ static bool _bq25896_usb_present() {
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
-
-int battery_read_pct() {
-    switch (_backend) {
-        case ADC_DIV:     return _read_adc();
-        case BQ25896_I2C: return _read_bq25896_pct();
-        default:          return -1;
-    }
-}
 
 bool battery_is_charging() {
     switch (_backend) {

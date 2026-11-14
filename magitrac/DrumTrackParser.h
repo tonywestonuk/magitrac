@@ -13,8 +13,8 @@
 //   OH ----------------
 //   ... (13 instrument rows per block)
 //
-// Multiple blocks per file.  Header values (tempo / time / swing / order)
-// are parsed for display but not used by the import logic.
+// Multiple blocks per file.  Of the header values only Tempo is kept (it
+// sets the audition speed); Time / Swing / Order are recognised and skipped.
 
 #define DRUM_PATTERN_STEPS       16
 #define DRUM_PATTERN_MAX_INSTRS  13      // matches DRUM_GM_ENTRIES
@@ -33,31 +33,35 @@ struct DrumPatternBlock {
     DrumPatternInstr instrs[DRUM_PATTERN_MAX_INSTRS];
     uint8_t          numInstrs;        // count of populated entries in `instrs`
 
-    int   activeCount() const;          // instruments with at least one hit
-    // Indices (into instrs[]) of active instruments, written into `out`.
-    // Returns number written.  Caller must size `out` to >= activeCount().
+    // Indices (into instrs[]) of the active instruments (those with at least
+    // one hit), written into `out`.  Returns the number written, at most
+    // `cap` — size `out` to DRUM_PATTERN_MAX_INSTRS to get them all.
     int   activeIndices(int* out, int cap) const;
 };
 
 class DrumPatternFile {
 public:
+    DrumPatternFile() = default;
+    ~DrumPatternFile();
+    DrumPatternFile(const DrumPatternFile&)            = delete;   // owns _blocks
+    DrumPatternFile& operator=(const DrumPatternFile&) = delete;
+
     // Parse `text` of `len` bytes.  Returns true on success (at least one
-    // block recognised).  Re-parsing replaces any previous content.
+    // block recognised).  Re-parsing replaces any previous content.  Also
+    // false if the block storage could not be allocated.
     bool parse(const char* text, uint32_t len);
 
     int  blockCount() const               { return _blockCount; }
     const DrumPatternBlock* block(int i) const {
-        return (i >= 0 && i < _blockCount) ? &_blocks[i] : nullptr;
+        return (_blocks && i >= 0 && i < _blockCount) ? &_blocks[i] : nullptr;
     }
 
     int  tempo() const                    { return _tempo; }
-    const char* time() const              { return _time; }
-    int  swing() const                    { return _swing; }
 
 private:
-    DrumPatternBlock _blocks[DRUM_PATTERN_MAX_BLOCKS];
+    // DRUM_PATTERN_MAX_BLOCKS entries (~9.5 KB) in PSRAM, allocated by the
+    // first parse() and kept — the object itself sits inside a global page.
+    DrumPatternBlock* _blocks = nullptr;
     int  _blockCount = 0;
     int  _tempo      = 0;
-    char _time[8]    = {};
-    int  _swing      = 0;
 };

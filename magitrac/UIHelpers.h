@@ -13,10 +13,3 @@ void uiButton(EPD_PainterAdafruit& d,
               const char* label,
               uint8_t bg, uint8_t fg,
               int ts = 3);
-
-// Two-line variant — line1 on top, line2 below with a small gap.
-void uiButton2Line(EPD_PainterAdafruit& d,
-                   int x, int y, int w, int h,
-                   const char* line1, const char* line2,
-                   uint8_t bg, uint8_t fg,
-                   int ts = 3);

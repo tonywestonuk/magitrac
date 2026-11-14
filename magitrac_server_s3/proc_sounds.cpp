@@ -2,6 +2,7 @@
 #include "audio_codec.h"
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 #include "esp_heap_caps.h"
 
 // ── Registry ──────────────────────────────────────────────────────────────────
@@ -92,7 +93,8 @@ static int16_t s_chFund[PROC_WT];
 // disc motor).  Two cascaded ~1 Hz one-poles on white noise give the slow
 // drift (±20 cents at the 95th percentile, matching the discs), one ~14 Hz
 // pole gives the fast jitter (±5 cents).  Advanced once per block by
-// procBlockTick; block rate = 32 kHz / 128 = 250 Hz.
+// procBlockTick; block rate = 32 kHz / 128 = 250 Hz.  NOTE: procBlockTick is
+// not called from the render loop at present, so s_chWowQ16 stays 0.
 static int32_t  s_chWowLp1 = 0, s_chWowLp2 = 0, s_chFlutLp = 0;
 static uint32_t s_chWowRng = 0x9E3779B9u;
 static int32_t  s_chWowQ16 = 0;
@@ -110,7 +112,7 @@ int16_t* gProcTabS[PROC_SOUND_COUNT];
 
 // THX sawtooth: additive to ~24 harmonics (mildly band-limited — tames aliasing
 // on the high octaves of the final chord without going dull).  Small internal
-// table (2 KB), read by thxSample in the hot loop.
+// table (2 KB), read by thxSampleStereo in the hot loop.
 int16_t gThxSaw[PROC_WT];
 
 ProcFormantState gProcFormant[PROC_FORMANT_STAGES] = {};
@@ -160,7 +162,11 @@ static void buildFramePair(int sound, const float* hA, const float* hS, int nh,
                                                       MALLOC_CAP_SPIRAM);
     if (!a || !s || !gProcTabA[sound] || !gProcTabS[sound]) {
         free(a); free(s);
-        return;   // PROC sound stays silent; everything else lives
+        // Leave both tables null (never half-built garbage) — procBlockPrep
+        // checks for that and renders the sound silent; everything else lives.
+        free(gProcTabA[sound]); gProcTabA[sound] = nullptr;
+        free(gProcTabS[sound]); gProcTabS[sound] = nullptr;
+        return;
     }
     for (int i = 0; i < PROC_WT; i++) { a[i] = 0.0f; s[i] = 0.0f; }
     uint32_t seed = 0x2F6E2B1u;
@@ -191,7 +197,7 @@ static void buildFramePair(int sound, const float* hA, const float* hS, int nh,
 
 void procSoundsInit() {
     buildFramePair(0, TT_ATTACK, TT_SUSTAIN, TT_NH);
-    float chSc;
+    float chSc = 0.0f;   // stays 0 if the frame alloc fails → s_chFund all zero
     buildFramePair(1, CH_ATTACK, CH_SUSTAIN, CH_NH, &chSc);
     {   // one BREATH step of h1, with the frames' h1 phase (first LCG draw)
         uint32_t seed = 0x2F6E2B1u * 1664525u + 1013904223u;
@@ -414,6 +420,12 @@ void procBlockTick(int sound) {
 
 void procBlockPrep(int sound, ProcVoiceState& ps, int16_t* scratch,
                    const volatile int* param) {
+    // Frame tables never built (PSRAM alloc failed in buildFramePair): play a
+    // silent wavetable rather than dereference null.
+    if (!gProcTabA[sound] || !gProcTabS[sound]) {
+        memset(scratch, 0, PROC_WT * sizeof(int16_t));
+        return;
+    }
     if (sound == 1) {
         // CHOIR ensemble: advance the per-osc vibrato LFOs (block rate) and
         // re-derive the increments; ~2^(c/1200) ≈ 1 + c·0.000578 for small c,

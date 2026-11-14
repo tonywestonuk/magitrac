@@ -8,22 +8,24 @@
 //
 //  y=  0  ┌─ Header: "WIFI" [BACK x=830,w=130]  (50px) ──────────────────────┐
 //  y= 50  ├─ "MODE" label strip (20px) ───────────────────────────────────────┤
-//  y= 70  ├─ Mode row: "MODE" [Server hosts AP] [External AP] (60px) ────────┤
+//  y= 70  ├─ Mode row: "MODE" [Server AP] [External AP] (60px) ──────────────┤
 //  y=130  ├─ "CREDENTIALS" label strip (20px) ────────────────────────────────┤
 //  y=150  ├─ SSID row: "SSID" [value tap-to-edit] [SCAN] (60px) ─────────────┤
-//  y=210  ├─ PSK row:  "PSK"  [value tap-to-edit]        (60px) ─────────────┤
+//  y=210  ├─ PSK row:  "PASSWORD" [value tap-to-edit]    (60px) ─────────────┤
 //  y=270  ├─ "CHANNEL" label strip (20px) ─────────────────────────────────────┤
 //  y=290  ├─ Channel row: "CHANNEL" [1] [6] [11]  (60px, Server-AP only) ────┤
 //  y=350  ├─ "ACTIONS" label strip (20px) ─────────────────────────────────────┤
-//  y=370  └─ Save (large button) ───────────────────────────────────────────────┘
+//  y=380  └─ Save (large button) ───────────────────────────────────────────────┘
 //
-// SCAN button: only enabled in External-AP mode (Server-AP picks its own
-// SSID, no scan needed).  CHANNEL row: only enabled in Server-AP mode
+// SSID / PASSWORD rows and the SCAN button: only editable in External-AP
+// mode (in Server-AP mode the server owns its SSID + PSK and the rows show a
+// read-only placeholder).  CHANNEL row: only enabled in Server-AP mode
 // (channel is determined by the external AP otherwise).
 //
 // SCAN flow: WiFi.scanNetworks() runs synchronously (~2-5s blocking).
-// Results displayed as a tappable list overlay; tap an entry to copy
-// its SSID into the SSID field.  Back to return without selecting.
+// Results displayed as a tappable list overlay (no scroll — capped to the 9
+// rows that fit); tap an entry to copy its SSID into the SSID field.  Back to
+// return without selecting.
 
 #define WP_SCAN_MAX 16
 

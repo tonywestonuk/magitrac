@@ -15,17 +15,24 @@ public:
     NoteGrid(NoteNode* pool, uint16_t* freeHead, uint16_t* noteHead)
         : _pool(pool), _freeHead(freeHead), _noteHead(noteHead) {}
 
-    // Const constructor — read-only operations only (set/clear are no-ops).
+    // Const constructor — read-only grid.  There is no free list (_freeHead is
+    // null), so set() / clear() / clearAll() refuse to run: set() returns
+    // false, the other two return without touching anything.
     NoteGrid(const NoteNode* pool, const uint16_t* noteHead)
         : _pool(const_cast<NoteNode*>(pool))
         , _freeHead(nullptr)
         , _noteHead(const_cast<uint16_t*>(noteHead)) {}
 
     // Returns the Note at (row, col), or an all-zero Note if absent.
+    // NB: all-zero is NOT the "empty" encoding set() looks for (velocity 0 is
+    // an explicit value) — use has() to tell an absent cell from a stored one.
     Note get(uint8_t row, uint8_t col) const;
 
-    // Insert or overwrite a note.  Clears the cell if n is all-zero.
-    // Returns false if the pool is full and a new node was needed.
+    // Insert or overwrite a note.  Clears the cell instead if n is empty:
+    // note 0, effect 0, param 0 and a "use default" velocity (high bit set,
+    // e.g. VEL_DEFAULT).  A velocity of 0–127 alone is enough to keep the cell.
+    // Returns false if the pool is full and a new node was needed, or if this
+    // is a read-only grid.
     bool set(uint8_t row, uint8_t col, const Note& n);
 
     // Remove the note at (row, col). No-op if absent.
@@ -43,15 +50,9 @@ public:
     // Call fn(row, col, note) for every note in the pattern, in (row,col) order.
     void forAll(void (*fn)(uint8_t row, uint8_t col, const Note& n, void* ctx), void* ctx) const;
 
-    // Returns the lowest row > afterRow that has at least one note, or 0xFF if none.
-    uint8_t nextOccupiedRow(uint8_t afterRow) const;
-
-    // Number of notes currently in this pattern.
-    uint16_t count() const;
-
 private:
     NoteNode* _pool;
-    uint16_t* _freeHead;
+    uint16_t* _freeHead;   // null for a read-only (const-constructed) grid
     uint16_t* _noteHead;
 
     // Returns the sort key used to order nodes.

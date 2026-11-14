@@ -10,6 +10,7 @@
 // param semantics for the value-taking commands:
 //   Set Tempo  A0  param = BPM        (clamped to song min/max on the server)
 //   Retrigger  1B  param = hit count  (2..8)
+//   Pan        0A  param = position   (00 left … 40 centre … 7F right; MIDI CC 10)
 
 struct EffectDef {
     uint8_t     effect;      // effect byte
@@ -22,6 +23,7 @@ static const EffectDef EFFECT_CATALOG[] = {
     { 0x00, 0x00, true,  "None"      },
     { 0xA0, 0x00, false, "Set Tempo" },
     { 0x1B, 0x00, false, "Retrigger" },
+    { 0x0A, 0x00, false, "Pan"       },
     { 0xFF, 0xFF, true,  "Stop Song" },
 };
 static const int EFFECT_CATALOG_LEN =
@@ -39,11 +41,4 @@ inline const char* effectCatalogName(uint8_t effect, uint8_t param) {
         return EFFECT_CATALOG[i].name;
     }
     return nullptr;
-}
-
-// True if the catalogue entry at idx expects the user to enter a param value
-// after picking it (Set Tempo, Retrigger).
-inline bool effectCatalogTakesParam(int idx) {
-    if (idx < 0 || idx >= EFFECT_CATALOG_LEN) return false;
-    return !EFFECT_CATALOG[idx].paramFixed;
 }

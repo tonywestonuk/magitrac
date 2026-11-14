@@ -488,10 +488,12 @@ int PerformancePage::hitPad(int sx, int sy) const {
 }
 
 // ── Light-control strip (PixelPost) ──────────────────────────────────────────
-// PREV / NEXT cycle the PixelPost effect, POW blacks the lights out — all three
-// grab control away from the PXL POST track.  RELEASE hands it back.  The first
-// three are always live (when paired); RELEASE is only enabled once we've
-// grabbed control, so it reads as "nothing to release" until then.
+// "< FX" / "FX >" step the PixelPost effect (PPO_PREV / PPO_NEXT) on a tap;
+// WHITE is momentary — full white while held (PPO_WHITE_ON on press,
+// PPO_WHITE_OFF on release).  All three grab control away from the PXL POST
+// track; RELEASE hands it back.  The first three are always live (when
+// paired); RELEASE is only enabled once we've grabbed control, so it reads as
+// "nothing to release" until then.
 
 void PerformancePage::drawLightStrip() {
     _d.fillRect(0, PP_LIGHT_Y, 960, PP_LIGHT_H, COL_WHITE);
@@ -595,7 +597,8 @@ void PerformancePage::drawEditHeader() {
     _d.setCursor((PP_HOME_X - tw) / 2, (PP_HDR_H - 24) / 2);
     _d.print("PAD SETUP");
 
-    uiButton(_d, PP_HOME_X, 0, PP_HOME_W, PP_HDR_H, "HOME",
+    // Sits where HOME does on the pad view, but only returns to the pads.
+    uiButton(_d, PP_HOME_X, 0, PP_HOME_W, PP_HDR_H, "BACK",
              COL_BLACK, COL_WHITE, 3);
 }
 
@@ -617,10 +620,10 @@ void PerformancePage::drawEditRow(int idx) {
                  y + (PE_ROW_H - 24) / 2);
     _d.print(numStr);
 
-    // Name field — bordered box with text
-    uint8_t nameBg = disabled ? COL_WHITE : COL_WHITE;
+    // Name field — bordered box with text.  Always white; a disabled row
+    // only greys the border and text.
     uint8_t nameFg = disabled ? COL_DKGREY : COL_BLACK;
-    _d.fillRect(PE_NAME_X, y + 5, PE_NAME_W, PE_ROW_H - 10, nameBg);
+    _d.fillRect(PE_NAME_X, y + 5, PE_NAME_W, PE_ROW_H - 10, COL_WHITE);
     _d.drawRect(PE_NAME_X, y + 5, PE_NAME_W, PE_ROW_H - 10, nameFg);
 
     const char* displayName;

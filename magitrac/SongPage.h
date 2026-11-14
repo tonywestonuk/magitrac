@@ -8,17 +8,21 @@
 #include "ConfirmDialog.h"
 #include "UIHelpers.h"
 #include "ServerPairing.h"
-#include "SongSource.h"
 #include "FileBrowser.h"
 
 // ── Layout (960×540) ──────────────────────────────────────────────────────────
 //
-// FILE BROWSER (see FileBrowser.h for layout constants):
-//   y=  0  ┌─ Header (50px) ──────────────────────────────────────────────────┐
-//   y= 50  ├─ [BACK x=0,w=160] .............. [PREV x=680] [NEXT x=818] (55px)┤
-//   y=105  ├─ 4-column × 7-row file grid (378px) ───────────────────────────┤
-//   y=483  ├─ [NEW][SAVE NAME][SAVE AS] footer (57px) ─────────────────────────┤
+// SERVER BROWSER — FileBrowser (see FileBrowser.h for constants):
+//   y=  0  ┌─ Header (50px): title / status banner ........ [HOME x=830,w=130]┐
+//   y= 50  ├─ Toolbar (55px): "1-7 of N (drag scroll - swipe left to delete)" ┤
+//   y=105  ├─ 7 full-width song rows (378px), drag-scroll with inertia;
+//          │  swipe a row left to reveal its DEL button ──────────────────────┤
+//   y=483  ├─ [NEW][SAVE name][SAVE AS] footer (57px) ─────────────────────────┤
 //   y=540  └──────────────────────────────────────────────────────────────────┘
+//
+// NOT CONNECTED (unpaired): header "SONGS", a two-line notice, [BACK] at
+// bottom-left.  Name entry (SAVE AS / NEW) uses the full-screen KeyboardPopup;
+// confirms use the ConfirmDialog overlay.
 
 // ── Result ────────────────────────────────────────────────────────────────────
 
@@ -38,13 +42,17 @@ public:
     void draw();
     SongPageResult poll();
 
-    // Boot-button short press — forwards to the keyboard's symbol layer when a
-    // name-entry keyboard is open; otherwise toggles the browser's delete mode.
-    void onBootPress();
-
     // Still used by the setlist's (legacy) local-load path; harmless server-side.
     void clearLoadedFile() { _loadedFilename[0] = '\0'; }
     void setServerLoadedName(const char* name);   // mark song as loaded from server (enables save)
+    // Name the loaded song after the push the server just completed: the file
+    // it was read from (gServerPairing.pushedSongFile(), ".mgt" stripped), or
+    // the song's own name field when the server reports no file.  This is the
+    // name SAVE and autosave write to.
+    void adoptPushedSongName();
+    // The server reported that an explicit save failed: put "SAVE FAILED" in
+    // the header bar (repainting now if the list is what's on screen).
+    void showSaveFailed();
     const char* srvLoadedName() const { return _srvLoadedName; }     // empty if no server file loaded
 
 private:
@@ -74,8 +82,14 @@ private:
     int      _srvPage;          // next server list page to request while accumulating
     bool     _srvListDrawn;     // per-page latch: false = next list page not yet appended
     char     _srvPendingDeleteName[SRV_NAME_MAX];  // server song pending delete confirm
-    uint32_t _srvLoadStartMs;   // millis() when requestSongLoad was last called
-    int      _pendingLoadAbsIdx; // server-list index tapped, awaiting save-changes confirm
+    uint32_t _srvLoadStartMs = 0;    // millis() when startServerLoad() last requested a song
+    bool     _srvLoadSlow = false;   // slow-link notice already shown for this load
+    // The load this page has in flight (startServerLoad → song / failure / link drop).
+    bool     _srvAwaitingSong   = false;  // requested, no result yet
+    bool     _srvReceivingShown = false;  // "Receiving song..." is standing in for the list
+    bool     _srvRerequested    = false;  // already re-issued once after a wrong song landed
+    char     _srvRequestedName[SRV_NAME_MAX];  // name asked for; "" = asked by list index
+    int      _pendingLoadAbsIdx = 0; // server-list index tapped, awaiting save-changes confirm
     bool     _pendingNew = false; // true = the save-changes confirm precedes a NEW song
 
     // Drawing
@@ -85,7 +99,10 @@ private:
     // page 0, showing `status` until the list arrives.
     void restartServerList(const char* status);
     // Request the server song at absolute list index, showing "Receiving...".
+    // With no link it requests nothing and shows NOT CONNECTED over the list.
     void startServerLoad(int absIdx);
+    // Repaint the browser with `title` in the header bar (the banner slot).
+    void showListBanner(const char* title);
     // Open the keyboard to name a new (blank) song before creating it.
     void beginNewSong();
     // True if `name` (case-insensitive) is already in the accumulated server list.

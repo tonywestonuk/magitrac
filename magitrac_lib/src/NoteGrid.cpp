@@ -57,6 +57,8 @@ bool NoteGrid::has(uint8_t row, uint8_t col) const {
 // ── set ───────────────────────────────────────────────────────────────────────
 
 bool NoteGrid::set(uint8_t row, uint8_t col, const Note& n) {
+    if (!_freeHead) return false;   // read-only grid (const constructor)
+
     // All-default note means clear.  Velocity counts as "set" only when its
     // high bit is clear (0–127 = explicit) — 0x80+ means "use default" and is
     // semantically empty.  This lets PIXELPOST columns persist velocity-only
@@ -135,6 +137,7 @@ bool NoteGrid::set(uint8_t row, uint8_t col, const Note& n) {
 // ── clear ─────────────────────────────────────────────────────────────────────
 
 void NoteGrid::clear(uint8_t row, uint8_t col) {
+    if (!_freeHead) return;         // read-only grid (const constructor)
     if (*_noteHead == NOTE_NULL) return;
     uint16_t key = _key(row, col);
 
@@ -172,9 +175,10 @@ void NoteGrid::clear(uint8_t row, uint8_t col) {
 // ── clearAll ─────────────────────────────────────────────────────────────────
 
 void NoteGrid::clearAll() {
+    if (!_freeHead) return;         // read-only grid (const constructor)
     if (*_noteHead == NOTE_NULL) return;
 
-    // Walk the circular list once, collecting all node indices, then free them.
+    // Walk the circular list once, returning each node to the free list.
     uint16_t idx = *_noteHead;
     do {
         uint16_t next = _pool[idx].next;
@@ -213,30 +217,4 @@ void NoteGrid::forAll(void (*fn)(uint8_t row, uint8_t col, const Note& n, void* 
         fn(n.row, n.col, out, ctx);
         idx = n.next;
     } while (idx != *_noteHead);
-}
-
-// ── nextOccupiedRow ───────────────────────────────────────────────────────────
-
-uint8_t NoteGrid::nextOccupiedRow(uint8_t afterRow) const {
-    if (*_noteHead == NOTE_NULL) return 0xFF;
-    uint16_t idx = *_noteHead;
-    do {
-        NoteNode& n = _pool[idx];
-        if (n.row > afterRow) return n.row;
-        idx = n.next;
-    } while (idx != *_noteHead);
-    return 0xFF;
-}
-
-// ── count ─────────────────────────────────────────────────────────────────────
-
-uint16_t NoteGrid::count() const {
-    if (*_noteHead == NOTE_NULL) return 0;
-    uint16_t c   = 0;
-    uint16_t idx = *_noteHead;
-    do {
-        ++c;
-        idx = _pool[idx].next;
-    } while (idx != *_noteHead);
-    return c;
 }

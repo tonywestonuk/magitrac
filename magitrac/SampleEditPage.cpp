@@ -21,6 +21,9 @@ void SampleEditPage::open(uint8_t sampleId, const char* name, uint8_t col,
     _wasDown    = _touch.isTouched;
     _dragMarker = -1;
     _dragScroll = false;
+    _dragWave   = false;
+    _backArmed  = false;
+    _specMode   = 0;       // a previous visit's spectrogram does not carry over
     _viewStart  = 0;
     _viewEnd    = 0;   // whole file
 

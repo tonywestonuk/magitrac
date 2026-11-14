@@ -64,13 +64,6 @@ void pairNvsSaveCreds(const char* ns,
     prefs.end();
 }
 
-void pairNvsClearCreds(const char* ns) {
-    Preferences prefs;
-    prefs.begin(ns, /*readOnly=*/false);
-    prefs.putUChar("creds", 0);
-    prefs.end();
-}
-
 // ── DEBUG dump ──────────────────────────────────────────────────────────────
 
 static void dumpUChar(Preferences& p, const char* key) {

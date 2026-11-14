@@ -10,20 +10,20 @@
 // SongConfigPage for the NOTE LOW / NOTE HIGH filter values.
 //
 // Layout (960×540):
-//   y=  0  ┌─ Header: title centred, CANCEL + OK in corners (60px)
+//   y=  0  ┌─ Header: title centred                        (60px)
 //   y= 60  ├─ Big current-value display: "C-5 (60)"                (80px)
 //   y=140  ├─ "NOTE" label strip (24px)
 //   y=164  ├─ 12 semitone buttons × 80px × 100px                 (100px)
 //   y=264  ├─ "OCTAVE" label strip (24px)
-//   y=288  ├─ 11 octave buttons (0..10) × 80px × 100px           (100px)
-//   y=388  ├─ Optional hint text                                  (32px)
+//   y=288  ├─ 11 octave buttons (0..10) × 80px × 100px, 8px gaps (100px)
+//   y=400  ├─ "Range x..y" hint, only when min/max narrow the range
 //   y=440  ├─ CANCEL / OK action buttons                         (100px)
 //   y=540  └─
 //
 // Caller flow:
 //   _picker.open(initialNote, minVal, maxVal, "MIDI-IN NOTE LOW");
-//   ...draw + poll until accepted()/cancelled() is true...
-//   if (_picker.accepted()) value = _picker.value();
+//   ...draw() once, then poll() each loop until it returns true (OK or CANCEL)...
+//   if (_picker.accepted()) value = _picker.value();   // false after CANCEL
 
 class MidiNotePicker {
 public:

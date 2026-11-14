@@ -18,25 +18,25 @@ class MagiLink {
 public:
     enum class Role : uint8_t { Unconfigured, Accept, Connect };
 
-    // Accept role: opens a WiFiServer on `port` and accepts the next
-    // client.  Spawns the worker task immediately; the worker waits
+    // Accept role: listens on `port` and serves one peer at a time from a
+    // single select() loop (listener + peer + loopback kick socket on
+    // port+1).  Spawns the worker task immediately; the worker waits
     // until a local IP is available (softAP or STA) before listening.
     void beginAccept(uint16_t port);
 
     // Connect role: connects to `peer:port` and stays connected.
     // Spawns the worker task immediately; the worker waits for a local
     // STA IP before attempting connect.
+    //
+    // One-shot: once the worker exists, a later call is ignored — it does
+    // NOT retarget the link, so a server that turns up at a new address is
+    // not followed until reboot.  A call that asks for a different
+    // peer/port is logged; a repeat of the same one is silent.
     void beginConnect(uint16_t port, IPAddress peer);
 
     // True between "connection established" and "connection dropped".
     // Updated from the worker task; safe to read from any task.
     bool isConnected() const { return _connected; }
-
-    // Peer IP of the currently-connected session, or 0.0.0.0 if not
-    // connected.  Accept role: the connecting client's IP.  Connect role:
-    // the configured peer.  Useful for the server to learn its client's
-    // address (e.g. for UDP unicasts) without a hardcoded convention.
-    IPAddress peerIP() const;
 
     // Monotonic counter, bumped every time a new connection is established —
     // including a preempt-swap to a fresh peer.  A session task can compare
@@ -44,6 +44,17 @@ public:
     // connection" robustly, even if it polls too slowly to observe the
     // isConnected() false→true edge during a preempt.
     uint32_t generation() const { return _generation; }
+
+    // Post a small, complete message frame to the peer via the worker's
+    // loopback kick socket (Accept role only).  Safe from any task with no
+    // mutex involved: the datagram lands in the kick socket's buffer and the
+    // select loop forwards it over TCP when it is next idle — so a post can
+    // never collide with an in-progress transfer.  Fire-and-forget: posts
+    // made while no peer is connected are drained and dropped, and UDP may
+    // drop under buffer pressure, so post only idempotent "state changed"
+    // events the peer can recover by pulling — never must-not-lose data.
+    // Returns false if the frame is oversized or the kick socket is not up.
+    bool postToPeer(const void* msg, size_t len);
 
     // ── Transactional API ────────────────────────────────────────────────────
     //
@@ -103,13 +114,17 @@ private:
     volatile uint32_t _generation = 0;   // ++ on each new established link
 
     // Registration table for per-id callbacks.  Worker task dispatches
-    // matching incoming messages here.  Server registers ~28 entries
-    // (full command set + the two streaming HEADER/BODY pairs); 48
-    // leaves headroom for future additions without another overflow.
+    // matching incoming messages here.  The server registers 48 (the client
+    // 19), so there are 16 slots left — registerCallback past the end only
+    // logs and returns false, and that message then silently never fires.
     struct RegisteredHandler { uint8_t msgType; MessageCb cb; void* ctx; };
-    static const int MAX_REGISTERED = 48;
+    static const int MAX_REGISTERED = 64;
     RegisteredHandler _registered[MAX_REGISTERED];
     int               _registeredCount = 0;
+
+    // Largest frame postToPeer accepts — kick messages are tiny events,
+    // never bulk (bulk flows only as direct responses to peer commands).
+    static const size_t KICK_MAX_BYTES = 64;
 
     // Buffer that read() returns a pointer into.  Single-slot — safe
     // because the mutex serialises all access.
@@ -120,9 +135,18 @@ private:
     void _runAcceptLoop();
     void _runConnectLoop();
 
+    // Receive progress for the frame currently being assembled in _recvBuf.
+    // A frame can arrive split across TCP segments, with seconds between the
+    // halves on a bad link — so the read is resumable: _rxHave bytes are in,
+    // and nobody has to sit on the mutex waiting for the rest.  Written under
+    // the mutex; the Connect worker also zeroes _rxHave when it drops a socket.
+    size_t   _rxHave       = 0;    // bytes of the current frame received so far
+    uint16_t _rxLen        = 0;    // its wire length (valid once _rxHave >= 3)
+    uint32_t _rxProgressMs = 0;    // millis() of the last byte received
+
     // Internal helpers (mutex-aware; caller must hold the mutex).
-    bool _readFully(uint8_t* dst, size_t n);   // blocking read of exactly n bytes
-    bool _readMessageRaw();                     // fills _recvBuf, NO dispatch
+    bool _pumpMessage();                        // non-blocking; true = whole frame in _recvBuf
+    bool _readMessageRaw();                     // blocking; fills _recvBuf, NO dispatch
     void _dispatch(const uint8_t* msg, size_t len);  // call registered handler if any
 };
 

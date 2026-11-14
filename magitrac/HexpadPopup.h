@@ -66,6 +66,10 @@ public:
     // Result — valid after isDone() returns true
     uint8_t effect() const { return _resultEffect; }
     uint8_t param()  const { return _resultParam; }
+    // Digits in the field when the popup closed.  0 on SET means nothing was
+    // entered (opened blank and left blank, or everything backspaced), which
+    // effect()/param() report as 0 — indistinguishable from a typed "00".
+    int digitCount() const { return _numDigits; }
 
 private:
     EPD_PainterAdafruit& _d;

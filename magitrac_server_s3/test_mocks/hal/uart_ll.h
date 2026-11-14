@@ -1,8 +1,9 @@
 #pragma once
 // Test-only stub for hal/uart_ll.h.  Lets midi_player.cpp compile under
-// UNIT_TEST — the sequencer logic doesn't care whether bytes actually leave
-// the (mock) FIFO.  All functions are no-ops; FIFO always reports "ready to
-// write" and "empty to read" so polling loops fall through immediately.
+// UNIT_TEST.  The FIFO always reports "ready to write" and "empty to read" so
+// polling loops fall through immediately.  Written bytes are appended to
+// _mockUartTx (until it fills) so a test can assert on the MIDI that went out;
+// a test resets _mockUartTxLen to 0 to start a fresh capture.
 #include <stdint.h>
 #include <stddef.h>
 
@@ -14,7 +15,12 @@ static inline uart_dev_t* _mock_uart_ll_get_hw(int /*n*/) { return (uart_dev_t*)
 #define UART_INTR_RXFIFO_TOUT  (1u << 8)
 
 static inline uint32_t uart_ll_get_txfifo_len(uart_dev_t*)                  { return 128; }
-static inline void     uart_ll_write_txfifo(uart_dev_t*, const uint8_t*, size_t) {}
+static uint8_t _mockUartTx[8192];
+static size_t  _mockUartTxLen = 0;
+static inline void     uart_ll_write_txfifo(uart_dev_t*, const uint8_t* b, size_t n) {
+    for (size_t i = 0; i < n && _mockUartTxLen < sizeof(_mockUartTx); i++)
+        _mockUartTx[_mockUartTxLen++] = b[i];
+}
 static inline uint32_t uart_ll_get_rxfifo_len(uart_dev_t*)                  { return 0; }
 static inline void     uart_ll_read_rxfifo(uart_dev_t*, uint8_t*, size_t)   {}
 static inline void     uart_ll_disable_intr_mask(uart_dev_t*, uint32_t)     {}

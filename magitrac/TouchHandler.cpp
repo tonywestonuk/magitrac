@@ -20,7 +20,6 @@ TouchHandler::TouchHandler(GT911_Lite& touch, TrackerUI& ui,
     , _startInGap(false)
     , _cellHoldArmed(false)
     , _holdStart(0)
-    , _holdFired(false)
     , _lastDragY(0)
     , _lastDragTime(0)
     , _dragVel(0.0f)
@@ -74,7 +73,7 @@ TouchResult TouchHandler::poll() {
     //   the falling edge is processed, so it implies finger-still-down. ──────
     if (_state == TouchState::BUTTON_PENDING &&
         _pendingButton == TouchAction::COLUMN_HEADER_TAP &&
-        !_holdFired && millis() - _holdStart >= 500) {
+        millis() - _holdStart >= 500) {
         result.action = TouchAction::COLUMN_HEADER_HOLD;
         result.col    = _dragStartCol;
         // The page that's about to open does its own touch polling, so we never
@@ -83,7 +82,6 @@ TouchResult TouchHandler::poll() {
         // recognised as a fresh rising edge.
         _state     = TouchState::IDLE;
         _wasDown   = false;
-        _holdFired = false;
         DBG("[TOUCH] -> COLUMN_HEADER_HOLD col=%d\n", _dragStartCol);
         return result;
     }
@@ -91,13 +89,12 @@ TouchResult TouchHandler::poll() {
     // Grid-cell long-press → paste (only armed when a row selection exists and
     // the sequencer is stopped; see the rising edge).  Same hand-off as above.
     if (_state == TouchState::DRAG_UNDECIDED && _cellHoldArmed &&
-        !_holdFired && millis() - _holdStart >= 500) {
+        millis() - _holdStart >= 500) {
         result.action = TouchAction::CELL_HOLD;
         result.row    = _dragStartRow;
         result.col    = _dragStartCol;
         _state     = TouchState::IDLE;
         _wasDown   = false;
-        _holdFired = false;
         DBG("[TOUCH] -> CELL_HOLD row=%d col=%d\n", _dragStartRow, _dragStartCol);
         return result;
     }
@@ -113,12 +110,11 @@ TouchResult TouchHandler::poll() {
         DBG("[TOUCH] up   screen(%d,%d)\n", tx, ty);
 
         if (_state == TouchState::BUTTON_PENDING) {
-            // Hold already fired during the press — release is silent.
+            // (A press that already fired its hold never gets here — the hold
+            // path reset _state to IDLE.)
             // Col 0 has no tap action; only output cols emit COLUMN_HEADER_TAP.
-            if (_holdFired) {
-                DBGLN("[TOUCH] -> release after hold (silent)");
-            } else if (_pendingButton == TouchAction::COLUMN_HEADER_TAP &&
-                       _dragStartCol == 0) {
+            if (_pendingButton == TouchAction::COLUMN_HEADER_TAP &&
+                _dragStartCol == 0) {
                 DBGLN("[TOUCH] -> col 0 tap suppressed");
             } else {
                 result.action = _pendingButton;
@@ -185,7 +181,6 @@ TouchResult TouchHandler::poll() {
             _pendingButton = TouchAction::COLUMN_HEADER_TAP;
             _dragStartCol = colHdr;
             _holdStart    = millis();
-            _holdFired    = false;
             return result;
         }
 
@@ -208,7 +203,6 @@ TouchResult TouchHandler::poll() {
             _startInGap    = stopped && _ui.hitGridGap(tx, ty, grow, gcol);
             _cellHoldArmed = stopped && _ui.hasRowSel();
             _holdStart     = millis();
-            _holdFired     = false;
             DBG("[TOUCH] -> grid touch  row=%d  col=%d  colOffset=%d\n",
                 row, col, _ui.colOffset());
             return result;

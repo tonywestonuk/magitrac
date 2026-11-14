@@ -134,7 +134,6 @@ DrumEditorPage::DrumEditorPage(EPD_PainterAdafruit& display, GT911_Lite& touch,
     , _pickerScroll(0)
     , _pickerWasDown(false)
     , _pickerDragStartY(0)
-    , _pickerDragStartScroll(0)
     , _pickerDragMoved(false)
     , _pickerDragActive(false)
     , _pickerAudActive(false)
@@ -549,8 +548,20 @@ int DrumEditorPage::findColumnForPlace(uint8_t row, uint8_t trackerNote) {
 }
 
 int DrumEditorPage::allocateNewDrumColumn() {
+    // Channel 0 is not proof a column is spare: it is also the OFF setting a
+    // user can give a column that still holds notes in other blocks, and
+    // taking it would wipe its settings and turn those notes into drums.
+    // Only a column with no notes in ANY block is free.
+    uint32_t used = 0;
+    for (int p = 0; p < MAX_PATTERNS; p++) {
+        const NoteGrid g(_song.notePool, &_song.patterns[p].noteHead);
+        g.forAll([](uint8_t, uint8_t col, const Note&, void* ctx) {
+            if (col < 32) *(uint32_t*)ctx |= (1u << col);
+        }, &used);
+    }
+
     for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (_song.columns[c].midiChannel == 0) {
+        if (_song.columns[c].midiChannel == 0 && !(used & (1u << c))) {
             ColumnSettings& cs = _song.columns[c];
             memset(&cs, 0, sizeof(cs));
             cs.midiChannel = DRUM_MIDI_CHANNEL;
@@ -617,7 +628,6 @@ void DrumEditorPage::openPicker() {
     _pickerWasDown         = _touch.isTouched;
     _pickerDragMoved       = false;
     _pickerDragStartY      = 0;
-    _pickerDragStartScroll = 0;
     _pickerDragActive      = false;
     _pickerAudActive       = false;
     _pickerScrollPx        = 0;
@@ -805,7 +815,6 @@ bool DrumEditorPage::pollPicker() {
             _pickerScrollPx        = _pickerScroll * DEP_PCK_ROW_H;
             _pickerDragStartPx     = _pickerScrollPx;
             _pickerDragStartY      = sy;
-            _pickerDragStartScroll = _pickerScroll;
             _pickerVelTrackY       = sy;
             _pickerVelTrackMs      = millis();
             _pickerDragMoved       = false;
@@ -1102,7 +1111,7 @@ void DrumEditorPage::importBlock(const DrumPatternFile& file, int blockIdx,
         const DrumPatternInstr& instr = blk->instrs[activeIdx[i]];
         const DrumGmEntry* m = kGmDefaults.find(instr.code);
         if (!m) continue;
-        int trackerInt = (int)m->midiNote - 11;   // TRACKER_TO_MIDI_OFFSET
+        int trackerInt = (int)m->midiNote - TRACKER_TO_MIDI_OFFSET;
         if (trackerInt < 1 || trackerInt > NOTE_MAX) continue;
         uint8_t trackerNote = (uint8_t)trackerInt;
 

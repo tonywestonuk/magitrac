@@ -71,13 +71,8 @@ static bool          s_lowLatency    = false;
 // Bring up our own full-duplex I2S channel pair (auto-assigned controller).
 // Pins come from M5's M-Bus map (same ones M5's begin() uses).
 static bool i2sInitDma(int descNum, int frameNum) {
-#if defined(CONFIG_IDF_TARGET_ESP32S3)
-    uint8_t bck = M5.getPin(m5::pin_name_t::mbus_pin24);   // SCLK
+    uint8_t bck = M5.getPin(m5::pin_name_t::mbus_pin24);   // SCLK  (CoreS3 M-Bus map)
     uint8_t mck = M5.getPin(m5::pin_name_t::mbus_pin22);   // MCLK
-#else
-    uint8_t bck = M5.getPin(m5::pin_name_t::mbus_pin22);
-    uint8_t mck = M5.getPin(m5::pin_name_t::mbus_pin24);
-#endif
     uint8_t di   = M5.getPin(m5::pin_name_t::mbus_pin26);  // DIN  (mic)
     uint8_t ws   = M5.getPin(m5::pin_name_t::mbus_pin21);  // LRCK
     uint8_t dout = M5.getPin(m5::pin_name_t::mbus_pin23);  // DOUT (speaker)
@@ -128,9 +123,9 @@ void audioCodecSetLowLatency(bool low) {
     if (sTx) { i2s_del_channel(sTx); sTx = nullptr; }
     if (sRx) { i2s_del_channel(sRx); sRx = nullptr; }
     s_lowLatency = low;
-    if (low) i2sInitDma(DMA_SMALL_DESC, DMA_SMALL_LEN);
-    else     i2sInitDma(DMA_LARGE_DESC, DMA_LARGE_LEN);
-    s_lowLatency = low;
+    bool ok = low ? i2sInitDma(DMA_SMALL_DESC, DMA_SMALL_LEN)
+                  : i2sInitDma(DMA_LARGE_DESC, DMA_LARGE_LEN);
+    if (!ok) Serial.println("[CODEC] I2S re-init FAILED — audio may be dead until reboot");
     s_reconfiguring = false;
 }
 
@@ -188,16 +183,6 @@ bool audioCodecInit() {
 }
 
 bool audioCodecReady() { return sReady; }
-
-void audioCodecSetMicBias(bool micMode) {
-    if (!sReady) return;
-    sDev.setMICStatus(micMode ? AUDIO_MIC_OPEN : AUDIO_MIC_CLOSE);
-}
-
-void audioCodecSetHPMode(bool american) {
-    if (!sReady) return;
-    sDev.setHPMode(american ? AUDIO_HPMODE_AMERICAN : AUDIO_HPMODE_NATIONAL);
-}
 
 bool audioCodecPlay(const uint8_t* buf, size_t bytes) {
     if (!sReady || !sTx || s_reconfiguring) return false;

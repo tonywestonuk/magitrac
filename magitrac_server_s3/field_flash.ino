@@ -9,7 +9,7 @@
 //   3. FLASH (re)broadcasts an ESP-NOW OTA packet pointing the posts at the
 //      server's OWN softAP; while that screen is up the server hosts a tiny HTTP
 //      server off the SD card so the posts can pull the bin, flash, and reboot.
-//   4. SKIP renames the bin to *.done and reboots the server — which both tidies
+//   4. DONE renames the bin to *.done and reboots the server — which both tidies
 //      up everything the HTTP server touched and returns to making music.  The
 //      HTTP server therefore NEVER runs during normal operation.
 //
@@ -66,7 +66,7 @@ uint32_t fieldFlashFirmwareSize() {
 // static .2, so no leases are handed out normally.  But the posts do a plain
 // WiFi.begin() and need DHCP to associate, so we open a lease pool well clear
 // of the server (.1) and client (.2) while flashing.  Torn down by the reboot
-// on SKIP.
+// on DONE.
 static void fieldFlashSetDhcp(bool on) {
     esp_netif_t* ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (!ap) return;
@@ -226,8 +226,8 @@ bool fieldFlashBroadcast() {
     snprintf(url, sizeof(url), "http://%s/%s", ip.toString().c_str(), FW_NAME);
 
     // Use the LIVE softAP creds so the posts join the network that's actually
-    // broadcasting — NOT srvSelfCredsGet()/magitrac_srv_self, which had drifted
-    // out of sync (told posts to join a non-existent SSID).
+    // broadcasting — NOT the magitrac_srv_self NVS creds (pairing.ino), which
+    // had drifted out of sync (told posts to join a non-existent SSID).
     Serial.printf("[FLD] OTA broadcast: ssid='%s' url='%s' (%u bytes from %s)\n",
                   gApSsid, url, (unsigned)fsize, sFwPath);
     pixelpostSendFirmwareUpdate(gApSsid, gApPsk, url);

@@ -46,17 +46,25 @@ private:
     bool                 _wasDown;
 
     // Backup state
-    char     _bkFolder[48];                        // full path e.g. "/backups/bk_20260425_103000"
+    char     _bkFolder[48];                        // full path e.g. "/backups/bk_260425_103000" (bk_YYMMDD_HHMMSS)
     char     _bkCurName[BK_FNAME_MAX];             // name of the file currently streaming (display only)
     int      _bkFileTotal;
     int      _bkFileCurrent;
-    // Set from UI task on Cancel tap, read from the v2 backup worker
-    // task — must be volatile for visibility across cores/tasks.
+    // Set by a Cancel tap.  The backup runs synchronously inside
+    // startBackup() on the UI task, which polls touch itself between
+    // messages; once set, the rest of the stream is drained, not written.
     volatile bool _bkCancelled;
 
     // Number of files fully written to SD this backup run.  Used by
     // drawBackupDone to show "N of M saved" (especially after a cancel).
     int _bkFilesSaved = 0;
+    // Files that did NOT make it onto the card (open failed, short write, or
+    // the stream ended early).  Non-zero turns the done screen into a warning.
+    int _bkFilesFailed = 0;
+    // Restore: files handed to the link, and files that could not be read
+    // from the card or sent.
+    int _rsFilesSent   = 0;
+    int _rsFilesFailed = 0;
 
     // Restore state
     char     _rsFolders[BR_MAX_FOLDERS][BR_FOLDER_MAX];
@@ -72,7 +80,6 @@ private:
     int      _rsFileCurrent;
     int      _rsRestoreCount;
     int      _rsRestoreList[BR_MAX_FILES];  // indices of files to restore
-    bool     _rsCancelled;
     int      _rsConfirmIdx;                 // -1 = restore all; else file index
 
     // FILE_LIST drag-scroll state — mirrors the folder list.

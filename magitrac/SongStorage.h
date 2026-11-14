@@ -4,7 +4,10 @@
 
 // ── SongStorage ───────────────────────────────────────────────────────────────
 //
-// Binary .mgt format:  [ SongFileHeader (8 bytes) ] [ Song (raw struct) ]
+// Binary .mgt format: the compact layout written by songWriteCompact()
+// ([Header] [patterns] [columns] [song tail] [noteCount] [notes] — the version
+// history is at the top of SongMigration.h).  loadSong() also reads older
+// versions via songReadAnyVersion().
 //
 // Call SD.begin(SD_CS_PIN) in setup() before using any of these.
 // All paths should be absolute, e.g. "/songs/MYSONG.mgt"

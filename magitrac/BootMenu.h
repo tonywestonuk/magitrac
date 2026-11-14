@@ -4,10 +4,14 @@
 #include "gt911_lite.h"
 #include "UIHelpers.h"
 
-// ── BootMenu — boot button popup overlay (960×540) ────────────────────────────
+// ── BootMenu — main menu popup overlay (960×540) ──────────────────────────────
 //
-// Drawn on top of whatever is currently on screen (no fillScreen).
-// Dismiss by tapping outside the box.
+// Opened by the tracker's MENU button (the name is historical — the BOOT
+// button now toggles the backlight).  open() draws it on top of whatever is
+// currently on screen (no fillScreen).  The next tap closes it: on a button it
+// returns that button's result, anywhere else — inside the box or out —
+// DISMISSED.  SONG is greyed when no song is loaded; a tap on it then just
+// dismisses.
 //
 // Row 1: [SONG] [INSTRUMENTS] [SETTINGS]
 // Row 2: [BACKUP] [PERFORM] [POSTS]
@@ -44,7 +48,6 @@ static const int BM_SETT_X  = BM_INST_X + BM_BTN_W + BM_BTN_GAP; // = 600
 static const int BM_BTN2_Y   = BM_BTN_Y + BM_BTN_H + 22;  // = 292
 static const int BM_BTN2_H   = 95;
 static const int BM_BTN2_W   = BM_BTN_W;
-static const int BM_BTN2_GAP = BM_BTN_GAP;
 static const int BM_BACKUP_X    = BM_SONG_X;   // = 150
 static const int BM_PERFORM_X   = BM_INST_X;   // = 375
 static const int BM_PIXELPOST_X = BM_SETT_X;   // = 600
@@ -63,7 +66,6 @@ public:
     void draw();
 
     bool isOpen()  const { return _open; }
-    void dismiss()       { _open = false; }
 
     BootMenuResult poll();
 
@@ -81,6 +83,5 @@ private:
     bool hitBackup     (int sx, int sy) const;
     bool hitPixelpost  (int sx, int sy) const;
     bool hitOrgan      (int sx, int sy) const;
-    bool hitInsideBox  (int sx, int sy) const;
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };
