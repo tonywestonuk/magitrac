@@ -277,8 +277,15 @@ private:
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
     void save();         // serialise + upload the current setlist (FK_SETLISTS)
     void saveMaster();   // serialise + upload the master catalog (master.txt)
+    void drawLoadWarning();
     bool loadSlotFromServer(uint8_t slot, Setlist* sl);
     bool loadMasterFromServer();
+    // True only once the server has answered for that file — with its
+    // contents, or with "no such file" (a genuinely new, empty list).  A load
+    // that timed out or errored leaves it false, and save()/saveMaster() then
+    // refuse: writing the empty in-memory list back would wipe the real one.
+    bool _listLoaded   = false;
+    bool _masterLoaded = false;
     bool fileExistsOnServer(const char* file);
     static void wrapText(const char* in, int maxChars,
                          char line1[], char line2[], int line1Cap, int line2Cap);

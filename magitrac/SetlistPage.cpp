@@ -99,7 +99,7 @@ void SetlistPage::draw() {
     _d.fillScreen(COL_WHITE);
     switch (_state) {
         case State::NOT_CONNECTED: drawNotConnected(); break;
-        case State::LIST:          drawList(); break;
+        case State::LIST:          drawList(); drawLoadWarning(); break;
         case State::INFO:          drawList(); drawInfo(); break;
         case State::WAITING_SONG:  drawWaitingSong(); break;
         case State::MASTER_SELECT: drawMasterChrome(); _msView.redraw(); break;
@@ -109,6 +109,18 @@ void SetlistPage::draw() {
         case State::PICK_FILE_SRV: drawPickChrome("PICK SONG (SERVER)"); _pickView.redraw(); break;
         case State::CONFIRM_DELETE: drawEdit(); _dialog.draw(); break;
     }
+}
+
+// A list that failed to load looks exactly like an empty one — say so, and
+// that nothing done here will be saved (see _listLoaded).
+void SetlistPage::drawLoadWarning() {
+    if (_listLoaded && _masterLoaded) return;
+    const char* msg = "COULD NOT LOAD FROM SERVER - CHANGES NOT SAVED";
+    _d.fillRect(0, SL_HDR_H, 960, 34, COL_BLACK);
+    _d.setTextSize(3);
+    _d.setTextColor(COL_WHITE);
+    _d.setCursor((960 - (int)strlen(msg) * 18) / 2, SL_HDR_H + 5);
+    _d.print(msg);
 }
 
 SetlistResult SetlistPage::poll() {
@@ -1303,6 +1315,10 @@ void SetlistPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
 
 void SetlistPage::save() {
     if (!gServerPairing.isPaired()) return;
+    if (!_listLoaded) {
+        Serial.println("[SetlistPage] setlist never loaded — NOT saving over it");
+        return;
+    }
     static char buf[SETLIST_SERIALIZE_MAX];
     size_t n = serializeSetlist(&_list, buf, sizeof(buf));
     char fname[24];
@@ -1312,12 +1328,17 @@ void SetlistPage::save() {
 
 void SetlistPage::saveMaster() {
     if (!gServerPairing.isPaired()) return;
+    if (!_masterLoaded) {
+        Serial.println("[SetlistPage] master catalog never loaded — NOT saving over it");
+        return;
+    }
     static char buf[MASTER_SERIALIZE_MAX];
     size_t n = serializeMasterList(&sMaster, buf, sizeof(buf));
     gServerPairing.sendFileSave(FK_SETLISTS, masterListFilename(), (const uint8_t*)buf, n);
 }
 
 bool SetlistPage::loadSlotFromServer(uint8_t slot, Setlist* sl) {
+    _listLoaded = false;
     if (!gServerPairing.isPaired()) { initSetlist(sl); return false; }
     char fname[24];
     buildSetlistFilename(slot, fname, sizeof(fname));
@@ -1330,21 +1351,26 @@ bool SetlistPage::loadSlotFromServer(uint8_t slot, Setlist* sl) {
             bool ok = parseSetlist((const char*)gServerPairing.fileLoadData(),
                                    gServerPairing.fileLoadLen(), sl);
             gServerPairing.resetFileLoad();
+            _listLoaded = ok;           // unparseable → leave the file alone
             return ok;
         }
-        if (st == FileLoadState::NOT_FOUND || st == FileLoadState::ERROR) {
+        if (st == FileLoadState::NOT_FOUND) {      // no file yet: a new, empty list
             gServerPairing.resetFileLoad();
             initSetlist(sl);
+            _listLoaded = true;
             return false;
         }
+        if (st == FileLoadState::ERROR) break;
         delay(5);
     }
+    Serial.printf("[SetlistPage] '%s' did not load — saving disabled for it\n", fname);
     gServerPairing.resetFileLoad();
     initSetlist(sl);
     return false;
 }
 
 bool SetlistPage::loadMasterFromServer() {
+    _masterLoaded = false;
     if (!gServerPairing.isPaired()) { initMasterList(&sMaster); return false; }
     gServerPairing.requestFileLoad(FK_SETLISTS, masterListFilename());
 
@@ -1355,15 +1381,19 @@ bool SetlistPage::loadMasterFromServer() {
             parseMasterList((const char*)gServerPairing.fileLoadData(),
                             gServerPairing.fileLoadLen(), &sMaster);
             gServerPairing.resetFileLoad();
+            _masterLoaded = true;
             return true;
         }
-        if (st == FileLoadState::NOT_FOUND || st == FileLoadState::ERROR) {
+        if (st == FileLoadState::NOT_FOUND) {      // no catalog yet: start one
             gServerPairing.resetFileLoad();
             initMasterList(&sMaster);
+            _masterLoaded = true;
             return false;
         }
+        if (st == FileLoadState::ERROR) break;
         delay(5);
     }
+    Serial.println("[SetlistPage] master catalog did not load — saving disabled for it");
     gServerPairing.resetFileLoad();
     initMasterList(&sMaster);
     return false;

@@ -269,6 +269,17 @@ void pairingHandleMessage(const uint8_t* data, int len) {
     }
 }
 
+// Leave pairing mode without a completed pairing.  enterPairingMode() took
+// the softAP down, turned auto-reconnect off and parked the radio on ch1 — put
+// all of that back, or the already-paired client can never reconnect.
+static void pairingAbandon(const char* why) {
+    Serial.printf("[PAIR] %s — restoring WiFi\n", why);
+    serverMode      = SERVER_STANDALONE;
+    needsFullRedraw = true;
+    WiFi.setAutoReconnect(true);
+    serverWifiBringUp();
+}
+
 // ── Main loop tick ────────────────────────────────────────────────────────────
 void pairingLoop() {
     uint32_t now = millis();
@@ -281,14 +292,11 @@ void pairingLoop() {
         case SERVER_PAIRING: {
             if (!sCancelArmed && !bezelDownAny()) sCancelArmed = true;
             if (sCancelArmed && bezelTappedAny()) {
-                serverMode = SERVER_STANDALONE;
-                needsFullRedraw = true;
+                pairingAbandon("cancelled");
                 return;
             }
             if (now - sPairingWindowMs >= PAIR_WINDOW_MS) {
-                Serial.println("[PAIR] pair window timed out");
-                serverMode = SERVER_STANDALONE;
-                needsFullRedraw = true;
+                pairingAbandon("pair window timed out");
                 return;
             }
 
@@ -316,14 +324,11 @@ void pairingLoop() {
         case SERVER_PAIRING_CONFIRM: {
             if (!sCancelArmed && !bezelDownAny()) sCancelArmed = true;
             if (sCancelArmed && bezelTappedAny()) {
-                serverMode = SERVER_STANDALONE;
-                needsFullRedraw = true;
+                pairingAbandon("cancelled");
                 return;
             }
             if (now - sPairingWindowMs >= PAIR_WINDOW_MS) {
-                Serial.println("[PAIR] pair window timed out (after CHALLENGE)");
-                serverMode = SERVER_STANDALONE;
-                needsFullRedraw = true;
+                pairingAbandon("pair window timed out (after CHALLENGE)");
             }
             break;
         }

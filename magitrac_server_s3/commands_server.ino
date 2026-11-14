@@ -156,8 +156,6 @@ static char     srvActiveName[SRV_FNAME_MAX] = {};  // filename (with .mgt)
 bool     srvHasActive     = false;
 
 #define SRV_RESTORE_TMP "/songs/_restore.tmp"       // restore upload lands here, then renames
-static char     srvDeleteName[SRV_FNAME_MAX] = {};  // name pending delete (deferred to main loop)
-static bool     srvDeletePending  = false;
 
 // MSG_NOTE_SET queue — produced on the MagiLink worker task, consumed by
 // commandsTick on the loop task, so every note-pool relink happens on one
@@ -168,8 +166,52 @@ static bool     srvDeletePending  = false;
 // the masks stay consistent across wrap.
 #define NOTE_SET_Q_LEN 64
 static MsgNoteSet       sNoteSetQ[NOTE_SET_Q_LEN];
+static uint16_t         sNoteSetSeq[NOTE_SET_Q_LEN];   // arrival stamp per entry
 static volatile uint8_t sNoteSetQHead = 0;
 static volatile uint8_t sNoteSetQTail = 0;
+
+// ── Ordered song operations ───────────────────────────────────────────────────
+// Everything the client sends that reads, replaces or saves the active song is
+// queued here by the MagiLink worker and run by commandsTick on the loop task
+// IN ARRIVAL ORDER.  The client sends pairs back to back — "save X, then load
+// Y"; "new song, patch its name, save it" — and both land before the loop task
+// runs once.  With one flag per kind, serviced in a fixed order, the load ran
+// first and Y was written out as X.mgt.
+//
+// Note edits keep their own ring (they come in bursts) but carry the same
+// arrival stamp, so commandsTick merges the two streams into one sequence.  A
+// song patch is applied inline for immediacy unless an operation is queued or
+// running, in which case it waits its turn here too.
+//
+// Single producer (the worker), single consumer (the loop task): head is
+// written only by the worker, tail only by the loop.  The tail advances AFTER
+// an operation has run, so "queue not empty" also means "one is in progress".
+enum {
+    OP_LOAD_NAME = 1,   // name
+    OP_LOAD_INDEX,      // a = page, b = index
+    OP_SAVE_ACTIVE,     // name, a = isAutosave
+    OP_NEW_SONG,
+    OP_SET_OFF,
+    OP_PUSH_DONE,       // a full-song push finished streaming in
+    OP_DELETE,          // name
+    OP_PATCH,           // offset, len, data
+};
+struct SongOp {
+    uint16_t seq;
+    uint8_t  kind, a, b, len;
+    uint16_t offset;
+    union {
+        char    name[SRV_NAME_MAX];
+        uint8_t data[SONG_PATCH_MAX];
+    };
+};
+#define SONG_OP_Q_LEN 16                        // power of two (uint8 index wrap)
+static SongOp*           sSongOpQ    = nullptr; // PSRAM, see commandsInit
+static volatile uint8_t  sSongOpHead = 0;
+static volatile uint8_t  sSongOpTail = 0;
+static uint16_t          sArrivalSeq = 0;       // worker only
+
+static bool sSongListDirty = false;   // /songs changed — refresh the on-screen list
 
 // Cell-tap audition, deferred behind the note-set queue (see MSG_NOTE_AUDITION).
 static volatile bool sAuditionPending = false;
@@ -194,12 +236,7 @@ static volatile uint8_t  sSampleSpecId      = 0;
 // A load reads SD and then streams ~35 KB (~750ms on a good link); doing that
 // inside the MagiLink callback would hold up the link worker.  The handler
 // sets a flag and commandsTick does the work on the loop task.
-static bool    srvLoadPending   = false;
-static uint8_t srvLoadPendingPage   = 0;
-static uint8_t srvLoadPendingIdx    = 0;
-static bool    srvLoadByNamePending = false;
 static bool    srvActiveSongReqPending = false;  // client pulled the active song
-static char    srvLoadByNameStr[SL_NAME_LEN] = {};
 static bool    srvListPending       = false;
 static uint8_t srvListPendingPage   = 0;
 
@@ -360,6 +397,10 @@ void commandsInit() {
     srvLoadScratch = (uint8_t*)heap_caps_malloc(sizeof(Song), MALLOC_CAP_SPIRAM);
     if (!srvLoadScratch)
         Serial.println("[CMD] srvLoadScratch: PSRAM alloc FAILED — loads read in place");
+    sSongOpQ = (SongOp*)heap_caps_malloc(SONG_OP_Q_LEN * sizeof(SongOp), MALLOC_CAP_SPIRAM);
+    if (!sSongOpQ) sSongOpQ = (SongOp*)malloc(SONG_OP_Q_LEN * sizeof(SongOp));
+    if (!sSongOpQ)
+        Serial.println("[CMD] song-op queue: ALLOC FAILED — load/save commands DISABLED");
     if (!srvBufOk) {
         Serial.printf("[CMD] srvActiveBuf: ALLOC FAILED for %u bytes — "
                       "song load/save DISABLED (internal free=%u, largest=%u)\n",
@@ -574,6 +615,8 @@ static void sendFile(uint8_t kind, const char* name) {
     hdr.kind       = kind;
     hdr.total_size = fsize;
     hdr.found      = found ? 1 : 0;
+    memset(hdr.name, 0, sizeof(hdr.name));
+    strncpy(hdr.name, name, sizeof(hdr.name) - 1);
     gMagiLink.send(&hdr, sizeof(hdr));
 
     if (found) {
@@ -649,6 +692,46 @@ static void quiesceSongReaders() {
     srvHasActive    = false;
     srvActiveBufLen = 0;
     for (int i = 0; i < 100 && sequencerSongReaderBusy(); i++) delay(1);
+}
+
+// Queue one song operation (worker task).  Never blocks: these arrive at human
+// pace, so a full queue means the loop task has been stuck for seconds — the
+// operation is dropped and logged rather than wedging the link.
+static bool songOpPush(uint8_t kind, const char* name, uint8_t nameMax,
+                       uint8_t a, uint8_t b) {
+    if (!sSongOpQ || (uint8_t)(sSongOpHead - sSongOpTail) >= SONG_OP_Q_LEN) {
+        Serial.printf("[CMD] song-op queue full — DROPPED op %u\n", (unsigned)kind);
+        return false;
+    }
+    SongOp* op = &sSongOpQ[sSongOpHead & (SONG_OP_Q_LEN - 1)];
+    memset(op, 0, sizeof(*op));
+    op->kind = kind;
+    op->a    = a;
+    op->b    = b;
+    if (name) {
+        size_t n = nameMax < sizeof(op->name) - 1 ? nameMax : sizeof(op->name) - 1;
+        strncpy(op->name, name, n);             // op->name is pre-zeroed
+    }
+    op->seq = sArrivalSeq++;
+    sSongOpHead++;
+    return true;
+}
+
+static bool songOpPushPatch(uint16_t offset, const uint8_t* data, uint8_t len) {
+    if (len > SONG_PATCH_MAX) return false;
+    if (!sSongOpQ || (uint8_t)(sSongOpHead - sSongOpTail) >= SONG_OP_Q_LEN) {
+        Serial.println("[CMD] song-op queue full — DROPPED patch");
+        return false;
+    }
+    SongOp* op = &sSongOpQ[sSongOpHead & (SONG_OP_Q_LEN - 1)];
+    memset(op, 0, sizeof(*op));
+    op->kind   = OP_PATCH;
+    op->offset = offset;
+    op->len    = len;
+    memcpy(op->data, data, len);
+    op->seq = sArrivalSeq++;
+    sSongOpHead++;
+    return true;
 }
 
 // Tell the client the server has no active song: set to OFF, nothing loaded
@@ -1094,24 +1177,21 @@ static void applySongPatch(const MsgSetSongData* msg) {
 }
 
 // ── Load song into active buffer without sending to client ────────────────────
-// The server-screen load.  Returns 0 on success, else a SongLoadFailReason
-// (NOT a bool — zero is the good result).  A failure leaves the previously
-// active song in place and playing, exactly as for a client-requested load.
-uint8_t srvLoadSongLocal(int listIdx) {
-    char (*raw)[SRV_FNAME_MAX] = srvSongScratch;
-    int total = srvListSongs(raw, SRV_MAX_SONGS);
-    if (listIdx < 0 || listIdx >= total) {
-        // The on-screen list no longer matches this scan — files changed
-        // underneath it, or the directory read came back short.
-        Serial.printf("[CMD] srvLoadSongLocal: index %d out of range (scan found %d songs)\n",
-                      listIdx, total);
-        return SONG_LOAD_FAIL_NOT_FOUND;
-    }
-
+// The server-screen load, by the name shown on the SONGS screen (no .mgt).
+// Returns 0 on success, else a SongLoadFailReason (NOT a bool — zero is the
+// good result).  A failure leaves the previously active song in place and
+// playing, exactly as for a client-requested load.
+//
+// By name, not by row number: the row only means something against the
+// directory scan the list was built from, and a fresh scan can differ.
+uint8_t srvLoadSongLocal(const char* bareName) {
+    if (!bareName || bareName[0] == '\0') return SONG_LOAD_FAIL_NOT_FOUND;
+    char file[SRV_FNAME_MAX + 8];
+    snprintf(file, sizeof(file), "%s.mgt", bareName);
     char path[48];
-    snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, raw[listIdx]);
+    snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, file);
     bool activeKept = true;
-    return srvLoadSongFile(path, raw[listIdx], &activeKept);
+    return srvLoadSongFile(path, file, &activeKept);
 }
 
 // ── Verified song write ───────────────────────────────────────────────────────
@@ -1310,6 +1390,8 @@ static void finaliseMagiLinkRestore() {
     if (sMagiRestoreIsInstruments) {
         loadInstrumentsFromSD();
         Serial.println("[CMD] instruments reloaded after restore");
+    } else {
+        sSongListDirty = true;
     }
 
     if (!sMagiRestoreIsInstruments && srvHasActive && srvActiveName[0] != '\0'
@@ -1413,7 +1495,7 @@ static void finaliseMagiLinkFileSave() {
 
 // ── MagiLink song save (client → server) state ─────────────────────────────
 // Populated by the MSG_SAVE_SONG_HEADER and _BODY callbacks (worker task).
-// On stream completion, the BODY callback sets sMagiSavePending; the main
+// On stream completion, the BODY callback queues OP_PUSH_DONE; the main
 // loop's commandsTick consumes it and writes to SD if a name was given.
 // The song write is deferred to the loop task, which owns srvActiveBuf and
 // the verified-save path.  (Restore and file-save do stream to SD from the
@@ -1421,7 +1503,6 @@ static void finaliseMagiLinkFileSave() {
 static char     sMagiSaveName[SRV_FNAME_MAX] = {};
 static uint32_t sMagiSaveExpectedBytes       = 0;  // Song bytes expected
 static uint32_t sMagiSaveReceivedBytes       = 0;  // Song bytes received so far
-static bool     sMagiSavePending             = false;
 
 void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (!srvBufOk) return;   // nowhere to receive the song into
@@ -1477,7 +1558,7 @@ void onMagiLinkSaveBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
     sMagiSaveReceivedBytes += b->data_len;
     if (sMagiSaveReceivedBytes == sMagiSaveExpectedBytes) {
         sMagiSaveExpectedBytes = 0;
-        sMagiSavePending       = true;
+        songOpPush(OP_PUSH_DONE, nullptr, 0, 0, 0);
     }
 }
 
@@ -1485,26 +1566,20 @@ void onMagiLinkSaveBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
 // Tells us to write the current srvActiveBuf to SD under the given name.
 // No song bytes on the wire — patches + note-sets have kept srvActiveBuf
 // in sync with the client's memory.  SD work deferred to commandsTick.
-static char sSaveActiveName[SRV_NAME_MAX] = {};
-static bool sSaveActivePending            = false;
-static bool sSaveActiveIsAutosave         = false;
 
 void onMagiLinkSaveActive(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (len < sizeof(MsgSaveActive)) return;
     const MsgSaveActive* m = (const MsgSaveActive*)msg;
-    strncpy(sSaveActiveName, m->name, sizeof(sSaveActiveName) - 1);
-    sSaveActiveName[sizeof(sSaveActiveName) - 1] = '\0';
-    sSaveActiveIsAutosave = (m->is_autosave != 0);
-    sSaveActivePending = true;
+    songOpPush(OP_SAVE_ACTIVE, m->name, sizeof(m->name) - 1, m->is_autosave != 0, 0);
 }
 
-// Called from commandsTick when sSaveActivePending fires.
-static void finaliseSaveActive() {
+// Runs as OP_SAVE_ACTIVE.
+static void finaliseSaveActive(const char* saveName, bool isAutosave) {
     if (!srvHasActive) {
         Serial.println("[CMD] save-active: no active song — ignoring");
         return;
     }
-    if (sSaveActiveName[0] == '\0') {
+    if (saveName[0] == '\0') {
         Serial.println("[CMD] save-active: empty name — ignoring");
         return;
     }
@@ -1512,9 +1587,9 @@ static void finaliseSaveActive() {
     // Autosave goes to /autosave/; explicit Save goes to /songs/ AND wipes the
     // matching /autosave/ draft (it's now superseded by the committed file).
     // Drafts are never auto-recovered on boot — see the autosave-policy note.
-    const char* dir = sSaveActiveIsAutosave ? SRV_AUTOSAVE_DIR : SRV_SONGS_DIR;
+    const char* dir = isAutosave ? SRV_AUTOSAVE_DIR : SRV_SONGS_DIR;
     char path[48];
-    snprintf(path, sizeof(path), "%s/%s.mgt", dir, sSaveActiveName);
+    snprintf(path, sizeof(path), "%s/%s.mgt", dir, saveName);
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
     SdLock _;
     if (!writeSongVerified(path, song)) {
@@ -1522,16 +1597,21 @@ static void finaliseSaveActive() {
         crashSetPhase(CP_IDLE);
         return;
     }
-    if (!sSaveActiveIsAutosave) {
+    if (!isAutosave) {
         // Explicit save committed — any pending autosave draft is now redundant.
         char autopath[48];
         snprintf(autopath, sizeof(autopath), "%s/%s.mgt",
-                 SRV_AUTOSAVE_DIR, sSaveActiveName);
+                 SRV_AUTOSAVE_DIR, saveName);
         if (SD.exists(autopath)) {
             SD.remove(autopath);
             Serial.printf("[CMD] cleared autosave '%s'\n", autopath);
         }
-        snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", sSaveActiveName);
+        snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", saveName);
+        // A name the on-screen list doesn't have yet is a new file.
+        bool listed = false;
+        for (int i = 0; i < numSongs && !listed; i++)
+            listed = (strcasecmp(songNames[i], saveName) == 0);
+        if (!listed) sSongListDirty = true;
     }
     crashSetPhase(CP_IDLE);   // autosave/save complete
 }
@@ -1539,19 +1619,17 @@ static void finaliseSaveActive() {
 // ── New-song: client → server ────────────────────────────────────────────
 // Server runs initSong() on its in-memory copy so it matches the
 // freshly-wiped client copy.  No bytes streamed.
-static bool sNewSongPending = false;
 
 void onMagiLinkNewSong(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (len < sizeof(MsgNewSong)) return;
-    sNewSongPending = true;
+    songOpPush(OP_NEW_SONG, nullptr, 0, 0, 0);
 }
 
 // ── Set-OFF: client → server "-- OFF -- / No Song" ────────────────────────────
-static bool sSetOffPending = false;
 
 void onMagiLinkSetNoSong(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (len < sizeof(MsgSetNoSong)) return;
-    sSetOffPending = true;   // deferred to commandsTick — same as loadSong(0)
+    songOpPush(OP_SET_OFF, nullptr, 0, 0, 0);   // run on the loop task — same as loadSong(0)
 }
 
 static void finaliseNewSong() {
@@ -1573,7 +1651,7 @@ static void finaliseNewSong() {
     Serial.println("[CMD] new-song: server memory wiped");
 }
 
-// Called from commandsTick when sMagiSavePending fires.  Writes the
+// Runs as OP_PUSH_DONE.  Writes the
 // in-memory song to SD if a name was provided; either way, marks
 // srvHasActive and resets the sequencer.
 static void finaliseMagiLinkSongSave() {
@@ -1585,9 +1663,10 @@ static void finaliseMagiLinkSongSave() {
         char path[48];
         snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, sMagiSaveName);
         SdLock _;
-        if (writeSongVerified(path, song))
+        if (writeSongVerified(path, song)) {
             snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", sMagiSaveName);
-        else
+            sSongListDirty = true;
+        } else
             Serial.printf("[CMD] save: verify failed '%s' — kept previous file\n", path);
     } else {
         Serial.println("[CMD] save: in-memory push (no SD write)");
@@ -1947,24 +2026,198 @@ static void sendActiveSongToClient() {
                   (unsigned)srvActiveBufLen, ok ? "OK" : "FAIL");
 }
 
-// ── Tick — call from main loop() to run deferred operations ──────────────────
-void commandsTick() {
-    // Apply queued note edits first, so anything below that reads or saves the
-    // song (save-active, autosave) sees them.  Skipped-but-consumed while a
-    // full push is in flight (srvHasActive false) — the push supersedes them.
-    while (sNoteSetQTail != sNoteSetQHead) {
-        const MsgNoteSet& m = sNoteSetQ[sNoteSetQTail & (NOTE_SET_Q_LEN - 1)];
-        if (srvHasActive) {
-            Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
-            if (m.pattern < song->numPatterns) {
-                NoteGrid grid(song->notePool, &song->noteFreeHead,
-                              &song->patterns[m.pattern].noteHead);
-                // Always set — NoteGrid::set clears internally when *all*
-                // fields are empty, but persists attr-only / vel-only rows.
-                grid.set(m.row, m.col, m.note);
+// ── Run one queued note edit (loop task) ──────────────────────────────────────
+// Skipped-but-consumed while no song is active (e.g. a full push is in
+// flight — the push supersedes them).
+static void applyQueuedNoteSet(uint8_t slot) {
+    const MsgNoteSet& m = sNoteSetQ[slot];
+    if (!srvHasActive) return;
+    Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
+    // The sequencer indexes its per-column state by these — refuse a cell
+    // that is outside the grid rather than store it.
+    if (m.pattern >= song->numPatterns || m.pattern >= MAX_PATTERNS ||
+        m.row >= MAX_ROWS || m.col >= MAX_COLUMNS) return;
+    NoteGrid grid(song->notePool, &song->noteFreeHead,
+                  &song->patterns[m.pattern].noteHead);
+    // Always set — NoteGrid::set clears internally when *all*
+    // fields are empty, but persists attr-only / vel-only rows.
+    grid.set(m.row, m.col, m.note);
+}
+
+// ── The on-screen song list follows the card ──────────────────────────────────
+// The SONGS screen shows a list read at boot.  After a save-as / new / delete /
+// restore it no longer matches /songs, so re-read it and put the highlight
+// back on whatever is actually loaded (OFF if that has no file yet).
+static void srvRefreshScreenSongList() {
+    loadSongList();
+    cursor = 0;
+    if (srvHasActive && srvActiveName[0] != '\0') {
+        for (int i = 0; i < numSongs; i++) {
+            char fn[SRV_FNAME_MAX + 8];
+            snprintf(fn, sizeof(fn), "%s.mgt", songNames[i]);
+            if (strcasecmp(fn, srvActiveName) == 0) { cursor = i + SONG_IDX_OFFSET; break; }
+        }
+    }
+    if (cursor >= scrollOffset + UI_VISIBLE_ROWS)
+        scrollOffset = cursor - UI_VISIBLE_ROWS + 1;
+    needsFullRedraw = true;
+}
+
+// ── Run one queued song operation (loop task) ─────────────────────────────────
+static void runSongOp(uint8_t slot) {
+    const SongOp& op = sSongOpQ[slot];
+    switch (op.kind) {
+
+    case OP_LOAD_NAME: {
+        // Mirror the load-by-index path: stop+reset the sequencer and
+        // sync the on-screen cursor so the row highlight tracks the
+        // song the client just pushed to us via the setlist.  Only when
+        // the load actually took — a failed one leaves the previous song
+        // active and playing, and must not reset it.
+        if (sendSongDataByName(op.name)) {
+            Serial.printf("[STOPSRC] load-by-name '%s' t=%lu\n",
+                          op.name, millis());
+            sequencerStop();
+            sequencerReset();
+            sequencerSendPatchesNow();   // patches up before the first note
+            int matchIdx = -1;
+            for (int i = 0; i < numSongs; i++) {
+                if (strcmp(songNames[i], op.name) == 0) {
+                    matchIdx = i;
+                    break;
+                }
+            }
+            if (matchIdx >= 0) {
+                cursor = matchIdx + SONG_IDX_OFFSET;
+                if (cursor >= scrollOffset + UI_VISIBLE_ROWS)
+                    scrollOffset = cursor - UI_VISIBLE_ROWS + 1;
+                if (cursor < scrollOffset)
+                    scrollOffset = cursor;
+                needsFullRedraw = true;
             }
         }
-        sNoteSetQTail++;
+        break;
+    }
+
+    case OP_LOAD_INDEX: {
+        int fileIdx = (int)op.a * SL_PER_PKT + (int)op.b;
+        if (sendSongData(op.a, op.b)) {
+            Serial.printf("[STOPSRC] load-by-index fileIdx=%d t=%lu\n",
+                          fileIdx, millis());
+            sequencerStop();
+            sequencerReset();
+            sequencerSendPatchesNow();   // patches up before the first note
+            // Sync the server display cursor to the song the client just loaded
+            int newCursor = fileIdx + SONG_IDX_OFFSET;
+            if (newCursor < 0) newCursor = 0;
+            if (newCursor >= numSongs + SONG_IDX_OFFSET)
+                newCursor = numSongs + SONG_IDX_OFFSET - 1;
+            cursor = newCursor;
+            if (cursor >= scrollOffset + UI_VISIBLE_ROWS)
+                scrollOffset = cursor - UI_VISIBLE_ROWS + 1;
+            if (cursor < scrollOffset)
+                scrollOffset = cursor;
+            needsFullRedraw = true;
+        }
+        break;
+    }
+
+    case OP_PUSH_DONE:
+        finaliseMagiLinkSongSave();
+        break;
+
+    case OP_SAVE_ACTIVE:
+        finaliseSaveActive(op.name, op.a != 0);
+        break;
+
+    case OP_NEW_SONG:
+        finaliseNewSong();
+        break;
+
+    case OP_SET_OFF:
+        // Same as the server's local "-- OFF --" selection: stop, drop the
+        // active song, tell the client, and sync the on-screen cursor to OFF.
+        sequencerStop();
+        srvHasActive    = false;
+        srvActiveName[0] = '\0';
+        sendNoSongToClient();
+        cursor          = 0;   // 0 = OFF (SONG_IDX_OFFSET)
+        needsFullRedraw = true;
+        break;
+
+    case OP_DELETE: {
+        char path[48];
+        snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, op.name);
+        {
+            SdLock _;
+            if (SD.exists(path)) {
+                SD.remove(path);
+                Serial.printf("[CMD] deleted '%s'\n", path);
+            } else {
+                snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, op.name);
+                if (SD.exists(path)) {
+                    SD.remove(path);
+                    Serial.printf("[CMD] deleted '%s'\n", path);
+                }
+            }
+            // Also wipe any matching autosave draft so a recovered file
+            // can't resurrect the song we just deleted.
+            char autopath[48];
+            snprintf(autopath, sizeof(autopath), "%s/%s.mgt",
+                     SRV_AUTOSAVE_DIR, op.name);
+            if (SD.exists(autopath)) {
+                SD.remove(autopath);
+                Serial.printf("[CMD] deleted autosave '%s'\n", autopath);
+            }
+        }
+        char expectedActive[SRV_FNAME_MAX];
+        snprintf(expectedActive, sizeof(expectedActive), "%s.mgt", op.name);
+        if (srvHasActive && strcmp(expectedActive, srvActiveName) == 0)
+            srvHasActive = false;
+        sSongListDirty = true;
+        break;
+    }
+
+    case OP_PATCH: {
+        MsgSetSongData m;
+        m.offset  = op.offset;
+        m.dataLen = op.len;
+        memcpy(m.data, op.data, op.len);
+        applySongPatch(&m);
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+// ── Tick — call from main loop() to run deferred operations ──────────────────
+void commandsTick() {
+    // Note edits and song operations, merged into the order they arrived.
+    // An operation can take a second (SD read + 35 KB stream); anything that
+    // arrives meanwhile simply queues behind it.
+    for (;;) {
+        bool haveNote = (sNoteSetQTail != sNoteSetQHead);
+        bool haveOp   = (sSongOpTail  != sSongOpHead);
+        if (!haveNote && !haveOp) break;
+        bool noteFirst = haveNote;
+        if (haveNote && haveOp) {
+            uint16_t ns = sNoteSetSeq[sNoteSetQTail & (NOTE_SET_Q_LEN - 1)];
+            uint16_t os = sSongOpQ[sSongOpTail & (SONG_OP_Q_LEN - 1)].seq;
+            noteFirst = (int16_t)(ns - os) < 0;          // wrap-safe "ns is older"
+        }
+        if (noteFirst) {
+            applyQueuedNoteSet(sNoteSetQTail & (NOTE_SET_Q_LEN - 1));
+            sNoteSetQTail++;
+        } else {
+            runSongOp(sSongOpTail & (SONG_OP_Q_LEN - 1));
+            sSongOpTail++;                                // only now is it "done"
+        }
+    }
+    if (sSongListDirty) {
+        sSongListDirty = false;
+        srvRefreshScreenSongList();
     }
 
     // Audition fires after the drain so it plays the just-set cell value.
@@ -2010,81 +2263,6 @@ void commandsTick() {
         }
     }
 
-    if (srvLoadByNamePending) {
-        srvLoadByNamePending = false;
-        // Mirror the load-by-index path: stop+reset the sequencer and
-        // sync the on-screen cursor so the row highlight tracks the
-        // song the client just pushed to us via the setlist.  Only when
-        // the load actually took — a failed one leaves the previous song
-        // active and playing, and must not reset it.
-        if (sendSongDataByName(srvLoadByNameStr)) {
-            Serial.printf("[STOPSRC] load-by-name '%s' t=%lu\n",
-                          srvLoadByNameStr, millis());
-            sequencerStop();
-            sequencerReset();
-            sequencerSendPatchesNow();   // patches up before the first note
-            int matchIdx = -1;
-            for (int i = 0; i < numSongs; i++) {
-                if (strcmp(songNames[i], srvLoadByNameStr) == 0) {
-                    matchIdx = i;
-                    break;
-                }
-            }
-            if (matchIdx >= 0) {
-                cursor = matchIdx + SONG_IDX_OFFSET;
-                if (cursor >= scrollOffset + UI_VISIBLE_ROWS)
-                    scrollOffset = cursor - UI_VISIBLE_ROWS + 1;
-                if (cursor < scrollOffset)
-                    scrollOffset = cursor;
-                needsFullRedraw = true;
-            }
-        }
-    }
-    if (srvLoadPending) {
-        srvLoadPending = false;
-        int fileIdx = (int)srvLoadPendingPage * SL_PER_PKT + (int)srvLoadPendingIdx;
-        if (sendSongData(srvLoadPendingPage, srvLoadPendingIdx)) {
-            Serial.printf("[STOPSRC] load-by-index fileIdx=%d t=%lu\n",
-                          fileIdx, millis());
-            sequencerStop();
-            sequencerReset();
-            sequencerSendPatchesNow();   // patches up before the first note
-            // Sync the server display cursor to the song the client just loaded
-            int newCursor = fileIdx + SONG_IDX_OFFSET;
-            if (newCursor < 0) newCursor = 0;
-            if (newCursor >= numSongs + SONG_IDX_OFFSET)
-                newCursor = numSongs + SONG_IDX_OFFSET - 1;
-            cursor = newCursor;
-            if (cursor >= scrollOffset + UI_VISIBLE_ROWS)
-                scrollOffset = cursor - UI_VISIBLE_ROWS + 1;
-            if (cursor < scrollOffset)
-                scrollOffset = cursor;
-            needsFullRedraw = true;
-        }
-    }
-    if (sMagiSavePending) {
-        sMagiSavePending = false;
-        finaliseMagiLinkSongSave();
-    }
-    if (sSaveActivePending) {
-        sSaveActivePending = false;
-        finaliseSaveActive();
-    }
-    if (sNewSongPending) {
-        sNewSongPending = false;
-        finaliseNewSong();
-    }
-    if (sSetOffPending) {
-        sSetOffPending = false;
-        // Same as the server's local "-- OFF --" selection: stop, drop the
-        // active song, tell the client, and sync the on-screen cursor to OFF.
-        sequencerStop();
-        srvHasActive    = false;
-        srvActiveName[0] = '\0';
-        sendNoSongToClient();
-        cursor          = 0;   // 0 = OFF (SONG_IDX_OFFSET)
-        needsFullRedraw = true;
-    }
     if (sMagiRestorePending) {
         sMagiRestorePending = false;
         finaliseMagiLinkRestore();
@@ -2108,37 +2286,6 @@ void commandsTick() {
     if (srvFileLoadPending) {
         srvFileLoadPending = false;
         sendFile(srvFileLoadPendingKind, srvFileLoadPendingName);
-    }
-    if (srvDeletePending) {
-        srvDeletePending = false;
-        char path[48];
-        snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, srvDeleteName);
-        {
-            SdLock _;
-            if (SD.exists(path)) {
-                SD.remove(path);
-                Serial.printf("[CMD] deleted '%s'\n", path);
-            } else {
-                snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, srvDeleteName);
-                if (SD.exists(path)) {
-                    SD.remove(path);
-                    Serial.printf("[CMD] deleted '%s'\n", path);
-                }
-            }
-            // Also wipe any matching autosave draft so a recovered file
-            // can't resurrect the song we just deleted.
-            char autopath[48];
-            snprintf(autopath, sizeof(autopath), "%s/%s.mgt",
-                     SRV_AUTOSAVE_DIR, srvDeleteName);
-            if (SD.exists(autopath)) {
-                SD.remove(autopath);
-                Serial.printf("[CMD] deleted autosave '%s'\n", autopath);
-            }
-        }
-        char expectedActive[SRV_FNAME_MAX];
-        snprintf(expectedActive, sizeof(expectedActive), "%s.mgt", srvDeleteName);
-        if (srvHasActive && strcmp(expectedActive, srvActiveName) == 0)
-            srvHasActive = false;
     }
     // Process list request AFTER finalize/delete so a save-then-list or
     // delete-then-list sequence returns the up-to-date directory.
@@ -2190,9 +2337,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             if (len < (int)sizeof(MsgSongLoadReq)) return;
             {
                 const MsgSongLoadReq* req = (const MsgSongLoadReq*)data;
-                srvLoadPendingPage = req->page;
-                srvLoadPendingIdx  = req->index;
-                srvLoadPending     = true;
+                songOpPush(OP_LOAD_INDEX, nullptr, 0, req->page, req->index);
             }
             break;
 
@@ -2204,9 +2349,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             if (len < (int)sizeof(MsgSongLoadNameReq)) return;
             {
                 const MsgSongLoadNameReq* req = (const MsgSongLoadNameReq*)data;
-                strncpy(srvLoadByNameStr, req->name, sizeof(srvLoadByNameStr) - 1);
-                srvLoadByNameStr[sizeof(srvLoadByNameStr) - 1] = '\0';
-                srvLoadByNamePending = true;
+                songOpPush(OP_LOAD_NAME, req->name, sizeof(req->name) - 1, 0, 0);
             }
             break;
 
@@ -2216,22 +2359,38 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             {
                 const MsgSetSongData* p = (const MsgSetSongData*)data;
                 if (len < (int)(6 + p->dataLen)) return;
-                applySongPatch(p);
+                // Inline for immediacy (live BPM / mute edits) — unless a song
+                // operation is queued or running, when it must keep its place.
+                if (sSongOpHead != sSongOpTail) songOpPushPatch(p->offset, p->data, p->dataLen);
+                else                            applySongPatch(p);
             }
             break;
 
         case MSG_NOTE_SET:
             if (len < (int)sizeof(MsgNoteSet)) return;
-            if (srvHasActive) {
+            {
                 // NoteGrid::set relinks the live note pool.  Queue it;
                 // commandsTick applies it on the loop task so all relinks
                 // happen in one place, in order with saves and loads.
-                // Queue full is effectively impossible (client paces edits at
-                // touch speed), but never drop silently — wait for a slot.
-                while ((uint8_t)(sNoteSetQHead - sNoteSetQTail) >= NOTE_SET_Q_LEN)
-                    delay(1);
-                sNoteSetQ[sNoteSetQHead & (NOTE_SET_Q_LEN - 1)] =
-                    *(const MsgNoteSet*)data;
+                MsgNoteSet m = *(const MsgNoteSet*)data;   // `data` is the link's buffer
+                if ((uint8_t)(sNoteSetQHead - sNoteSetQTail) >= NOTE_SET_Q_LEN) {
+                    // Full: a paste / drum import sends more than one loop pass
+                    // drains.  Wait for room — but NOT holding the link mutex:
+                    // the loop task that empties this queue may itself be
+                    // blocked waiting to send, and then neither side moves.
+                    gMagiLink.releaseMutex();
+                    uint32_t t0 = millis();
+                    while ((uint8_t)(sNoteSetQHead - sNoteSetQTail) >= NOTE_SET_Q_LEN &&
+                           millis() - t0 < 2000)
+                        delay(1);
+                }
+                if ((uint8_t)(sNoteSetQHead - sNoteSetQTail) >= NOTE_SET_Q_LEN) {
+                    Serial.println("[CMD] note-set queue stuck full for 2s — DROPPED an edit");
+                    break;
+                }
+                uint8_t slot = sNoteSetQHead & (NOTE_SET_Q_LEN - 1);
+                sNoteSetQ[slot]   = m;
+                sNoteSetSeq[slot] = sArrivalSeq++;
                 sNoteSetQHead++;
             }
             break;
@@ -2240,9 +2399,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             if (len < (int)sizeof(MsgSongDelete)) return;
             {
                 const MsgSongDelete* d = (const MsgSongDelete*)data;
-                strncpy(srvDeleteName, d->name, sizeof(srvDeleteName) - 1);
-                srvDeleteName[sizeof(srvDeleteName) - 1] = '\0';
-                srvDeletePending = true;  // defer SD delete to main loop
+                songOpPush(OP_DELETE, d->name, sizeof(d->name) - 1, 0, 0);   // SD work → loop task
             }
             break;
 

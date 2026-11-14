@@ -495,6 +495,11 @@ bool ServerPairing::sendNoteSet(const Song& song, uint8_t pattern, uint8_t row, 
     msg.col     = col;
     NoteGrid grid(song.notePool, &song.patterns[pattern].noteHead);
     msg.note = grid.get(row, col);
+    // get() hands back all-zero for a cell that isn't there, but all-zero is
+    // not "empty" to NoteGrid::set on the far side (velocity 0 is an explicit
+    // value — a PixelPost "slider 0" row).  Send the real empty encoding, or
+    // every cleared cell is stored on the server as a phantom note.
+    if (!grid.has(row, col)) msg.note.velocity = VEL_DEFAULT;
     return _sendLocked(&msg, sizeof(msg));
 }
 
@@ -1255,6 +1260,14 @@ void ServerPairing::_onMagiLinkFileLoad(const uint8_t* msg, size_t len) {
         }
         const MsgFileLoadHeader* h = (const MsgFileLoadHeader*)msg;
         if (h->kind != _fileLoadKind) return;
+        // A reply for a different file is the late answer to a request we
+        // already timed out of — its body must not be taken for this one.
+        // (State stays WAITING_HEADER, so its BODY / EndOfData are ignored.)
+        if (strncmp(h->name, _fileLoadName, FILE_NAME_LEN) != 0) {
+            Serial.printf("[SP] ignoring late file reply '%.47s' (waiting for '%s')\n",
+                          h->name, _fileLoadName);
+            return;
+        }
         if (!h->found) {
             _fileLoadState = FileLoadState::NOT_FOUND;
             return;

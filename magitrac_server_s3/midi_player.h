@@ -61,6 +61,12 @@ void     sequencerSetBPM(uint16_t bpm);  // set live BPM immediately (e.g. from 
 void sequencerTick();
 void sequencerMidiClockTick();  // emit 24-PPQN MIDI clock at the live tempo (Song::flags gated)
 void sequencerPollMidiIn();  // call every loop() — reads performer MIDI in
+// The control functions above (start/stop/seek/queue/preview/audition/raw
+// MIDI…) are safe to call from any task: off the MIDI task they are handed to
+// it and return once run.  The MIDI task must call sequencerBindMidiTask()
+// once at start and sequencerServiceRequests() every loop iteration.
+void sequencerBindMidiTask();
+void sequencerServiceRequests();
 bool sequencerSongReaderBusy();  // true while a loop-task walk of srvActiveBuf is in flight
 void seqSendSlotEnable();    // send CC 115 ch16 with current performerMask
 

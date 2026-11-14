@@ -26,6 +26,12 @@ FileBrowser::FileBrowser(EPD_PainterAdafruit& d, GT911_Lite& touch)
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 void FileBrowser::open() {
+    if (!_items) {
+        size_t bytes = (size_t)FB_MAX_ITEMS * STORAGE_FILENAME_MAX;
+        _items = (char (*)[STORAGE_FILENAME_MAX])ps_malloc(bytes);
+        if (!_items) _items = (char (*)[STORAGE_FILENAME_MAX])malloc(bytes);
+        if (!_items) Serial.println("[FB] item list alloc FAILED — list will be empty");
+    }
     _altMode   = false;
     _wasDown   = _touch.isTouched;
     _scroll    = 0;
@@ -71,7 +77,7 @@ void FileBrowser::clearItems() {
 }
 
 void FileBrowser::addItem(const char* name) {
-    if (_itemCount >= FB_MAX_ITEMS) return;
+    if (!_items || _itemCount >= FB_MAX_ITEMS) return;
     strncpy(_items[_itemCount], name, STORAGE_FILENAME_MAX - 1);
     _items[_itemCount][STORAGE_FILENAME_MAX - 1] = '\0';
     _itemCount++;

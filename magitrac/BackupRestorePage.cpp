@@ -229,12 +229,17 @@ void BackupRestorePage::drawBackupDone() {
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
     _d.setCursor(300, 180);
-    _d.print(_bkCancelled ? "Backup cancelled" : "Backup complete!");
+    _d.print(_bkCancelled       ? "Backup cancelled"
+           : _bkFilesFailed > 0 ? "Backup INCOMPLETE"
+                                : "Backup complete!");
 
     char buf[64];
     if (_bkCancelled) {
         snprintf(buf, sizeof(buf), "%d of %d files saved",
                  _bkFilesSaved, _bkFileTotal);
+    } else if (_bkFilesFailed > 0) {
+        snprintf(buf, sizeof(buf), "%d saved, %d FAILED",
+                 _bkFilesSaved, _bkFilesFailed);
     } else {
         snprintf(buf, sizeof(buf), "%d files saved", _bkFilesSaved);
     }
@@ -428,7 +433,13 @@ void BackupRestorePage::drawRestoreDone() {
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
     _d.setCursor(280, 200);
-    _d.print("Restore complete!");
+    _d.print(_rsFilesFailed > 0 ? "Restore INCOMPLETE" : "Restore complete!");
+    if (_rsFilesFailed > 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%d sent, %d FAILED", _rsFilesSent, _rsFilesFailed);
+        _d.setCursor(330, 250);
+        _d.print(buf);
+    }
 
     uiButton(_d, BR_BACK_X, BR_BACK_Y, BR_BACK_W, BR_BACK_H, "OK", COL_WHITE, COL_BLACK, 3);
 }
@@ -492,11 +503,20 @@ void BackupRestorePage::startBackup() {
     if (!SD.exists(BR_BACKUPS_DIR)) SD.mkdir(BR_BACKUPS_DIR);
     SD.mkdir(_bkFolder);
     Serial.printf("[BK] folder=%s\n", _bkFolder);
+    if (!SD.exists(_bkFolder)) {
+        // Nowhere to write: don't pull the whole stream just to drop it.
+        Serial.println("[BK] could not create the backup folder — SD card missing or full?");
+        strncpy(_errMsg, "Can't create backup folder (SD?)", sizeof(_errMsg));
+        _state = BRState::ERROR_SCREEN;
+        draw(); _d.paintLater();
+        return;
+    }
 
     _bkFileTotal   = 0;
     _bkFileCurrent = 0;
     _bkCancelled   = false;
     _bkFilesSaved  = 0;
+    _bkFilesFailed = 0;
     _bkCurName[0]  = '\0';
 
     // Show "backup in progress" — paintLater so the EPD work happens on
@@ -520,6 +540,7 @@ void BackupRestorePage::startBackup() {
     uint32_t curBytesWritten = 0;
     uint32_t curFileSize     = 0;
     bool     curOpenOk       = false;
+    bool     curWriteOk      = true;    // every write() for this file took all its bytes
     int      curIndex        = 0;
     int      bkIncomplete    = 0;
     int      bkOpenFail      = 0;
@@ -531,7 +552,9 @@ void BackupRestorePage::startBackup() {
 
     auto finishCurFile = [&]() {
         if (curIndex <= 0 || _bkCancelled) return;
-        bool complete = curBytesWritten >= curFileSize && curOpenOk;
+        bool complete = curBytesWritten >= curFileSize && curOpenOk && curWriteOk;
+        // "Saved" means it is on the card — not merely that its bytes arrived.
+        if (complete) _bkFilesSaved++; else _bkFilesFailed++;
         if (curFileSize == 0) bkZeroSize++;
         if (!curOpenOk) bkOpenFail++;
         else if (curBytesWritten < curFileSize) bkIncomplete++;
@@ -592,6 +615,7 @@ void BackupRestorePage::startBackup() {
             curFileSize     = h->file_size;
             curIndex        = h->file_index;
             curOpenOk       = false;
+            curWriteOk      = true;
 
             char nameStr[BK_FNAME_MAX] = {};
             strncpy(nameStr, h->filename, BK_FNAME_MAX - 1);
@@ -639,15 +663,13 @@ void BackupRestorePage::startBackup() {
             if (!_bkCancelled) {
                 if (curFile) {
                     size_t w = curFile.write(b->data, n);
+                    if (w != n) curWriteOk = false;
                     if (w != n)
                         Serial.printf("[BK] SD WRITE SHORT file %d want=%u wrote=%u at %u\n",
                                       curIndex, (unsigned)n, (unsigned)w,
                                       (unsigned)curBytesWritten);
                 }
-                uint32_t before = curBytesWritten;
                 curBytesWritten += n;
-                if (before < curFileSize && curBytesWritten >= curFileSize)
-                    _bkFilesSaved++;
                 if (curBytesWritten > curFileSize)
                     Serial.printf("[BK] file %d OVERRUN received=%u expected=%u\n",
                                   curIndex, (unsigned)curBytesWritten,
@@ -832,6 +854,8 @@ void BackupRestorePage::startRestore(int fileIdx) {
     _rsRestoreCount = 0;
     _rsFileCurrent  = 0;
     _rsCancelled    = false;
+    _rsFilesSent    = 0;
+    _rsFilesFailed  = 0;
 
     if (fileIdx < 0) {
         // Restore all
@@ -863,6 +887,7 @@ void BackupRestorePage::restoreTick() {
     File f = SD.open(path);
     if (!f) {
         Serial.printf("[RS] open failed '%s'\n", path);
+        _rsFilesFailed++;
         _rsFileCurrent++;
         restoreTick();
         return;
@@ -871,6 +896,8 @@ void BackupRestorePage::restoreTick() {
     static uint8_t restoreBuf[SONG_TRANSFER_MAX];
     if (fileSize > SONG_TRANSFER_MAX) {
         f.close();
+        Serial.printf("[RS] too big to restore '%s' (%u bytes)\n", path, (unsigned)fileSize);
+        _rsFilesFailed++;
         _rsFileCurrent++;
         restoreTick();
         return;
@@ -878,14 +905,18 @@ void BackupRestorePage::restoreTick() {
     uint32_t got = (uint32_t)f.read(restoreBuf, fileSize);
     f.close();
     if (got != fileSize) {
+        Serial.printf("[RS] short read '%s' (%u of %u)\n", path, (unsigned)got, (unsigned)fileSize);
+        _rsFilesFailed++;
         _rsFileCurrent++;
         restoreTick();
         return;
     }
 
     bool isInstr = (strcmp(name, "instruments.mgt") == 0);
-    gServerPairing.sendRestoreFile(name, isInstr, restoreBuf, fileSize);
-    Serial.printf("[RS] sent '%s' %u bytes instr=%d\n", name, fileSize, isInstr);
+    bool sent = gServerPairing.sendRestoreFile(name, isInstr, restoreBuf, fileSize);
+    if (sent) _rsFilesSent++; else _rsFilesFailed++;
+    Serial.printf("[RS] %s '%s' %u bytes instr=%d\n", sent ? "sent" : "SEND FAILED",
+                  name, fileSize, isInstr);
 
     // Give server time to finalize (commandsTick writes to SD) before next file
     delay(100);

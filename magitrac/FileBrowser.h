@@ -2,6 +2,7 @@
 #include "EPD_Painter_Adafruit.h"
 #include "gt911_lite.h"
 #include "SongStorage.h"
+#include "MagiMsg.h"      // SRV_MAX_SONGS
 #include "UIHelpers.h"
 #include "Constants.h"
 
@@ -46,9 +47,10 @@ static const int FB_SAVEAS_W = 320;
 
 // Max items the browser can hold at once.  Grid mode (SD) only shows one page
 // (≤ FB_PER_PAGE); list mode (server) accumulates the whole list, so this caps
-// it.  NOTE: the server can list up to SRV_MAX_SONGS (128); addItem() drops
-// anything past this cap, so songs beyond the 64th are not shown.
-static const int FB_MAX_ITEMS = 64;
+// it — sized to what the server can list, so no song is ever left off.  The
+// storage is allocated from PSRAM in open() (3 KB is too much to sit in
+// internal RAM, which the radios need).
+static const int FB_MAX_ITEMS = SRV_MAX_SONGS;
 
 // Drag-scroll list mode (used for the server browser): single full-width rows
 // between the toolbar and footer.
@@ -139,7 +141,7 @@ private:
     bool  _altMode;
     bool  _wasDown;
 
-    char  _items[FB_MAX_ITEMS][STORAGE_FILENAME_MAX];
+    char (*_items)[STORAGE_FILENAME_MAX] = nullptr;   // [FB_MAX_ITEMS], see open()
     int   _itemCount;
 
     // List-mode (drag-scroll) state.

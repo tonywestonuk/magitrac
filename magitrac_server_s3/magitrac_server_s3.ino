@@ -376,7 +376,9 @@ uint8_t loadSong(int idx) {
 
     bool    hadActive = srvHasActive;
     int     listIdx   = idx - SONG_IDX_OFFSET;
-    uint8_t fail      = srvLoadSongLocal(listIdx);
+    uint8_t fail      = (listIdx >= 0 && listIdx < numSongs)
+                      ? srvLoadSongLocal(songNames[listIdx])
+                      : (uint8_t)SONG_LOAD_FAIL_NOT_FOUND;
     if (fail == 0) {
         sequencerReset();
         sequencerSendPatchesNow();   // patches up before the first note
@@ -1231,7 +1233,9 @@ static volatile struct {
 
 // ── MIDI task — Core 1, high priority ─────────────────────────────────────────
 static void midiTaskFn(void* /*pv*/) {
+    sequencerBindMidiTask();          // this task now owns MIDI out + playhead
     for (;;) {
+        sequencerServiceRequests();   // control calls handed over from other tasks
         sequencerPollMidiIn();
         sequencerTick();
         sequencerMidiClockTick();
@@ -1253,6 +1257,90 @@ static bool consumeUsbMscBootFlag() {
 }
 
 // ── Setup / Loop ──────────────────────────────────────────────────────────────
+// ── Radio bring-up for the paired mode ────────────────────────────────────────
+// Brings WiFi up as stored at pairing: our own hidden softAP (SERVER_AP), a
+// station on someone else's AP (EXTERNAL_AP), or nothing if unpaired.  Called
+// from setup(), and again when pairing mode is cancelled or times out —
+// entering pairing mode tears the softAP down and parks the radio on ch1, and
+// without this the client could not reconnect until a power cycle.
+// Returns the MAGI_AP_MODE_* now in effect, or -1 if unpaired.  (Not 0 for
+// "unpaired": MAGI_AP_MODE_SERVER is itself 0.)
+int serverWifiBringUp() {
+    extern uint8_t wifiChannelLoad();
+    char    creds_ssid[33] = {};
+    char    creds_psk[64]  = {};
+    uint8_t apMode         = 0;
+    bool hasCreds = pairNvsLoadCreds("magitrac_srv", creds_ssid, creds_psk, &apMode);
+
+    if (hasCreds && apMode == MAGI_AP_MODE_SERVER) {
+        const uint8_t apChannel = magiWifiChannelFromIdx(wifiChannelLoad());
+        Serial.printf("[SETUP] branch=SERVER_AP ch=%u ssid='%s'\n",
+                      (unsigned)apChannel, creds_ssid);
+        // max_connection 8 (default 4): the client takes one slot and several
+        // PixelPost units pile on at once during a field OTA pull.
+        // Hidden SSID: a visible AP must answer every phone's broadcast probe
+        // request with a unicast probe response (retried if the phone has
+        // already hopped channels).  At a gig that is hundreds of phones and
+        // a real slice of our single radio's airtime spent on devices that
+        // will never join.  Hidden, the AP only answers probes that name it.
+        // The client connects by stored SSID (directed probe), so nothing on
+        // its side changes; the field-flash posts do the same.
+        bool apOk = WiFi.softAP(creds_ssid, creds_psk, apChannel,
+                                /*hidden=*/1, /*max_connection=*/8);
+        if (!apOk) {
+            Serial.println("[SETUP] softAP FAILED — common causes: PSK < 8 chars, SSID empty, channel out of range");
+        }
+        // Remember the LIVE AP creds — the field-flash OTA must hand the posts
+        // exactly these, not the magitrac_srv_self NVS (which can drift).
+        strncpy(gApSsid, creds_ssid, sizeof(gApSsid)); gApSsid[sizeof(gApSsid) - 1] = 0;
+        strncpy(gApPsk,  creds_psk,  sizeof(gApPsk));  gApPsk [sizeof(gApPsk)  - 1] = 0;
+        WiFi.softAPConfig(IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                          IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                          IPAddress(255, 255, 255, 0));
+        if (esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
+            esp_netif_dhcps_stop(ap_netif);
+        }
+
+        // RF-interference mitigation for the audio path (chord/scope/monitor):
+        // each WiFi TX burst couples ~10 Hz hum into the ES8388 analog input.
+        //  1) Drop 802.11b — its lowest basic rate (1 Mbps DSSS) makes the
+        //     beacon sit on-air ~1 ms; 11g/n forces 6 Mbps OFDM, ~6× shorter
+        //     burst → far less coupled energy.  No reconnect-timing change.
+        //  2) Beacon interval 100 → 400 ms (10 → 2.5 Hz): fewer bursts/sec.
+        //     Modest, so STA keepalive/discovery stays comfortable.
+        esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+        {
+            wifi_config_t apCfg = {};
+            if (esp_wifi_get_config(WIFI_IF_AP, &apCfg) == ESP_OK) {
+                apCfg.ap.beacon_interval = 400;          // ms (valid 100..60000)
+                esp_wifi_set_config(WIFI_IF_AP, &apCfg);
+            }
+        }
+
+        Serial.printf("[SETUP] AP IP: %s  SSID (hidden): %s  (11g/n, beacon 400ms)\n",
+                      WiFi.softAPIP().toString().c_str(),
+                      WiFi.softAPSSID().c_str());
+    } else if (hasCreds && apMode == MAGI_AP_MODE_EXTERNAL) {
+        Serial.printf("[SETUP] branch=EXTERNAL_AP ssid='%s' — STA join (DHCP)\n", creds_ssid);
+        // No WiFi.config(): let the external AP's DHCP server assign an IP.
+        // Clients find us via the periodic MSG_SERVER_ANNOUNCE broadcast
+        // (see sBroadcastNextMs in loop()), so the address doesn't need to
+        // be predictable from the client's side any more.
+        WiFi.begin(creds_ssid, creds_psk);
+        WiFi.mode(WIFI_STA);
+        // Match the AP path: drop 11b so our own TX bursts use shorter 11g/n
+        // OFDM frames (less RF coupling into the audio path).  The external
+        // AP owns the beacon interval here, so we can't change that.
+        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    } else {
+        Serial.printf("[SETUP] branch=NONE (hasCreds=%d apMode=%u) — pair via BtnC long-press\n",
+                      hasCreds ? 1 : 0, (unsigned)apMode);
+    }
+    return hasCreds ? (int)apMode : -1;
+}
+
 void setup() {
     auto cfg = M5.config();
     cfg.serial_baudrate = 115200;
@@ -1373,77 +1461,9 @@ void setup() {
     WiFi.persistent(false);
     WiFi.mode(WIFI_AP_STA);
 
-    char    creds_ssid[33] = {};
-    char    creds_psk[64]  = {};
-    uint8_t apMode         = 0;
-    bool hasCreds = pairNvsLoadCreds("magitrac_srv", creds_ssid, creds_psk, &apMode);
-
-    if (hasCreds && apMode == MAGI_AP_MODE_SERVER) {
-        const uint8_t apChannel = magiWifiChannelFromIdx(wifiChannelLoad());
-        Serial.printf("[SETUP] branch=SERVER_AP ch=%u ssid='%s'\n",
-                      (unsigned)apChannel, creds_ssid);
-        // max_connection 8 (default 4): the client takes one slot and several
-        // PixelPost units pile on at once during a field OTA pull.
-        // Hidden SSID: a visible AP must answer every phone's broadcast probe
-        // request with a unicast probe response (retried if the phone has
-        // already hopped channels).  At a gig that is hundreds of phones and
-        // a real slice of our single radio's airtime spent on devices that
-        // will never join.  Hidden, the AP only answers probes that name it.
-        // The client connects by stored SSID (directed probe), so nothing on
-        // its side changes; the field-flash posts do the same.
-        bool apOk = WiFi.softAP(creds_ssid, creds_psk, apChannel,
-                                /*hidden=*/1, /*max_connection=*/8);
-        if (!apOk) {
-            Serial.println("[SETUP] softAP FAILED — common causes: PSK < 8 chars, SSID empty, channel out of range");
-        }
-        // Remember the LIVE AP creds — the field-flash OTA must hand the posts
-        // exactly these, not the magitrac_srv_self NVS (which can drift).
-        strncpy(gApSsid, creds_ssid, sizeof(gApSsid)); gApSsid[sizeof(gApSsid) - 1] = 0;
-        strncpy(gApPsk,  creds_psk,  sizeof(gApPsk));  gApPsk [sizeof(gApPsk)  - 1] = 0;
-        WiFi.softAPConfig(IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
-                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
-                          IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
-                                    MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
-                          IPAddress(255, 255, 255, 0));
-        if (esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF")) {
-            esp_netif_dhcps_stop(ap_netif);
-        }
-
-        // RF-interference mitigation for the audio path (chord/scope/monitor):
-        // each WiFi TX burst couples ~10 Hz hum into the ES8388 analog input.
-        //  1) Drop 802.11b — its lowest basic rate (1 Mbps DSSS) makes the
-        //     beacon sit on-air ~1 ms; 11g/n forces 6 Mbps OFDM, ~6× shorter
-        //     burst → far less coupled energy.  No reconnect-timing change.
-        //  2) Beacon interval 100 → 400 ms (10 → 2.5 Hz): fewer bursts/sec.
-        //     Modest, so STA keepalive/discovery stays comfortable.
-        esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-        {
-            wifi_config_t apCfg = {};
-            if (esp_wifi_get_config(WIFI_IF_AP, &apCfg) == ESP_OK) {
-                apCfg.ap.beacon_interval = 400;          // ms (valid 100..60000)
-                esp_wifi_set_config(WIFI_IF_AP, &apCfg);
-            }
-        }
-
-        Serial.printf("[SETUP] AP IP: %s  SSID (hidden): %s  (11g/n, beacon 400ms)\n",
-                      WiFi.softAPIP().toString().c_str(),
-                      WiFi.softAPSSID().c_str());
-    } else if (hasCreds && apMode == MAGI_AP_MODE_EXTERNAL) {
-        Serial.printf("[SETUP] branch=EXTERNAL_AP ssid='%s' — STA join (DHCP)\n", creds_ssid);
-        // No WiFi.config(): let the external AP's DHCP server assign an IP.
-        // Clients find us via the periodic MSG_SERVER_ANNOUNCE broadcast
-        // (see sBroadcastNextMs in loop()), so the address doesn't need to
-        // be predictable from the client's side any more.
-        WiFi.begin(creds_ssid, creds_psk);
-        WiFi.mode(WIFI_STA);
-        // Match the AP path: drop 11b so our own TX bursts use shorter 11g/n
-        // OFDM frames (less RF coupling into the audio path).  The external
-        // AP owns the beacon interval here, so we can't change that.
-        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-    } else {
-        Serial.printf("[SETUP] branch=NONE (hasCreds=%d apMode=%u) — pair via BtnC long-press\n",
-                      hasCreds ? 1 : 0, (unsigned)apMode);
-    }
+    int     wifiMode = serverWifiBringUp();
+    bool    hasCreds = (wifiMode >= 0);
+    uint8_t apMode   = hasCreds ? (uint8_t)wifiMode : 0;
 
     // Pick the broadcast destination once we know which mode we're in.
     // softAP-hosted networks need the subnet broadcast (192.168.0.255)

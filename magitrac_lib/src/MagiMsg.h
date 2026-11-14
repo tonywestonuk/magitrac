@@ -630,7 +630,8 @@ struct MsgNoteSet {
     uint8_t  pattern;
     uint8_t  row;
     uint8_t  col;
-    Note     note;       // all-zero = clear the cell
+    Note     note;       // clear = note 0, effect 0, param 0, velocity VEL_DEFAULT
+                         //   (velocity 0 is an explicit value, NOT empty)
 };
 
 // Client → Server: audition the note at (pattern, row, col) for ~500ms.
@@ -979,13 +980,16 @@ struct MsgFileLoadReq {
 };
 
 // Server → client: header preceding the chunked body stream.  `found=0`
-// (file missing) means no BODY chunks will follow.  `kind` echoed.
+// (file missing) means no BODY chunks will follow.  `kind` and `name` are
+// echoed so the client can tell a late reply to a request it has given up on
+// from the reply to the one it is waiting for (same kind, different file).
 struct MsgFileLoadHeader {
     uint8_t  id     = MSG_FILE_LOAD_HEADER;
     uint16_t length = sizeof(MsgFileLoadHeader);
     uint8_t  kind;
     uint32_t total_size;
     uint8_t  found;
+    char     name[FILE_NAME_LEN];   // as requested, with extension
 };
 
 // Server → client: one chunk of raw file bytes.  Stream is closed by the

@@ -57,6 +57,13 @@ private:
     // Number of files fully written to SD this backup run.  Used by
     // drawBackupDone to show "N of M saved" (especially after a cancel).
     int _bkFilesSaved = 0;
+    // Files that did NOT make it onto the card (open failed, short write, or
+    // the stream ended early).  Non-zero turns the done screen into a warning.
+    int _bkFilesFailed = 0;
+    // Restore: files handed to the link, and files that could not be read
+    // from the card or sent.
+    int _rsFilesSent   = 0;
+    int _rsFilesFailed = 0;
 
     // Restore state
     char     _rsFolders[BR_MAX_FOLDERS][BR_FOLDER_MAX];
