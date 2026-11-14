@@ -177,7 +177,7 @@ copy.
 The sequencer source was compiled unmodified for a desktop host with a mocked
 millisecond clock and its MIDI output captured, and a scripted performance was
 replayed through it. Two builds were compared: the current firmware (*recall*)
-and the firmware immediately before the change (*first key*; commit `46ab5f3`).
+and the firmware immediately before the change (*first key*; tag `fumble-recall-baseline`, commit `46ab5f3`).
 
 The arrangement is one from the author's live set: 16-row blocks, a cue every
 four rows, 130 BPM. The performance visits four blocks.
@@ -344,8 +344,10 @@ for a direct comparison of feel.
 ## 7. Availability and rights
 
 The implementation is part of MagiTrac, published under the GNU GPL v3 at
-<https://github.com/tonywestonuk/magitrac>; the rule first appears in commit
-`b895970` (14 November 2026). The experiment in section 4 is in `paper/eval/`.
+<https://github.com/tonywestonuk/magitrac>. The rule first appears in commit
+`b895970` (tag `fumble-recall-v1`, 14 November 2026) and reached the `main`
+branch the same day as commit `68dc087`. The experiment in section 4 is in
+`paper/eval/`.
 
 The author does not intend to seek a patent on the rule described here and
 publishes this description so that anyone may use it. The licence above
