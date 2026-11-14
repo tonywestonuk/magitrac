@@ -1,6 +1,6 @@
 // MagiTrac Server — M5Stack CoreS3 + Module Audio v2.2 + Module MIDI (Port A)
 // Requires: M5Unified (display + touch buttons), M5Module-Audio (ES8388),
-//           arduinoFFT, magitrac_lib, pixelpost_proto.
+//           magitrac_lib, pixelpost_proto.
 
 // SD must precede M5Unified — M5GFX rebinds File I/O if it appears first.
 #include <SD.h>
@@ -29,11 +29,17 @@
 #include "esp_wifi.h"
 
 // ── Communications ───────────────────────────────────────────────────────────
-// Same architecture as the Core Basic server: MagiLink AP, MagiUdpLink for
-// loss-tolerant updates, ESP-NOW for pairing.  See magitrac_server.ino for
-// the full prose.
+// MagiLink (TCP, accept role on MAGI_PORT) carries commands and the bulk
+// transfers; MagiUdpLink carries the loss-tolerant updates (playhead, MIDI
+// note-in, preview row); ESP-NOW carries the pairing ceremony and the
+// PixelPost broadcasts.
 MagiCommsEspNow gTransportEspNow;
 static MagiUdpLink gUdpLink;
+
+// NVS namespace holding the pairing record and the WiFi creds + apMode.
+// Defined here — the main .ino comes first in the concatenated sketch — so
+// serverWifiBringUp() below and pairing.ino use the one name.
+#define SRV_NVS_NS "magitrac_srv"
 
 // Discovery broadcast — periodic UDP MSG_SERVER_ANNOUNCE so clients
 // (iOS app, future C-client EXTERNAL_AP support) can find this server's
@@ -119,6 +125,7 @@ static bool _touchDown    = false;
 static bool _dragMoved    = false;
 static int  _dragStartY   = 0;
 static int  _dragStartOff = 0;
+static int  _pressX       = 0;   // USB screen: x of the press (button hit-test)
 
 // ── Sample browser ────────────────────────────────────────────────────────────
 #define SRV_SAMPLES_DIR   "/samples"
@@ -296,7 +303,7 @@ void drawRow(int visIdx) {
     if (listIdx == 0) {
         lcd.print("-- OFF --");
     } else {
-        char buf[14];
+        char buf[UI_MAX_CHARS + 1];
         strncpy(buf, songNames[listIdx - SONG_IDX_OFFSET], UI_MAX_CHARS);
         buf[UI_MAX_CHARS] = '\0';
         lcd.print(buf);
@@ -368,9 +375,7 @@ uint8_t loadSong(int idx) {
     Serial.printf("[STOPSRC] local loadSong idx=%d t=%lu\n", idx, millis());
 
     if (idx == 0) {
-        sequencerStop();
-        srvHasActive = false;
-        sendNoSongToClient();
+        srvSetOff();   // stop, drop the active song AND its name, tell the client
         return 0;
     }
 
@@ -458,7 +463,7 @@ void drawUsbScreen() {
 // Called once at the end of setup().  If a fresh pixel_post.ino.bin is sitting
 // on the SD card (copied via USB-MSC), this dedicated screen owns the device:
 //   FLASH  — (re)broadcast the OTA packet; press again to catch stragglers.
-//   SKIP   — rename the firmware to *.done and REBOOT (clean teardown → music).
+//   DONE   — rename the firmware to *.done and REBOOT (clean teardown → music).
 // The HTTP server + DHCP run ONLY while this screen is up, so they never touch
 // the music path.  We serve posts in this foreground loop.  See field_flash.ino.
 void fieldFlashScreen() {
@@ -472,7 +477,7 @@ void fieldFlashScreen() {
     if (fsize == 0) return;
 
     const int FB_X = 20, FB_W = 200, FB_H = 56;
-    const int FLASH_Y = 196, SKIP_Y = 256;
+    const int FLASH_Y = 196, DONE_Y = 256;
     const bool canFlash = (WiFi.softAPIP() != IPAddress(0, 0, 0, 0));
 
     int  served = 0;            // full pulls since the last FLASH press
@@ -507,10 +512,10 @@ void fieldFlashScreen() {
         lcd.print("FLASH");
 
         uint16_t gr = lgfx::color565(110, 60, 0);
-        lcd.fillRoundRect(FB_X, SKIP_Y, FB_W, FB_H, 8, gr);
+        lcd.fillRoundRect(FB_X, DONE_Y, FB_W, FB_H, 8, gr);
         lcd.setTextColor(TFT_WHITE, gr);
         lcd.setTextSize(3);
-        lcd.setCursor(FB_X + 28, SKIP_Y + (FB_H - 24) / 2);
+        lcd.setCursor(FB_X + 28, DONE_Y + (FB_H - 24) / 2);
         lcd.print("DONE");
     };
 
@@ -534,8 +539,8 @@ void fieldFlashScreen() {
         if (!down && pressX >= 0) {
             bool inFlash = (pressX >= FB_X && pressX < FB_X + FB_W &&
                             pressY >= FLASH_Y && pressY < FLASH_Y + FB_H);
-            bool inSkip  = (pressX >= FB_X && pressX < FB_X + FB_W &&
-                            pressY >= SKIP_Y && pressY < SKIP_Y + FB_H);
+            bool inDone  = (pressX >= FB_X && pressX < FB_X + FB_W &&
+                            pressY >= DONE_Y && pressY < DONE_Y + FB_H);
             pressX = pressY = -1;
             if (inFlash && canFlash) {
                 served = 0;
@@ -544,7 +549,7 @@ void fieldFlashScreen() {
                         sizeof(status));
                 status[sizeof(status) - 1] = 0;
                 draw();
-            } else if (inSkip) {
+            } else if (inDone) {
                 // Tidy up by rebooting — kills the HTTP server + DHCP cleanly
                 // and brings the server back up making music.
                 fieldFlashMarkDone();
@@ -679,11 +684,12 @@ static void pollChordTouch() {
 }
 
 // ── Oscilloscope screen ─────────────────────────────────────────────────────────
-// Free-running time-domain view of the onboard (right) mic — the same source
-// the chord recogniser and pixelpost bands read.  Each captured frame (~32 ms)
-// is reduced by the mic task to one DC-blocked sample per column; we draw a
-// connected line.  Redraw is per-column erase-then-draw (no full clear) so the
-// trace stays flicker-free.  Tap freezes / unfreezes the trace.
+// Free-running time-domain view of the Module Audio mic (LEFT input) — the
+// same source the chord recogniser and pixelpost bands read.  Each captured
+// frame (~32 ms) is reduced by the mic task to one DC-blocked sample per
+// column; we draw a connected line.  Redraw is per-column erase-then-draw (no
+// full clear) so the trace stays flicker-free.  Tap freezes / unfreezes the
+// trace.
 static uint32_t gScopeLastSeq  = 0xFFFFFFFF;
 static int16_t  gScopePrevTop[SCOPE_COLS];
 static int16_t  gScopePrevBot[SCOPE_COLS];
@@ -1063,11 +1069,11 @@ static void pollUsbTouch() {
     if (down && !_touchDown) {
         _touchDown   = true;
         _dragStartY  = t.y;
-        _dragStartOff = t.x;          // reuse to remember the press x
+        _pressX      = t.x;
     } else if (!down && _touchDown) {
         _touchDown = false;
-        bool inBtn = (_dragStartOff >= USB_BTN_X && _dragStartOff < USB_BTN_X + USB_BTN_W &&
-                      _dragStartY  >= USB_BTN_Y && _dragStartY  < USB_BTN_Y + USB_BTN_H);
+        bool inBtn = (_pressX     >= USB_BTN_X && _pressX     < USB_BTN_X + USB_BTN_W &&
+                      _dragStartY >= USB_BTN_Y && _dragStartY < USB_BTN_Y + USB_BTN_H);
         if (inBtn) {
             requestUsbMscReboot();   // sets the NVS flag and resets into USB mode
         }
@@ -1270,7 +1276,7 @@ int serverWifiBringUp() {
     char    creds_ssid[33] = {};
     char    creds_psk[64]  = {};
     uint8_t apMode         = 0;
-    bool hasCreds = pairNvsLoadCreds("magitrac_srv", creds_ssid, creds_psk, &apMode);
+    bool hasCreds = pairNvsLoadCreds(SRV_NVS_NS, creds_ssid, creds_psk, &apMode);
 
     if (hasCreds && apMode == MAGI_AP_MODE_SERVER) {
         const uint8_t apChannel = magiWifiChannelFromIdx(wifiChannelLoad());
@@ -1326,7 +1332,7 @@ int serverWifiBringUp() {
         Serial.printf("[SETUP] branch=EXTERNAL_AP ssid='%s' — STA join (DHCP)\n", creds_ssid);
         // No WiFi.config(): let the external AP's DHCP server assign an IP.
         // Clients find us via the periodic MSG_SERVER_ANNOUNCE broadcast
-        // (see sBroadcastNextMs in loop()), so the address doesn't need to
+        // (see gAnnounceNextMs in loop()), so the address doesn't need to
         // be predictable from the client's side any more.
         WiFi.begin(creds_ssid, creds_psk);
         WiFi.mode(WIFI_STA);
@@ -1335,7 +1341,7 @@ int serverWifiBringUp() {
         // AP owns the beacon interval here, so we can't change that.
         esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     } else {
-        Serial.printf("[SETUP] branch=NONE (hasCreds=%d apMode=%u) — pair via BtnC long-press\n",
+        Serial.printf("[SETUP] branch=NONE (hasCreds=%d apMode=%u) — hold the bezel 2 s to pair\n",
                       hasCreds ? 1 : 0, (unsigned)apMode);
     }
     return hasCreds ? (int)apMode : -1;
@@ -1695,6 +1701,7 @@ void setup() {
     drawScreen();
     loadSong(cursor);
     crashSetBootStep(BS_DONE);
+    crashSetPhase(CP_IDLE);   // main-context breadcrumb: out of boot, nothing in progress
 }
 
 void loop() {
@@ -1746,7 +1753,8 @@ void loop() {
     }
 
     // ── Discovery broadcast ───────────────────────────────────────────
-    // Fire MSG_SERVER_ANNOUNCE to 255.255.255.255:MAGI_PORT every
+    // Fire MSG_SERVER_ANNOUNCE to gBroadcastIp:MAGI_PORT (the softAP subnet
+    // broadcast on SERVER_AP, 255.255.255.255 on EXTERNAL_AP) every
     // ANNOUNCE_INTERVAL_MS so clients on the same L2 can discover us
     // without a fixed-IP convention.  Only when WiFi link is up.
     if (millis() >= gAnnounceNextMs) {
@@ -1862,6 +1870,9 @@ void loop() {
                 drawTempoBPMArea(big, avg);
             }
         }
+        // The battery icon is part of the tempo chrome, and the normal poll
+        // further down is never reached while the screensaver is up.
+        if (batteryPoll()) batteryDrawIcon(240 - BATT_ICON_W - 4, 14, TFT_BLACK);
         return;
     }
 
@@ -1890,21 +1901,22 @@ void loop() {
         }
     }
 
-    if (batteryPoll()) {
+    // Poll every pass (it rate-limits itself), but leave the LCD alone while a
+    // pairing screen is up — a header drawn now would land on top of it.  The
+    // icon catches up with the full redraw when pairing ends.
+    if (batteryPoll() && !pairingIsActive()) {
         switch (gScreen) {
             case SCR_SONGS:   drawHeader();         break;
             case SCR_SAMPLES: drawSampleHeader();   break;
             case SCR_CHORD:   drawChordHeader();     break;
             case SCR_SCOPE:   drawScopeHeader();     break;
+            case SCR_ORGAN:   drawOrganHeader();     break;
             case SCR_USB:     /* whole-screen draw is heavy; just patch icon */ {
                 batteryDrawIcon(240 - BATT_ICON_W - 4,
                                 (UI_HEADER_H - BATT_ICON_H) / 2, COL_HDR);
                 break;
             }
             default: break;
-        }
-        if (gTempoMode) {
-            batteryDrawIcon(240 - BATT_ICON_W - 4, 14, TFT_BLACK);
         }
     }
 
@@ -1942,7 +1954,7 @@ void loop() {
     }
 
     // Scope screen: redraw each new captured frame (throttled to ~30 fps),
-    // and refresh the pk-pk / dropped-frame readout a few times a second.
+    // and refresh the pk-pk readout in the footer a few times a second.
     if (gScreen == SCR_SCOPE) {
         static uint32_t lastDrawMs = 0, lastFootMs = 0;
         uint32_t seq = scopeResultSeq();

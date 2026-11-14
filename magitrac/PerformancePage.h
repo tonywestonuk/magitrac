@@ -9,17 +9,19 @@
 // ── PerformancePage — 8 pads for live block switching ────────────────────────
 //
 //  PERFORM VIEW:
-//  y=  0  ┌─ Header: "PERFORMANCE"  [EDIT] [HOME]  (50px)
-//  y= 60  ├─ 4 pads top row (blocks 1–4)           (225px)
-//  y=295  ├─ 4 pads bottom row (blocks 5–8)         (225px)
-//  y=520  └─
+//  y=  0  ┌─ Header: title  [SETLIST] [EDIT] [HOME]            (50px)
+//  y= 60  ├─ 4 pads top row (blocks 1–4)                        (200px)
+//  y=270  ├─ 4 pads bottom row (blocks 5–8)                     (200px)
+//  y=478  ├─ Light strip: [< FX] [FX >] [WHITE] [RELEASE]       (54px)
+//  y=532  └─
 //
 //  PAD EDIT VIEW:
 //  y=  0  ┌─ Header: "PAD SETUP"  [BACK]           (50px)
 //  y= 55  ├─ 8 rows × 60px: [#] [NAME field] [IMM/QUE toggle]
 //  y=535  └─
 //
-//  HOME and EDIT require a 500ms hold to activate (anti-fumble during performance).
+//  SETLIST, EDIT and HOME require a 500ms hold to activate (anti-fumble during
+//  performance).  BACK in the pad-edit view is a plain tap and returns to the pads.
 
 // Header
 static const int PP_HDR_H      = 50;
@@ -34,7 +36,6 @@ static const int PP_BTN_H      = 40;
 
 // Pad grid — 4 columns × 2 rows
 static const int PP_PAD_COLS   = 4;
-static const int PP_PAD_ROWS   = 2;
 static const int PP_PAD_COUNT  = 8;
 static const int PP_PAD_MARGIN = 20;   // outer margin
 static const int PP_PAD_GAP    = 10;   // gap between pads
@@ -141,7 +142,7 @@ private:
 
     // ── Light-control strip (PixelPost) ──────────────────────────────────────
     void drawLightStrip();
-    int  hitLightBtn(int sx, int sy) const;   // 0=PREV 1=NEXT 2=POW 3=RELEASE; -1 none
+    int  hitLightBtn(int sx, int sy) const;   // 0=PREV 1=NEXT 2=WHITE 3=RELEASE; -1 none
     void fireLightButton(int btn);            // send the override + refresh strip
 
     // ── Pad edit view ────────────────────────────────────────────────────────

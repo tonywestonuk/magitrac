@@ -10,14 +10,17 @@
 
 // ── Full-screen popup layout (960×540) ───────────────────────────────────────
 //
-//   y=  0  ┌─ Header: "COL2 ROW07 / 15"  [<] [>] nav  (48px) ────────────────┐
+//   y=  0  ┌─ Header: [<] "COL2  ROW 07 / 15" [>]  row nav  (48px) ──────────┐
 //   y= 48  ├─ "NOTE" label strip (22px) ─────────────────────────────────────┤
 //   y= 70  ├─ 12 note-name buttons × 80px wide × 86px tall ─────────────────┤
 //   y=156  ├─ "OCTAVE" label strip (22px) ──────────────────────────────────┤
 //   y=178  ├─ 8 octave buttons × 120px wide × 78px tall ───────────────────┤
-//   y=256  ├─ "NOTE OFF / VELOCITY" label strip (22px) ────────────────────┤
-//   y=278  ├─ [OFF](480px) | [-] VV [+] velocity (480px)  (60px) ──────────┤
-//   y=338  ├─ [COPY]  [PASTE]  [OK]  action buttons (202px) ──────────────┤
+//   y=256  ├─ label strip (22px): "NOTE OFF / VELOCITY / ATTRIBUTES", or
+//          │  "INPUT OPTIONS" on col 0 ──────────────────────────────────────┤
+//   y=278  ├─ (60px) output cols: [CLR][OFF] [-] VV [+] [ATTR]
+//          │         col 0:       [CLR][WAIT][SYNC][PASS][AVRG] ─────────────┤
+//   y=338  ├─ [COPY] [PASTE] [OK] action buttons (202px); pixel-post columns
+//          │  get a leading [PXL] button (4 × 240px) ────────────────────────┤
 //   y=540  └──────────────────────────────────────────────────────────────────┘
 //  Sum: 48+22+86+22+78+22+60+202 = 540 ✓
 
@@ -42,16 +45,8 @@ static const int PE_ILBL_Y  = PE_OBTN_Y + PE_OBTN_H;       // = 256
 static const int PE_ILBL_H  = 22;
 static const int PE_IBTN_Y  = PE_ILBL_Y + PE_ILBL_H;       // = 278
 static const int PE_IBTN_H  = 60;
-static const int PE_IARROW_W = 200;                          // inst prev/next width
 
-// Velocity control (output columns) — right half of PE_IBTN row
-static const int PE_VEL_X     = PE_W / 2;                    // = 480
-static const int PE_VEL_W     = PE_W / 2;                    // = 480
-static const int PE_VEL_ARR_W = 120;                          // [-] and [+] width
-static const int PE_VEL_VAL_W = PE_VEL_W - 2 * PE_VEL_ARR_W; // = 240
-
-static const int PE_ACT_Y   = PE_IBTN_Y + PE_IBTN_H;       // = 338
-static const int PE_ACT_H   = PE_H - PE_ACT_Y;              // = 202
+static const int PE_ACT_Y   = PE_IBTN_Y + PE_IBTN_H;       // = 338 (runs to PE_H: 202px)
 
 // Action row — 3 buttons at 320px each: COPY | PASTE | OK
 static const int PE_ACT_BTN_W  = 320;
@@ -76,14 +71,9 @@ public:
     NoteEditor(EPD_PainterAdafruit& display, GT911_Lite& touch);
 
     // Open popup for the given cell — caller should display.clear() first.
-    // undoBuf is written before each commit so the caller can restore on undo.
-    void open(Song* song, uint8_t patternIdx, uint8_t row, uint8_t col,
-              UndoEntry* undoBuf, Instrument* instruments);
+    void open(Song* song, uint8_t patternIdx, uint8_t row, uint8_t col);
 
     bool isOpen() const { return _open; }
-
-    // Force-close without committing (e.g. page change while editor is open)
-    void close() { _open = false; }
 
     // Cell that was last committed (valid after pollTouch() returns true, or after pendingSync())
     uint8_t editPattern() const { return _syncPattern; }
@@ -98,7 +88,9 @@ public:
     // Full popup draw — call once after open()
     void draw();
 
-    // Poll touch. Returns true when popup should close (OK / CANCEL / CLEAR).
+    // Poll touch. Returns true when the popup closes — only OK does that (it
+    // commits the cell first).  CLR commits an empty cell but stays open; the
+    // header [<] [>] commit and move to the neighbouring row.
     // Caller should display.clear() + ui.drawAll() + display.paint() after.
     bool pollTouch();
 
@@ -106,9 +98,7 @@ private:
     EPD_PainterAdafruit& _d;
     GT911_Lite&          _touch;
 
-    Song*       _song;
-    UndoEntry*  _undoBuf;
-    Instrument* _instruments;
+    Song*      _song;
     uint8_t    _patternIdx;
     uint8_t    _row;
     uint8_t    _col;
@@ -171,6 +161,7 @@ private:
 
     // Session clipboard — static so it survives row navigation and re-opens
     static bool _clipHasNote;
+    static bool _clipOffNote;   // copied cell was a NOTE_OFF
     static uint8_t _clipSemitone;
     static uint8_t _clipOctave;
     static uint8_t _clipVelocity;

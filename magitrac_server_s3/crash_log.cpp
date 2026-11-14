@@ -110,8 +110,6 @@ static const char* phaseStr(uint8_t p) {
         case CP_SAMPLE_READ: return "sample-read";
         case CP_SONG_PUSH:   return "song-push";
         case CP_AUTOSAVE:    return "autosave";
-        case CP_SD_OP:       return "sd-op";
-        case CP_MIDI:        return "midi";
         default:             return "?";
     }
 }

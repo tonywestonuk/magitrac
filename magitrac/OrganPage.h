@@ -130,8 +130,9 @@ private:
     void hideKnobTip();        // wipe it + repaint what it covered
     void syncKnobs();              // send the active type's knob values to the server
     uint8_t& knobRef(int k);       // active slider store (per-type, or per-proc-sound)
-    void applyToSong();            // write voice + sliders into every ORGAN column + patch
-    void adoptFromSong();          // load voice + sliders from the song's ORGAN columns
+    void applyToSong();            // write the page state into Song::organ (OrganPatch) + patch the
+                                   // server — only if the song has an ORGAN column
+    void adoptFromSong();          // load the page state from Song::organ, if it is marked present
     int  hitKnob(int sx, int sy) const;   // knob index for the active type, or -1
     void applyPreset(int idx);
     bool hitHome(int sx, int sy) const;

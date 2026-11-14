@@ -3,25 +3,15 @@
 #include <stddef.h>
 
 // Shared ES8388 codec on the M5Stack Module Audio v2.2.  Init once at
-// boot (after M5.begin() + Wire is up), then SamplePlayer (TX) and
-// mic_spectrum (RX) both share the codec full-duplex.  No I²S0 mutex
-// needed any more — ES8388 has independent TX/RX paths on the same I²S
-// peripheral, and the IDF driver runs separate DMA channels for each
-// direction.
+// boot (after M5.begin() — the codec's I²C is the internal Wire1 bus), then
+// SamplePlayer (TX) and mic_spectrum (RX) both share the codec full-duplex
+// (the organ synth is a second TX user, exclusive with SamplePlayer; with the
+// vocoder on it also reads RX).  No I²S0 mutex needed any more — ES8388 has
+// independent TX/RX paths on the same I²S peripheral, and the IDF driver runs
+// separate DMA channels for each direction.
 
 bool audioCodecInit();           // returns true on success
 bool audioCodecReady();          // safe to call from anywhere
-
-// Switch the module's input bias (STM32 PB7 / LIN_MIC_PU_EN, via reg 0x00):
-// true  → bias pull-up ON  → MIC mode (electret biased)
-// false → bias pull-up OFF → LINE mode
-// Global (affects every reader of the codec) — restore to true after use.
-void audioCodecSetMicBias(bool micMode);
-
-// Headphone MODE line (STM32 PA.2 → MUX, register 0x10): false = National
-// (OMTP), true = American (CTIA).  Swaps the TRRS jack mic/ground routing —
-// a diagnostic for the output→input feedback coupling.  Default is National.
-void audioCodecSetHPMode(bool american);
 
 // Blocking write — call from a task only.  `bytes` should be a multiple
 // of 4 (16-bit stereo frames).  Returns false on failure.

@@ -1,4 +1,6 @@
-// Unit tests for sequencer WAIT/SYNC performer-snap logic.
+// Unit tests for the sequencer: WAIT/SYNC performer-snap logic, live note
+// edits (sequencerApplyNoteSet) against the play cursor, and MIDI-out checks
+// via the mock UART capture.
 //
 // Run from Terminal — NOT through the Arduino IDE:
 //   cd /Users/tonyweston/magitrac/magitrac_server_s3
@@ -41,10 +43,16 @@ void pixelpostSetSlider(uint8_t) {}
 void pixelpostSetEffect(uint8_t) {}
 bool pixelpostManualActive() { return false; }
 
-// Organ synth stubs (drawbar_organ.cpp is hardware-bound; the tests only need
-// the sequencer's routing to link, with the organ reading "inactive").
-bool organActive() { return false; }
-void organSetActive(bool) {}
+// Organ synth stubs (drawbar_organ.cpp is hardware-bound).  Only the active
+// flag is modelled — it starts "inactive" and follows organSetActive(), so the
+// sequencer's grab / release of the organ can be observed.
+static bool _mockOrganActive   = false;
+static int  _mockOrganOffCalls = 0;     // active → inactive transitions
+bool organActive() { return _mockOrganActive; }
+void organSetActive(bool on) {
+    if (!on && _mockOrganActive) _mockOrganOffCalls++;
+    _mockOrganActive = on;
+}
 void organNoteOn(uint8_t, uint8_t) {}
 void organNoteOff(uint8_t) {}
 void organSetSustain(bool) {}
@@ -69,12 +77,9 @@ void organSetVocoder(int) {}
 
 // ── External state required by midi_player.cpp ───────────────────────────────
 #include "TrackerData.h"
-Instrument srvInstruments[MAX_INSTRUMENTS] = {};
 
-static uint8_t _buf[sizeof(SongFileHeader) + sizeof(Song)];
 static uint8_t _srvBufStore[sizeof(SongFileHeader) + sizeof(Song)];
 uint8_t*  srvActiveBuf    = _srvBufStore;   // firmware: PSRAM pointer
-uint32_t  srvActiveBufLen = sizeof(_srvBufStore);
 bool      srvHasActive    = true;
 
 // ── Pull in the implementation under test ────────────────────────────────────
@@ -763,6 +768,666 @@ static void test_wait_timeout_resets_to_top() {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+// The row deadline is compared wrap-safely: a row scheduled just past the
+// millis() rollover must neither fire early nor stall.
+static void test_row_clock_survives_millis_wrap() {
+    printf("\ntest_row_clock_survives_millis_wrap\n");
+    buildWaitPattern(false);
+    _mockMs = 0xFFFFFFFFu - 150;
+    sequencerStart();
+    sequencerTick();                       // halt at row 0 WAIT
+    _mockMs += 100;
+    _test_onPerformerNote(60);             // resolve → row 1 due ROW_MS later, past the wrap
+    CHECK(_test_getRow() == 1,            "at row 1 after resolving row 0");
+    CHECK(_test_getNextRowMs() < _mockMs, "row deadline has wrapped below 'now'");
+
+    sequencerTick();
+    CHECK(_test_getRow() == 1,            "row 1 not played early before its wrapped deadline");
+
+    _mockMs += ROW_MS + 1;                 // crosses the rollover
+    sequencerTick();
+    CHECK(_test_getRow() == 2,            "row 1 played once the wrapped deadline passed");
+    sequencerStop();
+    _mockMs = 0;
+}
+
+// The snap cooldown deadline is compared wrap-safely too: a cooldown whose
+// deadline lands just past the millis() rollover must still suppress a fumble.
+static void test_snap_cooldown_survives_millis_wrap() {
+    printf("\ntest_snap_cooldown_survives_millis_wrap\n");
+    buildWaitPattern(false);               // WAITs on rows 0,2,4,6
+    _mockMs = 0xFFFFFFFFu - 130;
+    sequencerStart();
+    sequencerTick();                       // halt at row 0 WAIT
+    _mockMs += 100;
+    _test_onPerformerNote(60);             // snap; cooldown ends ~62 ms later, past the wrap
+    CHECK(_test_getRow() == 1,            "at row 1 after resolving row 0");
+
+    _mockMs += 5;                          // still before the rollover, inside the cooldown
+    _test_onPerformerNote(60);             // fumble — would pre-resolve the row 2 WAIT
+    CHECK(_test_getRow() == 1,            "fumble inside a wrapped cooldown is ignored");
+
+    _mockMs += 80;                         // across the rollover, cooldown over
+    CHECK(_mockMs < 1000,                 "clock has wrapped");
+    _test_onPerformerNote(60);
+    CHECK(_test_getRow() == 3,            "snap to row 2 allowed once the wrapped cooldown expired");
+    sequencerStop();
+    _mockMs = 0;
+}
+
+// ── MIDI-out capture ─────────────────────────────────────────────────────────
+// The mock UART records every byte the sequencer writes.  txReset() must be
+// called where the running-status cache is clear (straight after
+// sequencerStart()), so the capture begins on a status byte.
+static void txReset() { _mockUartTxLen = 0; }
+
+// Count captured channel messages with this status byte and first data byte,
+// following running status the way a synth would.
+static int txCount(uint8_t status, uint8_t d1) {
+    int     count = 0;
+    uint8_t rs = 0, have = 0, first = 0;
+    for (size_t i = 0; i < _mockUartTxLen; i++) {
+        uint8_t b = _mockUartTx[i];
+        if (b >= 0xF8) continue;                       // real-time
+        if (b & 0x80) { rs = b; have = 0; continue; }
+        if (rs < 0x80 || rs >= 0xF0) continue;         // no status / SysEx payload
+        int need = ((rs & 0xF0) == 0xC0 || (rs & 0xF0) == 0xD0) ? 1 : 2;
+        if (have == 0) first = b;
+        if (++have < need) continue;
+        have = 0;
+        if (rs == status && first == d1) count++;
+    }
+    return count;
+}
+static int noteOns(uint8_t ch0, uint8_t midiNote)  { return txCount((uint8_t)(0x90 | ch0), midiNote); }
+static int noteOffs(uint8_t ch0, uint8_t midiNote) { return txCount((uint8_t)(0x80 | ch0), midiNote); }
+
+// Two 8-row patterns, no cues.  Col 1 → MIDI ch 1, col 2 → MIDI ch 2.
+static Song* buildPlainSong() {
+    memset(srvActiveBuf, 0, sizeof(_srvBufStore));
+    SongFileHeader* hdr = (SongFileHeader*)srvActiveBuf;
+    hdr->magic = SONG_FILE_MAGIC; hdr->version = SONG_FILE_VERSION;
+    Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
+    song->bpm = 120; song->minBPM = 60; song->maxBPM = 240;
+    song->speed = 6; song->numPatterns = 2;
+    initPool(song);
+    for (int p = 0; p < 2; p++) {
+        song->patterns[p].length = 8;
+        for (int i = 0; i < 12; i++) {
+            song->patterns[p].inputNotes[i].switchMode      = BlockSwitch::STAY;
+            song->patterns[p].inputNotes[i].transposeAction = TransposeAction::KEEP;
+        }
+    }
+    song->columns[1].midiChannel = 1; song->columns[1].volume = 100;
+    song->columns[2].midiChannel = 2; song->columns[2].volume = 100;
+    return song;
+}
+
+static void putNote(Song* song, uint8_t pat, uint8_t row, uint8_t col, uint8_t note,
+                    uint8_t effect = 0, uint8_t param = 0) {
+    NoteGrid grid(song->notePool, &song->noteFreeHead, &song->patterns[pat].noteHead);
+    Note n = { note, VEL_DEFAULT, effect, param };
+    grid.set(row, col, n);
+}
+
+// Tracker note → the MIDI note a column with no transpose sends.
+static uint8_t midiOf(uint8_t trackerNote) { return (uint8_t)(trackerNote + 11); }
+
+// ── sequencerApplyNoteSet ────────────────────────────────────────────────────
+
+// A cell written ahead of the playhead sounds on this pass — including one at
+// the very row about to play, and one after the last existing note (where the
+// cursor had already run off the end of the list).  A cell written behind the
+// playhead does not sound until the next pass.
+static void test_noteset_unplayed_row_plays() {
+    printf("\ntest_noteset_unplayed_row_plays\n");
+    Song* song = buildPlainSong();
+    const uint8_t C = makeNote(0, 4), D = makeNote(2, 4), E = makeNote(4, 4),
+                  F = makeNote(5, 4), G = makeNote(7, 4);
+    putNote(song, 0, 0, 1, C);
+    putNote(song, 0, 1, 1, D);
+    _mockMs = 0;
+    sequencerStart();
+    txReset();
+    sequencerTick();                       // row 0
+    tickNextRow();                         // row 1 — the last note in the pattern
+    CHECK(_test_getRow() == 2,                    "playhead at row 2");
+    CHECK(noteOns(0, midiOf(C)) == 1 && noteOns(0, midiOf(D)) == 1, "rows 0 and 1 sounded");
+    CHECK(_test_getNextNoteIdx() == NOTE_NULL,    "cursor ran off the end of the list");
+
+    sequencerApplyNoteSet(0, 2, 1, G, VEL_DEFAULT, 0, 0);   // the row about to play
+    sequencerApplyNoteSet(0, 4, 1, E, VEL_DEFAULT, 0, 0);   // further ahead
+    sequencerApplyNoteSet(0, 0, 1, F, VEL_DEFAULT, 0, 0);   // already played: C → F
+    CHECK(_test_getNextNoteIdx() != NOTE_NULL &&
+          song->notePool[_test_getNextNoteIdx()].row == 2,  "cursor re-seated on the row-2 node");
+
+    tickNextRow();                         // row 2
+    CHECK(noteOns(0, midiOf(G)) == 1,             "note written at the next row plays");
+    tickNextRow();                         // row 3
+    CHECK(noteOns(0, midiOf(E)) == 0,             "row-4 note not played early");
+    tickNextRow();                         // row 4
+    CHECK(noteOns(0, midiOf(E)) == 1,             "note written ahead of the playhead plays");
+    CHECK(noteOns(0, midiOf(F)) == 0 && noteOns(0, midiOf(C)) == 1,
+                                                  "edited row 0 not replayed on this pass");
+    tickNextRow(); tickNextRow(); tickNextRow();   // rows 5, 6, 7 → wraps
+    CHECK(_test_getRow() == 0,                    "wrapped to row 0");
+    tickNextRow();                         // row 0, second pass
+    CHECK(noteOns(0, midiOf(F)) == 1 && noteOns(0, midiOf(C)) == 1,
+                                                  "edited row 0 plays its new note next pass");
+    sequencerStop();
+}
+
+// Deleting the very node the cursor is parked on must not leave the cursor on
+// the freed node: here the freed node is immediately reused by another
+// pattern, so a stale cursor would play that pattern's note and walk off into
+// its list.
+static void test_noteset_delete_cursor_node() {
+    printf("\ntest_noteset_delete_cursor_node\n");
+    Song* song = buildPlainSong();
+    const uint8_t C = makeNote(0, 4), D = makeNote(2, 4), E = makeNote(4, 4),
+                  A = makeNote(9, 4);
+    putNote(song, 0, 0, 1, C);
+    putNote(song, 0, 3, 1, D);
+    putNote(song, 0, 5, 1, E);
+    _mockMs = 0;
+    sequencerStart();
+    txReset();
+    sequencerTick();                       // row 0
+    tickNextRow(); tickNextRow();          // rows 1, 2
+    uint16_t parked = _test_getNextNoteIdx();
+    CHECK(_test_getRow() == 3 && parked != NOTE_NULL && song->notePool[parked].row == 3,
+                                                  "cursor parked on the row-3 node");
+
+    sequencerApplyNoteSet(0, 3, 1, NOTE_EMPTY, VEL_DEFAULT, 0, 0);   // delete it
+    uint16_t reseated = _test_getNextNoteIdx();
+    CHECK(reseated != parked && reseated != NOTE_NULL && song->notePool[reseated].row == 5,
+                                                  "cursor moved on to the row-5 node");
+    sequencerApplyNoteSet(1, 3, 1, A, VEL_DEFAULT, 0, 0);            // reuses the freed node
+    CHECK(song->patterns[1].noteHead == parked,   "freed node reused by the other pattern");
+    CHECK(_test_getNextNoteIdx() == reseated,     "cursor unaffected by the other pattern's edit");
+
+    tickNextRow();                         // row 3
+    CHECK(noteOns(0, midiOf(D)) == 0,             "deleted note does not play");
+    CHECK(noteOns(0, midiOf(A)) == 0,             "no stale read of the reused node");
+    tickNextRow();                         // row 4
+    tickNextRow();                         // row 5
+    CHECK(noteOns(0, midiOf(E)) == 1,             "playback continues with the row-5 note");
+    CHECK(_test_isRunning() && _test_getRow() == 6, "still running, playhead at row 6");
+    sequencerStop();
+}
+
+// An edit to a pattern that isn't the one loaded on the playhead leaves the
+// cursor alone; out-of-range or no-song edits change nothing at all.
+static void test_noteset_other_pattern_and_bounds() {
+    printf("\ntest_noteset_other_pattern_and_bounds\n");
+    Song* song = buildPlainSong();
+    const uint8_t C = makeNote(0, 4), D = makeNote(2, 4), A = makeNote(9, 4);
+    putNote(song, 0, 0, 1, C);
+    putNote(song, 0, 3, 1, D);
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();                       // row 0
+    uint16_t cursor = _test_getNextNoteIdx();
+    CHECK(cursor != NOTE_NULL && song->notePool[cursor].row == 3, "cursor on the row-3 node");
+
+    sequencerApplyNoteSet(1, 0, 1, A, VEL_DEFAULT, 0, 0);
+    NoteGrid other(song->notePool, &song->noteFreeHead, &song->patterns[1].noteHead);
+    CHECK(other.has(0, 1) && other.get(0, 1).note == A, "edit landed in pattern 1");
+    CHECK(_test_getNextNoteIdx() == cursor,       "cursor untouched by an edit in another pattern");
+
+    uint16_t freeBefore = song->noteFreeHead;
+    sequencerApplyNoteSet(2, 0, 1, A, VEL_DEFAULT, 0, 0);            // pattern >= numPatterns
+    sequencerApplyNoteSet(0, MAX_ROWS, 1, A, VEL_DEFAULT, 0, 0);     // row out of range
+    sequencerApplyNoteSet(0, 0, MAX_COLUMNS, A, VEL_DEFAULT, 0, 0);  // col out of range
+    srvHasActive = false;
+    sequencerApplyNoteSet(0, 6, 1, A, VEL_DEFAULT, 0, 0);            // no active song
+    srvHasActive = true;
+    NoteGrid cur(song->notePool, &song->noteFreeHead, &song->patterns[0].noteHead);
+    CHECK(song->noteFreeHead == freeBefore && !cur.has(6, 1), "rejected edits allocate nothing");
+    CHECK(_test_getNextNoteIdx() == cursor,       "cursor untouched by rejected edits");
+    sequencerStop();
+}
+
+// The cursor is also kept valid while stopped — PLAY resumes from it.
+static void test_noteset_while_stopped_then_resume() {
+    printf("\ntest_noteset_while_stopped_then_resume\n");
+    Song* song = buildPlainSong();
+    const uint8_t C = makeNote(0, 4), G = makeNote(7, 4);
+    putNote(song, 0, 0, 1, C);
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();                       // row 0
+    tickNextRow();                         // row 1 → playhead at row 2
+    sequencerStop();
+    sequencerApplyNoteSet(0, 2, 1, G, VEL_DEFAULT, 0, 0);
+    sequencerResume();
+    txReset();                             // resume's forced column setup cleared running status
+    sequencerTick();                       // row 2
+    CHECK(noteOns(0, midiOf(G)) == 1,             "note entered while stopped plays on resume");
+    sequencerStop();
+}
+
+// ── Note-off for MIDI note 0 ─────────────────────────────────────────────────
+// C-0 with a -24 column transpose clamps to MIDI note 0.  It must still be
+// tracked as sounding, so the OFF cell (and STOP) release it.
+static void test_midi_note_zero_gets_note_off() {
+    printf("\ntest_midi_note_zero_gets_note_off\n");
+    Song* song = buildPlainSong();
+    song->columns[1].transpose = -24;
+    putNote(song, 0, 0, 1, makeNote(0, 0));
+    putNote(song, 0, 2, 1, NOTE_OFF);
+    putNote(song, 0, 4, 1, makeNote(0, 0));
+    _mockMs = 0;
+    sequencerStart();
+    txReset();
+    sequencerTick();                       // row 0
+    CHECK(noteOns(0, 0) == 1,                     "note-on for MIDI note 0 sent");
+    tickNextRow();                         // row 1
+    CHECK(noteOffs(0, 0) == 0,                    "still sounding before the OFF row");
+    tickNextRow();                         // row 2 — OFF
+    CHECK(noteOffs(0, 0) == 1,                    "OFF cell releases MIDI note 0");
+    tickNextRow(); tickNextRow();          // rows 3, 4
+    CHECK(noteOns(0, 0) == 2,                     "note 0 retriggered at row 4");
+    sequencerStop();
+    CHECK(noteOffs(0, 0) == 2,                    "STOP releases a sounding MIDI note 0");
+}
+
+// ── FFFF row-stop and the organ ──────────────────────────────────────────────
+// Col 1 (MIDI) carries FFFF at row 2; col 2 is an ORGAN column, so the
+// sequencer grabs the organ at start.
+static Song* buildOrganStopSong() {
+    Song* song = buildPlainSong();
+    song->columns[2].midiChannel = ORGAN_CHANNEL;
+    putNote(song, 0, 0, 2, makeNote(0, 4));
+    putNote(song, 0, 2, 1, NOTE_EMPTY, 0xFF, 0xFF);
+    return song;
+}
+
+static void test_ffff_stop_defers_only_the_organ_release() {
+    printf("\ntest_ffff_stop_defers_only_the_organ_release\n");
+    gLastCallbackRow = 0xFF;
+    static bool sawStopped;
+    sawStopped = false;
+    seqSetStateCallback([](bool playing) { if (!playing) sawStopped = true; });
+
+    buildOrganStopSong();
+    _mockMs = 0;
+    sequencerStart();
+    CHECK(organActive() && sequencerOrganOwned(), "start grabs the organ for the ORGAN column");
+    sequencerTick();                       // row 0
+    tickNextRow();                         // row 1
+    int offBefore = _mockOrganOffCalls;
+    tickNextRow();                         // row 2 — FFFF
+    CHECK(!_test_isRunning() && sawStopped,       "FFFF stops the sequencer inline");
+    CHECK(organActive() && _mockOrganOffCalls == offBefore,
+                                                  "organ release not run inside the tick");
+    sequencerRawAuditionTick();
+    CHECK(!organActive() && !sequencerOrganOwned() && _mockOrganOffCalls == offBefore + 1,
+                                                  "organ released by the MIDI-task loop");
+    sequencerRawAuditionTick();
+    CHECK(_mockOrganOffCalls == offBefore + 1,    "released exactly once");
+
+    // A normal STOP still releases the organ immediately.
+    _mockMs = 0;
+    sequencerStart();
+    CHECK(organActive(),                          "organ grabbed again on start");
+    sequencerStop();
+    CHECK(!organActive() && !sequencerOrganOwned(), "sequencerStop() releases the organ at once");
+
+    // PLAY arriving before the parked release runs keeps the organ.
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick(); tickNextRow(); tickNextRow();   // → FFFF
+    CHECK(!_test_isRunning() && organActive(),    "stopped by FFFF, release parked");
+    sequencerResume();
+    sequencerRawAuditionTick();
+    CHECK(organActive() && sequencerOrganOwned(), "resume cancels the parked release");
+    sequencerStop();
+    CHECK(!organActive(),                         "organ released on the final stop");
+    seqSetStateCallback(nullptr);
+}
+
+// A WAIT on the LAST row of a block: once the performer resolves it the block
+// has ended, so the next row to play is row 0 of the following block — with
+// its notes.  (The snap used to wrap the row number without re-seating the
+// note cursor or running the block-end navigation, so the whole next pass was
+// silent.)
+static void test_wait_on_last_row_then_next_pass_plays() {
+    printf("\ntest_wait_on_last_row_then_next_pass_plays\n");
+    Song* song = buildPlainSong();
+    uint8_t n = makeNote(0, 4);
+    for (uint8_t p = 0; p < 2; p++) putNote(song, p, 0, 1, n);      // row 0 note in both blocks
+    {
+        NoteGrid grid(song->notePool, &song->noteFreeHead, &song->patterns[0].noteHead);
+        Note w = { makeNote(0, 4), 0, EFFECT_WAIT, 0 };
+        grid.set(7, INPUT_COLUMN, w);                               // WAIT on the last row
+    }
+    _mockMs = 0; txReset();
+    sequencerStart();
+    sequencerTick();                                 // row 0
+    CHECK(noteOns(0, midiOf(n)) == 1, "row 0 note played on the first pass");
+    for (int i = 0; i < 6; i++) tickNextRow();       // rows 1..6
+    tickNextRow();                                   // row 7 → WAIT halts
+    CHECK(_test_isWaiting(),        "halted at the last-row WAIT");
+    CHECK(_test_getRow() == 7,      "halted row is 7");
+
+    _mockMs += 100;
+    _test_onPerformerNote(60);                       // performer resolves it
+    CHECK(!_test_isWaiting(),       "WAIT resolved");
+    CHECK(_test_getRow() == 0,      "next row to play is row 0");
+
+    txReset();
+    tickNextRow();                                   // plays row 0 of the next pass
+    CHECK(noteOns(0, midiOf(n)) == 1, "row 0 note plays on the pass after a last-row WAIT");
+    CHECK(_test_isRunning(),        "still running");
+}
+
+// ── PAN effect (EFFECT_PAN → MIDI CC 10) ─────────────────────────────────────
+
+// Position of the first captured channel message {status, d1, d2} among all
+// channel messages (running status followed), or -1 if it never went out.
+static int txFind(uint8_t status, uint8_t d1, int d2 /* -1 = any */) {
+    int     index = 0;
+    uint8_t rs = 0, have = 0, first = 0;
+    for (size_t i = 0; i < _mockUartTxLen; i++) {
+        uint8_t b = _mockUartTx[i];
+        if (b >= 0xF8) continue;
+        if (b & 0x80) { rs = b; have = 0; continue; }
+        if (rs < 0x80 || rs >= 0xF0) continue;
+        int need = ((rs & 0xF0) == 0xC0 || (rs & 0xF0) == 0xD0) ? 1 : 2;
+        if (have == 0) first = b;
+        if (++have < need) continue;
+        have = 0;
+        if (rs == status && first == d1 && (d2 < 0 || b == (uint8_t)d2)) return index;
+        index++;
+    }
+    return -1;
+}
+
+static void test_pan_effect_sends_cc10() {
+    printf("\ntest_pan_effect_sends_cc10\n");
+    Song* song = buildPlainSong();                    // col 1 = ch 1, col 2 = ch 2
+    uint8_t n = makeNote(0, 4);
+    putNote(song, 0, 0, 1, n, EFFECT_PAN, 0x10);          // note + pan left-ish on ch 1
+    putNote(song, 0, 1, 2, NOTE_EMPTY, EFFECT_PAN, 0xC8); // pan only, over range, on ch 2
+    putNote(song, 0, 2, 1, n, EFFECT_PAN, 0x40);          // back to centre on ch 1
+    _mockMs = 0; txReset();
+    sequencerStart();
+    sequencerTick();                                   // row 0
+    int pan  = txFind(0xB0, 10, 0x10);
+    int note = txFind(0x90, midiOf(n), -1);
+    CHECK(pan >= 0,                 "row 0: CC 10 = 0x10 sent on channel 1");
+    CHECK(note >= 0 && pan < note,  "row 0: pan goes out before the note-on");
+    CHECK(txCount(0xB1, 10) == 0,   "row 0: nothing on channel 2 yet");
+
+    txReset(); tickNextRow();                          // row 1
+    CHECK(txFind(0xB1, 10, 127) >= 0, "row 1: param C8 is sent as 127 on channel 2 (no note needed)");
+
+    txReset(); tickNextRow();                          // row 2
+    CHECK(txFind(0xB0, 10, 64) >= 0,  "row 2: CC 10 = 64 (centre) on channel 1");
+
+    // The sequencer never sends a pan of its own accord: stopping and loading
+    // a song (the forced patch flush) leave pan to the synth / its preset.
+    sequencerStop();
+    txReset();
+    sequencerSendPatchesNow();
+    sequencerRawAuditionTick();
+    int cc10 = 0;
+    for (uint8_t ch = 0; ch < 16; ch++) cc10 += txCount((uint8_t)(0xB0 | ch), 10);
+    CHECK(cc10 == 0,                  "stop + song load send no CC 10");
+    CHECK(txCount(0xC1, song->columns[2].program) >= 1,
+                                      "song load does still send the column's program change");
+}
+
+static void test_pan_effect_ignored_where_it_does_not_apply() {
+    printf("\ntest_pan_effect_ignored_where_it_does_not_apply\n");
+    Song* song = buildPlainSong();
+    song->columns[1].mute = 1;                         // muted MIDI column
+    song->columns[3].midiChannel = SFX_CHANNEL;        // not a MIDI column
+    putNote(song, 0, 0, 1, NOTE_EMPTY, EFFECT_PAN, 0x00);
+    putNote(song, 0, 0, 3, NOTE_EMPTY, EFFECT_PAN, 0x00);
+    _mockMs = 0; txReset();
+    sequencerStart();
+    sequencerTick();
+    int cc10 = 0;
+    for (uint8_t ch = 0; ch < 16; ch++) cc10 += txCount((uint8_t)(0xB0 | ch), 10);
+    CHECK(cc10 == 0, "no CC 10 from a muted column or a non-MIDI column");
+    sequencerStop();
+}
+
+// ── Block switch inside the snap cooldown ────────────────────────────────────
+
+// A stray key caught just BEFORE the key that switches block: the stray one
+// takes effect and opens the fumble window, then the real one arrives inside
+// it.  The switch must still play the new block's first row — here that row carries an
+// OFF for the column the old block left sounding.  (It used to move to the new
+// block and then sit waiting on its row 0, so the OFF never went out and the
+// note hung until the next key.)
+static void test_block_switch_inside_cooldown_plays_new_block() {
+    printf("\ntest_block_switch_inside_cooldown_plays_new_block\n");
+    Song* song = buildPlainSong();                          // col 1 = ch 1, col 2 = ch 2
+    uint8_t n = makeNote(0, 4);
+    putNote(song, 0, 0, INPUT_COLUMN, NOTE_ANY, EFFECT_WAIT);
+    putNote(song, 0, 0, 1, n);                              // block 0 row 0: note on col 1
+    song->patterns[0].inputNotes[8].switchMode   = BlockSwitch::TOP;   // G# → block 1
+    song->patterns[0].inputNotes[8].switchTarget = 1;
+    putNote(song, 1, 0, INPUT_COLUMN, NOTE_ANY, EFFECT_WAIT);
+    putNote(song, 1, 0, 1, NOTE_OFF);                       // block 1 row 0: OFF on col 1
+    putNote(song, 1, 0, 2, n);                              //               note on col 2
+
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();
+    txReset();                                              // count only what follows                                        // halts on block 0 row 0
+    _mockMs = 100;
+    _test_onPerformerNote(69);                              // stray A: resolves the ANY wait
+    CHECK(noteOns(0, midiOf(n)) == 1,  "stray note played block 0 row 0 (col 1 sounding)");
+    _mockMs = 110;                                          // well inside the cooldown
+    _test_onPerformerNote(68);                              // G#: the intended block switch
+    CHECK(_test_getPattern() == 1,     "switched to block 1");
+    CHECK(!_test_isWaiting(),          "not left waiting on the new block's row 0");
+    CHECK(noteOffs(0, midiOf(n)) == 1, "new block's row 0 OFF silenced col 1");
+    CHECK(noteOns(1, midiOf(n)) == 1,  "new block's row 0 note played on col 2");
+    CHECK(_test_getRow() == 1,         "moved on to row 1 of the new block");
+}
+
+// The bounce of a key that restarts its OWN block: inside the cooldown it is
+// ignored, rather than rewinding to a row 0 that will not be played.
+static void test_same_block_restart_bounce_is_ignored() {
+    printf("\ntest_same_block_restart_bounce_is_ignored\n");
+    Song* song = buildPlainSong();
+    uint8_t n = makeNote(0, 4);
+    putNote(song, 0, 0, INPUT_COLUMN, NOTE_ANY, EFFECT_WAIT);
+    putNote(song, 0, 0, 1, n);
+    putNote(song, 0, 1, 1, NOTE_OFF);                       // row 1: OFF
+    song->patterns[0].inputNotes[0].switchMode   = BlockSwitch::TOP;   // C → top of block 0
+    song->patterns[0].inputNotes[0].switchTarget = 0;
+
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();
+    txReset();                                              // count only what follows
+    _mockMs = 100;
+    _test_onPerformerNote(60);                              // C: restart + play row 0
+    CHECK(_test_getRow() == 1 && !_test_isWaiting(), "row 0 played, on to row 1");
+    _mockMs = 110;
+    _test_onPerformerNote(60);                              // key bounce
+    CHECK(_test_getRow() == 1 && !_test_isWaiting(), "bounce did not rewind the block");
+    CHECK(noteOns(0, midiOf(n)) == 1,  "row 0 note was not retriggered");
+    tickNextRow();
+    CHECK(noteOffs(0, midiOf(n)) == 1, "row 1 OFF still plays");
+
+    // Outside the cooldown the same key does restart the block.
+    _mockMs += 400;
+    _test_onPerformerNote(60);
+    CHECK(noteOns(0, midiOf(n)) == 2,  "after the cooldown the key restarts the block again");
+}
+
+// ── Fumble rule: the last key counts ─────────────────────────────────────────
+
+// Two blocks in the shape of the real song that prompted this: in block 0, G
+// plays on (it is the WAIT note) and A-flat leads to block 1, whose first row
+// silences column 1 and starts a note on column 2.
+static Song* buildFumbleSong() {
+    Song* song = buildPlainSong();                          // col 1 = ch 1, col 2 = ch 2
+    uint8_t G = makeNote(7, 4), n = makeNote(0, 4);
+    putNote(song, 0, 0, INPUT_COLUMN, G, EFFECT_WAIT);
+    putNote(song, 0, 0, 1, n);
+    putNote(song, 0, 1, 1, NOTE_OFF);
+    putNote(song, 0, 4, INPUT_COLUMN, G, EFFECT_WAIT);
+    putNote(song, 0, 4, 1, n);
+    putNote(song, 0, 5, 1, NOTE_OFF);
+    song->patterns[0].inputNotes[8].switchMode   = BlockSwitch::TOP;   // A-flat → block 1
+    song->patterns[0].inputNotes[8].switchTarget = 1;
+    putNote(song, 1, 0, INPUT_COLUMN, NOTE_ANY, EFFECT_WAIT);
+    putNote(song, 1, 0, 1, NOTE_OFF);
+    putNote(song, 1, 0, 2, n);
+    return song;
+}
+
+// Play block 0 up to its second WAIT (row 4) and stop there, capture cleared.
+static void fumbleSongToRow4() {
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();                                        // halts on row 0
+    _mockMs = 100;
+    _test_onPerformerNote(67);                              // G: row 0
+    for (int i = 0; i < 4; i++) tickNextRow();              // rows 1..3, then halts on row 4
+    _mockMs += 300;                                         // well clear of the first fumble window
+    txReset();
+}
+
+static void test_fumble_last_key_counts_stray_switch_then_real_key() {
+    printf("\ntest_fumble_last_key_counts_stray_switch_then_real_key\n");
+    buildFumbleSong();
+    uint8_t n = makeNote(0, 4);
+    fumbleSongToRow4();
+    CHECK(_test_isWaiting() && _test_getRow() == 4 && _test_getPattern() == 0, "waiting on block 0 row 4");
+
+    _test_onPerformerNote(68);                              // A-flat (the slip): block 1 starts
+    CHECK(_test_getPattern() == 1,     "A-flat alone would take us to block 1");
+    CHECK(noteOns(1, midiOf(n)) == 1,  "…and block 1's row 0 has sounded on col 2");
+    _mockMs += 10;
+    _test_onPerformerNote(67);                              // G (what was meant)
+    CHECK(_test_getPattern() == 0,     "G straight after: back in block 0");
+    CHECK(_test_getRow() == 5 && !_test_isWaiting(), "block 0's row 4 was played, now on row 5");
+    CHECK(noteOns(0, midiOf(n)) == 1,  "row 4's note sounded on col 1");
+    CHECK(noteOffs(1, midiOf(n)) == 1, "the note the slip started on col 2 was silenced");
+    // (the snap re-derived the tempo from the long gap before it, so a row is
+    // now longer than ROW_MS — step until row 5 has gone)
+    for (int i = 0; i < 6 && _test_getRow() == 5; i++) tickNextRow();
+    CHECK(_test_getRow() == 6,         "block 0 carries on to row 6");
+    CHECK(noteOffs(0, midiOf(n)) == 1, "…having played row 5's OFF");
+}
+
+static void test_fumble_last_key_counts_real_key_then_switch() {
+    printf("\ntest_fumble_last_key_counts_real_key_then_switch\n");
+    buildFumbleSong();
+    uint8_t n = makeNote(0, 4);
+    fumbleSongToRow4();
+    _test_onPerformerNote(67);                              // G: row 4 plays (col 1 sounding)
+    CHECK(_test_getPattern() == 0 && _test_getRow() == 5, "G played block 0 row 4");
+    _mockMs += 10;
+    _test_onPerformerNote(68);                              // A-flat: the last key
+    CHECK(_test_getPattern() == 1,     "A-flat straight after: block 1");
+    CHECK(_test_getRow() == 1 && !_test_isWaiting(), "block 1's row 0 was played");
+    CHECK(noteOffs(0, midiOf(n)) == 1, "col 1 silenced (block 1's row 0 OFF)");
+    CHECK(noteOns(1, midiOf(n)) == 1,  "block 1's row 0 note sounded on col 2");
+}
+
+static void test_fumble_third_key_is_judged_from_the_start() {
+    printf("\ntest_fumble_third_key_is_judged_from_the_start\n");
+    buildFumbleSong();
+    fumbleSongToRow4();
+    _test_onPerformerNote(68);  _mockMs += 8;               // A-flat → block 1
+    _test_onPerformerNote(67);  _mockMs += 8;               // G      → back to block 0
+    CHECK(_test_getPattern() == 0,     "after A-flat, G: block 0");
+    _test_onPerformerNote(68);                              // A-flat again: it is the last key
+    CHECK(_test_getPattern() == 1 && _test_getRow() == 1, "after A-flat, G, A-flat: block 1, row 0 played");
+}
+
+static void test_fumble_wrong_note_after_does_not_undo() {
+    printf("\ntest_fumble_wrong_note_after_does_not_undo\n");
+    buildFumbleSong();
+    uint8_t n = makeNote(0, 4);
+    fumbleSongToRow4();
+    _test_onPerformerNote(67);                              // G: row 4 plays
+    _mockMs += 10;
+    _test_onPerformerNote(66);                              // F-sharp brushed: means nothing here
+    CHECK(_test_getPattern() == 0 && _test_getRow() == 5 && !_test_isWaiting(), "G still stands");
+    CHECK(noteOns(0, midiOf(n)) == 1 && noteOffs(0, midiOf(n)) == 0, "nothing replayed or cut");
+}
+
+static void test_fumble_chord_on_any_cue_plays_once() {
+    printf("\ntest_fumble_chord_on_any_cue_plays_once\n");
+    Song* song = buildPlainSong();
+    uint8_t n = makeNote(0, 4);
+    putNote(song, 0, 0, INPUT_COLUMN, NOTE_ANY, EFFECT_WAIT);
+    putNote(song, 0, 0, 1, n);
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();
+    txReset();
+    _mockMs = 100; _test_onPerformerNote(60);               // C
+    _mockMs += 6;  _test_onPerformerNote(64);               // E  — same cue, same result
+    _mockMs += 6;  _test_onPerformerNote(67);               // G
+    CHECK(noteOns(0, midiOf(n)) == 1,  "a chord on an any-note cue plays the row once");
+    CHECK(_test_getRow() == 1,         "and advances one row");
+}
+
+// The owner's confirming scenario: block A sends F to block B and G to block C,
+// anything else stays.  The performer fumbles E, F, G → must end on block C.
+// (Blocks A/B/C are patterns 0/1/2 here.)  Run twice: with E meaning something
+// in block A (an any-note cue it resolves) and with E meaning nothing there.
+static Song* buildThreeWaySong(bool anyCueInBlockA) {
+    Song* song = buildPlainSong();
+    uint8_t n = makeNote(0, 4);
+    song->numPatterns = 3;
+    song->patterns[2].length = 8;
+    for (int i = 0; i < 12; i++) {
+        song->patterns[2].inputNotes[i].switchMode      = BlockSwitch::STAY;
+        song->patterns[2].inputNotes[i].transposeAction = TransposeAction::KEEP;
+    }
+    song->columns[3].midiChannel = 3; song->columns[3].volume = 100;
+    if (anyCueInBlockA) putNote(song, 0, 0, INPUT_COLUMN, NOTE_ANY, EFFECT_WAIT);
+    putNote(song, 0, 0, 1, n);                                          // block A sounds on ch 1
+    song->patterns[0].inputNotes[5].switchMode   = BlockSwitch::TOP;    // F → block B
+    song->patterns[0].inputNotes[5].switchTarget = 1;
+    song->patterns[0].inputNotes[7].switchMode   = BlockSwitch::TOP;    // G → block C
+    song->patterns[0].inputNotes[7].switchTarget = 2;
+    putNote(song, 1, 0, INPUT_COLUMN, NOTE_ANY, EFFECT_WAIT);
+    putNote(song, 1, 0, 2, n);                                          // block B sounds on ch 2
+    putNote(song, 2, 0, INPUT_COLUMN, NOTE_ANY, EFFECT_WAIT);
+    putNote(song, 2, 0, 3, n);                                          // block C sounds on ch 3
+    return song;
+}
+
+static void fumbleEFG(bool anyCueInBlockA, const uint8_t keys[3], uint8_t expectPattern, const char* what) {
+    buildThreeWaySong(anyCueInBlockA);
+    uint8_t n = makeNote(0, 4);
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();
+    _mockMs = 100; txReset();
+    for (int i = 0; i < 3; i++) { _test_onPerformerNote(keys[i]); _mockMs += 8; }
+    CHECK(_test_getPattern() == expectPattern, what);
+    if (expectPattern == 2) {
+        CHECK(noteOns(2, midiOf(n)) == 1,                       "   block C's first row sounded");
+        CHECK(noteOns(1, midiOf(n)) == noteOffs(1, midiOf(n)),  "   nothing from block B left sounding");
+    }
+    sequencerStop();
+}
+
+static void test_fumble_e_f_g_lands_on_g_block() {
+    printf("\ntest_fumble_e_f_g_lands_on_g_block\n");
+    const uint8_t EFG[3] = { 64, 65, 67 }, EGF[3] = { 64, 67, 65 }, GFE[3] = { 67, 65, 64 };
+    fumbleEFG(true,  EFG, 2, "E, F, G (E resolves a cue in block A)  → block C");
+    fumbleEFG(false, EFG, 2, "E, F, G (E means nothing in block A)   → block C");
+    fumbleEFG(true,  EGF, 1, "E, G, F                                → block B (F was last)");
+    fumbleEFG(false, GFE, 1, "G, F, E where E means nothing          → block B (E is ignored, F stands)");
+    fumbleEFG(true,  GFE, 0, "G, F, E where E resolves block A's cue → block A (E was last)");
+}
+
 int main() {
     printf("=== Sequencer WAIT/SYNC unit tests ===\n");
     test_wait_resolves_current_row_only();
@@ -785,6 +1450,25 @@ int main() {
     test_avrg_keeps_only_last_4();
     test_transpose_applied_unconditionally();
     test_wait_timeout_resets_to_top();
+    test_row_clock_survives_millis_wrap();
+    test_snap_cooldown_survives_millis_wrap();
+    test_noteset_unplayed_row_plays();
+    test_noteset_delete_cursor_node();
+    test_noteset_other_pattern_and_bounds();
+    test_noteset_while_stopped_then_resume();
+    test_midi_note_zero_gets_note_off();
+    test_ffff_stop_defers_only_the_organ_release();
+    test_wait_on_last_row_then_next_pass_plays();
+    test_block_switch_inside_cooldown_plays_new_block();
+    test_same_block_restart_bounce_is_ignored();
+    test_fumble_last_key_counts_stray_switch_then_real_key();
+    test_fumble_last_key_counts_real_key_then_switch();
+    test_fumble_third_key_is_judged_from_the_start();
+    test_fumble_wrong_note_after_does_not_undo();
+    test_fumble_chord_on_any_cue_plays_once();
+    test_fumble_e_f_g_lands_on_g_block();
+    test_pan_effect_sends_cc10();
+    test_pan_effect_ignored_where_it_does_not_apply();
     printf("\n%d passed, %d failed\n", gPassed, gFailed);
     return gFailed > 0 ? 1 : 0;
 }

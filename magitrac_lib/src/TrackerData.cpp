@@ -33,18 +33,6 @@ void noteToString(uint8_t note, char* buf) {
     buf[3] = '\0';
 }
 
-void effectToString(uint8_t effect, uint8_t param, char* buf) {
-    if (effect == 0 && param == 0) {
-        buf[0] = '-'; buf[1] = '-'; buf[2] = '-'; buf[3] = '\0';
-        return;
-    }
-    buf[0] = HEX_CHARS[(effect >> 4) & 0xF];
-    buf[1] = HEX_CHARS[effect & 0xF];
-    buf[2] = HEX_CHARS[(param >> 4) & 0xF];
-    buf[3] = HEX_CHARS[param & 0xF];
-    buf[4] = '\0';
-}
-
 void velToString(uint8_t velocity, char* buf) {
     if (velocity & 0x80) {
         buf[0] = '-'; buf[1] = '-'; buf[2] = '\0';
@@ -91,14 +79,12 @@ void col0MetaToString(const Note& n, char* buf) {
     }
 }
 
-// ── Demo song — transposing major arpeggio ────────────────────────────────────
+// ── Blank song ────────────────────────────────────────────────────────────────
 //
-// Single 8-row pattern.  Column 1 plays C-E-G-C (major arpeggio).
-// Column 0 (input track) has C-4 WAIT on row 0 — sequencer halts until the
-// performer plays a note.  Each pitch class in inputNotes sets seqTranspose to
-// its own semitone offset (C=0, C#=1, D=2, … B=11), so whatever note the
-// performer hits becomes the new root: C plays C major, D plays D major, etc.
-// On WAIT timeout (500 ms) the pattern restarts from row 0.
+// Everything zeroed, then: the whole note pool chained into the free list,
+// every pattern empty, one 16-row pattern in use, 120 BPM (clamped 60–240),
+// speed 6, MIDI-in on any channel / any note, every channel except 10
+// following performer transpose, and column volume 100.  No notes, no cues.
 
 void initSong(Song* song) {
     memset(song, 0, sizeof(Song));

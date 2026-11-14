@@ -94,19 +94,23 @@ void MagiLink::beginAccept(uint16_t port) {
                 LINK_TASK_STACK, this, LINK_TASK_PRIO, &_impl->task);
 }
 
-IPAddress MagiLink::peerIP() const {
-    if (!_connected || !_impl) return IPAddress((uint32_t)0);
-    if (_role == Role::Accept) return _impl->peer.remoteIP();
-    return _peer;
-}
-
 void MagiLink::beginConnect(uint16_t port, IPAddress peer) {
     if (!_impl) _impl = new Impl();
     if (!_impl->mutex) {
         _impl->mutex = xSemaphoreCreateBinary();
         xSemaphoreGive(_impl->mutex);
     }
-    if (_impl->task) return;
+    if (_impl->task) {
+        // Already started — the worker keeps the peer it was given first.
+        // Say so when the caller asked for a different one; otherwise its
+        // own "beginConnect X" log reads as if the link had moved.
+        if (_role != Role::Connect || port != _port || !(peer == _peer)) {
+            Serial.printf("[LINK-CON] beginConnect(%s:%u) IGNORED — link already started for %s:%u\n",
+                          peer.toString().c_str(), (unsigned)port,
+                          _peer.toString().c_str(), (unsigned)_port);
+        }
+        return;
+    }
     _role = Role::Connect;
     _port = port;
     _peer = peer;

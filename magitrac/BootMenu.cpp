@@ -98,11 +98,6 @@ bool BootMenu::hitOrgan(int sx, int sy) const {
             sy >= BM_BTN3_Y  && sy < BM_BTN3_Y  + BM_BTN3_H);
 }
 
-bool BootMenu::hitInsideBox(int sx, int sy) const {
-    return (sx >= BM_BOX_X && sx < BM_BOX_X + BM_BOX_W &&
-            sy >= BM_BOX_Y && sy < BM_BOX_Y + BM_BOX_H);
-}
-
 void BootMenu::rawToScreen(int rx, int ry, int& sx, int& sy) const {
     sx = ry;
     sy = 540 - rx;

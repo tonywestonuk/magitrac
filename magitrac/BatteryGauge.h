@@ -36,8 +36,5 @@ void batteryGaugeUpdate(uint32_t nowMs);
 int  batteryGaugePct();
 bool batteryGaugeCharging();
 
-// Raw open-circuit-voltage estimate (mV) from the last update — for diagnostics.
-int  batteryGaugeVoc();
-
 // Result of the boot post-mortem (valid after batteryGaugeBegin()).
 const BatteryDeath& batteryLastDeath();

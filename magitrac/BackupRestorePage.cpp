@@ -123,7 +123,6 @@ BackupRestorePage::BackupRestorePage(EPD_PainterAdafruit& display,
     , _rsFileTotal(0)
     , _rsFileCurrent(0)
     , _rsRestoreCount(0)
-    , _rsCancelled(false)
     , _rsConfirmIdx(-1)
     , _rsFileScroll(0)
     , _rsFileDragStartY(0)
@@ -143,7 +142,6 @@ void BackupRestorePage::open() {
     _state   = BRState::MENU;
     _wasDown = _touch.isTouched;
     _bkCancelled = false;
-    _rsCancelled = false;
 }
 
 void BackupRestorePage::draw() {
@@ -537,6 +535,7 @@ void BackupRestorePage::startBackup() {
 
     // Receive loop: header → bodies → header → bodies → ... → end_of_data.
     File     curFile;
+    char     curPath[BK_FNAME_MAX + 48] = {};   // SD path of curFile; "" = none open
     uint32_t curBytesWritten = 0;
     uint32_t curFileSize     = 0;
     bool     curOpenOk       = false;
@@ -563,6 +562,30 @@ void BackupRestorePage::startBackup() {
                       complete ? "OK" : "INCOMPLETE", _bkCurName,
                       (unsigned)curFileSize, (unsigned)curBytesWritten,
                       curOpenOk ? 1 : 0);
+        // A failed file must not stay in the folder: it is listed for restore
+        // like any other, and a truncated .mgt would upload a corrupt song.
+        if (!complete) {
+            if (curFile) curFile.close();
+            if (curPath[0] != '\0') {
+                Serial.printf("[BK] removing failed file '%s'\n", curPath);
+                SD.remove(curPath);
+                curPath[0] = '\0';
+            }
+        }
+    };
+
+    // Close the file being written and, unless every byte of it made it to
+    // the card, remove it.  Used when the backup stops part-way (CANCEL or a
+    // dropped link): the folder still appears in the restore list like any
+    // other, and restoring a truncated .mgt would upload a corrupt song.
+    auto dropPartialFile = [&]() {
+        if (curFile) curFile.close();
+        if (curPath[0] != '\0' &&
+            !(curBytesWritten >= curFileSize && curWriteOk)) {
+            Serial.printf("[BK] removing partial file '%s'\n", curPath);
+            SD.remove(curPath);
+        }
+        curPath[0] = '\0';
     };
 
     while (!done) {
@@ -588,6 +611,14 @@ void BackupRestorePage::startBackup() {
         // changes to "CANCELLING..." — confirmation to the user.
         if (_bkCancelled && !cancelRepainted) {
             cancelRepainted = true;
+            // The file in hand may already be whole (its last body arrived and
+            // the next header has not).  finishCurFile() no longer counts once
+            // cancelled, and dropPartialFile() keeps a whole file — count it.
+            if (curIndex > 0 && curOpenOk && curWriteOk &&
+                curBytesWritten >= curFileSize) {
+                _bkFilesSaved++;
+            }
+            dropPartialFile();      // cur* still describe the file cut short
             draw(); _d.paintLater();
         }
 
@@ -642,13 +673,13 @@ void BackupRestorePage::startBackup() {
                 memset(_bkCurName, 0, sizeof(_bkCurName));
                 strncpy(_bkCurName, nameStr, sizeof(_bkCurName) - 1);
 
-                char path[BK_FNAME_MAX + 48];
-                snprintf(path, sizeof(path), "%s/%s", _bkFolder, nameStr);
-                if (SD.exists(path)) SD.remove(path);
-                curFile = SD.open(path, FILE_WRITE);
+                snprintf(curPath, sizeof(curPath), "%s/%s", _bkFolder, nameStr);
+                if (SD.exists(curPath)) SD.remove(curPath);
+                curFile = SD.open(curPath, FILE_WRITE);
                 curOpenOk = (bool)curFile;
                 if (!curFile) {
-                    Serial.printf("[BK] SD open failed '%s'\n", path);
+                    Serial.printf("[BK] SD open failed '%s'\n", curPath);
+                    curPath[0] = '\0';      // nothing on the card to clean up
                 }
 
                 // Per-file UI update — paintLater so the EPD repaint
@@ -691,6 +722,7 @@ void BackupRestorePage::startBackup() {
         }
     }
 
+    if (!readOk) dropPartialFile();     // link dropped mid-file
     if (curFile) curFile.close();
     gMagiLink.releaseMutex();
 
@@ -853,7 +885,6 @@ void BackupRestorePage::startRestore(int fileIdx) {
     }
     _rsRestoreCount = 0;
     _rsFileCurrent  = 0;
-    _rsCancelled    = false;
     _rsFilesSent    = 0;
     _rsFilesFailed  = 0;
 
@@ -872,7 +903,20 @@ void BackupRestorePage::startRestore(int fileIdx) {
 }
 
 void BackupRestorePage::restoreTick() {
-    if (_rsFileCurrent >= _rsRestoreCount || _rsCancelled) {
+    if (_rsFileCurrent >= _rsRestoreCount) {
+        _state = BRState::RESTORE_DONE;
+        draw(); _d.paint();
+        return;
+    }
+
+    // One whole file is read into RAM before it is sent.  ~36 KB — PSRAM,
+    // allocated on the first restore and kept.
+    static uint8_t* restoreBuf = nullptr;
+    if (!restoreBuf) restoreBuf = (uint8_t*)ps_malloc(SONG_TRANSFER_MAX);
+    if (!restoreBuf) {
+        Serial.println("[RS] no PSRAM for the restore buffer — restore abandoned");
+        _rsFilesFailed += _rsRestoreCount - _rsFileCurrent;
+        _rsFileCurrent  = _rsRestoreCount;
         _state = BRState::RESTORE_DONE;
         draw(); _d.paint();
         return;
@@ -893,7 +937,6 @@ void BackupRestorePage::restoreTick() {
         return;
     }
     uint32_t fileSize = (uint32_t)f.size();
-    static uint8_t restoreBuf[SONG_TRANSFER_MAX];
     if (fileSize > SONG_TRANSFER_MAX) {
         f.close();
         Serial.printf("[RS] too big to restore '%s' (%u bytes)\n", path, (unsigned)fileSize);

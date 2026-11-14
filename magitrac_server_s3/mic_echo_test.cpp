@@ -4,8 +4,8 @@
 #include <esp_heap_caps.h>
 #include <string.h>
 
-// 0.5 s of 16-bit stereo at 32 kHz = 32000 bytes — small enough to live in
-// internal SRAM (no PSRAM / staging nonsense).
+// 0.5 s of 16-bit stereo at 32 kHz = 16000 frames × 4 = 64000 bytes, taken
+// from internal RAM in one block (no PSRAM / staging nonsense).
 static constexpr float  REC_SECONDS  = 0.5f;
 static constexpr size_t REC_FRAMES   = (size_t)(AUDIO_CODEC_RATE_HZ * REC_SECONDS);  // stereo frames
 static constexpr size_t REC_BYTES    = REC_FRAMES * 4;   // 2 ch * 2 bytes

@@ -10,6 +10,7 @@ static const char* NOTE_NAMES[12] = {
 // ── Static clipboard ──────────────────────────────────────────────────────────
 bool    NoteEditor::_clipValid    = false;
 bool    NoteEditor::_clipHasNote  = false;
+bool    NoteEditor::_clipOffNote  = false;
 uint8_t NoteEditor::_clipSemitone = 0;
 uint8_t NoteEditor::_clipOctave   = 4;
 uint8_t NoteEditor::_clipVelocity = VEL_DEFAULT;
@@ -23,7 +24,6 @@ NoteEditor::NoteEditor(EPD_PainterAdafruit& display, GT911_Lite& touch)
     : _d(display)
     , _touch(touch)
     , _song(nullptr)
-    , _undoBuf(nullptr)
     , _patternIdx(0)
     , _row(0)
     , _col(0)
@@ -53,11 +53,8 @@ NoteEditor::NoteEditor(EPD_PainterAdafruit& display, GT911_Lite& touch)
 
 // ── open() ────────────────────────────────────────────────────────────────────
 
-void NoteEditor::open(Song* song, uint8_t patternIdx, uint8_t row, uint8_t col,
-                      UndoEntry* undoBuf, Instrument* instruments) {
-    _song        = song;
-    _undoBuf     = undoBuf;
-    _instruments = instruments;
+void NoteEditor::open(Song* song, uint8_t patternIdx, uint8_t row, uint8_t col) {
+    _song       = song;
     _patternIdx = patternIdx;
     _row        = row;
     _col        = col;
@@ -70,15 +67,6 @@ void NoteEditor::open(Song* song, uint8_t patternIdx, uint8_t row, uint8_t col,
 void NoteEditor::loadRow() {
     NoteGrid grid(_song->notePool, &_song->patterns[_patternIdx].noteHead);
     Note n = grid.get(_row, _col);
-
-    // Snapshot pre-edit state so undo always knows what was here before
-    if (_undoBuf) {
-        _undoBuf->valid      = true;
-        _undoBuf->patternIdx = _patternIdx;
-        _undoBuf->row        = _row;
-        _undoBuf->column     = _col;
-        _undoBuf->before     = n;
-    }
 
     _velocity = n.velocity;
     _effect   = n.effect;
@@ -320,9 +308,10 @@ void NoteEditor::drawActionButtons() {
     _d.setCursor(copyX + (w - lw) / 2, textY);
     _d.print("COPY");
 
-    // PASTE — light grey if clipboard available, dark grey + lighter text if empty
-    uint8_t pasteBg = _clipValid ? 1 : 2;
-    uint8_t pasteFg = _clipValid ? 3 : 1;
+    // PASTE — light grey if clipboard available; empty clipboard uses the
+    // disabled rule (white background + dark grey text).
+    uint8_t pasteBg = _clipValid ? COL_LTGREY : COL_WHITE;
+    uint8_t pasteFg = _clipValid ? COL_BLACK  : COL_DKGREY;
     _d.fillRect(pasteX, actY, w, actH, pasteBg);
     _d.drawRect(pasteX, actY, w, actH, 3);
     _d.setTextColor(pasteFg);
@@ -569,7 +558,7 @@ bool NoteEditor::pollTouch() {
             _offNote = false;
             _octave  = (uint8_t)oct;
             _hasNote = true;
-            if (_col == INPUT_COLUMN && !_waitSet && !_syncSet && !_passSet)
+            if (_col == INPUT_COLUMN && !_waitSet && !_syncSet && !_passSet && !_avrgSet)
                 _passSet = true;
             drawOctaveButtons();
             if (_col == INPUT_COLUMN) drawInputOptions();
@@ -730,6 +719,7 @@ bool NoteEditor::pollTouch() {
         if (tx >= copyX && tx < pasteX) {
             // COPY — snapshot working copy into clipboard
             _clipHasNote   = _hasNote;
+            _clipOffNote   = _offNote;
             _clipSemitone  = _semitone;
             _clipOctave    = _octave;
             _clipVelocity  = _velocity;
@@ -756,6 +746,9 @@ bool NoteEditor::pollTouch() {
         if (tx >= pasteX && tx < okX && _clipValid) {
             // PASTE — load clipboard into working copy
             _hasNote   = _clipHasNote;
+            // commit() tests _offNote first, so it has to follow the clipboard
+            // too.  Col 0 has no OFF control — never paste one in there.
+            _offNote   = _clipOffNote && _col != INPUT_COLUMN;
             _semitone  = _clipSemitone;
             _octave    = _clipOctave;
             _velocity  = _clipVelocity;

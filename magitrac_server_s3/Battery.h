@@ -18,9 +18,6 @@ void batteryInit();
 // warranted.
 bool batteryPoll();
 
-int  batteryPercent();    // 0..100, or -1 if unknown
-bool batteryCharging();
-
 // Icon size — exposed so headers can reserve the right amount of space.
 constexpr int BATT_ICON_W = 22;   // body + 2 px terminal cap
 constexpr int BATT_ICON_H = 12;

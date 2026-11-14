@@ -36,7 +36,6 @@ static const int DEP_TRANS_H    = 48;
 static const int DEP_PLAY_X     = 10;
 static const int DEP_PLAY_W     = 130;
 static const int DEP_BPM_LBL_X  = 170;
-static const int DEP_BPM_LBL_W  = 70;
 static const int DEP_BPM_MINUS_X = 250;
 static const int DEP_BPM_VAL_X   = 310;
 static const int DEP_BPM_VAL_W   = 100;
@@ -92,13 +91,16 @@ public:
 
     void open(uint8_t patIdx);
     void draw();
-    bool poll();        // returns true on HOME exit
+    // Returns true when the page hands control back: BACK was tapped, or
+    // IMPORT was tapped (then importRequested() is true and the page stays
+    // open underneath the import overlay).
+    bool poll();
 
     uint8_t patIdx() const { return _patIdx; }
 
-    // Caller polls this after closing the drum-track-import overlay; true
-    // means "user tapped IMPORT and chose a block + kit — perform the
-    // import now".  Drained by clearImportRequest().
+    // Checked by the caller when poll() returns true: true means the user
+    // tapped IMPORT, so open the drum-track-import overlay (drum-editor
+    // mode) instead of closing this page.  Drained by clearImportRequest().
     bool importRequested() const { return _importRequested; }
     void clearImportRequest()    { _importRequested = false; }
 
@@ -110,10 +112,11 @@ public:
     // Import a pre-parsed drum-pattern block + GS kit into this pattern's
     // ch10 columns.  Clears existing ch10 notes on this pattern first, then
     // writes the imported hits using the editor's same-drum-first allocation
-    // rules.  Sets a per-column resync mask, drained via resyncMask().
+    // rules.  Sends its own patches: the touched columns are collected in
+    // _resyncMask and resynced row-by-row before it returns, so the caller
+    // only has to clearResync() afterwards.
     void importBlock(const DrumPatternFile& file, int blockIdx, int kitIdx);
 
-    uint32_t resyncMask() const { return _resyncMask; }
     void     clearResync()      { _resyncMask = 0; }
 
 private:
@@ -155,7 +158,6 @@ private:
     int  _pickerScroll;
     bool _pickerWasDown;
     int  _pickerDragStartY;
-    int  _pickerDragStartScroll;
     bool _pickerDragMoved;
     bool _pickerDragActive;  // true between a picker-area rising edge and its release
 

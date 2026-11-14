@@ -19,7 +19,6 @@ BlockSettingsPage::BlockSettingsPage(EPD_PainterAdafruit& display,
     , _wasDown(false)
     , _confirmDelete(false)
     , _confirmSplit(false)
-    , _didDuplicate(false)
     , _didSplit(false)
     , _didStructuralChange(false)
     , _keyChangePending(false)
@@ -36,7 +35,6 @@ void BlockSettingsPage::open(uint8_t patIdx) {
     _selNote       = 0;
     _confirmDelete    = false;
     _confirmSplit     = false;
-    _didDuplicate     = false;
     _didSplit         = false;
     _didStructuralChange = false;
     _keyChangePending = false;
@@ -649,7 +647,6 @@ bool BlockSettingsPage::poll() {
             }, &ctx);
             _patIdx       = idx;
             _selNote      = 0;
-            _didDuplicate = true;
             _didStructuralChange = true;
             Serial.printf("[BSP] DUPLICATE -> pattern %d\n", idx);
             draw(); _d.paint();
@@ -668,6 +665,9 @@ bool BlockSettingsPage::poll() {
 
     // ── Length row ────────────────────────────────────────────────────────────
     if (ty >= BSP_LEN_Y && ty < BSP_LEN_Y + BSP_LEN_H) {
+        // The "LEN:" label is not a button — without this, integer division
+        // maps the label's x range onto index 0 (length 16).
+        if (tx < BSP_LEN_LBL_W) return false;
         int idx = (tx - BSP_LEN_LBL_W) / BSP_LEN_BTN_W;
         if (idx >= 0 && idx < BSP_LEN_COUNT) {
             if (pat().length != BSP_LENGTHS[idx]) _didStructuralChange = true;

@@ -9,13 +9,19 @@
 // today).  Same port number as TCP — TCP and UDP ports are independent
 // namespaces in the IP stack so they coexist without conflict.
 //
-// Listener (magitrac AP side): bind a UDP socket and poll for incoming
+// Listener (the magitrac client): bind a UDP socket and poll for incoming
 // datagrams from the main loop.  Each datagram is a complete message
 // (UDP preserves boundaries — no length-prefix framing needed).
 //
-// Sender (magitrac_server STA side): point at the AP's IP and fire
-// datagrams.  No ACK, no retry.  If the send buffer is full, the
+// Sender (the magitrac server): point at a destination and fire datagrams.
+// The server aims at the broadcast address (the subnet broadcast when it
+// hosts the AP, 255.255.255.255 on an external AP), so it never needs to
+// know the client's IP.  No ACK, no retry.  If the send buffer is full, the
 // datagram is dropped on the floor.
+//
+// The client's listener also receives the server's MSG_SERVER_ANNOUNCE
+// discovery beacon, which the server sends to the same port from a separate
+// socket of its own.
 
 #pragma once
 #include <stdint.h>
@@ -31,13 +37,15 @@ public:
     // the datagram's source address).
     using RecvCb = void (*)(const uint8_t* data, int len, const IPAddress& src);
 
-    // Bind a UDP socket to `port` on the local AP iface.  Call after WiFi
+    // Bind a UDP socket to `port` (any local interface).  Call after WiFi
     // is up.  Returns true on success.  Sender role calls `beginSender`
     // instead.
     bool beginListener(uint16_t port);
 
     // Configure remote endpoint for outgoing datagrams.  Local port is
-    // ephemeral (assigned by the kernel).  Call after WiFi STA is associated.
+    // ephemeral (assigned by the stack).  Safe to call before the network is
+    // up: the local socket is only bound on the first send() that finds an
+    // interface, and send() returns false until then.
     void beginSender(const uint8_t dest_ip[4], uint16_t port);
 
     // Fire one datagram.  Best-effort — returns false if the kernel send

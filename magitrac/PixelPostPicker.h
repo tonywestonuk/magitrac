@@ -111,6 +111,7 @@ private:
     uint8_t    _resultParam;
     uint8_t    _lastPadX;       // last touchpad x/y sent (for release send)
     uint8_t    _lastPadY;
+    bool       _padHeld = false;   // touched=true sent and not yet released
 
     void drawTitle();
     void drawEffectButtons();

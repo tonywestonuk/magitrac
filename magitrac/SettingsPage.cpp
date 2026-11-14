@@ -239,7 +239,15 @@ void SettingsPage::adjustMidi(int field, int delta) {
         int v = (int)gMaxProgram + delta;
         gMaxProgram = (uint8_t)constrain(v, 0, 127);
     }
+    // Not saved here: this runs on every 80 ms hold-repeat tick and each save
+    // is an NVS flash write.  poll() flushes once on finger-up.
+    _midiDirty = true;
+}
+
+void SettingsPage::flushMidiLimits() {
+    if (!_midiDirty) return;
     saveMidiLimits();
+    _midiDirty = false;
 }
 
 void SettingsPage::fireMidiHeld() {
@@ -369,6 +377,7 @@ int SettingsPage::poll() {
     if (falling) {
         _wasDown = false;
         _hold.release();
+        flushMidiLimits();      // a hold-repeat run just ended — one NVS write
 
         if (hitHome(sx, sy)) return 1;
         if (hitWifiPageBtn(sx, sy)) return 2;
@@ -399,6 +408,7 @@ int SettingsPage::poll() {
         // Single-tap MIDI +/- (no hold fired)
         if (!_hold.wasFired() && _hold.savedField() >= 0) {
             fireMidiHeld();
+            flushMidiLimits();
         }
     }
 

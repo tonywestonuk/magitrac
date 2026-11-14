@@ -7,18 +7,24 @@
 #include "KeyboardPopup.h"
 #include "HoldRepeat.h"
 
-// ── Column Editor — edit per-block column MIDI settings ──────────────────────
+// ── Column Editor — edit a column's MIDI settings ────────────────────────────
+//
+// ColumnSettings are per-SONG (one per column, shared by every block).
+// COPY / PASTE also carry the column's notes for the block the editor was
+// opened on; CLEAR resets the settings and deletes the column's notes in
+// every block.
 //
 //   y=  0  ┌─ "COL N: name" header (black bar, 48px)  [HOME x=830,w=130] ────┐
 //   y= 48  ├─ "MIDI SETTINGS" label strip (20px) ────────────────────────────┤
 //   y= 68  ├─ MIDI CH row (60px)  [−] value [+] ─────────────────────────────┤
-//   y=128  ├─ BANK row (60px) ────────────────────────────────────────────────┤
-//   y=188  ├─ PROG row (60px) ────────────────────────────────────────────────┤
-//   y=248  ├─ VOL row (60px) ─────────────────────────────────────────────────┤
-//   y=308  ├─ TRANS row (60px) ───────────────────────────────────────────────┤
-//   y=368  ├─ NAME row (60px) — name value at left, [PICK INSTR] in right gap ┤
-//   y=428  ├─ Action bar: [CLEAR COL] [COPY] [PASTE] [IMPORT DRUMS] ─────────┤
-//   y=488  └─ (gap / overlays) ──────────────────────────────────────────────┘
+//   y=128  ├─ BANK row (60px) — TUNE on SFX columns ──────────────────────────┤
+//   y=188  ├─ PROGRAM row (60px) — KIT on drums, VOICE on ORGAN ──────────────┤
+//   y=248  ├─ VOLUME row (60px) ──────────────────────────────────────────────┤
+//   y=308  ├─ TRANSPOSE row (60px) ───────────────────────────────────────────┤
+//   y=368  ├─ NAME row (60px) — name at left; right gap: [PICK INSTR], or
+//          │  [PICK][EDIT] on SFX (none on PXL / drums / ORGAN) ──────────────┤
+//   y=428  ├─ Action bar: [CLEAR n] [COPY] [PASTE] [IMPORT DRUMS] ───────────┤
+//   y=488  └─ (gap — "COLUMN COPIED" banner) ─────────────────────────────────┘
 
 static const int CE_W = 960;
 static const int CE_H = 540;
@@ -52,8 +58,7 @@ static const int CE_PICK_W   = 280;
 static const int CE_PICK_H   = CE_BTN_H;
 static const int CE_PICK_Y   = CE_ROW_Y + 5 * CE_ROW_H + (CE_ROW_H - CE_BTN_H) / 2;
 
-// Instrument list overlay (when picking)
-static const int CE_LIST_Y     = CE_LBL_Y + CE_LBL_H;
+// Instrument list overlay (when picking) — starts under the label strip
 static const int CE_LIST_ROW_H = 48;
 static const int CE_LIST_ROWS  = 8;
 static const int CE_LIST_PREV_X = 0;
@@ -68,27 +73,12 @@ static const int CE_CLEAR_X     = 10;
 static const int CE_CLEAR_W     = 220;
 static const int CE_COPY_X      = 240;
 static const int CE_COPY_W      = 220;
-static const int CE_SWAP_X      = 470;
-static const int CE_SWAP_W      = 220;
+static const int CE_PASTE_X     = 470;
+static const int CE_PASTE_W     = 220;
 static const int CE_IMPORT_X    = 700;
 static const int CE_IMPORT_W    = 250;
 
-// Column-picker overlay (for COPY/SWAP destination)
-// Buttons for cols 1..MAX_COLUMNS-1 in a 5-wide grid (col 0 is INPUT, excluded).
-// With MAX_COLUMNS=21, that's 20 buttons in 4 rows.
-static const int CE_PICKCOL_TITLE_Y  = 60;
-static const int CE_PICKCOL_TITLE_H  = 40;
-static const int CE_PICKCOL_GRID_Y   = 115;
-static const int CE_PICKCOL_BTN_W    = 180;
-static const int CE_PICKCOL_BTN_H    = 70;
-static const int CE_PICKCOL_GAP      = 10;
-static const int CE_PICKCOL_COLS     = 5;     // buttons per row in grid
-static const int CE_PICKCOL_X0       = 10;    // left margin: 10 + 5*(180+10) - 10 = 950
-static const int CE_PICKCOL_CANCEL_Y = 460;
-static const int CE_PICKCOL_CANCEL_W = 240;
-static const int CE_PICKCOL_CANCEL_H = 60;
-
-// Copy confirm dialog
+// PASTE / CLEAR confirm overlay
 static const int CE_CONF_TITLE_Y = 120;
 static const int CE_CONF_BODY_Y  = 220;
 static const int CE_CONF_BTN_Y   = 380;
@@ -155,7 +145,6 @@ private:
         NONE,
         CONFIRM_PASTE,
         CONFIRM_CLEAR,
-        PICK_SAMPLE,
     };
     Action   _action;
     bool     _pasteNotesPending = false;  // paste changed this block's notes
@@ -175,10 +164,9 @@ private:
     void drawHeader();
     void drawFieldRow(int field);
     void drawAllFields();
-    void drawPickButton();
     void drawPickList();               // instrument list overlay
     void drawPickSampleList();         // sample list overlay (SFX columns)
-    void drawActionBar();              // COPY / PASTE buttons (bottom of normal view)
+    void drawActionBar();              // CLEAR / COPY / PASTE / IMPORT DRUMS (bottom of normal view)
     void drawPasteConfirm();           // overlay: confirm destructive paste
     void drawClearConfirm();           // overlay: confirm destructive clear
 

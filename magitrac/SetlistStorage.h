@@ -31,7 +31,7 @@
 
 #define MASTER_MAX_ENTRIES     80
 
-// Worst-case serialised sizes — size static buffers from these.
+// Worst-case serialised sizes — size the serialise buffers from these.
 //   master : 80 × (32 + 24 + 200 + 2 colons + nl) ≈ 80 × 260 ≈ 20.8 KB
 //   setlist: 50 × (32 + nl) ≈ 1.7 KB
 #define MASTER_SERIALIZE_MAX   24576

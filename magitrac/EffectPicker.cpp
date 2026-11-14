@@ -13,7 +13,6 @@ EffectPicker::EffectPicker(EPD_PainterAdafruit& display, GT911_Lite& touch)
     , _took(false)
     , _effect(0)
     , _param(0)
-    , _idx(-1)
     , _selIdx(-1)
 {
     _view.configure(0, FXP_LIST_Y, FXP_W, FXP_LIST_H,
@@ -30,7 +29,6 @@ void EffectPicker::open(uint8_t curEffect, uint8_t curParam, bool fingerDown) {
     _took        = false;
     _effect      = curEffect;
     _param       = curParam;
-    _idx         = -1;
 
     // Highlight the row matching the cell's current effect (if catalogued).
     _selIdx = -1;
@@ -103,7 +101,6 @@ void EffectPicker::tap(int tx, int ty) {
     if (ty < 0) return;
     int i = ty / FXP_ROW_H;
     if (i < 0 || i >= EFFECT_CATALOG_LEN) return;
-    _idx     = i;
     _effect  = EFFECT_CATALOG[i].effect;
     if (EFFECT_CATALOG[i].paramFixed) _param = EFFECT_CATALOG[i].fixedParam;
     _took    = true;

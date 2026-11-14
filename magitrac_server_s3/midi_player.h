@@ -6,12 +6,19 @@ void sequencerStop();     // stop at current position
 void sequencerPanic();        // send All Notes Off (CC 123) on all 16 MIDI channels
 void sequencerQueueBlock(uint8_t pattern);  // queue block to play after current ends
 void sequencerCancelQueue();                // cancel queued block
-int8_t sequencerQueuedBlock();              // -1 if none, else queued pattern index
 void sequencerReset();    // snap to row 0 of current pattern without starting
 void sequencerPause();    // freeze position, keep all state — no state callback fired
 void sequencerUnpause();  // resume from frozen position
 void sequencerSeek(uint8_t pattern, uint8_t row);  // jump to position and play that row (scrub)
 void sequencerGoto(uint8_t pattern, uint8_t row);  // position only; tick handles WAIT/play if running
+
+// Apply one client note edit (MSG_NOTE_SET) to the active song.  Runs on the
+// MIDI task like the control calls above, so it can never interleave with a
+// walk of the note pool, and re-seats the play cursor afterwards (the edit may
+// free or re-link the node it points at).  An all-empty note (note 0, effect
+// 0, param 0, velocity high bit set) clears the cell.  Ignored with no active
+// song or an out-of-range pattern / row / col.
+void sequencerApplyNoteSet(uint8_t pattern, uint8_t row, uint8_t col, uint8_t note, uint8_t velocity, uint8_t effect, uint8_t param);
 
 // ── Column preview ───────────────────────────────────────────────────────────
 // Loop one column of one pattern at song bpm/speed for audition while editing.
@@ -20,7 +27,6 @@ void sequencerGoto(uint8_t pattern, uint8_t row);  // position only; tick handle
 // previewing.
 void sequencerStartPreview(uint8_t pattern, uint8_t col);
 void sequencerStopPreview();
-bool sequencerPreviewActive();
 
 // ── Single-note audition ─────────────────────────────────────────────────────
 // Play the note at (pattern, row, col) for ~500ms then auto note-off.  No-op
@@ -51,8 +57,8 @@ void sequencerAuditionProgram(uint8_t channel, uint8_t program);
 // deferred to the MIDI task (in sequencerRawAuditionTick) so it shares the
 // running-status cache instead of racing it from the command/loop task.
 void sequencerSendPatchesNow();
-// Call every main-loop iteration to drain the audition queue when its
-// hold timer expires.
+// Call every MIDI-task iteration: emits the deferred patch flush / audition
+// program change and drains the audition queue when its hold timer expires.
 void sequencerRawAuditionTick();
 
 bool     sequencerIsRunning();
@@ -60,20 +66,15 @@ uint16_t sequencerCurrentBPM();  // live BPM — updated each performer snap
 void     sequencerSetBPM(uint16_t bpm);  // set live BPM immediately (e.g. from config edit)
 void sequencerTick();
 void sequencerMidiClockTick();  // emit 24-PPQN MIDI clock at the live tempo (Song::flags gated)
-void sequencerPollMidiIn();  // call every loop() — reads performer MIDI in
+void sequencerPollMidiIn();  // call every MIDI-task iteration — reads performer MIDI in
 // The control functions above (start/stop/seek/queue/preview/audition/raw
 // MIDI…) are safe to call from any task: off the MIDI task they are handed to
 // it and return once run.  The MIDI task must call sequencerBindMidiTask()
 // once at start and sequencerServiceRequests() every loop iteration.
 void sequencerBindMidiTask();
 void sequencerServiceRequests();
-bool sequencerSongReaderBusy();  // true while a loop-task walk of srvActiveBuf is in flight
+bool sequencerSongReaderBusy();  // true while a MIDI-task walk of srvActiveBuf is in flight
 void seqSendSlotEnable();    // send CC 115 ch16 with current performerMask
-
-// Test mode — emulates a perfectly timed performer sending C-4 at a fixed interval.
-// intervalMs = time between notes (e.g. 500 = C-4 every 500ms).
-// Pass 0 to disable.
-void sequencerSetTestMode(uint32_t intervalMs);
 
 // Bring up UART1 for MIDI (no HardwareSerial).  Configures the peripheral via
 // the IDF driver but reads/writes through the uart_ll FIFO directly, with the
@@ -121,4 +122,10 @@ uint8_t _test_getRow();
 uint8_t _test_getPattern();
 bool    _test_isWaiting();
 bool    _test_isRunning();
+uint32_t _test_getAbsRow();
+uint8_t  _test_getLastSnapRow();
+uint32_t _test_getNextRowMs();
+uint16_t _test_getBPM();
+uint16_t _test_getNextNoteIdx();
+void     _test_pushBpmHistory(uint16_t bpm);
 #endif

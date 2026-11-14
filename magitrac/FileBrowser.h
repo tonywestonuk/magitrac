@@ -10,32 +10,17 @@
 
 static const int FB_HDR_H    = 50;
 static const int FB_TOOL_H   = 55;
-static const int FB_BTN_Y    = FB_HDR_H + 4;           // = 54
-static const int FB_BTN_H    = 47;
 
-// Title-bar buttons (consistent across pages):
-//   Left  — extended actions (here: DELETE mode toggle)
-//   Right — HOME (exit page)
+// Title-bar button, right side — HOME (exit page).  Deleting is a per-row
+// swipe, so there is no header DEL button.
 static const int FB_HOME_X   = 830;
 static const int FB_HOME_W   = 130;
-static const int FB_DEL_X    = 0;
-static const int FB_DEL_W    = 130;
 
-// Toolbar PREV/NEXT (pagination)
-static const int FB_PREV_X   = 680;
-static const int FB_PREV_W   = 134;
-static const int FB_NEXT_X   = 818;
-static const int FB_NEXT_W   = 142;
-
-static const int FB_COLS     = 4;
 static const int FB_ROWS     = 7;
-static const int FB_PER_PAGE = FB_COLS * FB_ROWS;       // = 28
-static const int FB_COL_W    = 960 / FB_COLS;            // = 240
 static const int FB_LIST_Y   = FB_HDR_H + FB_TOOL_H;    // = 105
 static const int FB_ROW_H    = 54;
 
 static const int FB_FOOT_Y   = FB_LIST_Y + FB_ROWS * FB_ROW_H;  // = 483
-static const int FB_FOOT_H   = 57;
 static const int FB_FBTN_Y   = FB_FOOT_Y + 4;
 static const int FB_FBTN_H   = 49;
 static const int FB_NEW_X    = 0;
@@ -45,15 +30,13 @@ static const int FB_SAVE_W   = 316;
 static const int FB_SAVEAS_X = 640;
 static const int FB_SAVEAS_W = 320;
 
-// Max items the browser can hold at once.  Grid mode (SD) only shows one page
-// (≤ FB_PER_PAGE); list mode (server) accumulates the whole list, so this caps
-// it — sized to what the server can list, so no song is ever left off.  The
-// storage is allocated from PSRAM in open() (3 KB is too much to sit in
-// internal RAM, which the radios need).
+// Max items the browser can hold at once.  The list accumulates the whole
+// server song list, so this caps it — sized to what the server can list, so no
+// song is ever left off.  The storage is allocated from PSRAM in open() (3 KB
+// is too much to sit in internal RAM, which the radios need).
 static const int FB_MAX_ITEMS = SRV_MAX_SONGS;
 
-// Drag-scroll list mode (used for the server browser): single full-width rows
-// between the toolbar and footer.
+// Drag-scroll list: single full-width rows between the toolbar and footer.
 static const int FB_LROW_H           = FB_ROW_H;                        // 54
 static const int FB_LIST_ROWS        = (FB_FOOT_Y - FB_LIST_Y) / FB_LROW_H; // 7
 static const int FB_LIST_DRAG_THRESH = 12;
@@ -69,10 +52,8 @@ enum class FileBrowserEvent : uint8_t {
     NEW,
     SAVE,
     SAVE_AS,
-    ITEM_TAP,     // result.index = page-relative item index
-    ITEM_DELETE,  // result.index = page-relative item index (delete mode)
-    PREV_PAGE,
-    NEXT_PAGE,
+    ITEM_TAP,     // result.index = index into the item list (itemName())
+    ITEM_DELETE,  // result.index = same; the swiped row's DEL was tapped
 };
 
 struct FileBrowserResult {
@@ -82,18 +63,19 @@ struct FileBrowserResult {
 
 // ── FileBrowser ───────────────────────────────────────────────────────────────
 //
-// Generic 4-column × 7-row file grid with header, toolbar (BACK/PREV/NEXT),
-// and footer (NEW / SAVE <name> / SAVE AS).
+// Song browser: header (title + HOME), a toolbar strip, the item area and a
+// footer (NEW / SAVE <name> / SAVE AS).  The item area is seven full-width
+// rows over the WHOLE item list, drag-scroll with inertia; the toolbar shows
+// "a-b of N".  Swipe a row left to reveal its DEL button.
 //
 // Usage:
-//   1. Call open() once when entering the browser state.
-//   2. Call setTitle(), setLoadedName(), setHasPrev/Next(), then
-//      clearItems() + addItem() to populate the current page.
+//   1. Call open() once when entering the browser state (resets scroll).
+//   2. Call setTitle(), setLoadedName(), then clearItems() + addItem() to
+//      populate.
 //      For async loading, call setStatusText() and clearItems() to show a
 //      placeholder message until items are ready.
 //   3. Call draw() to render.
 //   4. Call poll() every frame; handle the returned event.
-//   5. Tap the header bar to toggle delete mode (onBootPress() also available).
 
 class FileBrowser {
 public:
@@ -103,11 +85,9 @@ public:
     void open();
 
     // ── Configure before draw ────────────────────────────────────────────────
-    void setTitle     (const char* title);   // "SD CARD" / "SERVER" (delete mode overrides)
+    void setTitle     (const char* title);   // header text, e.g. "SERVER"
     void setLoadedName(const char* name);    // display name (no extension) for SAVE label + bold
-    void setHasPrev   (bool v);
-    void setHasNext   (bool v);
-    void setStatusText(const char* text);    // shown centred in grid when no items
+    void setStatusText(const char* text);    // shown in the item area while there are no items
 
     // ── Item list ────────────────────────────────────────────────────────────
     void clearItems();
@@ -116,15 +96,12 @@ public:
     const char* itemName(int i) const {      // valid 0..itemCount()-1
         return (i >= 0 && i < _itemCount) ? _items[i] : "";
     }
-
-    // Drag-scroll single-column list mode (server browser).  Off = paginated
-    // 4×7 grid (SD card).  Toggle before populating; resets scroll.
-    void setListMode(bool v);
-    bool listMode() const { return _listMode; }
-
-    // ── Header tap (or legacy boot button call) toggles delete mode ──────────
-    void onBootPress();
-    bool altMode() const { return _altMode; }
+    // Blank the item area (the status text shows instead) without losing the
+    // list; restoreItems() brings it back as it was, scroll position included.
+    // While hidden itemCount() is 0.  clearItems() / addItem() drop the hidden
+    // list, after which restoreItems() does nothing.
+    void hideItems();
+    void restoreItems();
 
     void             draw();
     FileBrowserResult poll();
@@ -136,20 +113,17 @@ private:
     char  _title[24];
     char  _loadedName[STORAGE_FILENAME_MAX];
     char  _statusText[32];
-    bool  _hasPrev;
-    bool  _hasNext;
-    bool  _altMode;
     bool  _wasDown;
 
     char (*_items)[STORAGE_FILENAME_MAX] = nullptr;   // [FB_MAX_ITEMS], see open()
     int   _itemCount;
+    int   _hiddenCount;       // items set aside by hideItems() (0 = none)
+    int   _hiddenScroll;      // _scroll at hideItems()
 
-    // List-mode (drag-scroll) state.
-    bool  _listMode;
+    // Drag-scroll state.
     int   _scroll;            // index of the first visible row
     int   _dragStartY;
     int   _dragStartScroll;
-    bool  _dragMoved;
 
     // Inertia (fling) — same model as the tracker grid: fractional-row position
     // + rows/sec velocity, exp-decayed (INERTIA_DECAY / INERTIA_MIN_VEL).
@@ -163,8 +137,7 @@ private:
     void coastInertia();      // advance the fling one tick (finger-up frames)
 
     // Swipe-to-delete: a horizontal left-swipe on a row reveals its DEL button;
-    // vertical scroll (or a tap elsewhere) hides it.  Replaces the list's
-    // old header DEL-mode toggle (grid mode still uses _altMode).
+    // vertical scroll (or a tap elsewhere) hides it.
     int   _dragStartX;        // press x (horizontal-swipe detection)
     int   _gestureDir;        // 0 undecided, 1 vertical scroll, 2 horizontal
     int   _pressRow;          // abs item index under the press (-1 = none)
@@ -172,21 +145,13 @@ private:
     bool  hitRowDel(int sx, int sy) const;   // tap on the revealed row's DEL
 
     void drawHeader ();
-    void drawToolbar();
-    void drawGrid   ();
-    void drawItem   (int col, int rowY, const char* name, bool isLoaded);
     void drawFooter ();
-    void drawList     ();                 // list-mode body
-    void drawListToolbar();               // scroll hint instead of PREV/NEXT
+    void drawList     ();                 // item rows
+    void drawListToolbar();               // "a-b of N" scroll hint
     int  hitListItem(int sx, int sy) const;  // absolute item index or -1
     int  maxScroll() const;
-    FileBrowserResult pollList();         // list-mode poll (drag + tap)
 
     bool hitHome  (int sx, int sy) const;
-    bool hitDel   (int sx, int sy) const;   // left-side DELETE-mode toggle
-    bool hitPrev  (int sx, int sy) const;
-    bool hitNext  (int sx, int sy) const;
-    int  hitItem  (int sx, int sy) const;   // page-relative index or -1
     bool hitNew   (int sx, int sy) const;
     bool hitSave  (int sx, int sy) const;
     bool hitSaveAs(int sx, int sy) const;

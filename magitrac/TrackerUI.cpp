@@ -1,7 +1,6 @@
 #include "TrackerUI.h"
 #include "NoteGrid.h"
 #include "UIHelpers.h"
-#include "SongSource.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -24,7 +23,6 @@ TrackerUI::TrackerUI(EPD_PainterAdafruit& display, Song& song, TrackerEngine& en
     , _emptyCellCached(false)
     , _battPct(-1)
     , _battCharging(false)
-    , _memPct(-1)
 {
     _statusMsg[0] = '\0';
     _clockStr[0]  = '\0';
@@ -37,10 +35,6 @@ void TrackerUI::setServerConnected(bool connected) {
 void TrackerUI::setBattery(int pct, bool charging) {
     _battPct      = pct;
     _battCharging = charging;
-}
-
-void TrackerUI::setMemPct(int pct) {
-    _memPct = pct;
 }
 
 void TrackerUI::setServerPlaying(bool playing) {
@@ -289,14 +283,14 @@ bool TrackerUI::hitGrid(int tx, int ty, int8_t& outRow, int8_t& outCol) const {
 
     int vi  = (ty - GRID_Y) / ROW_H;
     int vcol = (tx - ROW_NUM_W) / COL_W;
-    int pat = topRow() + vi;
+    int patRow = topRow() + vi;        // pattern row under the touch
     int col = _colOffset + vcol;
 
-    if (pat < 0 || pat >= _song.patterns[_engine.currentPattern()].length) return false;
+    if (patRow < 0 || patRow >= _song.patterns[_engine.currentPattern()].length) return false;
     if (vcol < 0 || vcol >= VISIBLE_COLUMNS) return false;
     if (col  < 0 || col  >= MAX_COLUMNS)     return false;
 
-    outRow = (int8_t)pat;
+    outRow = (int8_t)patRow;
     outCol = (int8_t)col;
     return true;
 }
@@ -401,11 +395,11 @@ bool TrackerUI::hitGridGap(int tx, int ty, int8_t& row, int8_t& col) const {
     int cxLeft = ROW_NUM_W + vcol * COL_W;
     if (tx < cxLeft + GAP_START_X) return false;   // left of the gap strip
     int vi  = (ty - GRID_Y) / ROW_H;
-    int pat = topRow() + vi;
+    int patRow = topRow() + vi;        // pattern row under the touch
     int c   = _colOffset + vcol;
-    if (pat < 0 || pat >= _song.patterns[_engine.currentPattern()].length) return false;
+    if (patRow < 0 || patRow >= _song.patterns[_engine.currentPattern()].length) return false;
     if (c < 0 || c >= MAX_COLUMNS) return false;
-    row = (int8_t)pat;
+    row = (int8_t)patRow;
     col = (int8_t)c;
     return true;
 }

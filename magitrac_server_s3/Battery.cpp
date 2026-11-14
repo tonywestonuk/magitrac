@@ -37,9 +37,6 @@ bool batteryPoll() {
     return changed;
 }
 
-int  batteryPercent()  { return sPct; }
-bool batteryCharging() { return sCharging; }
-
 void batteryDrawIcon(int x, int y, uint16_t bgColor) {
     auto& d = M5.Display;
 

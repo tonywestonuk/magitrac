@@ -39,6 +39,8 @@ struct NoteNode {
 #define EFFECT_WAT2 0x11 // column-0 effect: WAIT variant with 2 s timeout
 #define IS_WAIT_EFFECT(e) ((e) == EFFECT_WAIT || (e) == EFFECT_WAT1 || (e) == EFFECT_WAT2)
 #define EFFECT_PASA 0x12 // column-0 effect: PASS-All — absorbs every matching note until playhead passes
+#define EFFECT_PAN  0x0A // MIDI output-col effect: pan — param is the MIDI pan position (CC 10):
+                         //   00 = hard left, 40 = centre, 7F = hard right (above 7F is sent as 7F).
 #define EFFECT_RTRG 0x1B // MIDI output-col effect: retrigger — replay the note within its own row.
                          // param = total hit count (0/1 → 2 = "play twice"); clamped to 2..8.
                          // SFX / pixel_post columns ignore it.
@@ -117,7 +119,7 @@ struct InputNoteEntry {
     BlockSwitch     switchMode;      // what to do with block position (default: STAY)
     uint8_t         switchTarget;    // target pattern index (used when switchMode != STAY)
     TransposeAction transposeAction; // whether to change transposition (default: KEEP)
-    int8_t          transposeValue;  // semitone offset to apply (used when action == SET)
+    int8_t          transposeValue;  // semitone offset to apply (used when action == CUSTOM)
 };
 
 // ── Performance pad config ──────────────────────────────────────────────────
@@ -154,10 +156,13 @@ struct PerfPadConfig {
 //   note.effect/param → MSG_MOVE X/Y, rides pressed
 #define PIXELPOST_CHANNEL  18
 
-// ── Per-column MIDI output settings (one per column per pattern) ─────────────
+// ── Per-column MIDI output settings ──────────────────────────────────────────
+// One per column PER SONG (Song::columns) — shared by every pattern.
 
 struct ColumnSettings {
-    uint8_t midiChannel;               // 1–16 (0 = muted/unset)
+    uint8_t midiChannel;               // 1–16 (0 = muted/unset), or one of the
+                                       // special routes SFX_CHANNEL /
+                                       // PIXELPOST_CHANNEL / ORGAN_CHANNEL
     uint8_t bankMSB;                   // CC0, 0–127
     uint8_t program;                   // 0–127
     uint8_t volume;                    // CC7, 0–127
@@ -237,10 +242,6 @@ struct Song {
 // e.g. "C-4", "C#3", "---"
 void noteToString(uint8_t note, char* buf);
 
-// Writes 4-char effect string + null terminator (needs 5 bytes).
-// e.g. "0D02", "----"
-void effectToString(uint8_t effect, uint8_t param, char* buf);
-
 // Writes 2-char velocity string + null terminator (needs 3 bytes).
 // 0x80+ → "--", 0–127 → hex e.g. "5F"
 void velToString(uint8_t velocity, char* buf);
@@ -250,7 +251,9 @@ void velToString(uint8_t velocity, char* buf);
 void effectToString5(uint8_t effect, uint8_t param, char* buf);
 
 // Writes 4-char col-0 metadata string + null terminator (needs 5 bytes).
-// Shows "WAIT", "SYNC", or "    ".
+// Shows the col-0 cue effect: "WAIT", "WAT1", "WAT2", "SYNC" or "AVRG".  Any
+// other cell holding a real note reads "PASA" (EFFECT_PASA) or "PASS"; an
+// empty or NOTE_OFF cell reads "    ".
 void col0MetaToString(const Note& n, char* buf);
 
 // Pack semitone (0=C … 11=B) and octave (0–7) into a note value.
@@ -283,17 +286,23 @@ struct SerializedNote {
     uint8_t param;
 };
 
-// .mgt file layout (v18 compact):
+// .mgt file layout (v20 compact — the current SONG_FILE_VERSION):
 //   [ SongFileHeader              ]  (8 bytes)
 //   [ Pattern x MAX_PATTERNS      ]  (72 x 50 = 3600 bytes; noteHead ignored on load)
 //   [ ColumnSettings x MAX_COLUMNS ] (20 x 21 = 420 bytes; per-song column config)
-//   [ Song tail                   ]  (numPatterns ... _songPad)
+//   [ Song tail                   ]  (numPatterns ... flags, plus the struct's
+//                                     trailing alignment byte — written as
+//                                     sizeof(Song) - offsetof(Song, numPatterns))
 //   [ uint16_t noteCount          ]  (2 bytes)
 //   [ SerializedNote x noteCount  ]  (7 bytes each)
 //
 // Small songs = small files.  MAX_SONG_NOTES can change without a format bump.
-// Wire transfer (ESP-NOW) still uses the raw Song struct.
-// Bump FILE_VERSION whenever Pattern or Song tail layout changes,
+// Wire transfer (the MagiLink song push / save streams) uses the raw Song
+// struct, not this layout.  Only the current version loads: the readers for
+// older versions were removed (see SongMigration.h).  After a bump, existing
+// files are refused until re-saved — ask the owner whether a one-off
+// conversion is wanted.
+// Bump SONG_FILE_VERSION whenever Pattern or Song tail layout changes,
 // or when MAX_COLUMNS changes (it sizes Song::columns).
 
 #define SONG_FILE_MAGIC   0x4D414754UL   // "MAGT" as uint32
@@ -301,11 +310,13 @@ struct SerializedNote {
 
 struct SongFileHeader {
     uint32_t magic;    // must equal SONG_FILE_MAGIC
-    uint8_t  version;  // must equal SONG_FILE_VERSION
+    uint8_t  version;  // SONG_FILE_VERSION when written; any other value is
+                       // refused on load (songReadAnyVersion)
     uint8_t  _pad[3];  // reserved, write as 0
 };
 
 // ── Default song factory ──────────────────────────────────────────────────────
 
-// Fills *song with safe defaults and a simple demo pattern.
+// Fills *song with safe defaults: an empty note pool and one empty 16-row
+// pattern (no demo notes).
 void initSong(Song* song);

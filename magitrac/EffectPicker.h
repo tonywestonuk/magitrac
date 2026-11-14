@@ -43,7 +43,6 @@ public:
     bool    tookChoice()   const { return _took; }
     uint8_t chosenEffect() const { return _effect; }
     uint8_t chosenParam()  const { return _param; }
-    int     chosenIndex()  const { return _idx; }   // catalogue index (-1 = none)
 
 private:
     EPD_PainterAdafruit& _d;
@@ -57,7 +56,6 @@ private:
     bool    _took;
     uint8_t _effect;
     uint8_t _param;
-    int     _idx;      // catalogue index chosen (-1 = none)
     int     _selIdx;   // row to highlight (matches the cell's current effect)
 
     void drawChrome();

@@ -97,12 +97,6 @@ public:
 
     // Battery indicator — pct 0-100 (-1 = unknown), charging shows lightning bolt
     void setBattery(int pct, bool charging);
-    int  battPct()      const { return _battPct; }
-    bool battCharging() const { return _battCharging; }
-
-    // Memory used meter — pct 0-100 (-1 = unknown)
-    void setMemPct(int pct);
-    int  memPct() const { return _memPct; }
 
     // Connection status text shown in header (e.g. "Connecting...", "Connected")
     void setStatus(const char* msg);
@@ -176,7 +170,7 @@ private:
     bool                 _serverPlaying;
     int8_t               _selRow;
     int8_t               _selCol;
-    uint8_t              _colOffset;   // first visible column index (0 for MVP)
+    uint8_t              _colOffset;   // first visible column index (0..MAX_COLUMNS-VISIBLE_COLUMNS)
 
     // Row-select (copy source) state.  _rsState: 0 none, 1 anchor dot, 2 range.
     int8_t  _rsCol    = -1;
@@ -192,7 +186,6 @@ private:
     bool                 _noSong;
     int                  _battPct;      // -1 = unknown
     bool                 _battCharging;
-    int                  _memPct;       // -1 = unknown
     char                 _statusMsg[32];
     char                 _clockStr[20];  // "HH:MM  DD/MM/YY"
 

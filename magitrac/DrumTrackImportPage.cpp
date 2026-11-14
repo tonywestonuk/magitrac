@@ -65,6 +65,9 @@ static const int DT_OK_Y = 440;
 static const int DT_OK_W = 200;
 static const int DT_OK_H = 70;
 
+// How long a LOADING_* screen waits for the server before giving up.
+static const uint32_t DT_LOAD_TIMEOUT_MS = 10000;
+
 // Small helper — wipe the framebuffer before drawing a fresh page.
 // EPD_PainterAdafruit::clear() does a *physical* anti-ghost refresh, not
 // a framebuffer wipe; for inside-the-page redraws we want fillScreen.
@@ -116,8 +119,14 @@ bool DrumTrackImportPage::readTouch(int& sx, int& sy, bool& down) {
 }
 
 // ── State transitions ───────────────────────────────────────────────────────
+// The request calls return without touching the list/load state when the link
+// is down, so every LOADING_* entry checks isPaired() itself — otherwise the
+// poller would wait on (or misread) state left over from an earlier request.
 void DrumTrackImportPage::enterLoadingList() {
+    if (!gServerPairing.isPaired()) { enterError("Not connected"); return; }
     _state = State::LOADING_LIST;
+    _loadStartMs = millis();
+    _loadWasDown = false;
     gServerPairing.requestFileList(FK_DRUMTRACKS, 0);
     wipeFB(_d);
     drawLoading("Loading drum-track list...");
@@ -134,7 +143,10 @@ void DrumTrackImportPage::enterFilePicker() {
 }
 
 void DrumTrackImportPage::enterLoadingFile(const char* name) {
+    if (!gServerPairing.isPaired()) { enterError("Not connected"); return; }
     _state = State::LOADING_FILE;
+    _loadStartMs = millis();
+    _loadWasDown = false;
     gServerPairing.requestFileLoad(FK_DRUMTRACKS, name);
     wipeFB(_d);
     char what[80];
@@ -144,7 +156,10 @@ void DrumTrackImportPage::enterLoadingFile(const char* name) {
 }
 
 void DrumTrackImportPage::enterLoadingMap() {
+    if (!gServerPairing.isPaired()) { enterError("Not connected"); return; }
     _state = State::LOADING_MAP;
+    _loadStartMs = millis();
+    _loadWasDown = false;
     gServerPairing.requestFileLoad(FK_DRUMTRACKS, "gm_map.txt");
     wipeFB(_d);
     drawLoading("Loading drum mapping...");
@@ -287,14 +302,21 @@ void DrumTrackImportPage::drawBlockChoose() {
     _d.setCursor(60, DT_BC_INFO_Y);
     _d.print(drumsLine);
 
+    // Drum-editor mode has no destination range: DrumEditorPage::importBlock
+    // clears the block's ch10 notes and allocates columns itself.
+    const bool drumMode = (_mode == Mode::DRUM_EDITOR);
+
     char allocLine[80];
     if (activeN == 0) {
-        snprintf(allocLine, sizeof(allocLine), "(empty block — nothing to import)");
+        snprintf(allocLine, sizeof(allocLine), "(empty block - nothing to import)");
+    } else if (drumMode) {
+        snprintf(allocLine, sizeof(allocLine),
+                 "Imports into this block's drum (ch%d) columns", DRUM_MIDI_CHANNEL);
     } else {
         int endCol = (int)_startCol + activeN - 1;
         if (endCol >= MAX_COLUMNS) {
             snprintf(allocLine, sizeof(allocLine),
-                     "Needs %d cols from col %d — exceeds max (%d)",
+                     "Needs %d cols from col %d - exceeds max (%d)",
                      activeN, _startCol, MAX_COLUMNS - 1);
         } else {
             snprintf(allocLine, sizeof(allocLine),
@@ -320,31 +342,47 @@ void DrumTrackImportPage::drawBlockChoose() {
         _d.print(kitBuf);
     }
 
-    // Warning if any destination col already has notes in this pattern.
-    bool overflow = (activeN > 0 && (int)_startCol + activeN - 1 >= MAX_COLUMNS);
+    // Warning if the notes the import will clear already exist in this
+    // pattern: the destination cols (column mode) or any ch10 col (drum mode).
+    bool overflow = (!drumMode && activeN > 0
+                     && (int)_startCol + activeN - 1 >= MAX_COLUMNS);
     bool hasExisting = false;
     if (!overflow && activeN > 0) {
         const NoteGrid g(_song.notePool, &_song.patterns[_patIdx].noteHead);
-        for (int i = 0; i < activeN && !hasExisting; i++) {
-            uint8_t col = _startCol + i;
-            for (uint8_t r = 0; r < _song.patterns[_patIdx].length; r++) {
-                if (g.has(r, col)) { hasExisting = true; break; }
+        const uint8_t patLen = _song.patterns[_patIdx].length;
+        if (drumMode) {
+            for (int c = 1; c < MAX_COLUMNS && !hasExisting; c++) {
+                if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+                for (uint8_t r = 0; r < patLen; r++) {
+                    if (g.has(r, (uint8_t)c)) { hasExisting = true; break; }
+                }
+            }
+        } else {
+            for (int i = 0; i < activeN && !hasExisting; i++) {
+                uint8_t col = _startCol + i;
+                for (uint8_t r = 0; r < patLen; r++) {
+                    if (g.has(r, col)) { hasExisting = true; break; }
+                }
             }
         }
     }
     if (hasExisting) {
         _d.setTextSize(2);
         _d.setCursor(60, DT_BC_WARN_Y);
-        _d.print("Destination columns already have notes - will be cleared.");
+        _d.print(drumMode
+                 ? "This block's existing drum notes will be cleared."
+                 : "Destination columns already have notes - will be cleared.");
     }
 
     uiButton(_d, DT_BC_CANCEL_X, DT_BC_BTN_Y, DT_BC_BTN_W, DT_BC_BTN_H,
              "CANCEL", COL_WHITE, COL_BLACK, 4);
+    // Same rule as canImportSelected(), which gates the tap.  Disabled =
+    // white background + dark grey text.
     bool canImport = (activeN > 0) && !overflow;
     uiButton(_d, DT_BC_IMPORT_X, DT_BC_BTN_Y, DT_BC_BTN_W, DT_BC_BTN_H,
              canImport ? "IMPORT" : "(N/A)",
-             canImport ? COL_BLACK : COL_LTGREY,
-             COL_WHITE, 4);
+             canImport ? COL_BLACK : COL_WHITE,
+             canImport ? COL_WHITE : COL_DKGREY, 4);
     if (activeN > 0) {
         const char* lbl = _audPlaying ? "STOP" : "PLAY";
         uint16_t bg = _audPlaying ? COL_BLACK : COL_WHITE;
@@ -372,7 +410,6 @@ void DrumTrackImportPage::draw() {
         case State::LOADING_FILE:  drawLoading("Loading drum-track file..."); break;
         case State::LOADING_MAP:   drawLoading("Loading drum mapping...");     break;
         case State::BLOCK_CHOOSE:  drawBlockChoose();                           break;
-        case State::APPLYING:      drawLoading("Applying...");                  break;
         case State::ERROR_VIEW:    drawError();                                 break;
         case State::DONE:          break;
     }
@@ -387,13 +424,55 @@ bool DrumTrackImportPage::hitHomeOrBack(int sx, int sy) const {
     return false;
 }
 
+// True when the selected block can be imported: it has at least one active
+// instrument and, in column-editor mode, the columns it needs fit.
+bool DrumTrackImportPage::canImportSelected() const {
+    const DrumPatternBlock* blk = _file.block(_selectedBlock);
+    if (!blk) return false;
+    int activeIdx[DRUM_PATTERN_MAX_INSTRS];
+    int activeN = blk->activeIndices(activeIdx, DRUM_PATTERN_MAX_INSTRS);
+    if (activeN == 0) return false;
+    if (_mode == Mode::COLUMN_EDITOR
+        && (int)_startCol + activeN - 1 >= MAX_COLUMNS) return false;
+    return true;
+}
+
 // ── State pollers ────────────────────────────────────────────────────────────
+
+// Shared by the three LOADING_* pollers, called while the reply is still
+// outstanding.  A HOME tap closes the page; no reply within
+// DT_LOAD_TIMEOUT_MS becomes an error screen.  Returns true if it left the
+// loading state (the caller then drops its pending request).  Tracks the
+// press in _loadWasDown, not _wasDown, so a finger still down when the reply
+// lands is seen by the next screen as a fresh press rather than a drag.
+bool DrumTrackImportPage::pollLoadingEscape() {
+    int sx, sy; bool down;
+    if (readTouch(sx, sy, down)) {
+        if (down && !_loadWasDown) { _loadWasDown = true; }
+        else if (!down && _loadWasDown) {
+            _loadWasDown = false;
+            if (sy >= 0 && sy < DT_HDR_H
+                && sx >= DT_HOME_X && sx < DT_HOME_X + DT_HOME_W) {
+                _state = State::DONE;
+                return true;
+            }
+        }
+    }
+    if (millis() - _loadStartMs > DT_LOAD_TIMEOUT_MS) {
+        enterError("No reply from server");
+        return true;
+    }
+    return false;
+}
+
 void DrumTrackImportPage::pollLoadingList() {
     FileListState s = gServerPairing.fileListState();
     if (s == FileListState::READY) {
         enterFilePicker();
     } else if (s == FileListState::ERROR) {
         enterError("Failed to load drum-track list");
+    } else if (pollLoadingEscape()) {
+        gServerPairing.resetFileList();
     }
 }
 
@@ -458,6 +537,8 @@ void DrumTrackImportPage::pollLoadingFile() {
         enterError("File not found on server");
     } else if (s == FileLoadState::ERROR) {
         enterError("File too large or transfer failed");
+    } else if (pollLoadingEscape()) {
+        gServerPairing.resetFileLoad();     // a late reply is then ignored
     }
 }
 
@@ -473,6 +554,8 @@ void DrumTrackImportPage::pollLoadingMap() {
         // Map missing or unreadable — proceed with built-in defaults.
         sGmMapFetched = true;
         enterBlockChoose();
+    } else if (pollLoadingEscape()) {
+        gServerPairing.resetFileLoad();     // a late reply is then ignored
     }
 }
 
@@ -537,6 +620,9 @@ void DrumTrackImportPage::pollBlockChoose() {
                 return;
             }
             if (sx >= DT_BC_IMPORT_X && sx < DT_BC_IMPORT_X + DT_BC_BTN_W) {
+                // Button reads "(N/A)" — nothing to import.  In drum-editor
+                // mode going ahead would wipe the block's drums for nothing.
+                if (!canImportSelected()) return;
                 auditionStop();
                 if (_mode == Mode::DRUM_EDITOR) {
                     // Caller handles the actual placement via pickedFile()
@@ -545,7 +631,6 @@ void DrumTrackImportPage::pollBlockChoose() {
                     _state    = State::DONE;
                     return;
                 }
-                _state = State::APPLYING;
                 wipeFB(_d); drawLoading("Applying..."); _d.paintLater();
                 if (applyImport()) {
                     _imported = true;
@@ -565,8 +650,9 @@ void DrumTrackImportPage::pollError() {
     if (down && !_wasDown) { _wasDown = true; }
     else if (!down && _wasDown) {
         _wasDown = false;
-        if (sx >= DT_OK_X && sx < DT_OK_X + DT_OK_W
-            && sy >= DT_OK_Y && sy < DT_OK_Y + DT_OK_H) {
+        if ((sx >= DT_OK_X && sx < DT_OK_X + DT_OK_W
+             && sy >= DT_OK_Y && sy < DT_OK_Y + DT_OK_H)
+            || hitHomeOrBack(sx, sy)) {     // the header's HOME closes too
             _state = State::DONE;
         }
     }
@@ -582,7 +668,6 @@ bool DrumTrackImportPage::poll() {
         case State::LOADING_FILE: pollLoadingFile(); break;
         case State::LOADING_MAP:  pollLoadingMap();  break;
         case State::BLOCK_CHOOSE: pollBlockChoose(); break;
-        case State::APPLYING:     break;
         case State::ERROR_VIEW:   pollError();       break;
         case State::DONE:         break;
     }
@@ -625,7 +710,7 @@ void DrumTrackImportPage::auditionTick() {
         if (!instr.hits[_audStep]) continue;
         const DrumGmEntry* m = sGmMap.find(instr.code);
         if (!m) continue;
-        gServerPairing.sendAuditionRawNote(10, m->midiNote, m->velocity);
+        gServerPairing.sendAuditionRawNote(DRUM_MIDI_CHANNEL, m->midiNote, m->velocity);
     }
 
     _audStep = (_audStep + 1) % DRUM_PATTERN_STEPS;
@@ -647,10 +732,14 @@ bool DrumTrackImportPage::applyImport() {
     Pattern& pat = _song.patterns[_patIdx];
     NoteGrid g(_song.notePool, &_song.noteFreeHead, &pat.noteHead);
 
-    // 1) Clear destination cols for this pattern.
+    // 1) Clear destination cols for this pattern.  Each is marked for resync
+    //    here, not when its notes go in: a column whose drum has no mapping,
+    //    or one the import never reaches because the pool filled, has still
+    //    lost its notes and the server has to be told.
     for (int i = 0; i < activeN; i++) {
         uint8_t col = _startCol + i;
         for (uint8_t r = 0; r < MAX_ROWS; r++) g.clear(r, col);
+        _resyncMask |= (1u << col);
     }
 
     // 2) Walk each active instrument, place notes with repeat-then-truncate,
@@ -684,8 +773,6 @@ bool DrumTrackImportPage::applyImport() {
         cs.volume      = 100;
         strncpy(cs.name, m->name, INSTRUMENT_NAME_LEN - 1);
         cs.name[INSTRUMENT_NAME_LEN - 1] = '\0';
-
-        _resyncMask |= (1u << col);
     }
 
     return poolOk;

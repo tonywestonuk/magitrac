@@ -56,10 +56,11 @@ static void onEspNowRecv(const esp_now_recv_info* info, const uint8_t* data, int
     // Main dispatch:
     //   Unicasts → always.
     //   Broadcasts → only if a magitrac MSG_PAIR_PROBE — the magitrac
-    //     server broadcasts these while scanning channels 1/6/11 in pair
-    //     mode.  The MAGI_PAIR_MAGIC prefix at offset 1 disambiguates the
-    //     frame from random channel chatter.  CHALLENGE and OFFER are
-    //     unicast, so they don't appear in this branch.
+    //     client broadcasts these on ch1 while in pair mode, and the server
+    //     (also parked on ch1) answers.  The MAGI_PAIR_MAGIC prefix at
+    //     offset 1 disambiguates the frame from random channel chatter.
+    //     CHALLENGE and OFFER are unicast, so they don't appear in this
+    //     branch.
     if (isBcast) {
         if (data[0] != MSG_PAIR_PROBE) return;
         if (len < 1 + (int)sizeof(MAGI_PAIR_MAGIC) - 1) return;
@@ -73,9 +74,10 @@ static void onEspNowRecv(const esp_now_recv_info* info, const uint8_t* data, int
 bool MagiCommsEspNow::begin() {
     _inst = this;
 
-    // In coexist mode another transport (MagiCommsTcp AP role) has already
-    // taken WiFi up in AP_STA mode; touching WiFi.mode / channel / protocol
-    // here would clobber that setup and tear down the TCP listener.
+    // In coexist mode the sketch has already taken WiFi up for the MagiLink
+    // TCP data path; touching WiFi.mode / channel / protocol here
+    // would clobber that setup and tear the link down.  Every sketch in this
+    // repo sets coexist mode, so the standalone branch below is not exercised.
     if (!_coexist) {
         WiFi.mode(WIFI_STA);
         WiFi.setChannel(1);
@@ -87,7 +89,7 @@ bool MagiCommsEspNow::begin() {
         // ceremony (server boots ESP-NOW only when there are no TCP
         // creds; client uses coexist mode which already skipped LR).
         // LR-only mode silently dropped larger pairing frames (e.g. the
-        // 106-byte MSG_PAIR_OFFER) because the client AP transmits them
+        // 99-byte MSG_PAIR_OFFER) because the client AP transmits them
         // at standard 802.11n rates the LR receiver can't decode — small
         // frames sneak through at base rate but anything past ~30 bytes
         // can fail.  Trade-off: pixelpost MSG_TICK_SYNC broadcast sync
@@ -105,12 +107,12 @@ bool MagiCommsEspNow::begin() {
 
     // Force ESP-NOW frames to 1 Mbps DSSS — the slowest, most-reliable rate.
     // Without this, the WiFi driver does rate adaptation per-frame and tends
-    // to bump larger unicasts (e.g. 106-byte MSG_PAIR_OFFER) up to rates an
+    // to bump larger unicasts (e.g. 99-byte MSG_PAIR_OFFER) up to rates an
     // unassociated peer can't reliably decode.  Small frames sneak through
     // at base rate; larger ones get silently dropped.  Forcing 1M is bullet-
-    // proof for our pairing-traffic sizes.  Setting on both AP and STA so
-    // the same code works for the coexist (client AP-STA) and pure-STA
-    // (server) configs.
+    // proof for our pairing-traffic sizes.  Set on both interfaces because
+    // peers are bound to the AP interface in coexist mode and to STA
+    // otherwise (see addPeer / sendBroadcast).
     esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_1M_L);
     esp_wifi_config_espnow_rate(WIFI_IF_AP,  WIFI_PHY_RATE_1M_L);
     Serial.println("[MC] ESP-NOW rate forced to 1 Mbps DSSS");

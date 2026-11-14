@@ -14,10 +14,10 @@
 // State machine:
 //   LOADING_LIST → FILE_PICKER → LOADING_FILE → LOADING_MAP → BLOCK_CHOOSE
 //                                                                  ↓
-//                                                              APPLYING
-//                                                                  ↓
 //                                                                DONE (closes)
-// (ERROR state shown on any failure; user dismisses to close.)
+// (LOADING_MAP is skipped once the map is cached.  ERROR_VIEW is shown on any
+// failure — including "Not connected" and a load that gets no reply within
+// ~10 s; the user dismisses it to close.  HOME closes from every screen.)
 //
 // gm_map.txt is fetched once per device session and cached in a static
 // inside the .cpp.
@@ -44,9 +44,11 @@ public:
     // or import completed).
     bool poll();
 
-    // After a successful import: bitmask of columns that need full resync
-    // to the server (settings unchanged but notes mutated).  Drained by the
-    // caller via clearResync().
+    // Column-editor mode: bitmask of every destination column applyImport()
+    // cleared or wrote — set even when the import then failed part-way, since
+    // the clearing has already happened.  Non-zero means the caller must
+    // resync those columns (ColumnSettings + their notes in this pattern) to
+    // the server in full.  Drained by the caller via clearResync().
     uint32_t resyncMask() const { return _resyncMask; }
     void     clearResync()      { _resyncMask = 0; }
 
@@ -64,7 +66,6 @@ private:
         LOADING_FILE,
         LOADING_MAP,
         BLOCK_CHOOSE,
-        APPLYING,
         ERROR_VIEW,
         DONE,
     };
@@ -81,6 +82,8 @@ private:
     bool     _imported       = false;
     bool     _wasDown        = false;
     char     _errMsg[64]     = {};
+    uint32_t _loadStartMs    = 0;     // millis() when the current LOADING_* began
+    bool     _loadWasDown    = false; // press tracking for the LOADING_* screens
 
     // File picker
     int      _scroll         = 0;
@@ -130,7 +133,9 @@ private:
     void drawError();
 
     bool hitHomeOrBack(int sx, int sy) const;
+    bool canImportSelected() const;
 
+    bool pollLoadingEscape();     // HOME tap / timeout while a load is pending
     void pollLoadingList();
     void pollFilePicker();
     void pollLoadingFile();
@@ -138,6 +143,7 @@ private:
     void pollBlockChoose();
     void pollError();
 
-    // Performs the import.  Returns true on success; sets _resyncMask.
+    // Performs the import.  Returns true on success.  Sets _resyncMask for
+    // every column it touched, on failure too.
     bool applyImport();
 };

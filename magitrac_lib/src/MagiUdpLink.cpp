@@ -2,8 +2,8 @@
 #include <Arduino.h>
 
 // UDP-routed messages are tiny (3-byte SeqPos, 2-byte PreviewRow, 3-byte
-// MidiNoteIn); 256 B is plenty of headroom without putting a big buffer
-// on the stack.
+// MidiNoteIn, 19-byte ServerAnnounce); 256 B is plenty of headroom without
+// putting a big buffer on the stack.
 static const size_t MAX_UDP_PACKET = 256;
 
 bool MagiUdpLink::beginListener(uint16_t port) {
@@ -18,7 +18,7 @@ void MagiUdpLink::beginSender(const uint8_t dest_ip[4], uint16_t port) {
     _isListener = false;
     _destIp = IPAddress(dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3]);
     _destPort = port;
-    // Don't bind a local socket here — STA may not be associated yet.
+    // Don't bind a local socket here — the network may not be up yet.
     // Deferred to first send().
     Serial.printf("[UDP] sender → %u.%u.%u.%u:%u (lazy bind)\n",
                   dest_ip[0], dest_ip[1], dest_ip[2], dest_ip[3],

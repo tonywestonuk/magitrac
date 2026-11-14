@@ -72,6 +72,9 @@ public:
     // Returns true when HOME is tapped (caller returns to tracker).
     bool poll();
 
+    // True if anything was changed since open().
+    bool anyEditMade() const { return _anyEditMade; }
+
 private:
     EPD_PainterAdafruit& _d;
     GT911_Lite&          _touch;
@@ -84,7 +87,7 @@ private:
     uint8_t _editIdx;
     bool    _wasDown;
     bool    _anyEditMade;  // true if anything was changed since open()
-    bool    _saveOnExit;   // set by confirm dialog: true=save, false=discard
+    bool    _saveOnExit;   // true=save (confirm YES); false=discard (confirm NO, or HOME with no edits)
 
     HoldRepeat _hold;
 
@@ -106,6 +109,7 @@ private:
     bool hitPrev    (int sx, int sy) const;
     bool hitNext    (int sx, int sy) const;
     bool hitListHome(int sx, int sy) const;
+    bool hasNextPage() const;   // one rule for drawing NEXT and for acting on it
 
     // ── Hit tests — edit ──────────────────────────────────────────────────────
     bool hitBack    (int sx, int sy) const;
@@ -118,5 +122,6 @@ private:
 
 public:
     // After poll() returns true: whether to save (true) or discard (false).
+    // False also when nothing was edited, so a view-only visit pushes nothing.
     bool    saveOnExit()   const { return _saveOnExit; }
 };

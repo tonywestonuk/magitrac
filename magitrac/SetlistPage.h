@@ -62,7 +62,6 @@ static const int SL_ROW_H         = 50;
 static const int SL_ROWS_PER_PAGE = 7;
 
 static const int SL_NUM_X  = 10;
-static const int SL_NUM_W  = 50;
 static const int SL_NAME_X = 70;
 static const int SL_NAME_W = 720;
 static const int SL_MOVE_X = 800;
@@ -183,9 +182,11 @@ private:
     // MASTER_SELECT.
     bool    _msEditMode;        // taps open the editor instead of toggling
 
-    // Server song-file picker (streamed in, scrolled via _pickView).
-    static const int SRV_PICK_MAX = FILE_LIST_CACHE_MAX;
-    char    _srvPickNames[SRV_PICK_MAX][SETLIST_FILE_LEN];
+    // Server song-file picker (streamed in, scrolled via _pickView).  Sized
+    // for everything the server can list; the names live in PSRAM, allocated
+    // the first time the picker opens and kept.
+    static const int SRV_PICK_MAX = SRV_MAX_SONGS;
+    char  (*_srvPickNames)[SETLIST_FILE_LEN] = nullptr;
     int     _srvPickCount;
     int     _srvPickReqPage;
     bool    _srvPickLoaded;
@@ -194,12 +195,24 @@ private:
     uint32_t _srvLoadStartMs;   // WAITING_SONG
     bool     _srvLoadLate = false;   // timed out of WAITING_SONG; stream may still land
     char     _loadFailNote[32] = {}; // "   (LOAD FAILED - …)" for the INFO popup, or empty
-    SetlistResult takeReadySong();   // SONG_READY → copy + SONG_LOADED, else NONE
+    // The entry a server load was REQUESTED for, captured at request time.  A
+    // late load can land after the user has moved to another row (or removed
+    // this one), so the landed song must not be named from _selectedIdx.
+    char     _pendingFile[SETLIST_FILE_LEN]      = {};
+    char     _pendingName[SETLIST_SONG_NAME_LEN] = {};
+    // A song other than _pendingFile landed and the load was asked for again.
+    // Done once per request; what lands after that is taken and named as
+    // whatever it really is.
+    bool     _pendingRetried = false;
+    // SONG_READY → copy + SONG_LOADED.  NONE if the song was unusable, or was
+    // not the one asked for and has just been re-requested.
+    SetlistResult takeReadySong();
 
     char    _loadedFilename[32];
     char    _loadedDisplayName[SETLIST_SONG_NAME_LEN];
 
     // ── NOT_CONNECTED ──────────────────────────────────────────────────────────
+    bool _noMemory = false;      // open() could not allocate the catalog
     void drawNotConnected();
     SetlistResult pollNotConnected();
 
@@ -254,6 +267,7 @@ private:
     void drawEditFileRow();
     void drawEditNotesRow();
     void drawEditActionBar();
+    void drawEditNote();         // inline warning strip above the action bar
     bool pollEdit();
     bool hitEditFieldBtn(int y, int sx, int sy) const;
     bool hitEditFileClear(int sx, int sy) const;
@@ -261,7 +275,10 @@ private:
     bool hitEditOk(int sx, int sy) const;
     bool hitEditCancel(int sx, int sy) const;
     bool hitEditDelete(int sx, int sy) const;
-    void commitDraft();
+    // False (and _dupNameNote set) if the draft's name is already used by
+    // another entry — nothing is committed and the editor stays open.
+    bool commitDraft();
+    bool _dupNameNote = false;
     void openKeyboardFor(char* target, uint8_t maxLen, State afterState);
 
     // ── PICK_FILE_SRV (server song picker) ─────────────────────────────────────
@@ -277,6 +294,11 @@ private:
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
     void save();         // serialise + upload the current setlist (FK_SETLISTS)
     void saveMaster();   // serialise + upload the master catalog (master.txt)
+    bool saveSlot(uint8_t slot, const Setlist* sl);   // serialise + upload one slot
+    // A catalog entry was renamed (newName) or deleted (newName == nullptr):
+    // bring every setlist's references into line — the current one in memory,
+    // the other slots by load / patch / save.
+    void propagateNameChange(const char* oldName, const char* newName);
     void drawLoadWarning();
     bool loadSlotFromServer(uint8_t slot, Setlist* sl);
     bool loadMasterFromServer();
@@ -286,6 +308,14 @@ private:
     // refuse: writing the empty in-memory list back would wipe the real one.
     bool _listLoaded   = false;
     bool _masterLoaded = false;
+
+    // The server's song names, fetched once per open() on first need (PSRAM)
+    // so a row tap does not cost a full paged list fetch every time.
+    enum class SongCache : uint8_t { NONE, VALID, FAILED };
+    SongCache _srvSongCache = SongCache::NONE;
+    char    (*_srvSongNames)[SL_NAME_LEN] = nullptr;
+    int       _srvSongCount = 0;
+    bool fetchServerSongNames();
     bool fileExistsOnServer(const char* file);
     static void wrapText(const char* in, int maxChars,
                          char line1[], char line2[], int line1Cap, int line2Cap);

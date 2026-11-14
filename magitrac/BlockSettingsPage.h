@@ -132,7 +132,6 @@ private:
     bool    _wasDown;
     bool    _confirmDelete;    // true while waiting for delete confirmation
     bool    _confirmSplit;     // true while waiting for split confirmation
-    bool    _didDuplicate;    // set when a duplicate was performed this session
     bool    _didSplit;        // set when a split was performed this session
     // Set by any structural mutation (delete / new / duplicate / length /
     // inputNote edits) that isn't covered by an inline patch path.  Browse-and-
@@ -176,8 +175,8 @@ private:
     bool canSplit() const;
 
 public:
-    // True if a duplicate or split was performed since open() — caller should sendSongToServer
-    bool didDuplicate() const { return _didDuplicate; }
+    // True if a split was performed since open() — caller should sendSongToServer
+    // straight away.  (Duplicate rides didStructuralChange(), pushed on HOME.)
     bool didSplit()     const { return _didSplit; }
     void clearSplit()         { _didSplit = false; }
 

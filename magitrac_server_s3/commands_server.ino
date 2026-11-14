@@ -31,22 +31,21 @@
 // Shared namespace name with the client side ("magitrac_wifi") so the channel
 // setting is conceptually one thing across both devices, just stored locally.
 static const char* WIFI_NVS_NS = "magitrac_wifi";
-static uint8_t     sWifiChannelIdx = 0;   // 0/1/2 → 1/6/11
 
-// Load the persisted channel idx without touching WiFi.  Used by setup()
-// to pick the softAP channel before WiFi.softAP() is called.
+// Load the persisted channel idx (0/1/2 → ch 1/6/11) without touching WiFi.
+// Used by serverWifiBringUp() to pick the softAP channel before
+// WiFi.softAP() is called.
 uint8_t wifiChannelLoad() {
     Preferences prefs;
     prefs.begin(WIFI_NVS_NS, true);
-    sWifiChannelIdx = prefs.getUChar("idx", 0);
-    if (sWifiChannelIdx > 2) sWifiChannelIdx = 0;
+    uint8_t idx = prefs.getUChar("idx", 0);
+    if (idx > 2) idx = 0;
     prefs.end();
-    return sWifiChannelIdx;
+    return idx;
 }
 
 static void wifiChannelApply(uint8_t idx) {
     if (idx > 2) return;
-    sWifiChannelIdx = idx;
     Preferences prefs;
     prefs.begin(WIFI_NVS_NS, false);
     prefs.putUChar("idx", idx);
@@ -55,7 +54,7 @@ static void wifiChannelApply(uint8_t idx) {
     // Arduino-ESP32 — the call can silently fail when the AP is already
     // running, leaving the radio in a default fallback state (the AP
     // disappears or comes back as "ESP_xxxxxx" with no SSID/PSK).  Persist
-    // the new index and reboot so setup() runs its full softAP +
+    // the new index and reboot so serverWifiBringUp() runs its full softAP +
     // softAPConfig + dhcps_stop sequence cleanly on the new channel.
     Serial.printf("[WIFI] channel idx=%u saved — rebooting to apply\n",
                   (unsigned)idx);
@@ -75,7 +74,7 @@ static void wifiChannelApply(uint8_t idx) {
 #define SRV_AUTOSAVE_DIR "/autosave"
 
 // Song layout constants
-#define SRV_HDR_SIZE      8      // sizeof(SongFileHeader)
+#define SRV_HDR_SIZE      ((uint32_t)sizeof(SongFileHeader))   // Song starts here in srvActiveBuf
 #define SRV_SONG_XFER_MAX (sizeof(SongFileHeader) + sizeof(Song) + 64)
 
 static bool srvSdOk = false;
@@ -83,6 +82,7 @@ static bool srvSdOk = false;
 // ── Instruments ───────────────────────────────────────────────────────────────
 
 #define SRV_INSTRUMENTS_PATH "/instruments.mgt"
+#define SRV_INSTRUMENTS_TMP  "/instruments.tmp"   // save lands here, then renames
 #define INSTR_FILE_MAGIC     0x494E5354UL   // "INST"
 #define INSTR_FILE_VERSION   2
 
@@ -93,6 +93,13 @@ struct InstrFileHeader {
 };
 
 Instrument srvInstruments[MAX_INSTRUMENTS];
+
+// True when the instruments file was on the card at boot but would not load
+// (SD fault, bad header).  srvInstruments then holds the built-in defaults, and
+// writing those out would replace the user's instruments with them — so
+// saveInstrumentsToSD refuses until a load succeeds (e.g. after a restore of
+// instruments.mgt).
+static bool srvInstFileUnreadable = false;
 
 static void initDefaultInstruments() {
     for (int i = 0; i < MAX_INSTRUMENTS; i++) {
@@ -106,34 +113,73 @@ static void initDefaultInstruments() {
     }
 }
 
+// Reads the file into a scratch copy and only overwrites srvInstruments once
+// the whole file has been read and its header checked — a missing file, a bad
+// header or a short read leaves the in-memory instruments exactly as they were.
 static bool loadInstrumentsFromSD() {
-    SdLock _;
-    File f = SD.open(SRV_INSTRUMENTS_PATH);
-    if (!f) return false;
-    InstrFileHeader hdr;
-    bool ok = (f.read((uint8_t*)&hdr, sizeof(hdr)) == (int)sizeof(hdr)
-               && hdr.magic   == INSTR_FILE_MAGIC
-               && hdr.version == INSTR_FILE_VERSION);
-    if (ok)
-        ok = (f.read((uint8_t*)srvInstruments, sizeof(srvInstruments))
-              == (int)sizeof(srvInstruments));
-    f.close();
+    uint8_t* tmp = (uint8_t*)heap_caps_malloc(sizeof(srvInstruments), MALLOC_CAP_SPIRAM);
+    if (!tmp) tmp = (uint8_t*)malloc(sizeof(srvInstruments));
+    if (!tmp) {
+        Serial.println("[CMD] loadInstruments: FAIL (no scratch memory)");
+        return false;
+    }
+    bool ok = false;
+    {
+        SdLock _;
+        File f = SD.open(SRV_INSTRUMENTS_PATH);
+        if (f) {
+            InstrFileHeader hdr;
+            ok = (f.read((uint8_t*)&hdr, sizeof(hdr)) == (int)sizeof(hdr)
+                  && hdr.magic   == INSTR_FILE_MAGIC
+                  && hdr.version == INSTR_FILE_VERSION);
+            if (ok)
+                ok = (f.read(tmp, sizeof(srvInstruments))
+                      == (int)sizeof(srvInstruments));
+            f.close();
+        }
+    }
     // (no sanitization needed — instruments no longer carry midiChannel)
+    if (ok) {
+        memcpy(srvInstruments, tmp, sizeof(srvInstruments));
+        srvInstFileUnreadable = false;   // what is in memory is the file again
+    }
+    free(tmp);
     Serial.printf("[CMD] loadInstruments: %s\n", ok ? "OK" : "FAIL/missing");
     return ok;
 }
 
+// Written to a temp file first and renamed into place only if every byte went
+// out, so a failed write can't leave a truncated instruments file behind.
 static void saveInstrumentsToSD() {
+    if (srvInstFileUnreadable) {
+        Serial.println("[CMD] saveInstruments: REFUSED — " SRV_INSTRUMENTS_PATH
+                       " was unreadable at boot and memory holds defaults; "
+                       "file left untouched (restore or delete it to recover)");
+        return;
+    }
     SdLock _;
-    if (SD.exists(SRV_INSTRUMENTS_PATH)) SD.remove(SRV_INSTRUMENTS_PATH);
-    File f = SD.open(SRV_INSTRUMENTS_PATH, FILE_WRITE);
+    SD.remove(SRV_INSTRUMENTS_TMP);
+    File f = SD.open(SRV_INSTRUMENTS_TMP, FILE_WRITE);
     if (!f) { Serial.println("[CMD] saveInstruments: open failed"); return; }
     InstrFileHeader hdr;
     hdr.magic = INSTR_FILE_MAGIC; hdr.version = INSTR_FILE_VERSION;
     hdr._pad[0] = hdr._pad[1] = hdr._pad[2] = 0;
-    f.write((const uint8_t*)&hdr, sizeof(hdr));
-    f.write((const uint8_t*)srvInstruments, sizeof(srvInstruments));
+    bool ok = (f.write((const uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr));
+    if (ok)
+        ok = (f.write((const uint8_t*)srvInstruments, sizeof(srvInstruments))
+              == sizeof(srvInstruments));
     f.close();
+    if (!ok) {
+        SD.remove(SRV_INSTRUMENTS_TMP);
+        Serial.println("[CMD] saveInstruments: write FAILED — previous file kept");
+        return;
+    }
+    SD.remove(SRV_INSTRUMENTS_PATH);
+    if (!SD.rename(SRV_INSTRUMENTS_TMP, SRV_INSTRUMENTS_PATH)) {
+        Serial.println("[CMD] saveInstruments: rename FAILED — data left in "
+                       SRV_INSTRUMENTS_TMP);
+        return;
+    }
     Serial.println("[CMD] saveInstruments: OK");
 }
 
@@ -152,16 +198,18 @@ uint32_t srvActiveBufLen  = 0;
 // writes a Song through that pointer must bail rather than fault.
 bool     srvBufOk         = false;
 static uint8_t* srvLoadScratch = nullptr;           // sizeof(Song) staging, see commandsInit
+static uint8_t* srvPushScratch = nullptr;           // sizeof(Song) staging for full-song pushes
 static char     srvActiveName[SRV_FNAME_MAX] = {};  // filename (with .mgt)
 bool     srvHasActive     = false;
 
 #define SRV_RESTORE_TMP "/songs/_restore.tmp"       // restore upload lands here, then renames
 
 // MSG_NOTE_SET queue — produced on the MagiLink worker task, consumed by
-// commandsTick on the loop task, so every note-pool relink happens on one
-// task.  (The sequencer itself walks the pool on the MIDI task — see
-// midiTaskFn — so this keeps relinks off the link worker, not off a playing
-// walk.)  SPSC ring: head written only by the worker, tail only by
+// commandsTick on the loop task, which keeps note edits in arrival order with
+// the song operations below.  The loop task does not touch the note pool
+// itself: it hands each edit to the MIDI task (sequencerApplyNoteSet), the one
+// task that walks the pool, so a relink can never land under a playing walk.
+// SPSC ring: head written only by the worker, tail only by
 // the loop; uint8_t indices wrap at 256, a multiple of the queue length, so
 // the masks stay consistent across wrap.
 #define NOTE_SET_Q_LEN 64
@@ -211,7 +259,9 @@ static volatile uint8_t  sSongOpHead = 0;
 static volatile uint8_t  sSongOpTail = 0;
 static uint16_t          sArrivalSeq = 0;       // worker only
 
-static bool sSongListDirty = false;   // /songs changed — refresh the on-screen list
+// /songs changed — refresh the on-screen list.  Set by the loop task and by
+// the worker (a finished restore); consumed by commandsTick.
+static volatile bool sSongListDirty = false;
 
 // Cell-tap audition, deferred behind the note-set queue (see MSG_NOTE_AUDITION).
 static volatile bool sAuditionPending = false;
@@ -232,13 +282,16 @@ static volatile bool     sTrimSavePending   = false;
 static volatile bool     sSampleSpecPending = false;   // spectrogram request
 static volatile uint8_t  sSampleSpecId      = 0;
 
-// ── Deferred song-load request ─────────────────────────────────────────────────
-// A load reads SD and then streams ~35 KB (~750ms on a good link); doing that
-// inside the MagiLink callback would hold up the link worker.  The handler
-// sets a flag and commandsTick does the work on the loop task.
+// ── Deferred active-song pull + song-list request ──────────────────────────────
+// Streaming the active song is ~35 KB (~750ms on a good link) and a list is an
+// SD directory scan; doing either inside the MagiLink callback would hold up
+// the link worker.  The handler sets a flag and commandsTick does the work on
+// the loop task.  (Loads themselves are queued as song operations, above.)
 static bool    srvActiveSongReqPending = false;  // client pulled the active song
 static bool    srvListPending       = false;
 static uint8_t srvListPendingPage   = 0;
+static bool    srvSampleListPending     = false;  // manifest sync + page, SD work
+static uint8_t srvSampleListPendingPage = 0;
 
 // ── Generic file server ───────────────────────────────────────────────────────
 // FileKind enum (MagiMsg.h) → SD path lookup.  Whitelist controls what the
@@ -283,6 +336,13 @@ static bool fileKindHidesFromList(uint8_t kind, const char* name) {
     if (kind == FK_DRUMTRACKS && strcasecmp(name, SRV_GM_MAP_NAME) == 0) return true;
     return false;
 }
+
+// Most names one directory listing returns to the client (the client caches
+// the same number).  The scratch is PSRAM, allocated in commandsInit: 128
+// names x 48 bytes is far too big for the loop-task stack and too big to want
+// in internal RAM.  Loop task only (sendFileList), so one buffer is race-free.
+#define SRV_FILE_LIST_MAX 128
+static char (*srvFileScratch)[FILE_NAME_LEN] = nullptr;
 
 static bool    srvFileListPending      = false;
 static uint8_t srvFileListPendingKind  = 0;
@@ -397,7 +457,22 @@ void commandsInit() {
     srvLoadScratch = (uint8_t*)heap_caps_malloc(sizeof(Song), MALLOC_CAP_SPIRAM);
     if (!srvLoadScratch)
         Serial.println("[CMD] srvLoadScratch: PSRAM alloc FAILED — loads read in place");
-    sSongOpQ = (SongOp*)heap_caps_malloc(SONG_OP_Q_LEN * sizeof(SongOp), MALLOC_CAP_SPIRAM);
+    // Same idea for a full-song push from the client: the bytes stream into
+    // this buffer and replace the active song only once all of them are in,
+    // so a link drop mid-push leaves the current song loaded and playing.
+    // PSRAM only; without it pushes are received in place (see
+    // onMagiLinkSaveHeader).
+    srvPushScratch = (uint8_t*)heap_caps_malloc(sizeof(Song), MALLOC_CAP_SPIRAM);
+    if (!srvPushScratch)
+        Serial.println("[CMD] srvPushScratch: PSRAM alloc FAILED — pushes received in place");
+    // Name scratch for the generic file lists (see sendFileList).
+    srvFileScratch = (char (*)[FILE_NAME_LEN])
+        heap_caps_malloc(SRV_FILE_LIST_MAX * FILE_NAME_LEN, MALLOC_CAP_SPIRAM);
+    if (!srvFileScratch)
+        srvFileScratch = (char (*)[FILE_NAME_LEN])malloc(SRV_FILE_LIST_MAX * FILE_NAME_LEN);
+    if (!srvFileScratch)
+        Serial.println("[CMD] srvFileScratch: ALLOC FAILED — file lists will be empty");
+    sSongOpQ =(SongOp*)heap_caps_malloc(SONG_OP_Q_LEN * sizeof(SongOp), MALLOC_CAP_SPIRAM);
     if (!sSongOpQ) sSongOpQ = (SongOp*)malloc(SONG_OP_Q_LEN * sizeof(SongOp));
     if (!sSongOpQ)
         Serial.println("[CMD] song-op queue: ALLOC FAILED — load/save commands DISABLED");
@@ -436,8 +511,20 @@ void commandsInit() {
 
     initDefaultInstruments();
     if (srvSdOk && !loadInstrumentsFromSD()) {
-        saveInstrumentsToSD();  // write defaults so future boots load them
-        Serial.println("[CMD] instruments: created defaults");
+        // Defaults are only written when there is no file at all.  A file that
+        // is present but did not load (read error, bad header) is left alone —
+        // overwriting it here would replace the user's instruments with
+        // defaults on a transient SD fault.
+        bool missing;
+        { SdLock _; missing = !SD.exists(SRV_INSTRUMENTS_PATH); }
+        if (missing) {
+            saveInstrumentsToSD();  // write defaults so future boots load them
+            Serial.println("[CMD] instruments: created defaults");
+        } else {
+            srvInstFileUnreadable = true;   // later saves must not clobber it
+            Serial.println("[CMD] instruments: " SRV_INSTRUMENTS_PATH
+                           " present but unreadable — running on defaults, file untouched");
+        }
     }
 }
 
@@ -473,7 +560,9 @@ int srvListSongs(char names[][SRV_FNAME_MAX], int maxFiles) {
             const char* sl = strrchr(fn, '/');
             if (sl) fn = sl + 1;
             int len = (int)strlen(fn);
-            if (len >= 4) {
+            // Dot-files are skipped: macOS leaves a "._Name.mgt" sidecar beside
+            // every file copied over USB-MSC, and it is not a song.
+            if (fn[0] != '.' && len >= 4) {
                 const char* ext = fn + len - 4;
                 if (ext[0] == '.' && (ext[1]=='m'||ext[1]=='M') &&
                     (ext[2]=='g'||ext[2]=='G') && (ext[3]=='t'||ext[3]=='T')) {
@@ -510,11 +599,15 @@ static void sendSongList(uint8_t page) {
     memset(resp.names, 0, sizeof(resp.names));
 
     for (int i = 0; i < inPage; i++) {
-        // Strip .mgt extension for display
-        strncpy(resp.names[i], files[start + i], SL_NAME_LEN - 1);
-        resp.names[i][SL_NAME_LEN - 1] = '\0';
-        int len = (int)strlen(resp.names[i]);
-        if (len > 4 && resp.names[i][len - 4] == '.') resp.names[i][len - 4] = '\0';
+        // Strip the .mgt extension FIRST, then fit what is left to the field —
+        // truncating first could cut the extension in half and leave a stub
+        // of it in the name the client shows and asks to load.
+        const char* fn  = files[start + i];
+        int         len = (int)strlen(fn);
+        if (len > 4 && fn[len - 4] == '.') len -= 4;
+        if (len > SL_NAME_LEN - 1) len = SL_NAME_LEN - 1;
+        memcpy(resp.names[i], fn, (size_t)len);   // resp.names is pre-zeroed
+        resp.names[i][len] = '\0';
     }
 
     gMagiLink.acquireMutex();
@@ -524,7 +617,8 @@ static void sendSongList(uint8_t page) {
 
 // ── Generic file list ────────────────────────────────────────────────────────
 // Scans `dir` for files, applying the per-kind hide filter.  Returns count
-// collected into `out` (capped at maxFiles).
+// collected into `out` (capped at maxFiles), sorted case-insensitively like
+// the song list so the pages the client assembles are in a stable order.
 static int srvListFiles(uint8_t kind, const char* dir,
                         char out[][FILE_NAME_LEN], int maxFiles) {
     if (!srvSdOk || !dir) return 0;
@@ -548,6 +642,7 @@ static int srvListFiles(uint8_t kind, const char* dir,
         e.close();
     }
     d.close();
+    qsort(out, count, FILE_NAME_LEN, srvNameCmp);
     return count;
 }
 
@@ -557,8 +652,10 @@ static void sendFileList(uint8_t kind, uint8_t page) {
         Serial.printf("[CMD] file list: unknown kind=%u\n", (unsigned)kind);
         return;
     }
-    char files[SRV_MAX_FILES][FILE_NAME_LEN];
-    int total = srvListFiles(kind, dir, files, SRV_MAX_FILES);
+    char (*files)[FILE_NAME_LEN] = srvFileScratch;
+    int total = 0;
+    if (files) total = srvListFiles(kind, dir, files, SRV_FILE_LIST_MAX);
+    else       Serial.println("[CMD] file list: no name scratch — sending an empty list");
 
     int totalPages = total > 0 ? (total + FILE_LIST_PER_PKT - 1) / FILE_LIST_PER_PKT : 1;
     if (page >= (uint8_t)totalPages) page = totalPages - 1;
@@ -586,8 +683,17 @@ static void sendFileList(uint8_t kind, uint8_t page) {
 // Shared 1029-byte streaming buffer used by every chunked-body sender below
 // (backup, song push, instruments push, file load).  Declared up here
 // because sendFile() — the first user — would otherwise see it undeclared.
-// Mutex serialises use sites so one shared instance is safe.
+// Mutex serialises use sites so one shared instance is safe.  The four body
+// structs share one layout (id, length, data_len, data[1024]).  Nothing is
+// carried over between users: each sets `id` before its loop and `length`
+// to match what it actually puts on the wire — the truncated senders per
+// chunk, the backup once to the full struct size.
 static MsgBackupBody sStreamBody;
+
+// Payload bytes per chunk for the song push, instruments push and file load.
+// With the 5-byte body header that is a 517-byte frame on the wire rather than
+// the full 1029-byte struct — see sendActiveSongToClient for why.
+#define SRV_PUSH_CHUNK 512
 
 // ── Send a {kind}/{name} file as HEADER + chunked BODY + EndOfData ───────────
 // `name` is taken verbatim (with extension); the kind selects the dir via
@@ -598,6 +704,7 @@ static void sendFile(uint8_t kind, const char* name) {
     File f;
     uint32_t fsize = 0;
     bool found = false;
+    bool readFailed = false;
     if (dir) {
         char path[80];
         snprintf(path, sizeof(path), "%s/%s", dir, name);
@@ -620,17 +727,32 @@ static void sendFile(uint8_t kind, const char* name) {
     gMagiLink.send(&hdr, sizeof(hdr));
 
     if (found) {
-        sStreamBody.id     = MSG_FILE_LOAD_BODY;
-        sStreamBody.length = sizeof(sStreamBody);  // song/inst push leaves it short
+        // Truncated 512B-chunk frames, same RF rationale as
+        // sendActiveSongToClient; the wire `length` is set per chunk below.
+        sStreamBody.id = MSG_FILE_LOAD_BODY;
         uint32_t sent = 0;
         bool ok = true;
         while (ok && sent < fsize) {
             uint32_t remain = fsize - sent;
-            uint16_t chunk  = remain > 1024 ? 1024 : (uint16_t)remain;
-            { SdLock _; f.read(sStreamBody.data, chunk); }
-            sStreamBody.data_len = chunk;
-            ok = gMagiLink.send(&sStreamBody, sizeof(sStreamBody));
-            sent += chunk;
+            uint16_t chunk  = remain > SRV_PUSH_CHUNK ? SRV_PUSH_CHUNK : (uint16_t)remain;
+            int got;
+            { SdLock _; got = f.read(sStreamBody.data, chunk); }
+            if (got <= 0) {
+                // SD read failed mid-file.  Stop: the EndOfData below then
+                // arrives short of total_size and the client reports an error,
+                // instead of being handed stale buffer bytes as file content.
+                Serial.printf("[CMD] file send READ FAILED got=%d at %u/%u '%s'\n",
+                              got, (unsigned)sent, (unsigned)fsize, name);
+                readFailed = true;
+                break;
+            }
+            // Framed on what was actually read, so a short read still goes
+            // out as a well-formed frame.
+            uint16_t wire = (uint16_t)(offsetof(MsgFileLoadBody, data) + (size_t)got);
+            sStreamBody.data_len = (uint16_t)got;
+            sStreamBody.length   = wire;
+            ok = gMagiLink.send(&sStreamBody, wire);
+            sent += (uint32_t)got;
         }
         MsgEndOfData eod;
         gMagiLink.send(&eod, sizeof(eod));
@@ -639,7 +761,8 @@ static void sendFile(uint8_t kind, const char* name) {
     gMagiLink.releaseMutex();
     { SdLock _; if (f) f.close(); }
     Serial.printf("[CMD] file send kind=%u '%s' %u bytes (%s)\n",
-                  (unsigned)kind, name, (unsigned)fsize, found ? "OK" : "MISSING");
+                  (unsigned)kind, name, (unsigned)fsize,
+                  !found ? "MISSING" : readFailed ? "READ FAILED" : "OK");
 }
 
 // ── Send sample list page to client ────────────────────────────────────────────
@@ -647,6 +770,9 @@ static void sendFile(uint8_t kind, const char* name) {
 // any new files to /samples/samples.txt with the next free id, then pages the
 // updated list out.  This means the picker on the client is always fresh
 // without needing a separate "refresh samples" command.
+// Loop task only (commandsTick) — a directory scan plus a manifest rewrite is
+// too much SD work for the link worker.  The sync also re-reads trim.txt, so
+// commandsTick writes out any pending trim edit before calling this.
 static void sendSampleList(uint8_t page) {
     sampleManifestSync();
     int total = sampleManifestCount();
@@ -692,6 +818,20 @@ static void quiesceSongReaders() {
     srvHasActive    = false;
     srvActiveBufLen = 0;
     for (int i = 0; i < 100 && sequencerSongReaderBusy(); i++) delay(1);
+}
+
+// The counterpart of quiesceSongReaders: the Song body in srvActiveBuf is now
+// complete, so stamp the current file header in front of it and let readers
+// back in.  Shared by load, reload and new-song.  (The full-song push does NOT
+// use it — that path keeps the header the client sent.)
+static void commitActiveSong() {
+    SongFileHeader* h = (SongFileHeader*)srvActiveBuf;
+    h->magic   = SONG_FILE_MAGIC;
+    h->version = SONG_FILE_VERSION;
+    h->_pad[0] = h->_pad[1] = h->_pad[2] = 0;
+    srvActiveBufLen     = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
+    srvHasActive        = true;
+    gSamplePreloadDirty = true;
 }
 
 // Queue one song operation (worker task).  Never blocks: these arrive at human
@@ -742,6 +882,17 @@ void sendNoSongToClient() {
     gMagiLink.acquireMutex();
     gMagiLink.send(&msg, sizeof(msg));
     gMagiLink.releaseMutex();
+}
+
+// "-- OFF --": stop, drop the active song and its name, tell the client.  The
+// one routine behind the client's Set-OFF, the server screen's OFF row and a
+// delete of the active song.  Loop task only.  The caller looks after its own
+// cursor / redraw.
+void srvSetOff() {
+    sequencerStop();
+    srvHasActive     = false;
+    srvActiveName[0] = '\0';
+    sendNoSongToClient();
 }
 
 // Failure reply for an explicit load.  The client sits on its "receiving"
@@ -828,15 +979,9 @@ static uint8_t srvLoadSongFile(const char* path, const char* fileName, bool* act
         memcpy(active, song, sizeof(Song));
     }
 
-    SongFileHeader* h2 = (SongFileHeader*)srvActiveBuf;
-    h2->magic = SONG_FILE_MAGIC;
-    h2->version = SONG_FILE_VERSION;
-    h2->_pad[0] = h2->_pad[1] = h2->_pad[2] = 0;
-    srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
-
     strncpy(srvActiveName, fileName, sizeof(srvActiveName) - 1);
     srvActiveName[sizeof(srvActiveName) - 1] = '\0';
-    srvHasActive = true;  gSamplePreloadDirty = true;
+    commitActiveSong();
     Serial.printf("[CMD] song load OK '%s' %u bytes\n", path, (unsigned)srvActiveBufLen);
     return 0;
 }
@@ -1197,25 +1342,36 @@ uint8_t srvLoadSongLocal(const char* bareName) {
 // ── Verified song write ───────────────────────────────────────────────────────
 // Writes `song` to `path`, then reads the bytes straight back off the card and
 // CRC-checks them against the in-memory song before committing.  The write goes
-// to a sibling _save.tmp first; only a byte-verified temp is atomically renamed
-// over `path`, so a bad write (dying card, truncation, power glitch) can never
-// clobber the previous good file.  Retries once.  Returns true only when the
-// committed file is verified.
+// to a sibling _save.tmp first; only a byte-verified temp is swapped in for
+// `path`, so a bad write (dying card, truncation, power glitch) can never
+// clobber the previous good file.  The swap itself keeps the old file too: it
+// is renamed to `<path>.bak`, the temp is renamed into place, and only then is
+// the .bak removed — if the temp will not rename, the .bak is renamed back.
+// Retries once.  Returns true only when the committed file is verified.
 //
 // Caller MUST already hold SdLock — sSdMutex is non-recursive, do not re-lock.
 static bool writeSongVerified(const char* path, const Song* song) {
-    const uint32_t crcMem = songCrc32(song);
-
     // Temp file in the same directory as the target so the rename stays intra-FS.
     char tmp[64];
     const char* sl = strrchr(path, '/');
     if (sl) snprintf(tmp, sizeof(tmp), "%.*s/_save.tmp", (int)(sl - path), path);
     else    snprintf(tmp, sizeof(tmp), "/_save.tmp");
+    // Where the previous version waits while the temp is renamed in.  Not a
+    // .mgt name, so the song list and the backup never pick one up.
+    char bak[64];
+    snprintf(bak, sizeof(bak), "%s.bak", path);
+    bool oldStranded = false;   // previous version left in `bak`, `path` missing
 
     for (int attempt = 1; attempt <= 2; attempt++) {
         SD.remove(tmp);
         File f = SD.open(tmp, FILE_WRITE);
         if (!f) { Serial.printf("[CMD] save-verify: tmp open failed '%s'\n", tmp); continue; }
+        // Reference CRC taken per attempt, right before the write.  The song
+        // can change under a save (the link worker applies a song patch
+        // inline, or — without the staging buffer — streams a full-song push
+        // into it); with one CRC taken up front the retry
+        // would be comparing against the old bytes and could never pass.
+        const uint32_t crcMem = songCrc32(song);
         bool ok = songWriteCompact(f, song);
         uint32_t sz = (uint32_t)f.size();
         f.close();
@@ -1244,18 +1400,45 @@ static bool writeSongVerified(const char* path, const Song* song) {
             continue;
         }
 
-        // Verified — atomically swap the temp in for the canonical file.
-        SD.remove(path);
+        // Verified — swap the temp in for the canonical file.  The old file is
+        // moved aside, not deleted, until the new one is in place.
+        bool hadOld = SD.exists(path);
+        if (hadOld) {
+            SD.remove(bak);                    // a leftover would block the rename
+            if (!SD.rename(path, bak)) {
+                Serial.printf("[CMD] save-verify: could not move '%s' aside (try %d)\n",
+                              path, attempt);
+                SD.remove(tmp);
+                continue;                      // old file still in place, untouched
+            }
+        }
         if (!SD.rename(tmp, path)) {
             Serial.printf("[CMD] save-verify: rename '%s' -> '%s' FAILED (try %d)\n", tmp, path, attempt);
+            if (hadOld) {
+                if (SD.rename(bak, path)) {
+                    oldStranded = false;
+                } else {
+                    oldStranded = true;
+                    Serial.printf("[CMD] save-verify: could NOT put '%s' back — previous version is in '%s'\n",
+                                  path, bak);
+                }
+            }
             SD.remove(tmp);
             continue;
         }
+        // On a retry after a stranded swap `path` did not exist, so `bak` was
+        // not touched above — it still holds the older version; clear it now
+        // that a newer one is committed.
+        if (hadOld || oldStranded) SD.remove(bak);
         Serial.printf("[CMD] save-verify: '%s' %u bytes OK (crc=%08X)\n",
                       path, (unsigned)sz, (unsigned)crcDisk);
         return true;
     }
-    Serial.printf("[CMD] save-verify: GAVE UP on '%s' — existing file left intact\n", path);
+    if (oldStranded)
+        Serial.printf("[CMD] save-verify: GAVE UP on '%s' — nothing at that path now; "
+                      "the previous version is in '%s'\n", path, bak);
+    else
+        Serial.printf("[CMD] save-verify: GAVE UP on '%s' — previous file (if any) left in place\n", path);
     return false;
 }
 
@@ -1284,7 +1467,7 @@ static void sendInstrumentsData() {
     uint32_t sent = 0;
     while (ok && sent < total) {
         uint32_t remain = total - sent;
-        uint16_t chunk  = remain > 512 ? 512 : (uint16_t)remain;
+        uint16_t chunk  = remain > SRV_PUSH_CHUNK ? SRV_PUSH_CHUNK : (uint16_t)remain;
         uint16_t wire   = (uint16_t)(offsetof(MsgBackupBody, data) + chunk);
         sStreamBody.data_len = chunk;
         sStreamBody.length   = wire;
@@ -1301,22 +1484,95 @@ static void sendInstrumentsData() {
 // ── MagiLink restore (client → server) state ───────────────────────────────
 // Streams bytes incrementally to SRV_RESTORE_TMP on SD as they arrive on
 // the worker task, under SdLock (which serialises against SamplePlayer) —
-// no 35 KB RAM staging buffer needed.
+// no 35 KB RAM staging buffer needed.  The upload is finished on the worker
+// too: the frame that completes the byte count renames the temp into place.
+// A restore sends file after file with nothing in between, so per-file work
+// left for the loop task would be overtaken by the next HEADER reusing this
+// state and the temp file.  Only the follow-ups that touch srvInstruments /
+// srvActiveBuf are deferred to commandsTick, as the idempotent flags below.
 static File     sMagiRestoreFile;
 static char     sMagiRestoreName[BK_FNAME_MAX] = {};
 static bool     sMagiRestoreIsInstruments       = false;
 static uint32_t sMagiRestoreExpectedBytes       = 0;
 static uint32_t sMagiRestoreReceivedBytes       = 0;
-static bool     sMagiRestorePending             = false;
+static bool     sMagiRestoreWriteOk             = true;   // every chunk written in full
+static volatile bool sRestoreInstReloadPending  = false;  // instruments.mgt was replaced
+static volatile bool sRestoreSongReloadPending  = false;  // the active song's file was replaced
+
+// Runs on the worker once the last byte of a restore upload has been written
+// and the temp closed.  Moves the temp to its destination and flags the
+// follow-up work (reload instruments / reload the active song / refresh the
+// on-screen list) for the loop task.
+static void finaliseMagiLinkRestore() {
+    char path[BK_FNAME_MAX + 32];
+    if (sMagiRestoreIsInstruments) {
+        strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
+    } else {
+        // Route by extension so setlists/drumtracks go back to their own dirs,
+        // not into /songs.  (Cross-dir rename from the /songs temp is fine —
+        // same volume.)
+        snprintf(path, sizeof(path), "%s/%s",
+                 backupDirForName(sMagiRestoreName), sMagiRestoreName);
+    }
+    path[sizeof(path) - 1] = '\0';
+
+    bool renamed    = false;
+    bool removedOld = false;
+    {
+        SdLock _;
+        if (sMagiRestoreWriteOk) {
+            if (SD.exists(path)) removedOld = SD.remove(path);
+            renamed = SD.rename(SRV_RESTORE_TMP, path);
+        }
+        if (!renamed) SD.remove(SRV_RESTORE_TMP);
+    }
+    if (!renamed) {
+        Serial.printf("[CMD] restore FAILED '%s' (%u bytes) — %s\n",
+                      path, (unsigned)sMagiRestoreReceivedBytes,
+                      !sMagiRestoreWriteOk ? "SD write came up short; existing file kept"
+                      : removedOld         ? "rename into place failed AFTER the old file was removed"
+                                           : "rename into place failed");
+        return;
+    }
+    Serial.printf("[CMD] restored '%s' (%u bytes)\n",
+                  path, (unsigned)sMagiRestoreReceivedBytes);
+
+    if (sMagiRestoreIsInstruments) {
+        sRestoreInstReloadPending = true;
+    } else {
+        sSongListDirty = true;
+        // srvActiveName belongs to the loop task; this is an unlocked read of
+        // it.  Worst case (a load or save renaming the active song at this
+        // very moment) is one missed or one needless reload.  The loop task
+        // re-checks that a song is still active before reloading.
+        if (strcmp(sMagiRestoreName, srvActiveName) == 0)
+            sRestoreSongReloadPending = true;
+    }
+}
 
 void onMagiLinkRestoreHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (len < sizeof(MsgRestoreHeader)) return;
     const MsgRestoreHeader* h = (const MsgRestoreHeader*)msg;
+    if (sMagiRestoreExpectedBytes != 0)
+        Serial.printf("[CMD] restore: '%s' abandoned at %u/%u bytes — new upload starting\n",
+                      sMagiRestoreName, (unsigned)sMagiRestoreReceivedBytes,
+                      (unsigned)sMagiRestoreExpectedBytes);
     strncpy(sMagiRestoreName, h->name, sizeof(sMagiRestoreName) - 1);
     sMagiRestoreName[sizeof(sMagiRestoreName) - 1] = '\0';
     sMagiRestoreIsInstruments = (h->isInstruments != 0);
     sMagiRestoreExpectedBytes = h->total_size;
     sMagiRestoreReceivedBytes = 0;
+    sMagiRestoreWriteOk       = true;
+    if (sMagiRestoreExpectedBytes == 0) {
+        // Nothing will follow, so there is nothing to complete on.  An empty
+        // file is never worth replacing a real one with — leave the card alone.
+        SdLock _;
+        if (sMagiRestoreFile) sMagiRestoreFile.close();
+        SD.remove(SRV_RESTORE_TMP);
+        Serial.printf("[CMD] restore: '%s' is empty — ignored, existing file kept\n",
+                      sMagiRestoreName);
+        return;
+    }
     {
         SdLock _;
         if (sMagiRestoreFile) sMagiRestoreFile.close();
@@ -1338,19 +1594,21 @@ void onMagiLinkRestoreBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (len < sizeof(MsgRestoreBody)) return;
     if (!sMagiRestoreFile) return;
     const MsgRestoreBody* b = (const MsgRestoreBody*)msg;
-    if (b->data_len > 1024) return;
+    if (b->data_len > sizeof(b->data)) return;
     if (sMagiRestoreReceivedBytes + b->data_len > sMagiRestoreExpectedBytes) {
         Serial.println("[CMD] restore body overshoot — closing & dropping");
         {
             SdLock _;
             sMagiRestoreFile.close();
+            SD.remove(SRV_RESTORE_TMP);
         }
         sMagiRestoreExpectedBytes = 0;
         return;
     }
     {
         SdLock _;
-        sMagiRestoreFile.write(b->data, b->data_len);
+        if (sMagiRestoreFile.write(b->data, b->data_len) != (size_t)b->data_len)
+            sMagiRestoreWriteOk = false;
     }
     sMagiRestoreReceivedBytes += b->data_len;
     if (sMagiRestoreReceivedBytes >= sMagiRestoreExpectedBytes) {
@@ -1359,76 +1617,83 @@ void onMagiLinkRestoreBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
             sMagiRestoreFile.close();
         }
         sMagiRestoreExpectedBytes = 0;
-        sMagiRestorePending       = true;
-    }
-}
-
-// Called from commandsTick when sMagiRestorePending fires.  Moves the
-// temp file to its destination, reloads instruments if relevant, and
-// reloads the active song if the restored file matches.
-static void finaliseMagiLinkRestore() {
-    char path[BK_FNAME_MAX + 32];
-    if (sMagiRestoreIsInstruments) {
-        strncpy(path, SRV_INSTRUMENTS_PATH, sizeof(path) - 1);
-    } else {
-        // Route by extension so setlists/drumtracks go back to their own dirs,
-        // not into /songs.  (Cross-dir rename from the /songs temp is fine —
-        // same volume.)
-        snprintf(path, sizeof(path), "%s/%s",
-                 backupDirForName(sMagiRestoreName), sMagiRestoreName);
-    }
-    path[sizeof(path) - 1] = '\0';
-
-    {
-        SdLock _;
-        if (SD.exists(path)) SD.remove(path);
-        SD.rename(SRV_RESTORE_TMP, path);
-    }
-    Serial.printf("[CMD] restored '%s' (%u bytes)\n",
-                  path, (unsigned)sMagiRestoreReceivedBytes);
-
-    if (sMagiRestoreIsInstruments) {
-        loadInstrumentsFromSD();
-        Serial.println("[CMD] instruments reloaded after restore");
-    } else {
-        sSongListDirty = true;
-    }
-
-    if (!sMagiRestoreIsInstruments && srvHasActive && srvActiveName[0] != '\0'
-        && strcmp(sMagiRestoreName, srvActiveName) == 0) {
-        Serial.printf("[CMD] restored file is the active song — reloading\n");
-        reloadActiveSongFromSD();
+        // Here, not on the loop task — see the note at the top of this section.
+        finaliseMagiLinkRestore();
     }
 }
 
 // ── MagiLink generic file save (client → server) state ─────────────────────
 // Streams an uploaded {kind}/{name} file to a temp file in the target dir on
-// the worker task (SdLock-serialised, like restore); the main loop then
-// renames it into place and ACKs.  Completion is detected by byte count — the
-// stream has no terminator.  Used by setlists; the planned PC uploader shares
-// it.  Only one upload in flight at a time (mutex-serialised send side).
+// the worker task (SdLock-serialised, like restore).  Completion is detected
+// by byte count — the stream has no terminator — and the frame that completes
+// it renames the temp into place and ACKs, still on the worker.  It has to be
+// there: the client sends two saves back to back (the master catalog, then the
+// setlist), and a finalise left for the loop task was overtaken by the second
+// HEADER, which reused this state and the temp file before the first had been
+// renamed.  Used by setlists; the planned PC uploader shares it.  Only one
+// upload in flight at a time (mutex-serialised send side).
 static File     sMagiFileSaveFile;
 static uint8_t  sMagiFileSaveKind              = 0;
 static char     sMagiFileSaveName[FILE_NAME_LEN] = {};
 static char     sMagiFileSaveTmp[96]           = {};
 static uint32_t sMagiFileSaveExpectedBytes     = 0;
 static uint32_t sMagiFileSaveReceivedBytes     = 0;
-static bool     sMagiFileSavePending           = false;
+static bool     sMagiFileSaveWriteOk           = true;   // every chunk written in full
+
+// Worker task only, from inside a MagiLink callback: the dispatcher already
+// holds the link mutex for the callback, so this is a bare send — no
+// acquire/release (a release here would drop the dispatcher's hold early).
+static void sendFileSaveAck(uint8_t kind, bool ok) {
+    MsgFileSaveAck ack;
+    ack.kind = kind;
+    ack.ok   = ok ? 1 : 0;
+    gMagiLink.send(&ack, sizeof(ack));
+}
+
+// Runs on the worker once the temp holds the whole upload and is closed.
+// Renames it into place (same dir, so atomic) and ACKs the client.
+static void finaliseMagiLinkFileSave() {
+    const char* dir = fileKindToPath(sMagiFileSaveKind);
+    bool ok = false;
+    if (dir) {
+        char path[96];
+        snprintf(path, sizeof(path), "%s/%s", dir, sMagiFileSaveName);
+        SdLock _;
+        if (sMagiFileSaveWriteOk && sMagiFileSaveName[0] != '\0') {
+            if (SD.exists(path)) SD.remove(path);
+            ok = SD.rename(sMagiFileSaveTmp, path);
+        }
+        if (!ok) SD.remove(sMagiFileSaveTmp);
+    }
+    Serial.printf("[CMD] file saved kind=%u '%s' (%u bytes) %s\n",
+                  (unsigned)sMagiFileSaveKind, sMagiFileSaveName,
+                  (unsigned)sMagiFileSaveReceivedBytes,
+                  ok ? "OK" : !sMagiFileSaveWriteOk ? "FAIL (SD write came up short)" : "FAIL");
+    sendFileSaveAck(sMagiFileSaveKind, ok);
+}
 
 void onMagiLinkFileSaveHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (len < sizeof(MsgFileSaveHeader)) return;
     const MsgFileSaveHeader* h = (const MsgFileSaveHeader*)msg;
-    const char* dir = fileKindToPath(h->kind);
+    const uint8_t  kind  = h->kind;         // copied out before any send below
+    const uint32_t total = h->total_size;
+    const char* dir = fileKindToPath(kind);
+    if (sMagiFileSaveExpectedBytes != 0)
+        Serial.printf("[CMD] file save: '%s' abandoned at %u/%u bytes — new upload starting\n",
+                      sMagiFileSaveName, (unsigned)sMagiFileSaveReceivedBytes,
+                      (unsigned)sMagiFileSaveExpectedBytes);
     if (!dir) {
-        Serial.printf("[CMD] file save: unknown kind=%u\n", (unsigned)h->kind);
+        Serial.printf("[CMD] file save: unknown kind=%u\n", (unsigned)kind);
         sMagiFileSaveExpectedBytes = 0;
+        sendFileSaveAck(kind, false);       // the client is waiting on an ACK
         return;
     }
-    sMagiFileSaveKind = h->kind;
+    sMagiFileSaveKind = kind;
     strncpy(sMagiFileSaveName, h->name, sizeof(sMagiFileSaveName) - 1);
     sMagiFileSaveName[sizeof(sMagiFileSaveName) - 1] = '\0';
-    sMagiFileSaveExpectedBytes = h->total_size;
+    sMagiFileSaveExpectedBytes = total;
     sMagiFileSaveReceivedBytes = 0;
+    sMagiFileSaveWriteOk       = true;
     snprintf(sMagiFileSaveTmp, sizeof(sMagiFileSaveTmp), "%s/_save.tmp", dir);
     {
         SdLock _;
@@ -1440,11 +1705,19 @@ void onMagiLinkFileSaveHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (!sMagiFileSaveFile) {
         Serial.println("[CMD] file save: tmp open failed");
         sMagiFileSaveExpectedBytes = 0;
+        sendFileSaveAck(kind, false);
         return;
     }
     Serial.printf("[CMD] file save start: kind=%u name='%s' bytes=%u\n",
                   (unsigned)sMagiFileSaveKind, sMagiFileSaveName,
                   (unsigned)sMagiFileSaveExpectedBytes);
+    if (total == 0) {
+        // An empty file (e.g. a setlist with every entry removed): the client
+        // sends no BODY at all, so nothing would ever complete the count.
+        // The empty temp is the whole file — finish it now.
+        { SdLock _; sMagiFileSaveFile.close(); }
+        finaliseMagiLinkFileSave();
+    }
 }
 
 void onMagiLinkFileSaveBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
@@ -1452,113 +1725,200 @@ void onMagiLinkFileSaveBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (len < sizeof(MsgFileSaveBody)) return;
     if (!sMagiFileSaveFile) return;
     const MsgFileSaveBody* b = (const MsgFileSaveBody*)msg;
-    if (b->data_len > 1024) return;
+    if (b->data_len > sizeof(b->data)) return;
     if (sMagiFileSaveReceivedBytes + b->data_len > sMagiFileSaveExpectedBytes) {
         Serial.println("[CMD] file save body overshoot — dropping");
-        { SdLock _; sMagiFileSaveFile.close(); }
+        {
+            SdLock _;
+            sMagiFileSaveFile.close();
+            SD.remove(sMagiFileSaveTmp);
+        }
         sMagiFileSaveExpectedBytes = 0;
+        sendFileSaveAck(sMagiFileSaveKind, false);
         return;
     }
-    { SdLock _; sMagiFileSaveFile.write(b->data, b->data_len); }
+    {
+        SdLock _;
+        if (sMagiFileSaveFile.write(b->data, b->data_len) != (size_t)b->data_len)
+            sMagiFileSaveWriteOk = false;
+    }
     sMagiFileSaveReceivedBytes += b->data_len;
     if (sMagiFileSaveReceivedBytes >= sMagiFileSaveExpectedBytes) {
         { SdLock _; sMagiFileSaveFile.close(); }
         sMagiFileSaveExpectedBytes = 0;
-        sMagiFileSavePending       = true;
+        // Rename + ACK here, not on the loop task — see the note at the top
+        // of this section.
+        finaliseMagiLinkFileSave();
     }
 }
 
-// Called from commandsTick when sMagiFileSavePending fires.  Renames the temp
-// into place (same dir, so atomic) and ACKs the client.
-static void finaliseMagiLinkFileSave() {
-    const char* dir = fileKindToPath(sMagiFileSaveKind);
-    bool ok = false;
-    if (dir) {
-        char path[96];
-        snprintf(path, sizeof(path), "%s/%s", dir, sMagiFileSaveName);
-        SdLock _;
-        if (SD.exists(path)) SD.remove(path);
-        ok = SD.rename(sMagiFileSaveTmp, path);
-        if (!ok) SD.remove(sMagiFileSaveTmp);
-    }
-    Serial.printf("[CMD] file saved kind=%u '%s' (%u bytes) %s\n",
-                  (unsigned)sMagiFileSaveKind, sMagiFileSaveName,
-                  (unsigned)sMagiFileSaveReceivedBytes, ok ? "OK" : "FAIL");
-
-    MsgFileSaveAck ack;
-    ack.kind = sMagiFileSaveKind;
-    ack.ok   = ok ? 1 : 0;
+// ── Save result (server → client) ─────────────────────────────────────────────
+// The answer to a save the client asked for — an OP_SAVE_ACTIVE, or a
+// full-song push that carried a name — so it can report "saved" only when the
+// file really is on the card.  `name` is echoed as requested (no extension).
+//
+// Never call this holding SdLock: the link worker takes the link mutex first
+// and SdLock second, so a send made under SdLock can deadlock against it.
+// Nor from a link callback that still holds the dispatcher's mutex (the
+// release below would drop that hold early).
+static void sendSaveResult(const char* name, bool isAutosave, bool ok) {
+    if (!gMagiLink.isConnected()) return;
+    MsgSaveResult res;
+    res.ok          = ok ? 1 : 0;
+    res.is_autosave = isAutosave ? 1 : 0;
+    memset(res.name, 0, sizeof(res.name));
+    strncpy(res.name, name, sizeof(res.name) - 1);
     gMagiLink.acquireMutex();
-    gMagiLink.send(&ack, sizeof(ack));
+    gMagiLink.send(&res, sizeof(res));
     gMagiLink.releaseMutex();
 }
 
 // ── MagiLink song save (client → server) state ─────────────────────────────
 // Populated by the MSG_SAVE_SONG_HEADER and _BODY callbacks (worker task).
-// On stream completion, the BODY callback queues OP_PUSH_DONE; the main
-// loop's commandsTick consumes it and writes to SD if a name was given.
-// The song write is deferred to the loop task, which owns srvActiveBuf and
-// the verified-save path.  (Restore and file-save do stream to SD from the
-// worker, under SdLock.)
-static char     sMagiSaveName[SRV_FNAME_MAX] = {};
-static uint32_t sMagiSaveExpectedBytes       = 0;  // Song bytes expected
-static uint32_t sMagiSaveReceivedBytes       = 0;  // Song bytes received so far
+// The Song bytes stream into srvPushScratch — NOT into the active song — so
+// the current song stays loaded and playing until the whole push has arrived;
+// a link drop part-way through just abandons the scratch.  On completion the
+// BODY callback queues OP_PUSH_DONE, and finaliseMagiLinkSongSave (loop task,
+// which owns srvActiveBuf and the verified-save path) quiesces the sequencer,
+// copies the scratch over the active song and writes it to SD if a name was
+// given.  (Restore and file-save do stream to SD from the worker, under
+// SdLock.)
+//
+// No srvPushScratch (its PSRAM allocation failed at boot) → the old in-place
+// receive: the HEADER stops the sequencer and takes the song inactive, the
+// bodies land straight in srvActiveBuf, and a push that never completes
+// leaves the server with no song.
+static char           sMagiSaveName[SRV_FNAME_MAX] = {};
+static SongFileHeader sMagiSaveFileHdr;                  // as sent by the client (staged path)
+static uint32_t       sMagiSaveExpectedBytes       = 0;  // Song bytes expected; 0 = no push in flight
+static uint32_t       sMagiSaveReceivedBytes       = 0;  // Song bytes received so far
+// A complete push is waiting for (or is in) finaliseMagiLinkSongSave.  Until
+// the loop task clears this, the receive buffer, sMagiSaveName and
+// sMagiSaveFileHdr are its to read — the next HEADER waits for it.
+static volatile bool     sPushCommitPending = false;
+// The CP_SONG_PUSH breadcrumb is up for a push that has not been finalised.
+// sPushGen is the link generation the push arrived on, so commandsTick can
+// tell that the link dropped under it and take the breadcrumb down.
+static volatile bool     sPushPhaseArmed    = false;
+static volatile uint32_t sPushGen           = 0;
+
+// Take the CP_SONG_PUSH breadcrumb down, if it is up.
+static void pushPhaseEnd() {
+    if (!sPushPhaseArmed) return;
+    sPushPhaseArmed = false;
+    crashSetPhase(CP_IDLE);
+}
 
 void onMagiLinkSaveHeader(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (!srvBufOk) return;   // nowhere to receive the song into
     if (len < sizeof(MsgSongSaveHeader)) return;
-    const MsgSongSaveHeader* h = (const MsgSongSaveHeader*)msg;
-    if (h->song_bytes > sizeof(Song)) {
-        Serial.printf("[CMD] save header rejected: %u bytes > max %u\n",
-                      (unsigned)h->song_bytes, (unsigned)sizeof(Song));
+    // Copied out: the wait below can give up the link mutex, and after that
+    // `msg` (the link's receive buffer) is no longer ours to read.
+    MsgSongSaveHeader hdr = *(const MsgSongSaveHeader*)msg;
+    hdr.name[sizeof(hdr.name) - 1] = '\0';
+
+    // The previous push has all arrived but the loop task has not committed it
+    // yet.  Starting this one now would overwrite the bytes (and the name) it
+    // is about to commit, so wait for it — but NOT holding the link mutex: the
+    // loop task may have to send before it reaches that commit (same reasoning
+    // as the note-set queue in handleCommand).
+    if (sPushCommitPending) {
+        gMagiLink.releaseMutex();
+        uint32_t t0 = millis();
+        while (sPushCommitPending && millis() - t0 < 3000) delay(1);
+        if (sPushCommitPending) {
+            // sMagiSaveExpectedBytes is 0 (that push completed), so the bodies
+            // of this one are discarded as strays.
+            Serial.printf("[CMD] save header DROPPED name='%s' — previous push "
+                          "still not committed after 3s\n", hdr.name);
+            if (hdr.name[0] != '\0') sendSaveResult(hdr.name, false, false);
+            return;
+        }
+    }
+
+    if (sMagiSaveExpectedBytes != 0)
+        Serial.printf("[CMD] save header: previous push incomplete (%u/%u bytes) — restarting\n",
+                      (unsigned)sMagiSaveReceivedBytes, (unsigned)sMagiSaveExpectedBytes);
+
+    // The push is a raw Song struct, committed as a whole song on completion —
+    // anything but exactly sizeof(Song) is refused.  (A short one would be
+    // committed with a stale tail; zero would never complete.)
+    if (hdr.song_bytes != sizeof(Song)) {
+        Serial.printf("[CMD] save header rejected: %u bytes, expected %u\n",
+                      (unsigned)hdr.song_bytes, (unsigned)sizeof(Song));
         sMagiSaveExpectedBytes = 0;
+        pushPhaseEnd();
         return;
     }
-    // Stop the sequencer up-front: the receive writes incrementally into
-    // srvActiveBuf over many ms.  If the sequencer keeps reading it could
-    // follow a half-overwritten NoteNode pointer into garbage.
-    Serial.printf("[STOPSRC] save-header (full song push) name='%s' t=%lu\n",
-                  h->name, millis());
-    crashSetPhase(CP_SONG_PUSH);   // breadcrumb until finalise re-arms to idle
-    sequencerStop();
-    // Also drop srvHasActive so sequencerTick's early-return guards the
-    // buffer even if a tick was already past the seqRunning check when this
-    // header arrived.  Restored in finaliseMagiLinkSongSave().
-    srvHasActive = false;
-    // Those guards only stop NEW walks.  A tick/MIDI-poll already in flight on
-    // the loop task can be parked mid-walk in a midiTx FIFO wait for several
-    // ms; the body chunks that follow overwrite the note pool it is walking,
-    // and a torn `next` index reads far out of bounds (LoadProhibited) or
-    // breaks list circularity (watchdog).  Wait the in-flight walk out —
-    // dispatch is sequential on this task, so once we return no walker can
-    // race the body writes.  Bounded: a walk is µs–ms, never near 100 ms.
-    for (int i = 0; i < 100 && sequencerSongReaderBusy(); i++) delay(1);
-    // Stamp SongFileHeader at the front of srvActiveBuf.
-    memcpy(srvActiveBuf, &h->song_file_header, sizeof(SongFileHeader));
-    strncpy(sMagiSaveName, h->name, sizeof(sMagiSaveName) - 1);
+
+    // Breadcrumb until the push is finalised or abandoned (overshoot, a
+    // rejected restart, or a dropped link — see commandsTick).
+    sPushGen        = gMagiLink.generation();
+    sPushPhaseArmed = true;
+    crashSetPhase(CP_SONG_PUSH);
+
+    if (srvPushScratch) {
+        // Staged: nothing the sequencer reads is touched until the commit in
+        // finaliseMagiLinkSongSave.  Keep the file header for it.
+        memcpy(&sMagiSaveFileHdr, &hdr.song_file_header, sizeof(SongFileHeader));
+    } else {
+        // In place.  Stop the sequencer up-front: the receive writes
+        // incrementally into srvActiveBuf over many ms.  If the sequencer
+        // keeps reading it could follow a half-overwritten NoteNode pointer
+        // into garbage.
+        Serial.printf("[STOPSRC] save-header (full song push, in place) name='%s' t=%lu\n",
+                      hdr.name, millis());
+        sequencerStop();
+        // Also drop srvHasActive so sequencerTick's early-return guards the
+        // buffer even if a tick was already past the seqRunning check when
+        // this header arrived.  Restored in finaliseMagiLinkSongSave().
+        srvHasActive = false;
+        // Those guards only stop NEW walks.  A tick/MIDI-poll already in
+        // flight on the MIDI task can be parked mid-walk in a midiTx FIFO wait
+        // for several ms; the body chunks that follow overwrite the note pool
+        // it is walking, and a torn `next` index reads far out of bounds
+        // (LoadProhibited) or breaks list circularity (watchdog).  Wait the
+        // in-flight walk out — dispatch is sequential on this task, so once we
+        // return no walker can race the body writes.  Bounded: a walk is
+        // µs–ms, never near 100 ms.
+        for (int i = 0; i < 100 && sequencerSongReaderBusy(); i++) delay(1);
+        // Stamp SongFileHeader at the front of srvActiveBuf.
+        memcpy(srvActiveBuf, &hdr.song_file_header, sizeof(SongFileHeader));
+    }
+    strncpy(sMagiSaveName, hdr.name, sizeof(sMagiSaveName) - 1);
     sMagiSaveName[sizeof(sMagiSaveName) - 1] = '\0';
-    sMagiSaveExpectedBytes = h->song_bytes;
+    sMagiSaveExpectedBytes = hdr.song_bytes;
     sMagiSaveReceivedBytes = 0;
-    Serial.printf("[CMD] save start: name='%s' bytes=%u\n",
-                  sMagiSaveName, (unsigned)sMagiSaveExpectedBytes);
+    Serial.printf("[CMD] save start: name='%s' bytes=%u (%s)\n",
+                  sMagiSaveName, (unsigned)sMagiSaveExpectedBytes,
+                  srvPushScratch ? "staged" : "in place");
 }
 
 void onMagiLinkSaveBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
     if (sMagiSaveExpectedBytes == 0) return;          // stray body
     if (len < sizeof(MsgSongSaveBody)) return;
     const MsgSongSaveBody* b = (const MsgSongSaveBody*)msg;
-    if (b->data_len > 1024) return;
+    if (b->data_len > sizeof(b->data)) return;
     if (sMagiSaveReceivedBytes + b->data_len > sMagiSaveExpectedBytes) {
         Serial.println("[CMD] save body overshoot — dropping");
         sMagiSaveExpectedBytes = 0;
+        pushPhaseEnd();
         return;
     }
-    memcpy(srvActiveBuf + sizeof(SongFileHeader) + sMagiSaveReceivedBytes,
-           b->data, b->data_len);
+    // Expected is exactly sizeof(Song) (checked in the header), so this stays
+    // inside whichever buffer it is.
+    uint8_t* dst = srvPushScratch ? srvPushScratch
+                                  : srvActiveBuf + sizeof(SongFileHeader);
+    memcpy(dst + sMagiSaveReceivedBytes, b->data, b->data_len);
     sMagiSaveReceivedBytes += b->data_len;
     if (sMagiSaveReceivedBytes == sMagiSaveExpectedBytes) {
         sMagiSaveExpectedBytes = 0;
-        songOpPush(OP_PUSH_DONE, nullptr, 0, 0, 0);
+        sPushCommitPending = true;        // up before the loop task can see the op
+        if (!songOpPush(OP_PUSH_DONE, nullptr, 0, 0, 0)) {
+            // No commit will ever run for this push (songOpPush has logged it).
+            sPushCommitPending = false;
+            pushPhaseEnd();
+        }
     }
 }
 
@@ -1573,14 +1933,17 @@ void onMagiLinkSaveActive(const uint8_t* msg, size_t len, void* /*ctx*/) {
     songOpPush(OP_SAVE_ACTIVE, m->name, sizeof(m->name) - 1, m->is_autosave != 0, 0);
 }
 
-// Runs as OP_SAVE_ACTIVE.
+// Runs as OP_SAVE_ACTIVE.  Every way out answers the client with one
+// MsgSaveResult — ok only once the file is written and verified.
 static void finaliseSaveActive(const char* saveName, bool isAutosave) {
     if (!srvHasActive) {
         Serial.println("[CMD] save-active: no active song — ignoring");
+        sendSaveResult(saveName, isAutosave, false);
         return;
     }
     if (saveName[0] == '\0') {
         Serial.println("[CMD] save-active: empty name — ignoring");
+        sendSaveResult(saveName, isAutosave, false);
         return;
     }
     crashSetPhase(CP_AUTOSAVE);
@@ -1591,21 +1954,24 @@ static void finaliseSaveActive(const char* saveName, bool isAutosave) {
     char path[48];
     snprintf(path, sizeof(path), "%s/%s.mgt", dir, saveName);
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
-    SdLock _;
-    if (!writeSongVerified(path, song)) {
-        Serial.printf("[CMD] save-active: verify failed '%s' — kept previous file\n", path);
-        crashSetPhase(CP_IDLE);
-        return;
-    }
-    if (!isAutosave) {
-        // Explicit save committed — any pending autosave draft is now redundant.
-        char autopath[48];
-        snprintf(autopath, sizeof(autopath), "%s/%s.mgt",
-                 SRV_AUTOSAVE_DIR, saveName);
-        if (SD.exists(autopath)) {
-            SD.remove(autopath);
-            Serial.printf("[CMD] cleared autosave '%s'\n", autopath);
+    bool saved;
+    {
+        SdLock _;
+        saved = writeSongVerified(path, song);
+        if (saved && !isAutosave) {
+            // Explicit save committed — any pending autosave draft is now redundant.
+            char autopath[48];
+            snprintf(autopath, sizeof(autopath), "%s/%s.mgt",
+                     SRV_AUTOSAVE_DIR, saveName);
+            if (SD.exists(autopath)) {
+                SD.remove(autopath);
+                Serial.printf("[CMD] cleared autosave '%s'\n", autopath);
+            }
         }
+    }
+    if (!saved) {
+        Serial.printf("[CMD] save-active: verify failed '%s'\n", path);
+    } else if (!isAutosave) {
         snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", saveName);
         // A name the on-screen list doesn't have yet is a new file.
         bool listed = false;
@@ -1613,7 +1979,8 @@ static void finaliseSaveActive(const char* saveName, bool isAutosave) {
             listed = (strcasecmp(songNames[i], saveName) == 0);
         if (!listed) sSongListDirty = true;
     }
-    crashSetPhase(CP_IDLE);   // autosave/save complete
+    crashSetPhase(CP_IDLE);   // autosave/save complete (or failed)
+    sendSaveResult(saveName, isAutosave, saved);   // SdLock is released by now
 }
 
 // ── New-song: client → server ────────────────────────────────────────────
@@ -1633,41 +2000,56 @@ void onMagiLinkSetNoSong(const uint8_t* msg, size_t len, void* /*ctx*/) {
 }
 
 static void finaliseNewSong() {
+    if (!srvBufOk) {
+        Serial.println("[CMD] new-song refused — no song buffer (see PSRAM report at boot)");
+        return;
+    }
     Serial.printf("[STOPSRC] finaliseNewSong t=%lu\n", millis());
     quiesceSongReaders();
-    // Stamp a fresh SongFileHeader at the front of srvActiveBuf, then
-    // initSong() the Song body that follows.
-    SongFileHeader hdr;
-    hdr.magic   = SONG_FILE_MAGIC;
-    hdr.version = SONG_FILE_VERSION;
-    memset(hdr._pad, 0, sizeof(hdr._pad));
-    memcpy(srvActiveBuf, &hdr, sizeof(SongFileHeader));
+    // initSong() the Song body, then commit it behind a fresh SongFileHeader.
     Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
     initSong(song);
-    srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
-    srvHasActive    = true;  gSamplePreloadDirty = true;
     srvActiveName[0] = '\0';
+    commitActiveSong();
     sequencerReset();
     Serial.println("[CMD] new-song: server memory wiped");
 }
 
-// Runs as OP_PUSH_DONE.  Writes the
-// in-memory song to SD if a name was provided; either way, marks
-// srvHasActive and resets the sequencer.
+// Runs as OP_PUSH_DONE.  Makes the pushed song the active song — a staged
+// push is copied in from the scratch here, with the sequencer quiesced; an
+// in-place one is already sitting in srvActiveBuf — then writes it to SD if a
+// name was provided (and tells the client how that went) and resets the
+// sequencer.
 static void finaliseMagiLinkSongSave() {
+    crashSetPhase(CP_SONG_PUSH);   // a save that ran since the HEADER will have cleared it
+    Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
+    if (srvPushScratch) {
+        Serial.printf("[STOPSRC] full song push commit name='%s' t=%lu\n",
+                      sMagiSaveName, millis());
+        quiesceSongReaders();
+        // The header the client sent, then the song (commitActiveSong is not
+        // used here — see its comment).
+        memcpy(srvActiveBuf, &sMagiSaveFileHdr, sizeof(SongFileHeader));
+        memcpy(song, srvPushScratch, sizeof(Song));
+    }
     srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
     srvHasActive    = true;  gSamplePreloadDirty = true;
-    Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
 
     if (sMagiSaveName[0] != '\0') {
         char path[48];
         snprintf(path, sizeof(path), "%s/%s.mgt", SRV_SONGS_DIR, sMagiSaveName);
-        SdLock _;
-        if (writeSongVerified(path, song)) {
+        bool saved;
+        {
+            SdLock _;
+            saved = writeSongVerified(path, song);
+        }
+        if (saved) {
             snprintf(srvActiveName, sizeof(srvActiveName), "%s.mgt", sMagiSaveName);
             sSongListDirty = true;
-        } else
-            Serial.printf("[CMD] save: verify failed '%s' — kept previous file\n", path);
+        } else {
+            Serial.printf("[CMD] save: verify failed '%s'\n", path);
+        }
+        sendSaveResult(sMagiSaveName, false, saved);   // SdLock released above
     } else {
         Serial.println("[CMD] save: in-memory push (no SD write)");
     }
@@ -1675,7 +2057,9 @@ static void finaliseMagiLinkSongSave() {
                   sMagiSaveName, millis());
     sequencerStop();
     sequencerReset();
-    crashSetPhase(CP_IDLE);   // song-push complete
+    sPushPhaseArmed = false;
+    crashSetPhase(CP_IDLE);       // song-push complete
+    sPushCommitPending = false;   // last: the worker may now start receiving the next push
 }
 
 // ── MagiLink backup — streams the whole library (songs, instruments, ──────
@@ -1929,45 +2313,32 @@ void sendBackupToClient() {
 }
 
 // ── Reload the active song from SD into srvActiveBuf; notify client ─────────
+// Used when a restore has replaced the active song's file.  Goes through the
+// staged loader, so a file that will not load leaves the song in memory as it
+// is (and playing) instead of dropping the server to No Song.
 static void reloadActiveSongFromSD() {
+    // Own copy of the name: the loader writes srvActiveName on success.
+    char name[SRV_FNAME_MAX];
+    strncpy(name, srvActiveName, sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
     char path[48];
-    snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, srvActiveName);
+    snprintf(path, sizeof(path), "%s/%s", SRV_SONGS_DIR, name);
 
-    quiesceSongReaders();
-    bool loaded = false;
-    Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
-
-    {
-        SdLock _;
-        File f = SD.open(path);
-        if (!f) {
-            Serial.printf("[CMD] reload: open failed '%s'\n", path);
-            return;
-        }
-        SongFileHeader hdr;
-        if (f.read((uint8_t*)&hdr, sizeof(hdr)) == (int)sizeof(hdr)
-            && hdr.magic == SONG_FILE_MAGIC) {
-
-            loaded = songReadAnyVersion(f, hdr.version, song, nullptr);
-            if (loaded && hdr.version != SONG_FILE_VERSION)
-                Serial.printf("[CMD] migrated v%u->v%d '%s'\n",
-                              (unsigned)hdr.version, SONG_FILE_VERSION, path);
-        }
-        f.close();
-    }
-
-    if (!loaded) {
-        Serial.printf("[CMD] reload: load failed '%s'\n", path);
+    bool    activeKept = true;
+    uint8_t fail = srvLoadSongFile(path, name, &activeKept);
+    if (fail) {
+        Serial.printf("[CMD] reload: load failed '%s' (reason %u) — %s\n",
+                      path, (unsigned)fail,
+                      activeKept ? "song in memory kept" : "active song LOST");
+        if (!activeKept) sendNoSongToClient();   // the in-place read wiped it — say so
         return;
     }
-
-    SongFileHeader* h2 = (SongFileHeader*)srvActiveBuf;
-    h2->magic = SONG_FILE_MAGIC;
-    h2->version = SONG_FILE_VERSION;
-    h2->_pad[0] = h2->_pad[1] = h2->_pad[2] = 0;
-    srvActiveBufLen = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
-    srvHasActive = true;  gSamplePreloadDirty = true;
-    Serial.printf("[CMD] reloaded active song '%s' %u bytes\n", path, srvActiveBufLen);
+    // The loader left the sequencer stopped; put it at the top of the reloaded
+    // song (its old position may not exist in it) with its patches up, as
+    // every other load does.
+    sequencerReset();
+    sequencerSendPatchesNow();
+    Serial.printf("[CMD] reloaded active song '%s' %u bytes\n", path, (unsigned)srvActiveBufLen);
 
     // Tiny changed-event via the kick socket; the client pulls the song
     // with MSG_ACTIVE_SONG_REQ when it is ready.  Fire-and-forget: if the
@@ -1997,6 +2368,9 @@ static void sendActiveSongToClient() {
 
     MsgSongPushHeader hdr;
     hdr.total_size = srvActiveBufLen;
+    // The file this song is (with .mgt); empty for a song with no file yet.
+    memset(hdr.name, 0, sizeof(hdr.name));
+    strncpy(hdr.name, srvActiveName, sizeof(hdr.name) - 1);
     bool ok = gMagiLink.send(&hdr, sizeof(hdr));
 
     // Reuse the shared streaming body buffer; flip its id since backup may
@@ -2011,7 +2385,7 @@ static void sendActiveSongToClient() {
     uint32_t sent = 0;
     while (ok && sent < srvActiveBufLen) {
         uint32_t remain = srvActiveBufLen - sent;
-        uint16_t chunk  = remain > 512 ? 512 : (uint16_t)remain;
+        uint16_t chunk  = remain > SRV_PUSH_CHUNK ? SRV_PUSH_CHUNK : (uint16_t)remain;
         uint16_t wire   = (uint16_t)(offsetof(MsgBackupBody, data) + chunk);
         sStreamBody.data_len = chunk;
         sStreamBody.length   = wire;
@@ -2027,21 +2401,23 @@ static void sendActiveSongToClient() {
 }
 
 // ── Run one queued note edit (loop task) ──────────────────────────────────────
-// Skipped-but-consumed while no song is active (e.g. a full push is in
-// flight — the push supersedes them).
+// Validated here, applied on the MIDI task: sequencerApplyNoteSet does the
+// NoteGrid::set there, serialised with playback, and re-seats the play cursor
+// — the loop task never relinks the note pool under a playing walk.
+// Skipped-but-consumed while no song is active (set to OFF, or an in-place
+// full push in flight — the push supersedes them).
 static void applyQueuedNoteSet(uint8_t slot) {
     const MsgNoteSet& m = sNoteSetQ[slot];
     if (!srvHasActive) return;
-    Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
+    const Song* song = (const Song*)(srvActiveBuf + sizeof(SongFileHeader));
     // The sequencer indexes its per-column state by these — refuse a cell
     // that is outside the grid rather than store it.
     if (m.pattern >= song->numPatterns || m.pattern >= MAX_PATTERNS ||
         m.row >= MAX_ROWS || m.col >= MAX_COLUMNS) return;
-    NoteGrid grid(song->notePool, &song->noteFreeHead,
-                  &song->patterns[m.pattern].noteHead);
-    // Always set — NoteGrid::set clears internally when *all*
-    // fields are empty, but persists attr-only / vel-only rows.
-    grid.set(m.row, m.col, m.note);
+    // Always passed on — NoteGrid::set clears internally when *all* fields
+    // are empty, but persists attr-only / vel-only rows.
+    sequencerApplyNoteSet(m.pattern, m.row, m.col,
+                          m.note.note, m.note.velocity, m.note.effect, m.note.param);
 }
 
 // ── The on-screen song list follows the card ──────────────────────────────────
@@ -2135,12 +2511,10 @@ static void runSongOp(uint8_t slot) {
         break;
 
     case OP_SET_OFF:
-        // Same as the server's local "-- OFF --" selection: stop, drop the
-        // active song, tell the client, and sync the on-screen cursor to OFF.
-        sequencerStop();
-        srvHasActive    = false;
-        srvActiveName[0] = '\0';
-        sendNoSongToClient();
+        // Same as the server's local "-- OFF --" selection (srvSetOff: stop,
+        // drop the active song, tell the client), then sync the on-screen
+        // cursor to OFF.
+        srvSetOff();
         cursor          = 0;   // 0 = OFF (SONG_IDX_OFFSET)
         needsFullRedraw = true;
         break;
@@ -2160,8 +2534,9 @@ static void runSongOp(uint8_t slot) {
                     Serial.printf("[CMD] deleted '%s'\n", path);
                 }
             }
-            // Also wipe any matching autosave draft so a recovered file
-            // can't resurrect the song we just deleted.
+            // Also wipe any matching autosave draft, so no copy of the song
+            // we just deleted is left on the card.  (Drafts are never loaded
+            // automatically — see the autosave-policy note.)
             char autopath[48];
             snprintf(autopath, sizeof(autopath), "%s/%s.mgt",
                      SRV_AUTOSAVE_DIR, op.name);
@@ -2170,10 +2545,19 @@ static void runSongOp(uint8_t slot) {
                 Serial.printf("[CMD] deleted autosave '%s'\n", autopath);
             }
         }
+        // Deleting the song that is loaded sets the server to OFF, the same
+        // as choosing "-- OFF --": sequencer stopped, name cleared (so a later
+        // save or restore can't be matched against a file that is gone), the
+        // client told, the highlight on the OFF row.
         char expectedActive[SRV_FNAME_MAX];
         snprintf(expectedActive, sizeof(expectedActive), "%s.mgt", op.name);
-        if (srvHasActive && strcmp(expectedActive, srvActiveName) == 0)
-            srvHasActive = false;
+        if (srvHasActive && strcasecmp(expectedActive, srvActiveName) == 0) {
+            Serial.printf("[STOPSRC] deleted the active song '%s' t=%lu\n",
+                          expectedActive, millis());
+            srvSetOff();
+            cursor          = 0;   // 0 = OFF (SONG_IDX_OFFSET)
+            needsFullRedraw = true;
+        }
         sSongListDirty = true;
         break;
     }
@@ -2239,6 +2623,12 @@ void commandsTick() {
         sTrimSavePending = false;
         sampleTrimSave();
     }
+    // Sample list AFTER the trim save: the manifest sync it runs re-reads
+    // trim.txt, which would throw away a trim edit not yet written out.
+    if (srvSampleListPending) {
+        srvSampleListPending = false;
+        sendSampleList(srvSampleListPendingPage);
+    }
     if (sSampleInfoPending) {
         sSampleInfoPending = false;
         sendSampleInfo(sSampleInfoId, sSampleInfoVs, sSampleInfoVe);
@@ -2263,13 +2653,32 @@ void commandsTick() {
         }
     }
 
-    if (sMagiRestorePending) {
-        sMagiRestorePending = false;
-        finaliseMagiLinkRestore();
+    // A full-song push whose link dropped mid-stream never reaches
+    // OP_PUSH_DONE — take its crash breadcrumb down.  (A completed push that
+    // is merely waiting its turn in the queue is not abandoned.)
+    if (sPushPhaseArmed && !sPushCommitPending &&
+        (!gMagiLink.isConnected() || gMagiLink.generation() != sPushGen)) {
+        sPushPhaseArmed = false;
+        crashSetPhase(CP_IDLE);
+        Serial.printf("[CMD] full-song push abandoned — link dropped mid-stream (%s)\n",
+                      srvPushScratch ? "current song kept" : "received in place: no active song");
     }
-    if (sMagiFileSavePending) {
-        sMagiFileSavePending = false;
-        finaliseMagiLinkFileSave();
+
+    // Follow-ups to a restore.  The files themselves were renamed into place
+    // on the worker as each upload completed (see finaliseMagiLinkRestore);
+    // these touch srvInstruments / srvActiveBuf, so they run here.
+    if (sRestoreInstReloadPending) {
+        sRestoreInstReloadPending = false;
+        bool ok = loadInstrumentsFromSD();
+        Serial.printf("[CMD] instruments %s after restore\n",
+                      ok ? "reloaded" : "NOT reloaded — restored file did not load, memory unchanged");
+    }
+    if (sRestoreSongReloadPending) {
+        sRestoreSongReloadPending = false;
+        if (srvHasActive && srvActiveName[0] != '\0') {
+            Serial.printf("[CMD] restored file is the active song — reloading\n");
+            reloadActiveSongFromSD();
+        }
     }
     if (srvInstLoadPending) {
         srvInstLoadPending = false;
@@ -2309,7 +2718,10 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
 
         case MSG_SAMPLE_LIST_REQ:
             if (len < (int)sizeof(MsgSampleListReq)) return;
-            sendSampleList(((const MsgSampleListReq*)data)->page);
+            // Deferred to the loop task — the list is a directory scan plus a
+            // manifest rewrite.  Latest-wins, like the other list requests.
+            srvSampleListPendingPage = ((const MsgSampleListReq*)data)->page;
+            srvSampleListPending     = true;
             break;
 
         case MSG_FILE_LIST_REQ:
@@ -2355,10 +2767,11 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
 
         case MSG_SET_SONG_DATA:
             // MagiLink wire: id(1) + length(2) + offset(2) + dataLen(1) + data[dataLen]
-            if (len < 6) return;
             {
+                const int hdrLen = (int)offsetof(MsgSetSongData, data);
+                if (len < hdrLen) return;
                 const MsgSetSongData* p = (const MsgSetSongData*)data;
-                if (len < (int)(6 + p->dataLen)) return;
+                if (len < hdrLen + (int)p->dataLen) return;
                 // Inline for immediacy (live BPM / mute edits) — unless a song
                 // operation is queued or running, when it must keep its place.
                 if (sSongOpHead != sSongOpTail) songOpPushPatch(p->offset, p->data, p->dataLen);
@@ -2369,9 +2782,9 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
         case MSG_NOTE_SET:
             if (len < (int)sizeof(MsgNoteSet)) return;
             {
-                // NoteGrid::set relinks the live note pool.  Queue it;
-                // commandsTick applies it on the loop task so all relinks
-                // happen in one place, in order with saves and loads.
+                // A note edit relinks the live note pool.  Queue it:
+                // commandsTick takes it in arrival order with saves and
+                // loads and hands it to the MIDI task to apply.
                 MsgNoteSet m = *(const MsgNoteSet*)data;   // `data` is the link's buffer
                 if ((uint8_t)(sNoteSetQHead - sNoteSetQTail) >= NOTE_SET_Q_LEN) {
                     // Full: a paste / drum import sends more than one loop pass
@@ -2409,10 +2822,11 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
 
         case MSG_INSTRUMENTS_PATCH:
             // MagiLink wire: id(1) + length(2) + offset(2) + dataLen(1) + data[dataLen]
-            if (len < 6) return;
             {
+                const int hdrLen = (int)offsetof(MsgInstrumentsPatch, data);
+                if (len < hdrLen) return;
                 const MsgInstrumentsPatch* p = (const MsgInstrumentsPatch*)data;
-                if (len < (int)(6 + p->dataLen)) return;
+                if (len < hdrLen + (int)p->dataLen) return;
                 uint32_t end = (uint32_t)p->offset + p->dataLen;
                 if (end <= sizeof(srvInstruments)) {
                     memcpy((uint8_t*)srvInstruments + p->offset, p->data, p->dataLen);

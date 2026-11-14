@@ -27,17 +27,16 @@ public:
     // Connect role: connects to `peer:port` and stays connected.
     // Spawns the worker task immediately; the worker waits for a local
     // STA IP before attempting connect.
+    //
+    // One-shot: once the worker exists, a later call is ignored — it does
+    // NOT retarget the link, so a server that turns up at a new address is
+    // not followed until reboot.  A call that asks for a different
+    // peer/port is logged; a repeat of the same one is silent.
     void beginConnect(uint16_t port, IPAddress peer);
 
     // True between "connection established" and "connection dropped".
     // Updated from the worker task; safe to read from any task.
     bool isConnected() const { return _connected; }
-
-    // Peer IP of the currently-connected session, or 0.0.0.0 if not
-    // connected.  Accept role: the connecting client's IP.  Connect role:
-    // the configured peer.  Useful for the server to learn its client's
-    // address (e.g. for UDP unicasts) without a hardcoded convention.
-    IPAddress peerIP() const;
 
     // Monotonic counter, bumped every time a new connection is established —
     // including a preempt-swap to a fresh peer.  A session task can compare
@@ -116,7 +115,7 @@ private:
 
     // Registration table for per-id callbacks.  Worker task dispatches
     // matching incoming messages here.  The server registers 48 (the client
-    // 18), so there are 16 slots left — registerCallback past the end only
+    // 19), so there are 16 slots left — registerCallback past the end only
     // logs and returns false, and that message then silently never fires.
     struct RegisteredHandler { uint8_t msgType; MessageCb cb; void* ctx; };
     static const int MAX_REGISTERED = 64;

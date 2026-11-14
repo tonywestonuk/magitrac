@@ -9,10 +9,10 @@
 //
 // Layout (960×540) — same shape as PixelPostPicker for muscle memory:
 //
-//   y=  0  ┌─ "PIXEL POST — MANUAL" + [PWR OFF] [BACK] (50px) ─────────────┐
+//   y=  0  ┌─ "PIXEL POST - MANUAL" + [FW] [PWR OFF] [BACK] (50px) ────────┐
 //   y= 60  ├─ Effect 2×3 grid (left)  │ Slider │ Touchpad (right) ─────────┤
 //   y=420  ├─ ──────────────────────────────────────────────────────────────┤
-//   y=440  ├─ [1] [2] [3] [4] [5] [6] [7]   page selector (no BACK) ───────┤
+//   y=440  ├─ [1] [2] [3] [4] [5] [6] [7] [SET]   pages + settings ────────┤
 //   y=540  └──────────────────────────────────────────────────────────────────┘
 //
 // Touch semantics:
@@ -20,14 +20,15 @@
 //   - Slider drag  → MSG_PIXELPOST_SET_SLIDER(value)    sent on value change
 //   - Touchpad     → MSG_PIXELPOST_SET_TOUCHPAD(x,y,1)  while held
 //                    MSG_PIXELPOST_SET_TOUCHPAD(x,y,0)  on release
-//   - PWR OFF tap  → MSG_PIXELPOST_POWER_OFF(1)
+//   - PWR OFF tap  → confirm dialog, then MSG_PIXELPOST_POWER_OFF(1)
+//   - FW tap       → confirm dialog, then MSG_PIXELPOST_FIRMWARE_UPDATE
+//   - SET tap      → PixelPostSettingsPage (brightness cap / flash smoothing)
 //   - BACK tap     → close the page (returns to whoever opened it)
 //
 // All sends are fire-and-forget — the server's state cache + 2 s heartbeat
 // covers any TCP loss.
 
 static const int PPM_W           = 960;
-static const int PPM_H           = 540;
 
 static const int PPM_TITLE_Y     = 0;
 static const int PPM_TITLE_H     = 50;
@@ -105,9 +106,15 @@ private:
     uint8_t _lastSliderSent;
     uint8_t _lastPadXSent;
     uint8_t _lastPadYSent;
+    bool    _sliderSent = false;    // a slider value has been sent since open()
+    bool    _padHeld    = false;    // touched=true sent and not yet released
 
     PixelPostSettingsPage _settings;
-    ConfirmDialog         _confirmPwr;   // guards the all-posts PWR OFF
+    // One dialog guards both all-posts actions; _confirmAction says which
+    // one the open dialog is asking about.
+    enum class ConfirmAction : uint8_t { PWR_OFF, FW_UPDATE };
+    ConfirmDialog         _confirm;
+    ConfirmAction         _confirmAction = ConfirmAction::PWR_OFF;
 
     void drawTitle();
     void drawEffectButtons();

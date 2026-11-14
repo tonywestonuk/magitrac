@@ -7,9 +7,9 @@
 
 enum class PairClientState : uint8_t {
     IDLE,
-    AUTO_CONNECTING,   // has stored pairing; silently retrying connection
-    PAIRING_REQUEST,   // in pair mode; listening for MSG_PAIR_PROBE
-    PAIRING_CONFIRM,   // got probe + generated PIN; waiting for user to tap Confirm
+    AUTO_CONNECTING,   // has stored pairing; waiting for the server's MSG_CONNECT over MagiLink
+    PAIRING_REQUEST,   // in pair mode on ch1; broadcasting MSG_PAIR_PROBE, waiting for CHALLENGE
+    PAIRING_CONFIRM,   // got CHALLENGE (the server's PIN); waiting for user to tap Confirm
     SUCCESS,           // connected — session active
 };
 
@@ -17,9 +17,9 @@ enum class BrowseState : uint8_t {
     IDLE,
     WAITING_LIST,   // waiting for MSG_SONG_LIST_RESP
     LIST_READY,     // list available, user can select
-    WAITING_SONG,   // waiting for MSG_SONG_BLOB stream
-    SONG_READY,     // song fully received and validated
-    ERROR,
+    WAITING_SONG,   // waiting for the MSG_SONG_PUSH_HEADER / _BODY stream
+    SONG_READY,     // all bytes received (copySong() checks magic + version)
+    ERROR,          // never set at present
 };
 
 enum class SampleListState : uint8_t {
@@ -27,7 +27,7 @@ enum class SampleListState : uint8_t {
     WAITING,    // request sent, waiting for first MSG_SAMPLE_LIST_RESP
     PARTIAL,    // got some pages, more to come
     READY,      // all pages received
-    ERROR,
+    ERROR,      // never set at present
 };
 
 enum class FileListState : uint8_t {
@@ -35,7 +35,7 @@ enum class FileListState : uint8_t {
     WAITING,    // request sent, waiting for first MSG_FILE_LIST_RESP
     PARTIAL,    // got some pages, more to come
     READY,      // all pages received
-    ERROR,
+    ERROR,      // never set at present (pages that test for it never see it)
 };
 
 enum class FileLoadState : uint8_t {
@@ -47,7 +47,7 @@ enum class FileLoadState : uint8_t {
     ERROR,
 };
 
-#define FILE_LIST_CACHE_MAX 64    // ceiling on names cached client-side
+#define FILE_LIST_CACHE_MAX 128   // ceiling on names cached client-side
 #define FILE_LOAD_BUF_MAX   24576 // ceiling on a single fetched file
                                   //   (the master catalog master.txt, 80 songs
                                   //    × name/file/notes, is the largest ~21 KB)
@@ -70,11 +70,13 @@ public:
     void begin();   // init transport, load NVS pairing, auto-connect if paired
 
     // ── Pairing ceremony ──────────────────────────────────────────────────────
-    void startPairCeremony();           // enter listen mode for MSG_PAIR_PROBE
-    void confirmPairCode();             // user tapped Confirm → send MSG_PAIR_OFFER
+    void startPairCeremony();           // force ch1 + start broadcasting MSG_PAIR_PROBE
+    // User tapped Confirm → send MSG_PAIR_OFFER.  Only a send that succeeded
+    // commits the pairing (NVS + WiFi switch).  If every attempt fails, nothing
+    // is saved and the state stays PAIRING_CONFIRM, so Confirm can be tapped
+    // again until the pair window times out.
+    void confirmPairCode();
     void cancelPairing();               // abort ceremony or auto-connect
-    bool hasPairing()    const { return _hasPairing; }
-    void clearPairing();                // forget stored pairing (NVS clear)
     const uint8_t* pairCode() const { return _pairCode; }  // 4 bytes (ASCII digits)
 
     // ── Connection ────────────────────────────────────────────────────────────
@@ -83,8 +85,6 @@ public:
 
     PairClientState    pairState()   const { return _pairState; }
     bool           isPaired()    const { return _pairState == PairClientState::SUCCESS; }
-    const uint8_t* serverMac()  const { return _serverMac; }
-    const char*    serverName() const { return _serverName; }
 
     // ── Server file browse ────────────────────────────────────────────────────
     void requestSongList(uint8_t page = 0);
@@ -102,6 +102,18 @@ public:
     // (power-loss recovery); false writes to the canonical /songs/<name>.mgt
     // and clears any pending /autosave/<name>.mgt.
     bool sendSaveActive(const char* name, bool isAutosave = false);
+
+    // ── Save result (MSG_SAVE_RESULT from the server) ─────────────────────────
+    // The server answers sendSaveActive() and a NAMED sendSongToServer() with
+    // whether the file was really written and verified.  A true return from
+    // those two only means the request left this device.  Both clear a stale
+    // result before they send (an un-named sendSongToServer push gets no reply
+    // and leaves the result alone).  Read the fields while pending, then clear.
+    bool        saveResultPending() const;
+    bool        saveResultOk() const;           // true = written and verified
+    bool        saveResultIsAutosave() const;   // echoes the request
+    const char* saveResultName() const;         // as requested, no extension
+    void        clearSaveResult();
     // Tell the server to call initSong() on its in-memory copy — keeps
     // client and server in sync after the user creates a new blank song.
     bool sendNewSong();
@@ -151,7 +163,6 @@ public:
     void resetSampleList();
     SampleListState     sampleListState()        const { return _sampleListState; }
     int                 sampleListCount()        const { return _sampleCount; }
-    int                 sampleListTotalExpected() const { return _sampleTotal; }
     const SampleCacheEntry* sampleListEntry(int i) const {
         return (i >= 0 && i < _sampleCount) ? &_sampleCache[i] : nullptr;
     }
@@ -176,6 +187,8 @@ public:
     void requestFileLoad(uint8_t kind, const char* name);
     void resetFileLoad();
     FileLoadState   fileLoadState() const { return _fileLoadState; }
+    // Valid only in state READY (null if the PSRAM buffer was never allocated
+    // — a load then ends in ERROR, never READY).
     const uint8_t*  fileLoadData()  const { return _fileLoadBuf; }
     uint32_t        fileLoadLen()   const { return _fileLoadBufLen; }
 
@@ -218,7 +231,6 @@ public:
     bool sendPixelpostTouchpad      (uint8_t x, uint8_t y, bool touched);
     bool sendPixelpostPowerOff      (bool off);
     bool sendPixelpostOverride      (uint8_t op);   // PpOverrideOp (perf-page light strip)
-    bool sendPixelpostPostCount     (uint8_t count);
     bool sendPixelpostFirmwareUpdate();
     bool sendPixelpostFlashCtrl     (uint8_t value);
 
@@ -248,10 +260,14 @@ public:
 
     BrowseState browseState()      const { return _browseState; }
     int         listCount()        const { return _listCount; }
-    uint8_t     listPage()         const { return _listPage; }
     uint8_t     listTotalPages()   const { return _listTotalPages; }
     const char* listName(int i)    const { return _listNames[i]; }
     bool        copySong(Song* out) const;
+    // File name (WITH .mgt) of the most recently completed song push, as the
+    // server reported it in MSG_SONG_PUSH_HEADER.  "" if no push has completed
+    // yet, or the pushed song has no file (new / never saved).  Read it when
+    // copySong() succeeds — a later push replaces it.
+    const char* pushedSongFile() const;
 
     // ── Server discovery (MSG_SERVER_ANNOUNCE) ───────────────────────────
     // True once we've seen at least one beacon since boot.  Used by the
@@ -273,8 +289,10 @@ public:
     void _onMagiLinkConnect();
     // MagiLink: server sent MSG_DISCONNECT.  Transition out of SUCCESS.
     void _onMagiLinkDisconnect();
-    // MagiLink dispatcher for song-related messages: PUSH_HEADER, PUSH_BODY,
-    // NO_SONG.  Switches on msg[0] and updates browse state / _songBuf.
+    // MagiLink dispatcher for song-related messages: SONG_PUSH_HEADER / _BODY,
+    // NO_SONG, SONG_LOAD_FAILED, ACTIVE_SONG_CHANGED, SONG_LIST_RESP and
+    // SAVE_RESULT.  Switches on msg[0] and updates browse state / _songBuf /
+    // the list page / the save result.
     void _onMagiLinkSongMessage(const uint8_t* msg, size_t len);
     // MagiLink server-state notification: MSG_PLAY / MSG_STOP from server
     // tell us whether its sequencer is running.  Updates _serverPlaying.
@@ -297,12 +315,15 @@ private:
     void _setPairState(PairClientState s);
     void _setBrowseState(BrowseState s);
     void _tryAutoConnect();
+    // Leave pair mode without a new pairing: WiFi auto-reconnect back on, then
+    // AUTO_CONNECTING if a pairing is stored, else IDLE.  Shared by
+    // cancelPairing() and the pair-window timeouts.
+    void _leavePairMode();
 
     // Session
     PairClientState _pairState   = PairClientState::IDLE;
     uint32_t        _pairStateMs = 0;
     uint8_t         _serverMac[6]   = {};
-    char            _serverName[17] = {};
     bool            _ready          = false;
 
     // NVS-stored pairing.  _storedSecret is loaded but unused — kept on
@@ -366,6 +387,17 @@ private:
     uint32_t _songRecvExpected = 0;
     // Same for instruments push.
     uint32_t _instRecvExpected = 0;
+    // File name carried by the song push header: _pushIncomingFile belongs to
+    // the stream being received, _pushedSongFile to the last one that completed.
+    char     _pushIncomingFile[SRV_FNAME_MAX] = {};
+    char     _pushedSongFile[SRV_FNAME_MAX]   = {};
+
+    // Last MSG_SAVE_RESULT.  Written on the link task, read on the UI task:
+    // the fields are stored first and the flag raised last.
+    volatile bool _saveResultPending    = false;
+    bool          _saveResultOk         = false;
+    bool          _saveResultIsAutosave = false;
+    char          _saveResultName[SRV_NAME_MAX] = {};
 
     // Instruments receive buffer
     uint8_t* _instBuf         = nullptr;
@@ -376,7 +408,6 @@ private:
     SampleListState  _sampleListState = SampleListState::IDLE;
     SampleCacheEntry* _sampleCache = nullptr;  // PSRAM (alloc in begin()); control-rate
     int              _sampleCount     = 0;
-    int              _sampleTotal     = 0;
     uint8_t          _samplePage      = 0;
     uint8_t          _sampleTotalPages = 0;
 
@@ -390,7 +421,9 @@ private:
 
     FileLoadState _fileLoadState   = FileLoadState::IDLE;
     uint8_t       _fileLoadKind    = 0;
-    uint8_t       _fileLoadBuf[FILE_LOAD_BUF_MAX] = {};
+    uint8_t*      _fileLoadBuf     = nullptr;   // PSRAM, FILE_LOAD_BUF_MAX bytes
+                                                //   (alloc in begin()) — internal
+                                                //   RAM is the radios' budget
     uint32_t      _fileLoadBufLen  = 0;
     uint32_t      _fileLoadExpected = 0;
     char          _fileLoadName[FILE_NAME_LEN] = {};

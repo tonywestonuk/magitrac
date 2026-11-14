@@ -88,7 +88,7 @@ static void mscSdTeardown() {
 // digital-core reset here on the mistaken theory that the reset cleared the SD —
 // it doesn't; only cutting the card's Vdd does.  Reverted — simpler, and friendlier
 // to the USB-OTG → USB-Serial-JTAG console handoff.)
-static void mscHardReboot() {
+static void mscReboot() {
     Serial.flush();
     ESP.restart();
 }
@@ -150,13 +150,10 @@ void runUsbMsc() {
     // Exit USB-storage mode on either of:
     //   • the host ejecting the disk (preferred — clean unmount), or
     //   • a screen tap (fallback — wait for the boot-held touch to release first).
-    // The reboot uses mscHardReboot() (esp_restart_noos_dig — full digital
-    // peripheral reset), NOT ESP.restart(): a plain soft reset leaves the SPI/SD
-    // controller in the state SdFat left it, so the next boot's SD.begin() fails
-    // to mount until a power cycle.  The digital reset clears it — same effect as
-    // a power cycle, no crash.  sdRecoverBus()/retry in commandsInit() stays as a
-    // belt-and-braces card-level flush.  (usb_persist_restart(RESTART_NO_PERSIST)
-    // was also tried and was worse — see git history.)
+    // Either way the exit is mscSdTeardown() + mscReboot() — a plain
+    // ESP.restart().  The reset does nothing for the SD card itself; the next
+    // boot's sdPowerCycle() + sdRecoverBus()/retry in commandsInit() is what
+    // gets the card mounting again.
     bool released = false;
     for (;;) {
         if (sEjectReq) {
@@ -165,7 +162,7 @@ void runUsbMsc() {
             // hangs the bus — wedging this loop before it can reboot.  Just go.
             delay(800);          // let macOS finalise the unmount before USB drops
             mscSdTeardown();     // deselect CS before the reset
-            mscHardReboot();
+            mscReboot();
         }
 
         // Do NOT draw to the LCD here — it shares the SPI bus with the SD card,
@@ -179,7 +176,7 @@ void runUsbMsc() {
             banner("Restarting...", nullptr);
             delay(400);
             mscSdTeardown();
-            mscHardReboot();
+            mscReboot();
         }
         delay(10);
     }

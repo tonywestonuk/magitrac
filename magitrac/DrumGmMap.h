@@ -33,11 +33,6 @@ public:
     // Returns nullptr if no entry for this code.
     const DrumGmEntry* find(const char* code) const;
 
-    // Iterate by index (0..DRUM_GM_ENTRIES-1).
-    const DrumGmEntry* entry(int i) const {
-        return (i >= 0 && i < DRUM_GM_ENTRIES) ? &_entries[i] : nullptr;
-    }
-
 private:
     DrumGmEntry _entries[DRUM_GM_ENTRIES];
 };

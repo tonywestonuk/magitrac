@@ -7,6 +7,7 @@ ConfirmDialog::ConfirmDialog(EPD_PainterAdafruit& display, GT911_Lite& touch)
     , _open(false)
     , _confirmed(false)
     , _wasDown(false)
+    , _swallowLift(false)
 {
     _message[0] = '\0';
 }
@@ -14,9 +15,13 @@ ConfirmDialog::ConfirmDialog(EPD_PainterAdafruit& display, GT911_Lite& touch)
 void ConfirmDialog::open(const char* message) {
     strncpy(_message, message, sizeof(_message) - 1);
     _message[sizeof(_message) - 1] = '\0';
-    _open      = true;
-    _confirmed = false;
-    _wasDown   = _touch.isTouched;
+    _open        = true;
+    _confirmed   = false;
+    _wasDown     = _touch.isTouched;
+    // Opened with the finger still down (long-press hand-off): its release is
+    // the tail of the opening gesture, not an answer.  Same idea as
+    // HexpadPopup's fingerDown.
+    _swallowLift = _touch.isTouched;
 }
 
 void ConfirmDialog::draw() {
@@ -49,6 +54,7 @@ bool ConfirmDialog::poll() {
 
     if (!down && _wasDown) {
         _wasDown = false;
+        if (_swallowLift) { _swallowLift = false; return false; }
         if (hitYes(sx, sy)) {
             _confirmed = true;
             _open = false;

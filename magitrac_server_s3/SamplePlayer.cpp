@@ -151,8 +151,8 @@ struct RamSample {
     uint8_t   ch;       // 1 or 2
     uint8_t   loop;     // from trim metadata: held voices wrap at the end
     uint32_t  bytes;
-    uint32_t  trimStart, trimEnd;   // what's baked in — re-preload if it moves
-    uint8_t   trimLoop;
+    uint32_t  trimStart, trimEnd;   // the trim metadata AS STORED (unclamped) when
+    uint8_t   trimLoop;             //   this was baked — re-preload if it moves
 };
 static RamSample     s_ram[RAM_CACHE_MAX] = {};
 static size_t        s_ramBytes    = 0;
@@ -456,7 +456,8 @@ static void wavTaskFn(void*) {
                             outBuf[k] = (int16_t)(((int32_t)outBuf[k] * activeGainQ15) >> 15);
                     }
                     mixRamInto(outBuf, outFrames);   // RAM polyphony rides the stream
-                    audioCodecPlay((const uint8_t*)outBuf, outFrames * 4);
+                    if (!audioCodecPlay((const uint8_t*)outBuf, outFrames * 4))
+                        vTaskDelay(1);          // no codec / reconfiguring — don't spin
                 }
                 if (consumed <= 0) break;   // safety: never spin
                 done += consumed;
@@ -594,8 +595,9 @@ bool samplePreloadSync(const Song* song) {
         uint32_t frameBytes  = (uint32_t)numCh * 2;
         uint32_t totalFrames = (fsize - sizeof(hdr)) / frameBytes;
 
-        // Non-destructive trim: cache only the region playback will use —
-        // even a huge file becomes preloadable if its trimmed slice is small.
+        // Non-destructive trim: cache only the region playback will use.  (The
+        // whole file must still pass the fsize gate above — a big file with a
+        // small trimmed slice is NOT preloaded; it streams.)
         const SampleTrim* tr = sampleTrimFor(want[w]);
         uint32_t stF = tr ? tr->startFrame : 0;
         uint32_t enF = (tr && tr->endFrame) ? tr->endFrame : totalFrames;
@@ -620,7 +622,10 @@ bool samplePreloadSync(const Song* song) {
         s_ram[slot].ch        = (uint8_t)numCh;
         s_ram[slot].loop      = tr ? tr->loop : 0;
         s_ram[slot].bytes     = dataBytes;
-        s_ram[slot].trimStart = stF;
+        // Raw metadata, not the clamped stF/enF: the keep/evict test above
+        // compares against the raw table, and a clamped copy would never match
+        // an out-of-range trim (evict + reload on every sync).
+        s_ram[slot].trimStart = tr ? tr->startFrame : 0;
         s_ram[slot].trimEnd   = tr ? tr->endFrame : 0;
         s_ram[slot].trimLoop  = tr ? tr->loop : 0;
         s_ramBytes           += dataBytes;

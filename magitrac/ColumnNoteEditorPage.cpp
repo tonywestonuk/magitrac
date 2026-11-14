@@ -17,23 +17,25 @@ ColumnNoteEditorPage::ColumnNoteEditorPage(EPD_PainterAdafruit& display,
     , _selRow(0)
     , _topPitch(49)         // C-4 at the top of the window
     , _wasDown(false)
+    , _swallowLift(false)
     , _selStartCol(0)
     , _selEndCol(0)
     , _clipLen(0)
     , _drag(CneDrag::NONE)
-    , _dragStartX(0)
     , _dragStartY(0)
     , _dragStartTopPitch(49)
     , _dragStartCellCol(0)
     , _dragStartCellPitchIdx(0)
     , _popup(CnePopup::NONE)
     , _dirtyRow(0xFF)
-    , _dirtyAll(false)
+    , _pastePat(0)
+    , _pasteRowLo(0xFF)
+    , _pasteRowHi(0)
+    , _auditionRow(0xFF)
     , _previewing(false)
     , _previewStartPending(false)
     , _previewStopPending(false)
     , _previewRow(0xFF)
-    , _auditionRow(0xFF)
 {}
 
 NoteGrid ColumnNoteEditorPage::grid() {
@@ -61,12 +63,18 @@ void ColumnNoteEditorPage::open(uint8_t patIdx, uint8_t col, uint8_t row) {
     _segment     = row / 16;
     _selStartCol = row % 16;
     _selEndCol   = row % 16;
-    _wasDown     = false;
+    // The page opens from a 500 ms long-press, so the finger is normally
+    // still on the glass.  That press belongs to the tracker: swallow it until
+    // it lifts, or it re-seats the selected row (the column header sits under
+    // the selector strip's touch zone) and its release fires whatever button
+    // is under it.  Same idea as ConfirmDialog / HexpadPopup.
+    _wasDown     = _touch.isTouched;
+    _swallowLift = _touch.isTouched;
     _clipLen     = 0;
     _drag        = CneDrag::NONE;
     _popup       = CnePopup::NONE;
     _dirtyRow    = 0xFF;
-    _dirtyAll    = false;
+    _pasteRowLo  = 0xFF;
     _previewing            = false;
     _previewStartPending   = false;
     _previewStopPending    = false;
@@ -439,13 +447,6 @@ bool ColumnNoteEditorPage::hitGridCell(int sx, int sy, int8_t& col, int8_t& pitc
 
 // ── Edit operations ──────────────────────────────────────────────────────────
 
-void ColumnNoteEditorPage::clampTopPitch() {
-    int lo = CNE_VIS_PITCHES;        // bottom row needs pitch >= 1
-    int hi = NOTE_MAX;
-    if ((int)_topPitch < lo) _topPitch = (uint8_t)lo;
-    if ((int)_topPitch > hi) _topPitch = (uint8_t)hi;
-}
-
 void ColumnNoteEditorPage::markDirty(uint8_t row) {
     _dirtyRow = row;
 }
@@ -535,9 +536,13 @@ void ColumnNoteEditorPage::applyCopy() {
     uint8_t b = _selEndCol;
     if (a > b) { uint8_t t = a; a = b; b = t; }
     _clipLen = 0;
+    // get() reads a missing cell as {0,0,0,0}, and velocity 0 is an EXPLICIT
+    // velocity — indistinguishable from a real velocity-only row.  Record
+    // missing cells as all-default (VEL_DEFAULT) so paste's set() clears them.
     for (uint8_t i = a; i <= b && _clipLen < CNE_COLS; i++) {
         uint8_t row = segmentRow(i);
-        _clip[_clipLen++] = (row == 0xFF) ? Note{0,0,0,0} : g.get(row, _col);
+        if (row != 0xFF && g.has(row, _col)) _clip[_clipLen++] = g.get(row, _col);
+        else _clip[_clipLen++] = Note{ NOTE_EMPTY, VEL_DEFAULT, 0, 0 };
     }
 }
 
@@ -550,14 +555,14 @@ void ColumnNoteEditorPage::applyPaste() {
         if (segCol >= CNE_COLS) break;
         uint8_t row = segmentRow(segCol);
         if (row == 0xFF) break;
-        const Note& n = _clip[i];
-        if (n.note == NOTE_EMPTY && n.effect == 0 && n.param == 0) {
-            g.clear(row, _col);
-        } else {
-            g.set(row, _col, n);
-        }
+        // set() clears the cell itself for an all-default note (how applyCopy
+        // records a missing cell) and keeps velocity-only / attr-only rows.
+        g.set(row, _col, _clip[i]);
+        // Rows are written in ascending order: remember the run for the
+        // caller's targeted note-set resync.
+        if (_pasteRowLo == 0xFF) { _pastePat = _patIdx; _pasteRowLo = row; }
+        _pasteRowHi = row;
     }
-    _dirtyAll = true;   // bulk edit — caller resyncs the song
 }
 
 void ColumnNoteEditorPage::setPreviewRow(uint8_t row) {
@@ -614,7 +619,7 @@ void ColumnNoteEditorPage::stepSegment(int delta) {
     }
 }
 
-// ── Poll — full Slice 2 state machine ────────────────────────────────────────
+// ── Poll — popup hand-off, then the touch state machine ──────────────────────
 
 bool ColumnNoteEditorPage::poll() {
     // ── Popup mode: defer to the popup until it closes ───────────────────────
@@ -625,7 +630,15 @@ bool ColumnNoteEditorPage::poll() {
             Note n = g.get(_selRow, _col);
             if (_popup == CnePopup::VEL) {
                 if (_hexpad.isCleared()) n.velocity = VEL_DEFAULT;
-                else                     n.velocity = _hexpad.effect();   // 1st byte
+                else if ((n.velocity & 0x80) && _hexpad.digitCount() == 0) {
+                    // A default velocity opens the pad blank; SET with nothing
+                    // typed means "no change", not "explicit velocity 0".
+                } else {
+                    // The 2-digit hexpad accepts 00..FF, but 0x80+ means
+                    // "default velocity" — clamp to the top explicit value.
+                    uint8_t v = _hexpad.effect();   // 1st byte
+                    n.velocity = (v > 0x7F) ? 0x7F : v;
+                }
             } else { // ATTR
                 if (_hexpad.isCleared()) { n.effect = 0; n.param = 0; }
                 else { n.effect = _hexpad.effect(); n.param = _hexpad.param(); }
@@ -715,7 +728,6 @@ bool ColumnNoteEditorPage::poll() {
         int8_t pidx;
         if (hitGridCell(sx, sy, c, pidx)) {
             _drag                  = CneDrag::GRID_MAYBE;
-            _dragStartX            = sx;
             _dragStartY            = sy;
             _dragStartTopPitch     = _topPitch;
             _dragStartCellCol      = c;
@@ -731,6 +743,7 @@ bool ColumnNoteEditorPage::poll() {
         _wasDown = false;
         CneDrag was = _drag;
         _drag = CneDrag::NONE;
+        if (_swallowLift) { _swallowLift = false; return false; }   // opening press
 
         if (was == CneDrag::GRID_PITCH) {
             // Drag committed — no tap.

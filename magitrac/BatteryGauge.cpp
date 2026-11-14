@@ -54,7 +54,6 @@ static int ocvToSoc(int mv) {
 // ── State ────────────────────────────────────────────────────────────────────
 static float        s_soc      = -1.0f;   // smoothed SoC (-1 = unseeded)
 static bool         s_charging = false;
-static int          s_voc      = -1;
 static bool         s_lowFlag  = false;
 static uint32_t     s_lastPersistMs = 0;
 static BatteryDeath s_death = { false, false, 0 };
@@ -102,7 +101,9 @@ void batteryGaugeBegin() {
     }
     s_lowFlag = false;
 
-    // Seed the smoothed value from the persisted SoC; the first update refines it.
+    // Seed the smoothed value from the persisted SoC.  Updates then move it
+    // toward the measured value by at most SLEW_PER_UPDATE each — the first
+    // one included, so a stale seed takes several polls to converge.
     if (valid) s_soc = prevSoc;
 }
 
@@ -124,7 +125,6 @@ void batteryGaugeUpdate(uint32_t nowMs) {
     } else {
         voc = mv + ILOAD_MA * RINT_MOHM / 1000;    // load sags V down
     }
-    s_voc = voc;
 
     int raw = ocvToSoc(voc);
     if (phase == BATT_CHARGE_DONE) raw = 100;      // anchor: charger says full
@@ -157,5 +157,4 @@ void batteryGaugeUpdate(uint32_t nowMs) {
 
 int  batteryGaugePct()      { return s_soc < 0 ? -1 : (int)lroundf(s_soc); }
 bool batteryGaugeCharging() { return s_charging; }
-int  batteryGaugeVoc()      { return s_voc; }
 const BatteryDeath& batteryLastDeath() { return s_death; }

@@ -17,10 +17,11 @@
 //  y=310  ├─ "MIDI" label strip (20px) ──────────────────────────────────────┤
 //  y=330  ├─ MAX BANK row (50px)  [−] value [+] ─────────────────────────────┤
 //  y=380  ├─ MAX PROGRAM row (50px) ──────────────────────────────────────────┤
-//  y=430  └─ ────────────────────────────────────────────────────────────────┘
+//  y=430  ├─ "NETWORK" label strip (20px) ───────────────────────────────────┤
+//  y=450  ├─ SERVER LINK row (50px)  [WIFI...] [PAIR SERVER] ────────────────┤
+//  y=500  └─ ────────────────────────────────────────────────────────────────┘
 
 static const int SP_W          = 960;
-static const int SP_H          = 540;
 
 static const int SP_HDR_H      = 50;
 static const int SP_HOME_X     = 830;
@@ -66,18 +67,20 @@ static const int SP_PAIR_X      = 775;
 static const int SP_PAIR_W      = 175;
 
 // ── Global MIDI limits (persisted via NVS) ────────────────────────────────────
-// Loaded on boot, saved when changed on SettingsPage.
+// Loaded on boot; SettingsPage saves them on finger-up after a change (one
+// NVS write per hold-repeat run, not one per step).
 // ColumnEditor uses these for program/bank wrap-around.
 extern uint8_t gMaxBank;       // 1-based display (stored as 0-based internally)
 extern uint8_t gMaxProgram;    // 1-based display (stored as 0-based internally)
 
 void loadMidiLimits();         // call once in setup()
-void saveMidiLimits();         // called by SettingsPage after change
+void saveMidiLimits();         // called by SettingsPage on finger-up after a change
 
-// ── Global WiFi channel (persisted via NVS) ───────────────────────────────────
-// Loaded on boot and applied to WiFi.setChannel() after gComms.begin().
-// Updated on SettingsPage WIFI row tap, which also sweep-sends MSG_SET_WIFI_CHANNEL
-// across all three channels so a mismatched server gets re-aligned.
+// ── Global WiFi channel index (persisted via NVS) ─────────────────────────────
+// Loaded on boot purely so the settings UI can show it — the client never
+// sets its own radio channel from it.  WiFiSettingsPage edits it: SAVE
+// persists a changed value and, in Server-AP mode with the link up, sends the
+// server one MsgSetWifiChannel.
 extern uint8_t gWifiChannelIdx;   // 0, 1, 2 → channels 1, 6, 11
 
 void loadWifiChannel();
@@ -108,6 +111,7 @@ private:
     int8_t  _month, _day, _hour, _minute, _second;
 
     HoldRepeat _hold;  // MIDI rows hold-repeat
+    bool    _midiDirty = false;   // gMaxBank / gMaxProgram changed, not yet in NVS
 
     void drawHeader();
     void drawSectionLabel();
@@ -117,6 +121,7 @@ private:
     void drawMidiRow(int field);
     void drawWifiSection();
     void adjustMidi(int field, int delta);
+    void flushMidiLimits();     // write the limits to NVS if they changed
     void fireMidiHeld();
     void readRTC();
     void applyNumpadResult();

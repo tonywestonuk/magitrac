@@ -11,12 +11,13 @@ static inline bool isDrums(uint8_t ch) { return ch == DRUM_MIDI_CHANNEL; }
 static inline bool isOrgan(uint8_t ch) { return ch == ORGAN_CHANNEL; }
 
 // ORGAN columns: the VOICE field picks the voice — the 4 synth types then the
-// procedural sounds.  Order mirrors the server's ORGAN_TYPE_NAMES +
-// PROC_SOUNDS registries (0..3 = types, 4+k = proc sound k).  The voice (and
+// procedural sounds.  Order mirrors the server's organ type numbering
+// (drawbar_organ.h) + its PROC_SOUNDS registry (0..3 = types, 4+k = proc
+// sound k).  The voice (and
 // the rest of the organ patch) lives ONCE per song in Song::organ.
 static const char* const ORGAN_VOICES[] =
-    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "TWO TRIBES", "CHOIR" };
-#define ORGAN_VOICE_COUNT 6
+    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "TWO TRIBES", "CHOIR", "THX" };
+#define ORGAN_VOICE_COUNT ((int)(sizeof(ORGAN_VOICES) / sizeof(ORGAN_VOICES[0])))
 
 // First ORGAN column creates the song's organ patch with playable defaults
 // (classic 888 registration); the organ page refines it from there.
@@ -178,9 +179,8 @@ void ColumnEditor::drawFieldRow(int field) {
     bool sfx = isSfx(_song.columns[_col].midiChannel);
     bool pxl = isPxl(_song.columns[_col].midiChannel);
     bool org = isOrgan(_song.columns[_col].midiChannel);
-    // BANK is meaningless on PXL and ORGAN (on SFX it hosts the live ROOT
+    // BANK is meaningless on PXL and ORGAN (on SFX it hosts the live TUNE
     // field); PROGRAM is meaningless on PXL.  Render greyed and disable +/-.
-    (void)sfx;
     bool disabled = (org && field == 1) || (pxl && (field == 1 || field == 2));
     uint16_t fg = disabled ? COL_DKGREY : COL_BLACK;
 
@@ -198,7 +198,7 @@ void ColumnEditor::drawFieldRow(int field) {
     _d.print(value);
 
     // −/+ buttons (not for NAME field — NAME row hosts the PICK INSTR/SAMPLE
-    // button instead).  BANK +/- is hidden when on SFX.
+    // button instead).  Disabled rows (see above) draw no buttons.
     if (field < 5) {
         if (disabled) {
             // No buttons drawn; row is purely informational.
@@ -226,11 +226,6 @@ void ColumnEditor::drawFieldRow(int field) {
 
 void ColumnEditor::drawAllFields() {
     for (int i = 0; i < CE_NUM_FIELDS; i++) drawFieldRow(i);
-}
-
-void ColumnEditor::drawPickButton() {
-    // PICK INSTR button is rendered as part of the NAME row (field 5).
-    drawFieldRow(5);
 }
 
 void ColumnEditor::draw() {
@@ -368,7 +363,7 @@ void ColumnEditor::drawPickSampleList() {
     uiButton(_d, (CE_W - 200) / 2, navY + CE_BTN_H + 8, 200, CE_BTN_H, "CANCEL", COL_DKGREY, COL_WHITE, 3);
 }
 
-// ── Action bar (COPY / PASTE) ────────────────────────────────────────────────
+// ── Action bar (CLEAR / COPY / PASTE / IMPORT DRUMS) ─────────────────────────
 
 // Column clipboard — one column's settings + one block's notes.  static so a
 // COPY survives closing/reopening the editor: paste into a different column
@@ -396,10 +391,10 @@ void ColumnEditor::drawActionBar() {
              "COPY",        COL_WHITE, COL_BLACK, 2);
     // PASTE greyed until something is copied.
     if (s_colClip.has)
-        uiButton(_d, CE_SWAP_X, btnY, CE_SWAP_W, CE_ACT_BTN_H,
+        uiButton(_d, CE_PASTE_X, btnY, CE_PASTE_W, CE_ACT_BTN_H,
                  "PASTE", COL_WHITE, COL_BLACK, 2);
     else
-        uiButton(_d, CE_SWAP_X, btnY, CE_SWAP_W, CE_ACT_BTN_H,
+        uiButton(_d, CE_PASTE_X, btnY, CE_PASTE_W, CE_ACT_BTN_H,
                  "PASTE", COL_WHITE, COL_DKGREY, 2);
     uiButton(_d, CE_IMPORT_X, btnY, CE_IMPORT_W, CE_ACT_BTN_H,
              "IMPORT DRUMS", COL_WHITE, COL_BLACK, 2);
@@ -413,7 +408,13 @@ void ColumnEditor::copyToClip() {
     s_colClip.settings = _song.columns[_col];
     Pattern& pat = _song.patterns[_patIdx];
     NoteGrid g(_song.notePool, &_song.noteFreeHead, &pat.noteHead);
-    for (uint8_t r = 0; r < MAX_ROWS; r++) s_colClip.notes[r] = g.get(r, _col);
+    // get() reads a missing cell as {0,0,0,0}, and velocity 0 is an EXPLICIT
+    // velocity — indistinguishable from a real velocity-only row.  Record
+    // missing cells as all-default (VEL_DEFAULT) so paste's set() clears them.
+    for (uint8_t r = 0; r < MAX_ROWS; r++) {
+        if (g.has(r, _col)) s_colClip.notes[r] = g.get(r, _col);
+        else                s_colClip.notes[r] = Note{ NOTE_EMPTY, VEL_DEFAULT, 0, 0 };
+    }
 }
 
 void ColumnEditor::pasteFromClip() {
@@ -421,10 +422,11 @@ void ColumnEditor::pasteFromClip() {
     _song.columns[_col] = s_colClip.settings;
     Pattern& pat = _song.patterns[_patIdx];
     NoteGrid g(_song.notePool, &_song.noteFreeHead, &pat.noteHead);
-    for (uint8_t r = 0; r < MAX_ROWS; r++) {
-        if (s_colClip.notes[r].note == NOTE_EMPTY) g.clear(r, _col);
-        else                                       g.set(r, _col, s_colClip.notes[r]);
-    }
+    // set() clears the cell itself for an all-default note (how copyToClip
+    // records a missing cell) and keeps velocity-only / attr-only rows (PXL
+    // slider + move rows, effect-only rows) that a "note == NOTE_EMPTY →
+    // clear" test would drop.
+    for (uint8_t r = 0; r < MAX_ROWS; r++) g.set(r, _col, s_colClip.notes[r]);
     _patchPending      = true;   // settings → server (existing patch path)
     _pasteNotesPending = true;   // this block's cells → server (targeted resync)
 }
@@ -491,7 +493,7 @@ void ColumnEditor::drawClearConfirm() {
              "NO",  COL_WHITE, COL_BLACK, 4);
 }
 
-// ── Apply COPY / SWAP / CLEAR ────────────────────────────────────────────────
+// ── Apply CLEAR ──────────────────────────────────────────────────────────────
 
 void ColumnEditor::doClearColumn(uint8_t col) {
     if (col >= MAX_COLUMNS) return;
@@ -552,7 +554,7 @@ void ColumnEditor::adjustField(int field, int delta) {
             }
             break;
         }
-        case 1: {  // BANK — ROOT on SFX; locked on PXL and ORGAN
+        case 1: {  // BANK — TUNE on SFX; locked on PXL and ORGAN
             if (isSfx(c.midiChannel)) {
                 // TUNE: ± cents from native pitch.  HoldRepeat's delta never
                 // accelerates (fixed ±1 every 80 ms), so grow the step while
@@ -798,7 +800,8 @@ bool ColumnEditor::poll() {
                 c.program   = inst.program;
                 c.volume    = inst.volume;
                 c.transpose = inst.transpose;
-                strncpy(c.name, inst.name, INSTRUMENT_NAME_LEN);
+                strncpy(c.name, inst.name, INSTRUMENT_NAME_LEN - 1);
+                c.name[INSTRUMENT_NAME_LEN - 1] = '\0';
                 _patchPending = true;
             }
             _picking = false;
@@ -872,7 +875,8 @@ bool ColumnEditor::poll() {
 
         if (f == 5) break;  // NAME handled above on falling edge
         // Suppress +/- on disabled rows: BANK is locked on PXL (on SFX it's
-        // the live ROOT field), PROGRAM is locked on PXL.
+        // the live TUNE field), PROGRAM is locked on PXL.  (ORGAN's BANK lock
+        // is enforced inside adjustField.)
         if (f == 1 && isPxl(cs().midiChannel)) break;
         if (f == 2 && isPxl(cs().midiChannel)) break;
         // −/+ buttons (fields 0-4)
@@ -898,9 +902,11 @@ bool ColumnEditor::poll() {
         return false;
     }
 
-    // PICK INSTRUMENT / SAMPLE button — no picker on PXL or drums (kit picker).
+    // PICK INSTRUMENT / SAMPLE button — no picker on PXL, drums (kit picker)
+    // or ORGAN (voice picker): same test drawFieldRow uses to draw it.
     // On SFX the gap is split: [PICK][EDIT] — EDIT opens the trim/loop editor.
     if (!isPxl(cs().midiChannel) && !isDrums(cs().midiChannel) &&
+        !isOrgan(cs().midiChannel) &&
         ty >= CE_PICK_Y && ty < CE_PICK_Y + CE_PICK_H) {
         if (isSfx(cs().midiChannel) &&
             tx >= CE_PICK_X + 180 && tx < CE_PICK_X + CE_PICK_W) {
@@ -957,7 +963,7 @@ bool ColumnEditor::poll() {
             _d.paintLater();
             return false;
         }
-        if (tx >= CE_SWAP_X && tx < CE_SWAP_X + CE_SWAP_W) {
+        if (tx >= CE_PASTE_X && tx < CE_PASTE_X + CE_PASTE_W) {
             if (s_colClip.has) {          // PASTE — confirm the overwrite
                 _action = Action::CONFIRM_PASTE;
                 drawPasteConfirm();

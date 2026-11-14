@@ -37,8 +37,6 @@ static const int PPS_BACK_W      = 130;
 
 // Two rows of [-] [VALUE] [+] with a label above each.
 static const int PPS_LABEL_X     = 60;
-static const int PPS_LABEL_W     = 360;
-static const int PPS_LABEL_TS    = 4;
 
 static const int PPS_BTN_W       = 100;
 static const int PPS_BTN_H       = 100;
@@ -156,18 +154,9 @@ void PixelPostSettingsPage::drawSmoothingRow() {
 }
 
 void PixelPostSettingsPage::redrawAndSync() {
-    drawBrightnessRow();
-    drawSmoothingRow();
-    // Re-render the help line so the "Layer disabled" text appears/clears.
-    _d.fillRect(0, PPS_HELP_Y, PPS_W, PPS_H - PPS_HELP_Y, COL_WHITE);
-    _d.setTextSize(2);
-    _d.setTextColor(COL_DKGREY);
-    _d.setCursor(PPS_LABEL_X, PPS_HELP_Y);
-    if (gPixelPostFlashCtrl == 0) {
-        _d.print("Layer disabled - posts run at full brightness, no smoothing.");
-    } else {
-        _d.print("Smoothing 0=instant 4=~1s ramp. Brightness 15=full 0=black.");
-    }
+    // Both value rows plus the help line, whose "Layer disabled" text
+    // appears/clears with the value.
+    drawRows();
     _d.paintLater();
     savePixelPostFlashCtrl();
     gServerPairing.sendPixelpostFlashCtrl(gPixelPostFlashCtrl);
@@ -186,12 +175,10 @@ bool PixelPostSettingsPage::poll() {
         return false;
     }
 
-    bool rising  = ( down && !_wasDown);
-    bool falling = (!down &&  _wasDown);
+    bool falling = (!down && _wasDown);
     _wasDown = down;
 
     if (!falling) return false;
-    (void)rising;
 
     if (hitBack(sx, sy)) {
         _open = false;

@@ -7,12 +7,16 @@
 // ── KeyboardPopup — full-screen QWERTY text entry (960×540) ──────────────────
 //
 // Layout:
-//   y=  0  ┌─ Text field (75px) — black bg, white text ──────────────────────┐
+//   y=  0  ┌─ Text field (75px) — black bg, white text; ["123"/"ABC"] layer
+//          │  toggle button at its left ─────────────────────────────────────┐
 //   y= 75  ├─ Row 1: Q W E R T Y U I O P (10 × 96px slots, key h=108) ──────┤
 //   y=191  ├─ Row 2: A S D F G H J K L   (offset 48px) ─────────────────────┤
-//   y=307  ├─ Row 3: Z X C V B N M  [BKSP: 2 slots] (offset 96px) ──────────┤
-//   y=423  ├─ Row 4: [CANCEL / 3 slots] [SPACE / 4 slots] [DONE / 3 slots] ──┤
+//   y=307  ├─ Row 3: [shift] Z X C V B N M  [BKSP: 2 slots] ────────────────┤
+//   y=423  ├─ Row 4: [CANCEL] [SPACE] [DONE]  (320px each) ─────────────────┤
 //   y=540  └──────────────────────────────────────────────────────────────────┘
+//
+// The symbol layer swaps the three letter rows for digits / punctuation and
+// leaves the shift slot blank.
 
 static const int KBD_W         = 960;
 static const int KBD_H         = 540;
@@ -33,12 +37,14 @@ class KeyboardPopup {
 public:
     KeyboardPopup(EPD_PainterAdafruit& display, GT911_Lite& touch);
 
-    // Open keyboard; edits buf (max maxLen chars, must be null-terminated).
-    // Caller owns buf; keyboard writes into it directly.
+    // Open keyboard; edits buf in place (must be null-terminated).  maxLen is
+    // the buffer size INCLUDING the terminator: typing stops at maxLen - 1
+    // characters.  Caller owns buf; the keyboard writes into it directly as
+    // keys are tapped.  CANCEL puts back the text buf held when open() was
+    // called, so a cancelled edit leaves the caller's buffer untouched.
     void open(char* buf, uint8_t maxLen);
 
     bool isOpen() const { return _open; }
-    void close()        { _open = false; }
 
     // Full redraw — call once after open()
     void draw();
@@ -48,7 +54,8 @@ public:
     bool poll();
     bool isDone() const { return _done; }
 
-    // Toggle between alpha and symbol/number layer (boot button alt mode).
+    // Toggle between alpha and symbol/number layer (the "123"/"ABC" button in
+    // the text field calls this).
     void toggleSymbolLayer();
 
 private:
