@@ -16,6 +16,9 @@ your timing.
 - **[Reference](docs/reference.md)** — note cues, effects, block
   navigation, exact sequencer semantics
 - **[Lights](docs/lights.md)** — the PixelPost/DMX light system
+- **[Fumble recall](paper/fumble-recall.md)** — a short paper on how the
+  sequencer treats a fumbled cue: it acts on the first key, and for half a
+  row the last key counts
 
 ## Repository layout
 
@@ -23,7 +26,8 @@ your timing.
 - **`magitrac_server_s3/`** — server (M5Stack CoreS3 + Module Audio): sequencer, MIDI out, sample playback, drawbar organ, chord recogniser, touch UI.
 - **`magitrac_lib/`** — shared library: song data model, MagiLink TCP transport, pairing.
 - **`magitrac_gigbar_dmx/`, `magitrac_dmx/`** — PixelPost/DMX light nodes driven by the server over ESP-NOW broadcast.
-- **`magitrac_server/`** — frozen fallback server build (M5Core Basic, ESP32 classic).
+- **`magitrac_server/`** — the original server (M5Core Basic, ESP32 classic). Obsolete and no longer builds; kept for reference.
+- **`paper/`** — the fumble-recall paper and the replay experiment behind it.
 
 Client and server pair over a dedicated softAP network; the client is the editor/remote, the server is the brain that drives synths, samples and lights in time.
 

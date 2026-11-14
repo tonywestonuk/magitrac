@@ -83,6 +83,19 @@ A block-level **key-change mode** additionally decides what happens
 positionally when the performer's pitch class changes: `SAME` keeps the
 row; `TOP` follows the block's end-navigation and restarts from row 0.
 
+### Fumbled cues — the last key counts
+
+A key that does something (takes a cue, switches block, transposes) acts
+**immediately**. For **half a row** afterwards, a *different* key takes it
+back: the sequencer returns to where it was before the first key and acts on
+the new one from there, and any notes the first key started are cut. So if
+you catch a wrong key on the way to the right one, just land the right one —
+you end up exactly where you would have without the slip.
+
+The earlier key stands if the later one is the same key, would do exactly the
+same thing (a chord on an any-key cue), or means nothing in that block. The
+background and measurements are in [the paper](../paper/fumble-recall.md).
+
 ## Effects (output columns)
 
 Effects are entered as two hex bytes (effect, then param):
@@ -90,6 +103,7 @@ Effects are entered as two hex bytes (effect, then param):
 | Hex | Name | What it does |
 |---|---|---|
 | `1B` `xx` | **Retrigger** (ratchet) | replays the note evenly within its own row; param = total hits (0/1 mean 2; clamped 2–8). `1B04` = four hits per row. The next note or OFF cancels a roll in flight. MIDI columns only |
+| `0A` `xx` | **Pan** | sends MIDI CC 10 on the column's channel: `00` hard left, `40` centre, `7F` right. Sent only where it is written — nothing re-centres it for you. MIDI columns only |
 | `A0` `xx` | **Set tempo** | param = BPM (clamped to the song's min/max). Holds until the next WAIT snap re-derives the tempo. MIDI columns only |
 | `FF` `FF` | **STOP** | halts the sequencer and sends note-offs on every active column — a hard end-of-song |
 
