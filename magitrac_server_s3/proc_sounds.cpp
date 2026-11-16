@@ -27,6 +27,14 @@ const ProcSoundInfo PROC_SOUNDS[PROC_SOUND_COUNT] = {
     // Peaks stay well clear of clip at 1-3 notes; raise further if still quiet.
     { "THX",        5, { "SWEEP", "SPREAD", "BRIGHT", "STACK", "DETUNE" },
                        { 5, 4, 6, 6, 3 }, 128, 0, 2500 },
+    // VOCODER — mic-driven channel vocoder (own render path in
+    // drawbar_organ.cpp; slider meanings in proc_sounds.h).  Defaults: a plain
+    // sawtooth, no width LFO, the gate and smoothing where the bench had them.
+    // gain 4: the oscillator at full = 32 drawbar-units, as a saw needs to be
+    // to fill the vowel bands.  relMs 60: notes let go a little softer than
+    // the organ's 12 ms.
+    { "VOCODER",    5, { "WAVE", "PWM", "SSS", "GATE", "SMOOTH" },
+                       { 0, 0, 4, 1, 3 }, 4, 0xFF, 60 },
 };
 
 // ── TWO TRIBES — the FGTH bass stab ───────────────────────────────────────────
@@ -105,6 +113,7 @@ static const int32_t MORPH_INC[PROC_SOUND_COUNT] = {
     (int32_t)(65536.0 * 128 /* BLOCK_FRAMES */ / (0.080 * AUDIO_CODEC_RATE_HZ)),
     (int32_t)(65536.0 * 128 /* BLOCK_FRAMES */ / (0.300 * AUDIO_CODEC_RATE_HZ)),
     0,   // THX has its own render path — no wavetable morph
+    0,   // VOCODER likewise
 };
 
 int16_t* gProcTabA[PROC_SOUND_COUNT];   // PSRAM (procSoundsInit allocates)
@@ -213,6 +222,7 @@ void procSoundsInit() {
     buildFormantStage(1, 1, 1050.0f, 3.0f, 2.00f, true);   // "ah" F2
     buildFormantStage(1, 2, 2800.0f, 3.0f, 2.00f, true);   // singer's formant
     gProcFormantNstage[PROC_IDX_THX] = 0;                  // THX: no formant
+    gProcFormantNstage[PROC_IDX_VOC] = 0;                  // VOCODER: none (and bypassed)
 
     // THX sawtooth wavetable (sum of harmonics 1/h, mildly band-limited).
     {

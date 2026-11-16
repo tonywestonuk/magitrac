@@ -131,11 +131,14 @@ public:
     bool sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
                              uint8_t col = 0xFF);   // col: SFX sample audition source
 
-    // Sample editor: GET requests meta+overview (arrives via sampleInfo*),
-    // SET stores trim/loop metadata, STOP ends a looping audition.
+    // Sample editor / sample page: GET requests meta+overview (arrives via
+    // sampleInfo*), SET stores trim/loop/tune metadata, STOP silences the
+    // sample player, PLAY sounds the sample at `note` (60 = native), KEYS
+    // makes the server's MIDI-in keys play it (see SampleEditOp).
     bool sendSampleEdit(uint8_t op, uint8_t sampleId,
                         uint32_t startFrame = 0, uint32_t endFrame = 0,
-                        uint8_t loop = 0);
+                        uint8_t loop = 0, int16_t tuneCents = 0,
+                        uint8_t note = 60);
     bool sampleInfoPending() const   { return _sampleInfoPending; }
     void clearSampleInfo()           { _sampleInfoPending = false; }
     const MsgSampleInfo& sampleInfo() const { return _sampleInfo; }

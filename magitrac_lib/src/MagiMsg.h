@@ -411,11 +411,12 @@ struct MsgSetWifiChannel {
 //  ORGAN_OP_PARAM     → per-type knob: `index` = knob 0..2, `value` 0..8
 //  ORGAN_OP_PROCSEL   → PROC type: select procedural sound `value`
 //  ORGAN_OP_REVERB    → stereo reverb: `value` 0=off,1=room,2=hall
-//  ORGAN_OP_VOCODER   → mic vocoder: `value` 0=off,1=on (organ = carrier, mic = modulator)
+//  (10 was ORGAN_OP_VOCODER — the vocoder is now a procedural sound, chosen
+//   with ORGAN_OP_PROCSEL like the others.)
 enum OrganOp : uint8_t {
     ORGAN_OP_EXIT = 0, ORGAN_OP_ENTER = 1, ORGAN_OP_SET = 2, ORGAN_OP_TYPE = 3,
     ORGAN_OP_VIBCHORUS = 4, ORGAN_OP_LESLIE = 5, ORGAN_OP_DRIVE = 6, ORGAN_OP_PARAM = 7,
-    ORGAN_OP_PROCSEL = 8, ORGAN_OP_REVERB = 9, ORGAN_OP_VOCODER = 10
+    ORGAN_OP_PROCSEL = 8, ORGAN_OP_REVERB = 9
 };
 struct MsgOrgan {
     uint8_t  id     = MSG_ORGAN;
@@ -701,19 +702,38 @@ struct MsgMidiNoteIn {
 };
 
 // ── Sample editor (non-destructive trim/loop) ─────────────────────────────────
-// The WAV files never change: per-sample metadata (start/end frame + loop
-// flag) lives in /samples/trim.txt on the server and is applied at playback
-// (and at PSRAM preload — the cache holds just the trimmed region).
+// The WAV files never change: per-sample metadata (start/end frame, loop flag
+// and a TUNE offset) lives in /samples/trim.txt on the server and is applied
+// at playback (and at PSRAM preload — the cache holds just the trimmed region).
 enum SampleEditOp : uint8_t {
     SAMPLE_EDIT_GET  = 0,   // reply with MsgSampleInfo; startFrame/endFrame =
                             // the VIEW window to render peaks for (0,0 = all),
                             // so a zoomed view gets full-resolution peaks
     SAMPLE_EDIT_SET  = 1,   // store startFrame/endFrame/loop for sampleId
-    SAMPLE_EDIT_STOP = 2,   // stop audition playback (needed for looped play)
+    SAMPLE_EDIT_STOP = 2,   // stop audition playback (needed for looped play);
+                            // while a song runs, only what PLAY started
     SAMPLE_EDIT_SPEC = 3,   // reply with a spectrogram of the trimmed region:
                             // SAMPLE_SPEC_PAGES × MsgSampleInfo, kind = page+1,
                             // peaks[] = SAMPLE_SPEC_PAGE_BYTES of slice data
+    SAMPLE_EDIT_PLAY = 4,   // play sampleId once, no column involved: `note`
+                            // sets the pitch (60 = native + the sample's TUNE).
+                            // Works over a running song.
+    SAMPLE_EDIT_KEYS = 5,   // sampleId != 0: live MIDI-in keys play this sample
+                            // on the server (key down = sound, key up = stop),
+                            // stopped or over a running song (where the keys
+                            // stay the song's cues as well).
+                            // A LEASE, not a switch: the client repeats it every
+                            // SAMPLE_KEYS_RENEW_MS and the server drops the mode
+                            // SAMPLE_KEYS_LEASE_MS after the last one, so a
+                            // client that vanishes can't leave it on.
+                            // sampleId 0 = off now.
+    SAMPLE_EDIT_PADS = 6,   // sampleId != 0: the samples page (the squares) is
+                            // open — load every sample that fits into memory
+                            // so the squares are polyphonic.  A lease like
+                            // KEYS, renewed the same way; 0 = closed.
 };
+#define SAMPLE_KEYS_RENEW_MS  2000
+#define SAMPLE_KEYS_LEASE_MS  6000
 
 // Spectrogram (Fairlight Page-D waterfall — display only): SLICES time steps
 // × BINS log-spaced frequency bins (60 Hz .. 8 kHz), one magnitude byte each.
@@ -730,6 +750,8 @@ struct MsgSampleEdit {
     uint32_t startFrame;    // SET only
     uint32_t endFrame;      // SET only; 0 = end of file
     uint8_t  loop;          // SET only; 0/1
+    int16_t  tuneCents;     // SET only; the sample's own TUNE, ± cents
+    uint8_t  note;          // PLAY only; MIDI note, 60 = native pitch
 };
 
 // Waveform overview: min/max peak pairs, int8 (-127..127), one pair per
@@ -749,6 +771,7 @@ struct MsgSampleInfo {
     uint32_t endFrame;      // stored meta; 0 = end of file
     uint32_t viewStart;     // window the peaks cover (echoes the GET request)
     uint32_t viewEnd;
+    int16_t  tuneCents;     // stored meta: the sample's own TUNE, ± cents
     int8_t   peaks[SAMPLE_OVERVIEW_N * 2];   // min,max per column of the window
 };
 

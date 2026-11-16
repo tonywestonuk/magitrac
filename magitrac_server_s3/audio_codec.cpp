@@ -195,3 +195,10 @@ bool audioCodecRecord(uint8_t* buf, size_t bytes) {
     size_t got = 0;
     return i2s_channel_read(sRx, buf, bytes, &got, portMAX_DELAY) == ESP_OK;
 }
+
+size_t audioCodecRecordSome(uint8_t* buf, size_t bytes, uint32_t waitMs) {
+    if (!sReady || !sRx || s_reconfiguring) return 0;
+    size_t got = 0;
+    i2s_channel_read(sRx, buf, bytes, &got, pdMS_TO_TICKS(waitMs));   // a timeout still reports what it got
+    return got;
+}

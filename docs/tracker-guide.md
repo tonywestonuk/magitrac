@@ -61,7 +61,7 @@ to its SD card. Explicit SAVE / SAVE AS lives in the song browser.
 
 Tap "MENU" for the main menu: **SONG** (song settings), **INSTRUMENTS**,
 **SETTINGS**, **BACKUP**, **PERFORM**, **POSTS** (manual light control),
-**PAIR**, and **ORGAN**. Tap outside the box to dismiss.
+**PAIR**, **ORGAN** and **SAMPLES**. Tap outside the box to dismiss.
 
 ## Song browser (tap the song name)
 
@@ -146,7 +146,7 @@ synth while you work.
 
 **Import** (from the Drum Editor or Column Editor) — reads
 drum-patterns.com-style text files from the `/drumtracks/` folder on the
-**server's SD card** (put them there via the server's USB mode). Pick a
+**server's SD card** (copy them on with the card in a computer). Pick a
 file, pick which pattern block from it, choose a kit, audition, and IMPORT
 — it fills consecutive columns with the drum lanes. An optional
 `gm_map.txt` on the card customises the two-letter-code → GM-note mapping.
@@ -163,6 +163,11 @@ tagged **IMM** or **QUE**:
 - The header buttons (**SETLIST / EDIT / HOME**) need a **½-second hold**
   — quick taps are ignored so a mid-song fumble can't throw you off the
   page. EDIT opens pad setup (names + IMMEDIATE/QUEUED per pad).
+- Two **icon buttons** sit in a column under HOME, beside the pads: the
+  drawbars-and-keyboard icon opens the [Organ](#organ-menu--organ) page
+  and the waveform icon opens the [Samples](#samples-menu--samples) page.
+  They need the same ½-second hold. The song keeps playing while you are
+  there, and **BACK** on either page returns here.
 
 The **light strip** along the bottom controls the PixelPost rig live:
 **&lt; FX / FX &gt;** step the light effect (grabbing control from the
@@ -193,10 +198,81 @@ exit you're asked "SAVE INSTRUMENTS?" — YES pushes the bank to the server.
 ## Organ (MENU → ORGAN)
 
 Live control of the server's drawbar organ: drag the nine drawbars, tap the
-voice type to cycle (DRAWBAR / TONEWHEEL / CLAUDE / NEBULA / SAMPLE),
-toggle **VIB / LESLIE / DRIVE**, or grab a preset (FULL, JAZZ, GOSPEL,
-FLUTE, ROCK). Play your MIDI keyboard to sound it; every tweak streams
-live. HOME exits organ mode on both devices.
+voice type to cycle (DRAWBAR / TONEWHEEL / CLAUDE / NEBULA / PROC),
+toggle **VIB / LESLIE / DRIVE / VERB**, or grab a preset (FULL, JAZZ,
+GOSPEL, FLUTE, ROCK). Play your MIDI keyboard to sound it; every tweak
+streams live. HOME exits organ mode on both devices.
+
+The **PROC** type swaps the drawbars for a list of built sounds, each with
+its own five sliders: TWO TRIBES, CHOIR, THX and **VOCODER**.
+
+**VOCODER** makes the notes you hold speak whatever goes into the server's
+microphone. Hold a chord and talk or sing; with no keys held it is silent.
+
+- **WAVE** — the tone being vocoded. 0 is a sawtooth (full). 1 to 8 are a
+  pulse, from square at 1 (hollow, reedy) down to thin and buzzy at 8.
+- **PWM** — a slow wobble on the pulse's width, slightly different for each
+  held note, which makes a chord shimmer. It does nothing on the sawtooth,
+  and less the thinner the pulse is.
+- **SSS** — how much hiss is added for consonants like s, t and f.
+- **GATE** — how loud the microphone has to be before the vocoder opens.
+  Raise it on a loud stage so the band doesn't trigger it; too high and it
+  starts cutting your quieter words.
+- **SMOOTH** — how slowly the sound lets go of each part of your voice.
+  Low is crisp and robotic, with the clearest words; high is smeared and
+  choral.
+
+## Samples (MENU → SAMPLES)
+
+Every WAV in the server's `/samples/` folder as a square, 18 to a page
+(**<** / **>** turn the page when there are more).
+
+- **Tap a square** — that sample goes **on the keys**: your MIDI keyboard
+  now plays it at the pitch of each key (and, with a song playing, the keys
+  go on cueing the song as usual). Its square turns black with white text.
+  Tap it again to take it off the keys, or tap another square to move it.
+  The tap itself makes no sound.
+- **Hold a square** for half a second:
+  - with the song **stopped**, the sample editor opens for that sample;
+  - with a song **playing**, the sample plays once, at its own pitch.
+- **STOP** silences everything; it is how you end a sample whose LOOP is on.
+  While a song is playing it stops only what this page started.
+
+The page doesn't need a song loaded, and it works over a running song.
+
+**How many at once.** While this page is open the server loads the samples
+into memory, shortest first, and those play up to eight at a time — your
+keys, held squares and the song's own samples together. A sample with more than 2 MB of
+audio (about 23 seconds of mono at 44.1 kHz, half that in stereo), or one
+there is no room left for (6 MB in all), plays from the SD card instead, and
+there is only one such stream: starting another replaces it, and so does a
+song sample that streams — in either direction. Loading takes a few
+seconds after the page first opens; until a sample is in, it streams.
+
+While the organ is sounding (the organ page, or a song with an organ
+column) samples are silent, squares included: the organ and the sample
+player share the one audio output.
+
+### Sample editor
+
+Also reached from a sample column's Column Editor (**EDIT** next to PICK
+SAMPLE). Nothing here alters the WAV: the settings are stored beside it and
+belong to the sample, so they apply in every song that uses it.
+
+- **Start / end** — drag either marker on the waveform. **ZOOM −/+**, the
+  scrollbar, or dragging the waveform itself move around a long sample.
+  With more than 3 MB of audio in view the waveform is a quick estimate
+  (so even a very long sample opens in about two seconds); zoom in and it
+  is exact.
+- **LOOP** — a held note keeps repeating the region between the markers.
+- **TUNE −/+** — the sample's pitch, shown as semitones.cents. A tap is one
+  cent; hold to run faster. A sample column's own TUNE is added on top.
+- **PLAY / STOP** — hear it. **SPECTRUM** shows a waterfall of the region.
+- **Your MIDI keyboard plays the sample** while the editor is open (with
+  the song stopped): middle C is its tuned pitch, the other keys repitch
+  it, and chords work once the sample has loaded into memory (up to 2 MB
+  of audio).
+- **BACK** returns to the squares, or to the column you came from.
 
 ## Lights, manually (MENU → POSTS)
 

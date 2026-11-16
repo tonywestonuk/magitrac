@@ -85,78 +85,200 @@ static volatile bool s_sustain  = false;   // damper pedal (MIDI CC64) held
 // Classic channel vocoder: the mic (modulator) is split into N log-spaced bands;
 // each band's amplitude envelope gates the SAME band of the organ (carrier), so
 // the held chord "speaks/sings" the mic.  Bandpass biquads are RBJ BPF (0 dB peak
-// gain), one coefficient set per band shared by the modulator + carrier filters.
-// A sibilance path injects filtered noise so consonants (s/t/f) come through.
-// Runs in float (the FX chain already does); only when both organ + vocoder on.
+// gain).  Runs in float (the FX chain already does); only when both organ +
+// vocoder are on.
+//
+// Reworked Nov 2026 after measuring the first version on the bench (its actual
+// code, run on recorded speech — the mic itself had been proven clean with the
+// hold-to-record test):
+//   • Its "sibilance" path added white noise in proportion to the whole voice,
+//     not just the consonants, and regardless of the organ: it came out 4 dB
+//     LOUDER than the voice-shaped organ, and played with no keys held.  That
+//     hiss was most of what you heard.  Consonant noise is now fed into the top
+//     bands of the CARRIER instead (see vocoderProcess), so the mic's own
+//     band envelopes decide when it sounds and no keys = silence.
+//   • The output sat 9 dB below the dry organ and depended on how loud / close
+//     the voice was.  It now follows the voice's level slowly and scales by it.
+//   • The envelope followers were fast enough (1 ms / 10 ms) to carry the
+//     voice's own pitch into the organ as a buzz.  Slower, with a smoothing
+//     stage: half the wobble.
+//   • Analysis filters are a little narrower than the synthesis ones, so each
+//     band listens to less of its neighbours.
+//   • The organ is a poor thing to shape: an 8-8-8 registration has 0.2% of
+//     its energy between 600 Hz and 3.4 kHz, where vowels differ, so the voice
+//     could only turn it up and down ("it just changes the volume").  The
+//     vocoder was therefore taken off the drawbar organ altogether and made a
+//     PROC sound of its own (PROC_IDX_VOC): each held note is one oscillator
+//     (vocOsc) — a sawtooth, or a pulse of one of eight widths, by the WAVE
+//     slider, the pulse with a slow per-note LFO on its width (PWM) — and
+//     those are the carrier.  (No sine: it has no harmonics for a vowel to
+//     shape.)
+//     The bands above 500 Hz get a fixed treble lift.
+// The times, Qs, gain and lift below are bench-derived starting points — tune
+// by ear.  SSS, GATE and SMOOTH are on sliders: they depend on the voice, the
+// mic, how loud the stage is, and taste.
 #define VOC_BANDS 16
-static const float VOC_F_LO = 180.0f, VOC_F_HI = 7000.0f, VOC_Q = 5.0f;
-static const float VOC_ATK  = 0.030f, VOC_REL = 0.0030f;  // env one-pole coefs (fast up / slow down)
-static float s_vocGain = 3.2f;    // makeup loudness — ear-tune knob
-static float s_vocSib  = 1.5f;    // sibilance/noise amount — ear-tune knob
+static const float VOC_F_LO = 180.0f, VOC_F_HI = 7000.0f;
+static const float VOC_Q_MOD = 7.0f;         // analysis (mic) filters
+static const float VOC_Q_CAR = 4.0f;         // synthesis (organ) filters
+static const float VOC_ATK_MS = 2.0f;        // envelope follower attack
+// Its release, and the smoothing after it, come from the SMOOTH slider (0..8):
+// release = 5 ms × 2^(slider/2) → 5, 7, 10, 14, 20, 28, 40, 57, 80 ms, with the
+// smoothing stage at 0.4 of that (kept within 3 … 25 ms).  3 is the bench
+// setting (14 ms / 5.7 ms).  See vocSetSmooth().
+#define VOC_NOISE_BAND 12          // bands from here up (3.4 kHz+) also carry noise
+static float s_vocGain = 2.0f;     // output level when the loudest band is at the reference — ear-tune knob
+static float s_vocSib  = 0.3f;     // consonant noise, relative to the chord's own level — set per block from the SSS slider
+static const float VOC_SIB_PER_STEP = 0.075f;   // SSS slider 0..8 → 0 .. 0.6 (4 = 0.3)
+#define VOC_CARRIER_SHIFT 1        // extra headroom on the summed carrier (chords would clip)
+// Treble lift on the bands above VOC_LIFT_HZ: gain = (f / VOC_LIFT_HZ)^VOC_LIFT_EXP
+// (0.5 = +3 dB per octave).  Speech and a sawtooth both fall away with
+// frequency; without a lift the upper formants come out too faint to hear.
+static const float VOC_LIFT_HZ = 500.0f, VOC_LIFT_EXP = 0.5f, VOC_LIFT_MAX = 8.0f;
+// Pulse width: WAVE slider 1..8 → 50% (square) … 6%, in equal steps.  PWM
+// slider 0..8 → an LFO swings the width either side of that, by PWM/8 of the
+// room there is down to VOC_WIDTH_MIN (so a square at PWM 8 sweeps 4%…96%, and
+// a thin pulse only a little — it has nowhere to go).  The LFO runs at about
+// VOC_PWM_HZ, each note a little different and starting somewhere different,
+// so a chord shimmers rather than pumping.
+static const float VOC_WIDTH_WIDE = 0.50f, VOC_WIDTH_THIN = 0.06f;
+static const float VOC_PWM_HZ = 0.7f, VOC_WIDTH_MIN = 0.04f;
+// A square wave carries about 5 dB more energy than a sawtooth of the same
+// height; the pulse is drawn this much shorter so moving WAVE off the sawtooth
+// changes the tone and not the loudness.
+static const float VOC_PULSE_PEAK = 32767.0f * 0.6f;
+static const float VOC_REF_FLOOR = 250.0f;   // the level follower never boosts beyond 1/this
+// Band level treated as silence.  GATE slider 0..8 → 12.5 × 2^slider: 12 … 3200
+// (each step doubles it = 6 dB; 1 = the bench value, 25).  For scale, normal
+// speech close to the mic puts its strong bands at roughly 500–3000.
+static float voc_gate = 25.0f;
 
-static volatile bool s_vocoder = false;
+// Set by the audio task for each pass: the VOCODER sound is selected AND its
+// mic feed is in step (see organTaskFn).  renderBlock runs the vocoder only then.
+static bool    s_vocBlock = false;
 static int16_t s_micBlock[BLOCK_FRAMES * 2];   // modulator block (LEFT = mic), full-duplex
 
-// b1 = 0 for a BPF, so store only b0(=-b2), a1, a2.
-static float voc_b0[VOC_BANDS], voc_a1[VOC_BANDS], voc_a2[VOC_BANDS];
+static float voc_mb0[VOC_BANDS], voc_ma1[VOC_BANDS], voc_ma2[VOC_BANDS];   // analysis (mic)
+static float voc_cb0[VOC_BANDS], voc_ca1[VOC_BANDS], voc_ca2[VOC_BANDS];   // synthesis (organ)
 static float voc_mx1[VOC_BANDS], voc_mx2[VOC_BANDS], voc_my1[VOC_BANDS], voc_my2[VOC_BANDS];
 static float voc_cx1[VOC_BANDS], voc_cx2[VOC_BANDS], voc_cy1[VOC_BANDS], voc_cy2[VOC_BANDS];
-static float voc_env[VOC_BANDS];
-static float voc_hpLp = 0.0f, voc_sibEnv = 0.0f;
+static float voc_env[VOC_BANDS], voc_sm[VOC_BANDS];
+static float voc_lift[VOC_BANDS];
+static float voc_ref = 0.0f, voc_carEnv = 0.0f;
+static float voc_kAtk, voc_kRel, voc_kSm, voc_kRefUp, voc_kRefDn, voc_kCarUp, voc_kCarDn;
 static uint32_t voc_rng = 0x1357BD13u;
 
 static void vocoderReset() {
     for (int b = 0; b < VOC_BANDS; b++) {
         voc_mx1[b]=voc_mx2[b]=voc_my1[b]=voc_my2[b]=0.0f;
         voc_cx1[b]=voc_cx2[b]=voc_cy1[b]=voc_cy2[b]=0.0f;
-        voc_env[b]=0.0f;
+        voc_env[b]=voc_sm[b]=0.0f;
     }
-    voc_hpLp = 0.0f; voc_sibEnv = 0.0f;
+    voc_ref = VOC_REF_FLOOR; voc_carEnv = 0.0f;
+}
+
+static void vocBpf(float f0, float q, float& b0, float& a1, float& a2) {
+    float w0 = 2.0f * PI * f0 / AUDIO_CODEC_RATE_HZ;
+    float alpha = sinf(w0) / (2.0f * q);
+    float a0 = 1.0f + alpha;
+    b0 = alpha / a0;  a1 = (-2.0f * cosf(w0)) / a0;  a2 = (1.0f - alpha) / a0;   // b1 = 0, b2 = -b0
+}
+static float vocCoef(float ms) { return 1.0f - expf(-1000.0f / (ms * AUDIO_CODEC_RATE_HZ)); }
+
+// SMOOTH slider (0..8) → the envelope release + smoothing coefficients.
+static void vocSetSmooth(int slider) {
+    float rel = 5.0f * powf(2.0f, (float)slider * 0.5f);
+    float sm  = rel * 0.4f;
+    if (sm < 3.0f)  sm = 3.0f;
+    if (sm > 25.0f) sm = 25.0f;
+    voc_kRel = vocCoef(rel);
+    voc_kSm  = vocCoef(sm);
 }
 
 static void vocoderInit() {
     for (int b = 0; b < VOC_BANDS; b++) {
         float f0 = VOC_F_LO * powf(VOC_F_HI / VOC_F_LO, (float)b / (VOC_BANDS - 1));
-        float w0 = 2.0f * PI * f0 / AUDIO_CODEC_RATE_HZ;
-        float alpha = sinf(w0) / (2.0f * VOC_Q);
-        float a0 = 1.0f + alpha;
-        voc_b0[b] = alpha / a0;                 // b2 = -b0, b1 = 0
-        voc_a1[b] = (-2.0f * cosf(w0)) / a0;
-        voc_a2[b] = (1.0f - alpha) / a0;
+        vocBpf(f0, VOC_Q_MOD, voc_mb0[b], voc_ma1[b], voc_ma2[b]);
+        vocBpf(f0, VOC_Q_CAR, voc_cb0[b], voc_ca1[b], voc_ca2[b]);
+        float lift = powf(f0 / VOC_LIFT_HZ, VOC_LIFT_EXP);
+        voc_lift[b] = (lift < 1.0f) ? 1.0f : (lift > VOC_LIFT_MAX) ? VOC_LIFT_MAX : lift;
     }
+    voc_kAtk   = vocCoef(VOC_ATK_MS);
+    vocSetSmooth(3);                    // until the slider says otherwise
+    voc_kRefUp = vocCoef(10.0f);        voc_kRefDn = vocCoef(1500.0f);
+    voc_kCarUp = vocCoef(5.0f);         voc_kCarDn = vocCoef(80.0f);
     vocoderReset();
 }
 
-static inline float vocBiquad(float x, int b, float& x1, float& x2, float& y1, float& y2) {
-    float y = voc_b0[b] * (x - x2) - voc_a1[b] * y1 - voc_a2[b] * y2;   // b1=0, b2=-b0
-    x2 = x1; x1 = x; y2 = y1; y1 = y;
-    return y;
+// The correction that rounds off a step in a waveform (polyBLEP): without it a
+// sawtooth or pulse played high folds back down as out-of-tune grit.  t = where
+// in the cycle (0..1), dt = step per sample.
+static inline float vocBlep(float t, float dt) {
+    if (t < dt)        { float x = t / dt;           return x + x - x * x - 1.0f; }
+    if (t > 1.0f - dt) { float x = (t - 1.0f) / dt;  return x * x + x + x + 1.0f; }
+    return 0.0f;
+}
+
+// One VOCODER carrier oscillator sample at the note's pitch: a sawtooth, or
+// (pulse = true) a pulse whose high part is `width` of the cycle (0.5 =
+// square).  ±32767, like one of the organ's sine partials.
+static inline int32_t vocOsc(uint32_t phase, uint32_t inc, bool pulse, float width) {
+    float t  = (float)phase * (1.0f / 4294967296.0f);    // 0..1 through the cycle
+    float dt = (float)inc   * (1.0f / 4294967296.0f);
+    if (!pulse) {                                        // falling ramp, stepping up at 0
+        float s = 1.0f - 2.0f * t + vocBlep(t, dt);
+        return (int32_t)(s * 32767.0f);
+    }
+    float t2 = t - width; if (t2 < 0.0f) t2 += 1.0f;     // up at 0, down at `width`
+    float s  = ((t < width) ? 1.0f : -1.0f) + vocBlep(t, dt) - vocBlep(t2, dt);
+    return (int32_t)(s * VOC_PULSE_PEAK);                // (its DC goes in the band filters)
 }
 
 // carrier = organ sample, mod = mic sample (both int, int16-ish range).
 static int32_t vocoderProcess(int32_t carrier, int32_t mod) {
     float c = (float)carrier, m = (float)mod;
-    float acc = 0.0f;
+
+    // Consonant noise: unvoiced sounds (s, t, f, sh) have no pitch, and an
+    // organ has almost nothing up where they live, so there is nothing for the
+    // top bands to shape.  Give those bands noise to work with — scaled to the
+    // chord's own level, so no keys held = no noise, and band-limited by the
+    // synthesis filters it is fed through.  The mic's top-band envelopes do the
+    // rest: vowels barely open them, sibilants open them wide.
+    float ca = fabsf(c);
+    voc_carEnv += (ca - voc_carEnv) * ((ca > voc_carEnv) ? voc_kCarUp : voc_kCarDn);
+    voc_rng = voc_rng * 1664525u + 1013904223u;
+    float nz = (float)((int16_t)(voc_rng >> 16)) * (1.0f / 32768.0f);
+    float cHi = c + nz * voc_carEnv * s_vocSib;
+
+    float acc = 0.0f, top = 0.0f;
     for (int b = 0; b < VOC_BANDS; b++) {
-        float mbp = vocBiquad(m, b, voc_mx1[b], voc_mx2[b], voc_my1[b], voc_my2[b]);
+        // analysis: mic band → rectify → fast-attack/slow-release → smooth
+        float mbp = voc_mb0[b] * (m - voc_mx2[b]) - voc_ma1[b] * voc_my1[b] - voc_ma2[b] * voc_my2[b];
+        voc_mx2[b] = voc_mx1[b]; voc_mx1[b] = m; voc_my2[b] = voc_my1[b]; voc_my1[b] = mbp;
         float a = fabsf(mbp);
         float e = voc_env[b];
-        e += (a - e) * ((a > e) ? VOC_ATK : VOC_REL);   // fast attack, slow release
+        e += (a - e) * ((a > e) ? voc_kAtk : voc_kRel);
         voc_env[b] = e;
-        float cbp = vocBiquad(c, b, voc_cx1[b], voc_cx2[b], voc_cy1[b], voc_cy2[b]);
-        acc += cbp * e;
-    }
-    float out = acc * (s_vocGain / 32768.0f);           // env is ~amplitude → normalise
+        float s = voc_sm[b] + (e - voc_sm[b]) * voc_kSm;
+        voc_sm[b] = s;
+        if (s > top) top = s;
 
-    // Sibilance: highpass the mic, follow its envelope, inject white noise so
-    // unvoiced consonants (which have no pitch for the bands to track) come through.
-    voc_hpLp += (m - voc_hpLp) * 0.35f;                 // ~3 kHz corner
-    float hp = m - voc_hpLp;
-    float sa = fabsf(hp);
-    voc_sibEnv += (sa - voc_sibEnv) * ((sa > voc_sibEnv) ? 0.05f : 0.004f);
-    voc_rng = voc_rng * 1664525u + 1013904223u;
-    float noise = (float)((int16_t)(voc_rng >> 16));
-    out += noise * voc_sibEnv * (s_vocSib / 32768.0f);
+        // synthesis: the same band of the organ (top bands: organ + noise)
+        float x = (b >= VOC_NOISE_BAND) ? cHi : c;
+        float cbp = voc_cb0[b] * (x - voc_cx2[b]) - voc_ca1[b] * voc_cy1[b] - voc_ca2[b] * voc_cy2[b];
+        voc_cx2[b] = voc_cx1[b]; voc_cx1[b] = x; voc_cy2[b] = voc_cy1[b]; voc_cy1[b] = cbp;
+
+        float g = s - voc_gate;                     // below the gate = silence
+        if (g > 0.0f) acc += cbp * g * voc_lift[b];
+    }
+
+    // Level: follow the voice's loudest band slowly (quick up, 1.5 s down) and
+    // scale by it, so speaking quietly or further from the mic still drives the
+    // organ to full level.  The floor stops room noise being boosted to it.
+    voc_ref += (top - voc_ref) * ((top > voc_ref) ? voc_kRefUp : voc_kRefDn);
+    float ref = (voc_ref > VOC_REF_FLOOR) ? voc_ref : VOC_REF_FLOOR;
+    if (ref < 2.0f * voc_gate) ref = 2.0f * voc_gate;    // nothing just over a high gate gets full boost
+    float out = acc * (s_vocGain / ref);
 
     if (out >  32767.0f) out =  32767.0f;
     if (out < -32768.0f) out = -32768.0f;
@@ -259,6 +381,9 @@ struct Voice {
     uint32_t phase2[ORGAN_DRAWBARS];// NEBULA detuned twin oscillators
     uint32_t inc2[ORGAN_DRAWBARS];
     int32_t  glideQ16;              // NEBULA attack pitch glide, Q16 (65536 = settled)
+    uint32_t vocPhase, vocInc;      // VOCODER carrier oscillator at the note's pitch
+    uint32_t vocLfoPh, vocLfoInc;   // its pulse-width LFO (advanced once per block)
+    float    vocWidth;              // this block's pulse width
     ProcVoiceState proc;            // PROC generator state
 };
 static Voice voices[ORGAN_VOICES];
@@ -277,8 +402,23 @@ static void voiceStart(Voice& v, uint8_t note) {
     v.note      = note;
     v.stage     = ENV_ATTACK;
     v.sustained = 0;
+    // VOCODER carrier oscillator: the note's own pitch, starting at a
+    // note-dependent point in its cycle so a chord's notes don't all peak together.
+    v.vocInc    = (uint32_t)((double)midiHz(note) * 4294967296.0 / AUDIO_CODEC_RATE_HZ);
+    v.vocPhase  = (uint32_t)note * 0x9E3779B9u;
+    // Pulse-width LFO: its own starting point and a rate within ±20% of
+    // VOC_PWM_HZ per note (per-BLOCK increment).
+    if (v.rng == 0) v.rng = 0x1234567u ^ (note * 2654435761u);
+    v.rng = v.rng * 1664525u + 1013904223u;
+    v.vocLfoPh  = v.rng;
+    v.rng = v.rng * 1664525u + 1013904223u;
+    float lfoHz = VOC_PWM_HZ * (0.8f + 0.4f * (float)(v.rng >> 16) / 65536.0f);
+    v.vocLfoInc = (uint32_t)((double)lfoHz * BLOCK_FRAMES / AUDIO_CODEC_RATE_HZ * 4294967296.0);
+    v.vocWidth  = 0.5f;
     if (s_type == ORGAN_PROC) {
-        if (s_procSel == PROC_IDX_THX) {
+        if (s_procSel == PROC_IDX_VOC) {
+            // just the carrier oscillator set up above
+        } else if (s_procSel == PROC_IDX_THX) {
             int vi = (int)(&v - voices);   // this voice's index → its scratch row
             ThxVoice* tv = (ThxVoice*)s_voiceScratch[vi];
             if (tv->rng == 0) tv->rng = 0x1234567u ^ (note * 2654435761u);
@@ -465,6 +605,26 @@ static void renderBlock(int16_t* out) {
 
     bool driveOn = (s_drive != 0);
 
+    // VOCODER sound: its five sliders, once per block.  (vocOn also needs the
+    // mic feed primed — see organTaskFn.)
+    bool  vocSel   = proc && procSel == PROC_IDX_VOC;
+    bool  vocOn    = vocSel && s_vocBlock;
+    bool  vocPulse = false;
+    float vocBaseW = 0.5f, vocPwmAmp = 0.0f;
+    if (vocSel) {
+        int wave = s_param[0];                 // 0 = saw, 1..8 = pulse, wide → thin
+        vocPulse = (wave > 0);
+        if (vocPulse) {
+            vocBaseW  = VOC_WIDTH_WIDE - (float)(wave - 1) * ((VOC_WIDTH_WIDE - VOC_WIDTH_THIN) / 7.0f);
+            vocPwmAmp = (float)s_param[1] * 0.125f * (vocBaseW - VOC_WIDTH_MIN);
+        }
+        s_vocSib = (float)s_param[2] * VOC_SIB_PER_STEP;
+        voc_gate = 12.5f * (float)(1 << s_param[3]);
+        static int lastSmooth = -1;
+        int smooth = s_param[4];
+        if (smooth != lastSmooth) { lastSmooth = smooth; vocSetSmooth(smooth); }
+    }
+
     int rvb      = s_reverb;
     int rvFb     = RV_FB_Q15[rvb];
     int rvDamp   = RV_DAMP_Q8[rvb];
@@ -507,6 +667,19 @@ static void renderBlock(int16_t* out) {
                                            wtab[v.phase2[h] >> (32 - SINE_BITS)]) >> 1);
                     acc += (int32_t)s * db[h];
                 }
+            } else if (vocSel) {
+                // VOCODER: one oscillator per note — the carrier (see vocOsc).
+                // The pulse's width moves once per block: the WAVE width ± the
+                // note's own slow triangle LFO × the PWM amount.
+                if (n == 0) {
+                    v.vocLfoPh += v.vocLfoInc;
+                    int32_t tri = (int32_t)(v.vocLfoPh >> 15) - 65536;       // -65536..65535 ramp
+                    if (tri < 0) tri = -tri;                                 // 0..65536 triangle
+                    v.vocWidth = vocBaseW + vocPwmAmp * ((float)tri * (1.0f / 32768.0f) - 1.0f);
+                }
+                v.vocPhase += v.vocInc;
+                // × 8 = one drawbar fully out; × the registry gain (4) = 32 units.
+                acc = vocOsc(v.vocPhase, v.vocInc, vocPulse, v.vocWidth) * (8 * procGain);
             } else if (proc && procSel == PROC_IDX_THX) {
                 // THX DEEP NOTE: a converging cluster of detuned saws sharing the
                 // voice's scratch row as its ThxVoice state.  Glide advances once
@@ -566,14 +739,14 @@ static void renderBlock(int16_t* out) {
         // has mixL==mixR → side==0 → bit-identical to the old mono path.
         int32_t mid  = (mixL + mixR) >> 1;
         int32_t side = (mixL - mixR) >> 1;
-        int32_t s = mid >> ORGAN_MASTER_SHIFT;
+        int32_t s = mid >> (vocSel ? ORGAN_MASTER_SHIFT + VOC_CARRIER_SHIFT : ORGAN_MASTER_SHIFT);
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
 
         // PROC BRIGHT slider — global one-pole low-pass tone control — then the
         // THROAT formant (boost can exceed int16, so re-clamp before the FX
         // chain writes int16 delay buffers).
-        if (proc) {
+        if (proc && !vocSel) {                         // (VOCODER's sliders mean other things)
             int alpha = 16 + s_param[2] * 30;          // 16 (dark) .. 256 (open)
             s_procLp += ((s - s_procLp) * alpha) >> 8;
             s = procFormant(s_procLp, procSel, s_param[4]);
@@ -581,10 +754,12 @@ static void renderBlock(int16_t* out) {
             if (s < -32768) s = -32768;
         }
 
-        // Vocoder: shape the organ tone (carrier) with the mic (modulator) so the
-        // held chord speaks/sings.  Placed before the spatial FX so reverb washes
-        // over the voice.  Mic = LEFT channel of the full-duplex record block.
-        if (s_vocoder) s = vocoderProcess(s, s_micBlock[2 * n]);
+        // VOCODER sound: shape the oscillators (carrier) with the mic (modulator)
+        // so the held chord speaks/sings.  Placed before the spatial FX so reverb
+        // washes over the voice.  Mic = LEFT channel of the full-duplex record
+        // block.  Until the mic feed is in step (the first ~32 ms) it is silent
+        // rather than letting the bare oscillators through.
+        if (vocSel) s = vocOn ? vocoderProcess(s, s_micBlock[2 * n]) : 0;
 
         // 1. Scanner vibrato/chorus — dry mixed with an LFO-swept fractional delay.
         if (vcOn) {
@@ -685,13 +860,61 @@ static void renderBlock(int16_t* out) {
     s_voiceCount = live;
 }
 
+// ── Vocoder mic feed: keeping the two buffers in step ─────────────────────────
+// Mic and speaker run off one clock, 64 frames (2 ms) per DMA buffer, four
+// buffers each way.  This task makes 128 frames per pass and is paced by the
+// speaker side (the write blocks while its buffers are full).  How much mic
+// audio is queued when a pass starts is then fixed by how the two sides
+// happened to be filled when the vocoder came on — and both ways it used to
+// come on were bad:
+//   • vocoder switched on while the organ was already playing: the mic side
+//     had been running unread, so it was FULL.  It stayed full — one pass 2 ms
+//     late and 2 ms of mic audio was thrown away.
+//   • organ started with the vocoder already on (a song's patch): the blocking
+//     mic read paced the task instead, the speaker side never filled, and any
+//     late pass was a gap in the output.
+// So whenever the vocoder comes on (either way) it is primed: for
+// VOC_PRIME_BLOCKS passes the mic is not read (the vocoder hears silence)
+// while the speaker side fills and takes over the pacing; then the mic side
+// is emptied once.  From there each pass finds exactly the two buffers that
+// arrived during the previous one — about 4 ms of slack against a late pass on
+// the output and 6 ms on the mic.
+#define VOC_PRIME_BLOCKS  8       // 32 ms
+#define VOC_READ_WAIT_MS  6       // normally the block is already there
+
 static void organTaskFn(void*) {
     static int16_t block[BLOCK_FRAMES * 2];
+    bool vocWas   = false;
+    int  vocPrime = 0;
     for (;;) {
-        if (!s_active) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        if (!s_active) { vocWas = false; vTaskDelay(pdMS_TO_TICKS(20)); continue; }
         drainEvents();
-        // Full-duplex: grab the mic block as the vocoder modulator before render.
-        if (s_vocoder) audioCodecRecord((uint8_t*)s_micBlock, sizeof(s_micBlock));
+
+        // Full-duplex: the mic block is the vocoder's modulator for this pass.
+        bool voc = (s_type == ORGAN_PROC && s_procSel == PROC_IDX_VOC);
+        if (voc && !vocWas) {
+            vocPrime = VOC_PRIME_BLOCKS;
+            vocoderReset();              // stale filter state → a click (this task owns it)
+        }
+        vocWas = voc;
+        s_vocBlock = voc && vocPrime == 0;
+        if (voc) {
+            if (vocPrime > 0) {
+                if (--vocPrime == 0) {       // empty the mic side: start from "nothing queued"
+                    while (audioCodecRecordSome((uint8_t*)s_micBlock, sizeof(s_micBlock), 0)
+                           == sizeof(s_micBlock)) {}
+                    s_vocBlock = true;       // in step from this pass on
+                }
+                memset(s_micBlock, 0, sizeof(s_micBlock));
+            } else {
+                size_t got = audioCodecRecordSome((uint8_t*)s_micBlock, sizeof(s_micBlock),
+                                                  VOC_READ_WAIT_MS);
+                if (got < sizeof(s_micBlock)) {
+                    memset((uint8_t*)s_micBlock + got, 0, sizeof(s_micBlock) - got);
+                }
+            }
+        }
+
         renderBlock(block);
         if (!audioCodecPlay((const uint8_t*)block, sizeof(block)))  // blocks → paces us
             vTaskDelay(1);                  // no codec / reconfiguring — don't spin
@@ -814,16 +1037,6 @@ int  organGetLeslie()         { return s_leslie; }
 int  organGetDrive()          { return s_drive; }
 int  organGetReverb()         { return s_reverb; }
 
-void organSetVocoder(int v) {
-    bool on = (v != 0);
-    if (on == s_vocoder) return;
-    // vocoderReset() is race-free here: s_vocoder is still false, so the audio
-    // task isn't touching the filter state yet.  Mic bias is already on+verified
-    // from audioCodecInit(), so we don't re-touch I²C from this (command) task.
-    if (on) vocoderReset();           // clear stale filter state → no click/ring
-    s_vocoder = on;
-}
-int  organGetVocoder()        { return s_vocoder ? 1 : 0; }
 
 void organSetParam(int idx, int value) {
     if (idx < 0 || idx >= ORGAN_PARAMS) return;
@@ -843,7 +1056,10 @@ void organSetProcSound(int i) {
     // sounds use as a wavetable — so crossing the THX boundary with notes still
     // held would reinterpret stale bytes (a loud blast).  Release sounding
     // voices cleanly across that boundary; other switches morph in place.
-    if (i == PROC_IDX_THX || s_procSel == PROC_IDX_THX) {
+    // Same for VOCODER: its voices carry no wavetable state, and a wavetable
+    // voice carried into it would stop making sense.
+    if (i == PROC_IDX_THX || s_procSel == PROC_IDX_THX ||
+        i == PROC_IDX_VOC || s_procSel == PROC_IDX_VOC) {
         for (int v = 0; v < ORGAN_VOICES; v++)
             if (voices[v].stage != ENV_IDLE) voices[v].stage = ENV_RELEASE;
     }

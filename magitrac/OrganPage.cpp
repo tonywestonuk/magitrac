@@ -14,13 +14,12 @@ static const char* const OR_VC_NAMES[OR_VC_N]   = { "OFF", "V1", "V2", "V3", "C1
 static const char* const OR_LES_NAMES[OR_LES_N] = { "STOP", "SLOW", "FAST" };
 static const char* const OR_DRV_NAMES[OR_DRV_N] = { "OFF", "ON" };
 static const char* const OR_RVB_NAMES[OR_RVB_N] = { "OFF", "ROOM", "HALL" };
-static const char* const OR_VOC_NAMES[OR_VOC_N] = { "OFF", "ON" };
 
 static int orFxX(int i) { return OR_FX_X0 + i * (OR_FX_W + OR_FX_GAP); }
 
 // Paged effects (top bar slots 1..3).  Add new effects here and they page
 // automatically.
-enum { FX_VIB = 0, FX_LES, FX_DRIVE, FX_VERB, FX_VOCODER, FX_COUNT };
+enum { FX_VIB = 0, FX_LES, FX_DRIVE, FX_VERB, FX_COUNT };
 static int orFxPages() { return (FX_COUNT + OR_FX_PER_PAGE - 1) / OR_FX_PER_PAGE; }
 
 // Per-type knob column.  Order/meaning must match the server's s_param mapping.
@@ -43,6 +42,13 @@ static const OrProcCfg OR_PROC[OR_PROC_N] = {
                     { 4, 4, 8, 4, 4 } },
     { "THX",        { 5, { "SWEEP", "SPREAD", "BRIGHT", "STACK", "DETUNE" } },
                     { 5, 4, 6, 6, 3 } },
+    // The mic vocoder: the held notes speak what goes into the server's mic.
+    // WAVE is the tone being vocoded: 0 = sawtooth, 1..8 = pulse from square
+    // down to thin.  PWM is a slow LFO on the pulse's width.  SSS is the
+    // consonant noise, GATE how loud the mic must be before it opens, SMOOTH
+    // how slowly the bands let go.
+    { "VOCODER",    { 5, { "WAVE", "PWM", "SSS", "GATE", "SMOOTH" } },
+                    { 0, 0, 4, 1, 3 } },
 };
 
 // PROC's 5-slider column starts further left (no drawbars in that mode).
@@ -76,7 +82,6 @@ OrganPage::OrganPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song
     , _leslie(0)
     , _drive(0)
     , _reverb(0)
-    , _vocoder(0)
     , _fxPage(0)
     , _procSel(0)
 {
@@ -114,7 +119,7 @@ void OrganPage::applyToSong() {
     if (!used) return;
 
     OrganPatch& op = _song.organ;
-    op.flags = 1 | (_vocoder ? 2 : 0);   // bit0 = present, bit1 = vocoder on
+    op.flags = 1;                        // bit0 = present (bit1 was the old vocoder toggle)
     op.voice = (_type < OR_TYPE_PROC) ? (uint8_t)_type
                                       : (uint8_t)(OR_TYPE_PROC + _procSel);
     for (int b = 0; b < ORGAN_PATCH_BARS; b++) op.bars[b] = _bars[b];
@@ -147,12 +152,12 @@ void OrganPage::adoptFromSong() {
     _leslie       = op.leslie    % OR_LES_N;
     _drive        = op.drive     % OR_DRV_N;
     _reverb       = op.reverb    % OR_RVB_N;
-    _vocoder      = (op.flags & 2) ? 1 : 0;
     _activePreset = -1;   // registration came from the song, not a preset
 }
 
-void OrganPage::open() {
-    _open    = true;
+void OrganPage::open(bool backLabel) {
+    _open      = true;
+    _backLabel = backLabel;
     _wasDown = _touch.isTouched;
     _dragCol  = -1;
     _dragKnob = -1;      // a drag cut short by leaving the page must not resume
@@ -167,7 +172,6 @@ void OrganPage::open() {
     gServerPairing.sendOrgan(ORGAN_OP_TYPE,      0, (uint8_t)_type);
     if (_type == OR_TYPE_PROC)
         gServerPairing.sendOrgan(ORGAN_OP_PROCSEL, 0, (uint8_t)_procSel);
-    gServerPairing.sendOrgan(ORGAN_OP_VOCODER,   0, (uint8_t)_vocoder);
     gServerPairing.sendOrgan(ORGAN_OP_VIBCHORUS, 0, (uint8_t)_vibChorus);
     gServerPairing.sendOrgan(ORGAN_OP_LESLIE,    0, (uint8_t)_leslie);
     gServerPairing.sendOrgan(ORGAN_OP_DRIVE,     0, (uint8_t)_drive);
@@ -260,7 +264,6 @@ void OrganPage::drawFxButton(int slot, int id) {
         case FX_LES:   snprintf(buf, sizeof(buf), "LES %s",   OR_LES_NAMES[_leslie]);   on = _leslie;    break;
         case FX_DRIVE: snprintf(buf, sizeof(buf), "DRIVE %s", OR_DRV_NAMES[_drive]);    on = _drive;     break;
         case FX_VERB:  snprintf(buf, sizeof(buf), "VERB %s",  OR_RVB_NAMES[_reverb]);   on = _reverb;    break;
-        case FX_VOCODER: snprintf(buf, sizeof(buf), "VOCODE %s", OR_VOC_NAMES[_vocoder]); on = _vocoder; break;
         default:       return;
     }
     uiButton(_d, orFxX(slot), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf,
@@ -277,8 +280,6 @@ void OrganPage::cycleFx(int id) {
                        gServerPairing.sendOrgan(ORGAN_OP_DRIVE,     0, (uint8_t)_drive);     break;
         case FX_VERB:  _reverb    = (_reverb + 1) % OR_RVB_N;
                        gServerPairing.sendOrgan(ORGAN_OP_REVERB,    0, (uint8_t)_reverb);    break;
-        case FX_VOCODER: _vocoder = (_vocoder + 1) % OR_VOC_N;
-                       gServerPairing.sendOrgan(ORGAN_OP_VOCODER,   0, (uint8_t)_vocoder);   break;
         default:       return;
     }
     applyToSong();
@@ -302,7 +303,8 @@ void OrganPage::drawHeader() {
     snprintf(buf, sizeof(buf), "FX %d/%d", _fxPage + 1, orFxPages());
     uiButton(_d, orFxX(4), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf, COL_LTGREY, COL_BLACK, 2);
 
-    uiButton(_d, OR_HOME_X, OR_BTN_Y, OR_HOME_W, OR_BTN_H, "HOME", COL_WHITE, COL_BLACK, 3);
+    uiButton(_d, OR_HOME_X, OR_BTN_Y, OR_HOME_W, OR_BTN_H, _backLabel ? "BACK" : "HOME",
+             COL_WHITE, COL_BLACK, 3);
 }
 
 void OrganPage::drawKnobs() {
@@ -356,7 +358,14 @@ void OrganPage::drawKnobTip(int k) {
     _d.drawRect(x + 2, OR_TIP_Y + 2, OR_TIP_W - 4, OR_TIP_H - 4, COL_BLACK);
 
     char buf[24];
-    snprintf(buf, sizeof(buf), "%s  %d", cfg.names[k], (int)knobRef(k));
+    int  v = (int)knobRef(k);
+    if (_type == OR_TYPE_PROC && _procSel == OR_PROC_VOC && k == 0) {
+        // The vocoder's WAVE slider picks a waveform, not an amount: name it.
+        if (v == 0) snprintf(buf, sizeof(buf), "SAWTOOTH");
+        else        snprintf(buf, sizeof(buf), "PULSE %d", v);
+    } else {
+        snprintf(buf, sizeof(buf), "%s  %d", cfg.names[k], v);
+    }
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
     int tw = (int)strlen(buf) * 18;

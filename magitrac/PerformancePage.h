@@ -10,18 +10,23 @@
 //
 //  PERFORM VIEW:
 //  y=  0  ┌─ Header: title  [SETLIST] [EDIT] [HOME]            (50px)
-//  y= 60  ├─ 4 pads top row (blocks 1–4)                        (200px)
-//  y=270  ├─ 4 pads bottom row (blocks 5–8)                     (200px)
+//  y= 60  ├─ 4 pads top row (blocks 1–4)      │ [organ icon]    (200px)
+//  y=270  ├─ 4 pads bottom row (blocks 5–8)   │ [sample icon]   (200px)
 //  y=478  ├─ Light strip: [< FX] [FX >] [WHITE] [RELEASE]       (54px)
 //  y=532  └─
+//
+//  The two icon buttons sit in a column directly under HOME (same x, same
+//  width) and open the organ page and the samples page; the sketch brings
+//  this page back when their BACK is tapped (see resume()).
 //
 //  PAD EDIT VIEW:
 //  y=  0  ┌─ Header: "PAD SETUP"  [BACK]           (50px)
 //  y= 55  ├─ 8 rows × 60px: [#] [NAME field] [IMM/QUE toggle]
 //  y=535  └─
 //
-//  SETLIST, EDIT and HOME require a 500ms hold to activate (anti-fumble during
-//  performance).  BACK in the pad-edit view is a plain tap and returns to the pads.
+//  SETLIST, EDIT, HOME and the two icon buttons require a 500ms hold to
+//  activate (anti-fumble during performance).  BACK in the pad-edit view is a
+//  plain tap and returns to the pads.
 
 // Header
 static const int PP_HDR_H      = 50;
@@ -34,13 +39,18 @@ static const int PP_HOME_W     = 130;
 static const int PP_BTN_Y      = 5;
 static const int PP_BTN_H      = 40;
 
-// Pad grid — 4 columns × 2 rows
+// Side column under HOME: organ (beside the top pad row) + samples (bottom row).
+static const int PP_SIDE_X     = PP_HOME_X;   // 830
+static const int PP_SIDE_W     = PP_HOME_W;   // 130
+
+// Pad grid — 4 columns × 2 rows, left of the side column
 static const int PP_PAD_COLS   = 4;
 static const int PP_PAD_COUNT  = 8;
-static const int PP_PAD_MARGIN = 20;   // outer margin
-static const int PP_PAD_GAP    = 10;   // gap between pads
+static const int PP_PAD_MARGIN = 20;   // outer (left) margin
+static const int PP_PAD_GAP    = 10;   // gap between pads, and before the side column
 static const int PP_PAD_Y0     = 60;   // first row top
-static const int PP_PAD_W      = (960 - 2 * PP_PAD_MARGIN - (PP_PAD_COLS - 1) * PP_PAD_GAP) / PP_PAD_COLS;  // 220
+static const int PP_PAD_W      = (PP_SIDE_X - PP_PAD_GAP - PP_PAD_MARGIN
+                                  - (PP_PAD_COLS - 1) * PP_PAD_GAP) / PP_PAD_COLS;  // 192
 static const int PP_PAD_H      = 200;  // shortened from 225 to free a light-control strip
 static const int PP_PAD_ROW_GAP = 10;
 
@@ -77,9 +87,16 @@ public:
         NONE,
         HOME,       // HOME held — exit performance page
         SETLIST,    // SETLIST held — open setlist page
+        ORGAN,      // organ icon held — open the organ page, come back here after
+        SAMPLES,    // sample icon held — open the samples page, come back here after
     };
 
     void open(uint8_t currentPattern, bool stopped = false);
+    // Back from a page opened off this one (ORGAN / SAMPLES): same song, same
+    // title, pad edits kept.  The caller redraws.  `stopped` darkens the pads
+    // if the song stopped meanwhile; a playing song's position arrives with
+    // the next server update.
+    void resume(bool stopped);
     void draw();
     Result poll();
 
@@ -107,7 +124,7 @@ private:
     bool     _patchPending;     // perfPad config changed, needs server sync
 
     // Hold tracking for header buttons + pads
-    enum class HoldTarget : uint8_t { NONE, HOME, EDIT, SETLIST, PAD };
+    enum class HoldTarget : uint8_t { NONE, HOME, EDIT, SETLIST, PAD, ORGAN, SAMPLES };
     HoldTarget _holdTarget;
     uint32_t   _holdStartMs;
     bool       _holdFired;
@@ -138,6 +155,10 @@ private:
     bool hitEdit(int sx, int sy) const;
     bool hitSetlist(int sx, int sy) const;
     int  hitPad(int sx, int sy) const;
+    int  hitSide(int sx, int sy) const;      // 0 = organ, 1 = samples; -1 none
+    void drawSideButtons();
+    void drawOrganIcon(int cx, int cy);      // centred on (cx, cy)
+    void drawSampleIcon(int cx, int cy);
     Result pollPerf();
 
     // ── Light-control strip (PixelPost) ──────────────────────────────────────

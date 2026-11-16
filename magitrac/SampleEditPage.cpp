@@ -3,6 +3,10 @@
 #include "UIHelpers.h"
 #include "Constants.h"
 #include "TrackerData.h"   // SFX_CHANNEL
+#include "MagiLink.h"      // gMagiLink.isConnected() — gates the key lease
+#include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
+
+static uint32_t sDbgOpenMs = 0;   // [SMPDBG] when open() started
 
 void SampleEditPage::rawToScreen(int rx, int ry, int& sx, int& sy) const {
     sx = ry;
@@ -26,11 +30,23 @@ void SampleEditPage::open(uint8_t sampleId, const char* name, uint8_t col,
     _specMode   = 0;       // a previous visit's spectrogram does not carry over
     _viewStart  = 0;
     _viewEnd    = 0;   // whole file
+    _sampleTune = 0;       // until the server's meta arrives
+    _tuneHold.release();
+    _tuneStep   = 1;
 
+    sDbgOpenMs = millis();
     gServerPairing.clearSampleInfo();
     gServerPairing.sendSampleEdit(SAMPLE_EDIT_GET, _sampleId);
+    if (standalone()) {
+        // The MIDI-in keyboard now plays this sample (server side); poll()
+        // keeps the lease alive.
+        gServerPairing.sendSampleEdit(SAMPLE_EDIT_KEYS, _sampleId);
+        _keysLastMs = millis();
+    }
+    uint32_t dbgSent = millis();
 
     _d.clear();                    // anti-ghost cycle only — doesn't touch the FB
+    uint32_t dbgClear = millis();
     _d.fillScreen(COL_WHITE);      // ...so wipe the bitmap too
     _d.setTextSize(3);
     _d.setTextColor(COL_BLACK);
@@ -38,6 +54,10 @@ void SampleEditPage::open(uint8_t sampleId, const char* name, uint8_t col,
     _d.print("LOADING...");
     drawHeader();
     _d.paint();
+    SMPDBG("editor open id=%u '%s': requests sent %lu ms, display clear %lu ms, "
+           "LOADING paint %lu ms | open() total %lu ms", (unsigned)_sampleId, _name,
+           (unsigned long)(dbgSent - sDbgOpenMs), (unsigned long)(dbgClear - dbgSent),
+           (unsigned long)(millis() - dbgClear), (unsigned long)(millis() - sDbgOpenMs));
 }
 
 void SampleEditPage::adopt() {
@@ -45,6 +65,7 @@ void SampleEditPage::adopt() {
     _start = _info.startFrame;
     _end   = _info.endFrame;          // 0 = end of file
     _loop  = _info.loop != 0;
+    _sampleTune = _info.tuneCents;
     if (_start >= _info.totalFrames) _start = 0;
     if (_end > _info.totalFrames)    _end   = 0;
     _loading = false;
@@ -52,7 +73,7 @@ void SampleEditPage::adopt() {
 
 void SampleEditPage::sendMeta() {
     gServerPairing.sendSampleEdit(SAMPLE_EDIT_SET, _sampleId,
-                                  _start, _end, _loop ? 1 : 0);
+                                  _start, _end, _loop ? 1 : 0, _sampleTune);
 }
 
 void SampleEditPage::fetchView() {
@@ -199,13 +220,52 @@ void SampleEditPage::drawZoomRow() {
     char z[24];
     uint32_t len = viewLen() ? viewLen() : 1;
     snprintf(z, sizeof(z), "x%lu", (unsigned long)(_info.totalFrames / len));
-    _d.setTextSize(3);
+    _d.setTextSize(2);
     _d.setTextColor(COL_DKGREY);
-    _d.setCursor(SE_ZIN_X + SE_ZBTN_W + 40, btnY + (SE_BTN_H - 24) / 2);
+    _d.setCursor(SE_ZIN_X + SE_ZBTN_W + 12, btnY + (SE_BTN_H - 16) / 2);
     _d.print(z);
+
+    drawTune();
 
     uiButton(_d, SE_SPEC_X, btnY, SE_SPEC_W, SE_BTN_H, "SPECTRUM",
              COL_WHITE, COL_BLACK, 2);
+}
+
+// TUNE: the sample's own pitch offset, shown as semitones.cents ("+7.05").
+void SampleEditPage::drawTune() {
+    int btnY = SE_ZOOM_Y + (SE_ZOOM_H - SE_BTN_H) / 2;
+    uiButton(_d, SE_TUNE_DN_X, btnY, SE_TUNE_BTN_W, SE_BTN_H, "-",
+             COL_WHITE, COL_BLACK, 3);
+    uiButton(_d, SE_TUNE_UP_X, btnY, SE_TUNE_BTN_W, SE_BTN_H, "+",
+             COL_WHITE, COL_BLACK, 3);
+
+    _d.fillRect(SE_TUNE_VAL_X, btnY, SE_TUNE_VAL_W, SE_BTN_H, COL_WHITE);
+    _d.setTextSize(2);
+    _d.setTextColor(COL_DKGREY);
+    _d.setCursor(SE_TUNE_VAL_X + (SE_TUNE_VAL_W - 4 * 12) / 2, btnY + 2);
+    _d.print("TUNE");
+
+    char v[16];
+    int a = (_sampleTune < 0) ? -_sampleTune : _sampleTune;
+    snprintf(v, sizeof(v), "%c%d.%02d", (_sampleTune < 0) ? '-' : '+',
+             a / 100, a % 100);
+    _d.setTextSize(3);
+    _d.setTextColor(COL_BLACK);
+    _d.setCursor(SE_TUNE_VAL_X + (SE_TUNE_VAL_W - (int)strlen(v) * 18) / 2,
+                 btnY + 26);
+    _d.print(v);
+}
+
+// Repaint only — the value goes to the server when the finger lifts
+// (sendMeta), so a held button doesn't send a message per step.
+void SampleEditPage::stepTune(int cents) {
+    int v = (int)_sampleTune + cents;
+    if (v < -4800) v = -4800;
+    if (v >  4800) v =  4800;
+    if (v == _sampleTune) return;
+    _sampleTune = (int16_t)v;
+    drawTune();
+    _d.paintLater();
 }
 
 // Fairlight CMI "Page D" homage — 3D hidden-line waterfall of the trimmed
@@ -382,9 +442,13 @@ bool SampleEditPage::poll() {
             _viewStart = _info.viewStart;
             _viewEnd   = _info.viewEnd;
         }
+        uint32_t dbgDraw = millis();
         if (first) draw();
         else { drawWave(); drawScrollbar(); drawZoomRow(); }
         _d.paintLater();
+        SMPDBG("editor: waveform (%s) noticed %lu ms after open(), drawn in %lu ms, "
+               "paint queued", first ? "first" : "zoom/scroll",
+               (unsigned long)(dbgDraw - sDbgOpenMs), (unsigned long)(millis() - dbgDraw));
     }
 
     // A non-looping audition ends on its own — flip STOP back to PLAY.
@@ -405,8 +469,29 @@ bool SampleEditPage::poll() {
         _specMode = 2;
     }
 
-    if (!_touch.read()) return false;   // no new touch event this frame
+    // Keep the server's "MIDI keys play this sample" lease alive.  Skipped
+    // while the link is down: a send into a dead link blocks for seconds.
+    if (standalone() &&
+        (uint32_t)(millis() - _keysLastMs) >= SAMPLE_KEYS_RENEW_MS) {
+        _keysLastMs = millis();
+        if (gMagiLink.isConnected())
+            gServerPairing.sendSampleEdit(SAMPLE_EDIT_KEYS, _sampleId);
+    }
+
+    // read() is true only on a state change; isTouched holds the last-seen
+    // state either way, which is what the hold-repeat needs.
+    bool ev   = _touch.read();
     bool down = _touch.isTouched;
+
+    // TUNE −/+ held: repeat, accelerating to a semitone per step.  Gated on
+    // the finger still being down so a stalled loop can't run on after it.
+    if (down && _tuneHold.active() && _tuneHold.tickFast()) {
+        _tuneStep += _tuneStep / 4 + 1;
+        if (_tuneStep > 100) _tuneStep = 100;
+        stepTune(_tuneHold.delta() * _tuneStep);
+    }
+
+    if (!ev) return false;              // no new touch event this frame
     int  tx, ty;
     rawToScreen(_touch.x, _touch.y, tx, ty);
 
@@ -514,11 +599,15 @@ bool SampleEditPage::poll() {
                     uint32_t endF   = _end ? _end : _info.totalFrames;
                     uint32_t frames = (endF > _start) ? endF - _start : 0;
                     uint32_t rate   = _info.rate ? _info.rate : 32000;
-                    float    spd    = exp2f((float)_tuneCents / 1200.0f);
+                    float    spd    = exp2f((float)(_tuneCents + _sampleTune)
+                                            / 1200.0f);
                     uint32_t ms     = (uint32_t)((float)frames * 1000.0f
                                                  / ((float)rate * spd));
                     _playEndMs = millis() + ms + 400;
-                    gServerPairing.sendAuditionRawNote(SFX_CHANNEL, 60, 100, _col);
+                    if (standalone())      // the bare sample at native pitch
+                        gServerPairing.sendSampleEdit(SAMPLE_EDIT_PLAY, _sampleId);
+                    else                   // through the column's settings
+                        gServerPairing.sendAuditionRawNote(SFX_CHANNEL, 60, 100, _col);
                 }
                 drawHeader();
                 _d.paintLater();
@@ -553,11 +642,20 @@ bool SampleEditPage::poll() {
             return false;
         }
 
-        // Zoom + spectrum buttons.
+        // Zoom, tune + spectrum buttons.
         int btnY = SE_ZOOM_Y + (SE_ZOOM_H - SE_BTN_H) / 2;
         if (ty >= btnY && ty < btnY + SE_BTN_H) {
             if (tx >= SE_ZOUT_X && tx < SE_ZOUT_X + SE_ZBTN_W)     zoom(-1);
             else if (tx >= SE_ZIN_X && tx < SE_ZIN_X + SE_ZBTN_W)  zoom(+1);
+            else if ((tx >= SE_TUNE_DN_X && tx < SE_TUNE_DN_X + SE_TUNE_BTN_W) ||
+                     (tx >= SE_TUNE_UP_X && tx < SE_TUNE_UP_X + SE_TUNE_BTN_W)) {
+                // A tap is one cent; holding repeats and accelerates.  The
+                // new value is stored when the finger lifts.
+                int dir = (tx >= SE_TUNE_UP_X) ? +1 : -1;
+                _tuneStep = 1;
+                stepTune(dir);
+                _tuneHold.start(0, dir);
+            }
             else if (tx >= SE_SPEC_X && tx < SE_SPEC_X + SE_SPEC_W) {
                 auditionStop();
                 _specMode = 1;
@@ -573,10 +671,16 @@ bool SampleEditPage::poll() {
         }
     } else if (!down && _wasDown) {
         _wasDown = false;
+        if (_tuneHold.active()) {
+            _tuneHold.release();
+            sendMeta();                            // store the tuned value
+        }
         if (_backArmed) {
             _backArmed = false;
             auditionStop();
-            return true;                           // back to the ColumnEditor
+            if (standalone())                      // keys go back to normal
+                gServerPairing.sendSampleEdit(SAMPLE_EDIT_KEYS, 0);
+            return true;                           // caller picks where to
         }
     }
     return false;

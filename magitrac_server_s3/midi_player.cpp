@@ -12,6 +12,7 @@
 #endif
 #include "SamplePlayer.h"
 #include "SampleManifest.h"
+#include "SampleDebug.h"   // [SMPDBG] lines (off unless SAMPLE_DEBUG is 1)
 #include "drawbar_organ.h"
 #include "proc_sounds.h"   // PROC_SOUND_COUNT — organ-column program → voice map
 
@@ -429,8 +430,11 @@ static struct { uint8_t note; int voice; } seqSfxAudPoly[SEQ_AUD_POLY] = {
     { 0, -1 }, { 0, -1 }, { 0, -1 }, { 0, -1 }, { 0, -1 }, { 0, -1 },
 };
 
+// Safe while a song runs: the poly table only ever holds voices a key started
+// (and a voice handle can't stop a slot that has since been reused), and
+// seqSfxAudNote is cleared the moment the song takes the SD stream for one of
+// its own samples (sfxStreamPlay), so a late key-up can't cut song SFX.
 static void seqSfxAudNoteOff(uint8_t note) {
-    if (seqRunning) return;   // guard: a stale note must never cut song SFX
     for (int i = 0; i < SEQ_AUD_POLY; i++) {
         if (seqSfxAudPoly[i].voice >= 0 && seqSfxAudPoly[i].note == note) {
             sampleStopVoice(seqSfxAudPoly[i].voice);
@@ -449,23 +453,143 @@ static void seqSfxAudNoteOff(uint8_t note) {
 // columns) and TUNE offset (cents from native — brings an arbitrarily-pitched
 // recording in tune with the band).  All zero = native, the pre-existing
 // behaviour.
+// The sample's own TUNE (set in the sample editor, stored with its trim) is
+// added on top, so a sample tuned once is in tune in every song that uses it.
 static float sfxPitchFor(const ColumnSettings& cs, uint8_t note) {
     return (float)((int)note - SAMPLE_ROOT_NOTE + (int)cs.transpose)
-         + (float)cs.sfxTuneCents * 0.01f;
+         + (float)((int)cs.sfxTuneCents + (int)sampleTuneCentsFor(cs.program)) * 0.01f;
 }
 
-// Queue a column's sample on the (mono) SD stream at `semis` from native, with
-// its saved trim/loop.  Returns false if the manifest has no such sample.
-static bool sfxStreamPlay(const ColumnSettings& cs, float semis) {
-    const char* fname = sampleManifestNameFor(cs.program);
+// Queue a sample on the (mono) SD stream at `semis` from native, with its
+// saved trim/loop.  Returns false if the manifest has no such sample.
+static bool sfxStreamPlayId(uint8_t sampleId, float semis, uint8_t volume) {
+    const char* fname = sampleManifestNameFor(sampleId);
     if (!fname) return false;
     char path[64];
     snprintf(path, sizeof(path), "/samples/%s", fname);
-    const SampleTrim* tr = sampleTrimFor(cs.program);
-    samplePlayerPlay(path, semis, cs.volume,
+    const SampleTrim* tr = sampleTrimFor(sampleId);
+    samplePlayerPlay(path, semis, volume,
                      tr ? tr->startFrame : 0, tr ? tr->endFrame : 0,
                      tr && tr->loop);
     return true;
+}
+
+// Sounds started from the client's samples page — a square tapped (unkeyed),
+// or a MIDI key playing the page's keyed sample.  They may play while a song
+// runs, so they are tracked apart from the song's own: the page's STOP must
+// silence only these, and a song column's note-off must not cut one that has
+// since taken over the (single) SD stream.
+#define SEQ_PAD_POLY 8
+static int           seqPadVoice[SEQ_PAD_POLY] = { -1, -1, -1, -1, -1, -1, -1, -1 };   // squares' RAM voices
+static uint8_t       seqPadNext       = 0;        // round-robin slot
+static volatile bool seqPadOwnsStream = false;    // the SD stream is the page's, not the song's
+
+static bool sfxStreamPlay(const ColumnSettings& cs, float semis) {
+    if (!sfxStreamPlayId(cs.program, semis, cs.volume)) return false;
+    seqPadOwnsStream = false;      // the song has the stream now…
+    seqSfxAudNote    = 0xFF;       // …so no key's release may stop it
+    return true;
+}
+
+// Start a sample outside the song (tune-by-ear, the client's sample page):
+// preloaded → a RAM voice, else the SD stream.  `keyed` pairs the sound with
+// MIDI key `note`, so that key's note-off (seqSfxAudNoteOff) stops it; an
+// unkeyed sound (a pad tapped on the client) has no note-off and just plays.
+static void sfxAudStart(uint8_t sampleId, float semis, uint8_t volume,
+                        uint8_t note, bool keyed) {
+    int h = samplePlayRam(sampleId, semis, volume);
+#if SAMPLE_DEBUG
+    debugPrintf("[SMPDBG] t=%lu play id=%u note=%u %s -> %s\n", (unsigned long)millis(),
+                (unsigned)sampleId, (unsigned)note, keyed ? "key" : "pad",
+                h >= 0 ? "RAM voice" : "SD stream");
+#endif
+    if (h >= 0) {
+        if (!keyed) {              // remember it so the pads' STOP can find it
+            seqPadVoice[seqPadNext] = h;
+            seqPadNext = (uint8_t)((seqPadNext + 1) % SEQ_PAD_POLY);
+            return;
+        }
+        // Polyphonic live playing: pair the voice with its key so the
+        // note-off releases exactly this one.  Table full → oldest slot.
+        int slot = 0;
+        for (int i = 0; i < SEQ_AUD_POLY; i++)
+            if (seqSfxAudPoly[i].voice < 0) { slot = i; break; }
+        if (seqSfxAudPoly[slot].voice >= 0)          // table full: evict
+            sampleStopVoice(seqSfxAudPoly[slot].voice);
+        seqSfxAudPoly[slot].note  = note;
+        seqSfxAudPoly[slot].voice = h;
+        return;
+    }
+    if (!sfxStreamPlayId(sampleId, semis, volume)) return;
+    // The stream is mono: this sound replaced whatever held it before — a
+    // key, or (while a song runs) one of the song's streamed samples.
+    seqSfxAudNote    = keyed ? note : 0xFF;
+    seqPadOwnsStream = true;
+}
+
+// A key's velocity → the player's volume: velocity 100 is the sample at its own
+// level (127); harder than that is louder — up to 161 at velocity 127, which is
+// +4 dB and will clip a sample that is already recorded hot — and softer is
+// quieter, on the squared taper (velocity 50 = a quarter of the level).
+static inline uint8_t seqKeyVolume(uint8_t velocity) {
+    return (uint8_t)(((int)velocity * 127 + 50) / 100);
+}
+
+// ── Sample page (client) — a sample played with no song column ───────────────
+// seqKeysSampleId != 0 while the client has a sample "on the keys" — its
+// sample editor is open, or a square on its samples page was held during a
+// song: live MIDI keys play that sample here on the MIDI task (no wire round
+// trip, chords work, no song needed).  It is a lease the client keeps
+// renewing — see SAMPLE_EDIT_KEYS in MagiMsg.h.
+static volatile uint8_t  seqKeysSampleId = 0;
+static volatile uint32_t seqKeysStampMs  = 0;
+
+uint8_t sequencerSampleKeysId() {
+    uint8_t id = seqKeysSampleId;
+    if (id && (uint32_t)(millis() - seqKeysStampMs) > SAMPLE_KEYS_LEASE_MS) {
+        seqKeysSampleId = 0;
+        id = 0;
+    }
+    return id;
+}
+
+void sequencerSampleKeys(uint8_t sampleId) {
+    seqKeysStampMs  = millis();
+    seqKeysSampleId = sampleId;
+}
+
+// Pitch: MIDI note 60 = the sample's native pitch + its own TUNE.  Loudness:
+// `volume` in the player's terms (127 = the sample at its own level, squared
+// taper).  A square is always 127 — there is no column to take a volume from;
+// a key passes its velocity through seqKeyVolume().
+//
+// Both squares and keys play over a running song (a key is then ALSO the
+// performer's cue — see the MIDI parser).  A sample in the PSRAM cache is just
+// another RAM voice; any other takes the single SD stream, cutting a song
+// sample that was streaming.
+static void seqSamplePlayImpl(uint8_t sampleId, uint8_t note, bool keyed, uint8_t volume = 127) {
+    if (sampleId == 0 || note > 127) return;
+    if (organActive()) return;     // organ owns the codec
+    float semis = (float)((int)note - 60)
+                + (float)sampleTuneCentsFor(sampleId) * 0.01f;
+    sfxAudStart(sampleId, semis, volume, note, keyed);
+}
+
+// The samples page's STOP.  Stopped: silence the whole sample player (also
+// ends a looping audition).  Song running: only what the page started — its
+// squares and its keyed notes.
+static void seqSamplePadsStopImpl() {
+    if (!seqRunning) {
+        samplePlayerStop();
+    } else {
+        for (int i = 0; i < SEQ_PAD_POLY; i++) sampleStopVoice(seqPadVoice[i]);
+        for (int i = 0; i < SEQ_AUD_POLY; i++) sampleStopVoice(seqSfxAudPoly[i].voice);
+        if (seqPadOwnsStream) samplePlayerStopStream();
+    }
+    for (int i = 0; i < SEQ_PAD_POLY; i++) seqPadVoice[i] = -1;
+    for (int i = 0; i < SEQ_AUD_POLY; i++) seqSfxAudPoly[i].voice = -1;
+    seqSfxAudNote    = 0xFF;
+    seqPadOwnsStream = false;
 }
 
 // Trigger a column's sample: preloaded → polyphonic RAM voice; not cached →
@@ -549,8 +673,6 @@ static void seqOrganApplySongPatch() {
     if (organGetLeslie()    != op.leslie)    organSetLeslie(op.leslie);
     if (organGetDrive()     != op.drive)     organSetDrive(op.drive);
     if (organGetReverb()    != op.reverb)    organSetReverb(op.reverb);
-    int voc = (op.flags & 2) ? 1 : 0;        // vocoder rides flags bit1 (no format bump)
-    if (organGetVocoder()   != voc)          organSetVocoder(voc);
 }
 
 static void seqNoteOff(int col) {
@@ -560,9 +682,11 @@ static void seqNoteOff(int col) {
         if (seqSfxVoice[col] >= 0) {
             sampleStopVoice(seqSfxVoice[col]);   // this column's RAM voice only
             seqSfxVoice[col] = -1;
-        } else {
+        } else if (!seqPadOwnsStream) {
             samplePlayerStopStream();            // it was the (single) SD stream;
         }                                        // other columns' RAM voices ring on
+                                                 // (a pad that took the stream
+                                                 // since is not this column's)
     } else if (seqActiveChan[col] == SEQ_CHAN_ORGAN) {
         organNoteOff(seqActiveNote[col]);
     } else {
@@ -1360,7 +1484,17 @@ static void sequencerPollMidiInBody() {
                 // Raw monitor first — sees every note on any channel (organ).
                 if (seqRawNoteCallback) seqRawNoteCallback(velocity > 0, midiByte1, velocity);
                 if (velocity == 0) seqSfxAudNoteOff(midiByte1);   // running-status note-off
-                if (velocity >= SEQ_MIN_PERFORMER_VEL && srvActiveBuf) {
+                // The client has a sample on the keys (its editor is open, or a
+                // square was held during a song): the key plays it, on any
+                // channel at any velocity.  Stopped, that is all the key does
+                // — it is not step input.  With a song running it is ALSO the
+                // performer's cue, as with the organ.
+                uint8_t keysId = sequencerSampleKeysId();
+                if (keysId && velocity > 0)
+                    seqSamplePlayImpl(keysId, midiByte1, true, seqKeyVolume(velocity));
+                if (keysId && !seqRunning) {
+                    // (the sample's key only)
+                } else if (velocity >= SEQ_MIN_PERFORMER_VEL && srvActiveBuf) {
                     const Song* s = seqSong();
                     uint8_t ch = midiStatus & 0x0F;  // 0-based channel
                     // Channel filter applies in both play and step-input.
@@ -1779,22 +1913,10 @@ static void seqAuditionRawNoteImpl(uint8_t channel, uint8_t note, uint8_t veloci
         if (organActive()) return;             // organ owns the codec
         const ColumnSettings& cs = seqSong()->columns[col];
         float semis = (float)((int)note - 60 + (int)cs.transpose)
-                    + (float)cs.sfxTuneCents * 0.01f;
-        int h = samplePlayRam(cs.program, semis, cs.volume);
-        if (h >= 0) {
-            // Polyphonic live playing: pair the voice with its key so the
-            // note-off releases exactly this one.  Table full → oldest slot.
-            int slot = 0;
-            for (int i = 0; i < SEQ_AUD_POLY; i++)
-                if (seqSfxAudPoly[i].voice < 0) { slot = i; break; }
-            if (seqSfxAudPoly[slot].voice >= 0)          // table full: evict
-                sampleStopVoice(seqSfxAudPoly[slot].voice);
-            seqSfxAudPoly[slot].note  = note;
-            seqSfxAudPoly[slot].voice = h;
-            return;
-        }
-        if (!sfxStreamPlay(cs, semis)) return;
-        seqSfxAudNote = note;   // the local MIDI parser stops it on note-off
+                    + (float)((int)cs.sfxTuneCents
+                              + (int)sampleTuneCentsFor(cs.program)) * 0.01f;
+        // Keyed: the local MIDI parser stops it on that key's note-off.
+        sfxAudStart(cs.program, semis, cs.volume, note, true);
         return;
     }
     if (channel < 1 || channel > 16) return;
@@ -2317,6 +2439,16 @@ void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
                               uint8_t col) {
     SeqReq r{}; r.a = channel; r.b = note; r.c = velocity; r.d = col;
     r.fn = [](const SeqReq& q) { seqAuditionRawNoteImpl(q.a, q.b, q.c, q.d); };
+    seqRun(r);
+}
+void sequencerSamplePlay(uint8_t sampleId, uint8_t note) {
+    SeqReq r{}; r.a = sampleId; r.b = note;
+    r.fn = [](const SeqReq& q) { seqSamplePlayImpl(q.a, q.b, false); };
+    seqRun(r);
+}
+void sequencerSamplePadsStop() {
+    SeqReq r{};
+    r.fn = [](const SeqReq&) { seqSamplePadsStopImpl(); };
     seqRun(r);
 }
 void sequencerApplyNoteSet(uint8_t pattern, uint8_t row, uint8_t col,

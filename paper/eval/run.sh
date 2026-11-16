@@ -16,8 +16,18 @@ SRV="$HERE/../../magitrac_server_s3"
 LIB="$HERE/../../magitrac_lib/src"
 B="$HERE/build"
 mkdir -p "$B"
-git -C "$HERE" show fumble-recall-baseline:magitrac_server_s3/midi_player.cpp > "$B/midi_player_first.cpp"
-FLAGS="-std=c++11 -w -DUNIT_TEST -I $SRV/test_mocks -I $SRV -I $LIB -I $HERE -I $HERE/mocks"
-g++ $FLAGS -DMIDI_PLAYER_CPP="\"$SRV/midi_player.cpp\""        "$HERE/replay.cpp" -o "$B/sim_recall"
-g++ $FLAGS -DMIDI_PLAYER_CPP="\"$B/midi_player_first.cpp\""    "$HERE/replay.cpp" -o "$B/sim_first"
+# The baseline is built against ITS OWN headers, not this checkout's: the
+# sequencer's neighbours (organ, sample player) have moved on since the tag.
+rm -rf "$B/base" && mkdir -p "$B/base"
+ROOT=$(git -C "$HERE" rev-parse --show-toplevel)
+git -C "$ROOT" archive -o "$B/base.tar" fumble-recall-baseline magitrac_server_s3 magitrac_lib/src
+tar -x -f "$B/base.tar" -C "$B/base"
+BSRV="$B/base/magitrac_server_s3"
+BLIB="$B/base/magitrac_lib/src"
+OPTS="-std=c++11 -w -DUNIT_TEST -I $HERE -I $HERE/mocks"
+g++ $OPTS -I "$SRV/test_mocks"  -I "$SRV"  -I "$LIB"  -DMIDI_PLAYER_CPP="\"$SRV/midi_player.cpp\""   "$HERE/replay.cpp" -o "$B/sim_recall"
+# (the host mocks — Arduino.h, the MIDI-capturing UART — are harness plumbing,
+#  newer than the tag: they come from this checkout, searched last.)
+rm -rf "$BSRV/test_mocks"
+g++ $OPTS -I "$SRV/test_mocks"  -I "$BSRV" -I "$BLIB" -I "$SRV" -DMIDI_PLAYER_CPP="\"$BSRV/midi_player.cpp\""  "$HERE/replay.cpp" -o "$B/sim_first"
 python3 "$HERE/fumble_eval.py" "$B" "$1"

@@ -12,7 +12,7 @@ your timing.
 - **[Tracker Guide](docs/tracker-guide.md)** — the handheld client, page
   by page
 - **[Server Guide](docs/server-guide.md)** — the stage box: screens,
-  samples, USB file transfer, organ
+  samples, organ
 - **[Reference](docs/reference.md)** — note cues, effects, block
   navigation, exact sequencer semantics
 - **[Lights](docs/lights.md)** — the PixelPost/DMX light system
@@ -33,7 +33,7 @@ Client and server pair over a dedicated softAP network; the client is the editor
 
 ## Building
 
-Sketches build from the Arduino IDE with the ESP32 board package. `magitrac_lib` must be available as a library (symlink or copy into your Arduino libraries folder). The CoreS3 server needs USB Mode set to TinyUSB for USB-MSC file transfer. See [Getting Started](docs/getting-started.md) for the full library list and board settings.
+Sketches build from the Arduino IDE with the ESP32 board package. `magitrac_lib` must be available as a library (symlink or copy into your Arduino libraries folder). See [Getting Started](docs/getting-started.md) for the full library list and board settings.
 
 ## License
 

@@ -10,6 +10,7 @@
 #include "SongMigration.h"
 #include "midi_player.h"
 #include "SampleManifest.h"
+#include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
 #include "esp32s3_dsp.h"   // ESP32S3_FFT — spectrogram (same engine as pixelpost bands)
 
 // ── Direct-from-Mac PixelPost OTA (client FW button) ──────────────────────────
@@ -63,9 +64,15 @@ static void wifiChannelApply(uint8_t idx) {
 }
 
 // CoreS3 SD: SCLK=G36, MISO=G35, MOSI=G37, CS=G4.  SPI.begin() with those
-// pins runs in setup() before commandsInit(); SD.begin(cs) then picks up
-// the default SPI bus we just configured.
+// pins runs in setup() before commandsInit(); SD.begin() then picks up the
+// default SPI bus we just configured.
 #define SRV_SD_CS      4
+// SD bus clock.  SD.begin() defaults to 4 MHz, which measured 423 KB/s on this
+// card — a 2.8 MB sample took 7 s just to scan for its waveform.  25 MHz is
+// what the former USB-drive mode (SdFat) ran this card and wiring at, and it
+// measures about 1.5 MB/s.  The library keeps CRC checking on, so a marginal
+// bus shows up as failed reads, not as bad data.
+#define SRV_SD_HZ      25000000
 #define SRV_SONGS_DIR  "/songs"
 // Autosave drafts land here, NOT /songs/.  They are never promoted or
 // recovered automatically (see the autosave-policy note below) — an explicit
@@ -92,7 +99,13 @@ struct InstrFileHeader {
     uint8_t  _pad[3];
 };
 
-Instrument srvInstruments[MAX_INSTRUMENTS];
+// The instrument bank: MAX_INSTRUMENTS entries in PSRAM (4.6 KB — control-rate
+// data, so not internal RAM).  Allocated at the top of commandsInit(); every
+// user below checks for the nullptr a double allocation failure would leave.
+Instrument* srvInstruments = nullptr;
+#define SRV_INSTRUMENTS_BYTES (sizeof(Instrument) * MAX_INSTRUMENTS)
+// Scratch for a full /songs enumeration (see "Shared scratch" further down).
+static char (*srvSongScratch)[SRV_FNAME_MAX] = nullptr;
 
 // True when the instruments file was on the card at boot but would not load
 // (SD fault, bad header).  srvInstruments then holds the built-in defaults, and
@@ -102,6 +115,7 @@ Instrument srvInstruments[MAX_INSTRUMENTS];
 static bool srvInstFileUnreadable = false;
 
 static void initDefaultInstruments() {
+    if (!srvInstruments) return;
     for (int i = 0; i < MAX_INSTRUMENTS; i++) {
         Instrument& inst = srvInstruments[i];
         memset(&inst, 0, sizeof(inst));
@@ -117,8 +131,9 @@ static void initDefaultInstruments() {
 // the whole file has been read and its header checked — a missing file, a bad
 // header or a short read leaves the in-memory instruments exactly as they were.
 static bool loadInstrumentsFromSD() {
-    uint8_t* tmp = (uint8_t*)heap_caps_malloc(sizeof(srvInstruments), MALLOC_CAP_SPIRAM);
-    if (!tmp) tmp = (uint8_t*)malloc(sizeof(srvInstruments));
+    if (!srvInstruments) return false;
+    uint8_t* tmp = (uint8_t*)heap_caps_malloc(SRV_INSTRUMENTS_BYTES, MALLOC_CAP_SPIRAM);
+    if (!tmp) tmp = (uint8_t*)malloc(SRV_INSTRUMENTS_BYTES);
     if (!tmp) {
         Serial.println("[CMD] loadInstruments: FAIL (no scratch memory)");
         return false;
@@ -133,14 +148,14 @@ static bool loadInstrumentsFromSD() {
                   && hdr.magic   == INSTR_FILE_MAGIC
                   && hdr.version == INSTR_FILE_VERSION);
             if (ok)
-                ok = (f.read(tmp, sizeof(srvInstruments))
-                      == (int)sizeof(srvInstruments));
+                ok = (f.read(tmp, SRV_INSTRUMENTS_BYTES)
+                      == (int)SRV_INSTRUMENTS_BYTES);
             f.close();
         }
     }
     // (no sanitization needed — instruments no longer carry midiChannel)
     if (ok) {
-        memcpy(srvInstruments, tmp, sizeof(srvInstruments));
+        memcpy(srvInstruments, tmp, SRV_INSTRUMENTS_BYTES);
         srvInstFileUnreadable = false;   // what is in memory is the file again
     }
     free(tmp);
@@ -151,6 +166,7 @@ static bool loadInstrumentsFromSD() {
 // Written to a temp file first and renamed into place only if every byte went
 // out, so a failed write can't leave a truncated instruments file behind.
 static void saveInstrumentsToSD() {
+    if (!srvInstruments) return;
     if (srvInstFileUnreadable) {
         Serial.println("[CMD] saveInstruments: REFUSED — " SRV_INSTRUMENTS_PATH
                        " was unreadable at boot and memory holds defaults; "
@@ -166,8 +182,8 @@ static void saveInstrumentsToSD() {
     hdr._pad[0] = hdr._pad[1] = hdr._pad[2] = 0;
     bool ok = (f.write((const uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr));
     if (ok)
-        ok = (f.write((const uint8_t*)srvInstruments, sizeof(srvInstruments))
-              == sizeof(srvInstruments));
+        ok = (f.write((const uint8_t*)srvInstruments, SRV_INSTRUMENTS_BYTES)
+              == SRV_INSTRUMENTS_BYTES);
     f.close();
     if (!ok) {
         SD.remove(SRV_INSTRUMENTS_TMP);
@@ -267,9 +283,10 @@ static volatile bool sSongListDirty = false;
 static volatile bool sAuditionPending = false;
 static uint8_t       sAuditionPat = 0, sAuditionRow = 0, sAuditionCol = 0;
 
-// PSRAM sample-preload sync: set whenever the active song (or its column
-// settings) changes; commandsTick runs samplePreloadSync on the loop task when
-// the sequencer is stopped and the player is quiet (SD reads + buffer frees).
+// PSRAM sample-preload sync: set whenever what should be in the sample cache
+// may have changed (the active song or its column settings, a trim edit, the
+// client's samples page or editor opening or closing); commandsTick then
+// steps samplePreloadSync on the loop task until it reports done.
 static volatile bool gSamplePreloadDirty = false;
 
 // Sample-editor requests, deferred to the loop task (overview = a windowed
@@ -278,7 +295,18 @@ static volatile bool     sSampleInfoPending = false;
 static volatile uint8_t  sSampleInfoId      = 0;
 static volatile uint32_t sSampleInfoVs      = 0;   // requested view window
 static volatile uint32_t sSampleInfoVe      = 0;   // 0,0 = whole file
+static volatile uint32_t sSampleInfoRxMs    = 0;   // [SMPDBG] when the request arrived
 static volatile bool     sTrimSavePending   = false;
+static volatile uint32_t sTrimSaveStampMs   = 0;   // last edit — the save waits
+                                                   // for the edits to settle
+static const uint32_t    TRIM_SAVE_SETTLE_MS = 1500;
+static uint8_t           sKeysPreloadId     = 0;   // editor sample being kept preloaded
+// Client's samples page open (SAMPLE_EDIT_PADS lease): every sample that fits
+// is wanted in memory.  Stamp = last renewal; sPadsWanted = what the preloader
+// was last told.
+static volatile bool     sPadsLease         = false;
+static volatile uint32_t sPadsLeaseMs       = 0;
+static bool              sPadsWanted        = false;
 static volatile bool     sSampleSpecPending = false;   // spectrogram request
 static volatile uint8_t  sSampleSpecId      = 0;
 
@@ -386,6 +414,8 @@ static void writeDefaultGmMap() {
 // the delete handler).  Recovering a draft, if ever wanted, must be a
 // deliberate user action — never a silent boot step.
 
+// (History: these two were written for the USB-drive mode, since removed.  They
+// stay as cheap insurance against a card left wedged by a reset mid-transfer.)
 // After a USB-MSC session the SD card is left in SPI mode by SdFat (25 MHz,
 // DEDICATED_SPI) and an ESP.restart() does NOT power-cycle it.  If the host
 // ejected while the card was mid (multi-)block read it keeps streaming data and
@@ -436,6 +466,10 @@ void commandsInit() {
     // that distinguishes "bad hardware" from "heap merely full".
     Serial.printf("[CMD] PSRAM: %u bytes total, %u free\n",
                   (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram());
+
+    // Control-rate tables (see srvAllocPsram): before anything below uses them.
+    srvInstruments = (Instrument*)srvAllocPsram(SRV_INSTRUMENTS_BYTES);
+    srvSongScratch = (char (*)[SRV_FNAME_MAX])srvAllocPsram(SRV_MAX_SONGS * SRV_FNAME_MAX);
 
     srvActiveBuf = (uint8_t*)heap_caps_malloc(SRV_SONG_XFER_MAX, MALLOC_CAP_SPIRAM);
     if (!srvActiveBuf) {
@@ -488,7 +522,7 @@ void commandsInit() {
     srvSdOk = false;
     for (int attempt = 0; attempt < 4 && !srvSdOk; ++attempt) {
         sdRecoverBus();                            // idle the card before each try
-        srvSdOk = SD.begin(SRV_SD_CS);
+        srvSdOk = SD.begin(SRV_SD_CS, SPI, SRV_SD_HZ);
         if (!srvSdOk) {
             Serial.printf("[CMD] SD.begin attempt %d failed\n", attempt + 1);
             delay(100);
@@ -537,14 +571,15 @@ static int srvNameCmp(const void* a, const void* b) {
 // load-local) is deferred to the loop task, so they never run concurrently and
 // a single static buffer is race-free — and at SRV_MAX_SONGS entries it is too
 // big (~3 KB) to want on the loop-task stack.  Same "one task only" rationale
-// as the backup path's static names[] buffer.
-static char srvSongScratch[SRV_MAX_SONGS][SRV_FNAME_MAX];
+// as the backup path's static names[] buffer.  It is srvSongScratch, declared
+// with the instrument bank near the top of this file: SRV_MAX_SONGS rows in
+// PSRAM, allocated in commandsInit(); srvListSongs returns 0 if it is missing.
 
 // ── List .mgt files in /songs ──────────────────────────────────────────────────
 // Returns names sorted alphabetically (case-insensitive) so every paginated
 // list the client assembles is in a stable, sorted order.
 int srvListSongs(char names[][SRV_FNAME_MAX], int maxFiles) {
-    if (!srvSdOk) return 0;
+    if (!srvSdOk || !names) return 0;
     SdLock _;
     File d = SD.open(SRV_SONGS_DIR);
     if (!d || !d.isDirectory()) {
@@ -1070,10 +1105,109 @@ static bool sendSongDataByName(const char* name) {
     return sendSongDataFromPath(path, display);
 }
 
+// ── Sample editor: waveform overview peaks ────────────────────────────────────
+// Min/max of the LEFT channel for each of the SAMPLE_OVERVIEW_N columns across
+// viewFrames frames starting at frame vs, scaled int16 → int8 into peaks[]
+// (min,max pairs; the caller zeroes it first).  `rd` is a scratch buffer of
+// SAMPLE_OVERVIEW_RD int16s.
+//
+// Two ways to do it, chosen by sampleOverviewSampled():
+//   exact   — read every frame of the window, in order.  `f` must already be
+//             positioned at frame vs.  Costs time in proportion to the window.
+//   sampled — seek to each column and read one buffer-load from its start.
+//             Costs SAMPLE_OVERVIEW_N seeks however big the window is, and the
+//             picture is an estimate: a click shorter than the gap between
+//             slices can be missed.  It turns exact again as the client zooms
+//             in, because it re-requests peaks for just its visible window.
+//
+// Measured on the CoreS3 (SD at 25 MHz, 2.8 MB stereo WAV, Nov 2026):
+//   sequential read            ≈ 1.5 MB/s, whatever the request or stdio
+//                                buffer size (4 KB … 64 KB all the same)
+//   seek + 2 KB read           7.4 ms through the library's 4 KB stdio buffer
+//                              4.3 ms with a 2 KB stdio buffer and the seek
+//                                     rounded to a 512-byte sector boundary
+// So 400 sampled columns cost about 1.7 s, which a full read matches at about
+// 2.6 MB.  Exact is the better picture, so it is kept up to 3 MB (≈ 2 s);
+// beyond that the scan samples and no sample takes longer than that to open.
+// For the sampled figure to hold, the caller opens the file afresh and calls
+// setBufferSize(SAMPLE_OVERVIEW_SLICE_BYTES) before the first read.
+#define SAMPLE_OVERVIEW_RD            1024                       // int16s in `rd`
+#define SAMPLE_OVERVIEW_SLICE_BYTES   (SAMPLE_OVERVIEW_RD * 2)   // 2048
+#define SAMPLE_OVERVIEW_SAMPLED_BYTES (3UL * 1024UL * 1024UL)
+
+static bool sampleOverviewSampled(uint32_t viewFrames, uint16_t numCh) {
+    return (uint64_t)viewFrames * numCh * 2 > SAMPLE_OVERVIEW_SAMPLED_BYTES;
+}
+
+static void sampleOverviewPeaks(File& f, uint32_t dataOffset, uint32_t vs,
+                                uint32_t viewFrames, uint16_t numCh,
+                                int16_t* rd, int8_t* peaks, bool sampled) {
+    const uint32_t frameBytes = (uint32_t)numCh * 2;
+
+    if (sampled) {
+        const uint32_t sliceFrames = SAMPLE_OVERVIEW_RD / numCh;
+        const uint32_t viewPos     = dataOffset + vs * frameBytes;   // window start
+        for (int col = 0; col < SAMPLE_OVERVIEW_N; col++) {
+            uint32_t f0  = (uint32_t)(((uint64_t)col * viewFrames) / SAMPLE_OVERVIEW_N);
+            // Round down to a sector boundary (one clean multi-sector read
+            // instead of three); 512 is a whole number of frames from the
+            // 44-byte header for mono and stereo alike.  Never back past the
+            // window start — for the first column that would be the header.
+            uint32_t pos = (viewPos + f0 * frameBytes) & ~511UL;
+            if (pos < viewPos) pos = viewPos;
+            uint32_t first = (pos - dataOffset) / frameBytes - vs;   // frame in window
+            if (!f.seek(pos)) break;
+            int got = f.read((uint8_t*)rd, sliceFrames * frameBytes);
+            int n = got / (int)frameBytes;
+            if (n <= 0) break;
+            if ((uint32_t)n > viewFrames - first) n = (int)(viewFrames - first);
+            int16_t mn = 32767, mx = -32768;
+            for (int i = 0; i < n; i++) {
+                int16_t s = rd[i * numCh];
+                if (s < mn) mn = s;
+                if (s > mx) mx = s;
+            }
+            peaks[col * 2]     = (int8_t)(mn >> 8);
+            peaks[col * 2 + 1] = (int8_t)(mx >> 8);
+        }
+        return;
+    }
+
+    // Exact: every frame of the window, in order.
+    uint32_t bucket = (viewFrames + SAMPLE_OVERVIEW_N - 1) / SAMPLE_OVERVIEW_N;
+    if (bucket == 0) bucket = 1;
+    uint32_t frame = 0;
+    int      col   = 0;
+    int16_t  mn = 32767, mx = -32768;
+    while (frame < viewFrames && col < SAMPLE_OVERVIEW_N) {
+        int got = f.read((uint8_t*)rd, SAMPLE_OVERVIEW_RD * sizeof(int16_t));
+        if (got <= 0) break;
+        int n = got / (int)frameBytes;
+        for (int i = 0; i < n && col < SAMPLE_OVERVIEW_N; i++) {
+            if (frame >= viewFrames) break;
+            int16_t s = rd[i * numCh];
+            if (s < mn) mn = s;
+            if (s > mx) mx = s;
+            if (++frame % bucket == 0) {
+                peaks[col * 2]     = (int8_t)(mn >> 8);
+                peaks[col * 2 + 1] = (int8_t)(mx >> 8);
+                col++;
+                mn = 32767; mx = -32768;
+            }
+        }
+    }
+    if (col < SAMPLE_OVERVIEW_N && mn != 32767) { // final partial bucket
+        peaks[col * 2]     = (int8_t)(mn >> 8);
+        peaks[col * 2 + 1] = (int8_t)(mx >> 8);
+    }
+}
+
 // ── Sample editor: build + send meta + waveform overview ──────────────────────
-// Windowed SD read (min/max peaks per bucket over [vs, ve); 0,0 = whole file)
+// Windowed SD read (min/max peaks per column over [vs, ve); 0,0 = whole file)
 // — called from commandsTick on the loop task only.  A zoomed-in client asks
-// for its visible window and gets full-resolution peaks for it.
+// for its visible window and gets full-resolution peaks for it; a window of
+// more than 3 MB is sampled rather than read end to end (see
+// sampleOverviewPeaks).
 static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
     const char* fname = sampleManifestNameFor(id);
     if (!fname) return;
@@ -1084,7 +1218,8 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
     // spectrogram builder below for the incident that taught us this).
     MsgSampleInfo* infoP =
         (MsgSampleInfo*)heap_caps_malloc(sizeof(MsgSampleInfo), MALLOC_CAP_SPIRAM);
-    int16_t* rdP = (int16_t*)heap_caps_malloc(1024 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t* rdP = (int16_t*)heap_caps_malloc(SAMPLE_OVERVIEW_RD * sizeof(int16_t),
+                                              MALLOC_CAP_SPIRAM);
     if (!infoP || !rdP) { free(infoP); free(rdP); return; }
     MsgSampleInfo& info = *infoP;
     info = MsgSampleInfo();      // NSDMI: id + length
@@ -1092,10 +1227,16 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
     uint32_t totalFrames = 0, rate = 0;
     uint16_t numCh = 0;
     bool ok = false;
+    // [SMPDBG] step timings
+    uint32_t dbgT0 = millis(), dbgLock = 0, dbgOpen = 0, dbgHdr = 0, dbgScan = 0;
+    uint32_t dbgSize = 0, dbgView = 0;
+    bool     dbgSampled = false;
     memset(info.peaks, 0, sizeof(info.peaks));
     {
         SdLock _;
+        dbgLock = millis();
         File f = SD.open(path);
+        dbgOpen = millis();
         if (f) do {
             uint8_t hdr[44];
             if (f.read(hdr, sizeof(hdr)) != sizeof(hdr)) break;
@@ -1105,41 +1246,30 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
             uint16_t bitsPer = (uint16_t)hdr[34] | ((uint16_t)hdr[35] << 8);
             if ((numCh != 1 && numCh != 2) || bitsPer != 16) break;
             uint32_t frameBytes = (uint32_t)numCh * 2;
-            totalFrames = ((uint32_t)f.size() - sizeof(hdr)) / frameBytes;
+            dbgSize     = (uint32_t)f.size();
+            totalFrames = (dbgSize - sizeof(hdr)) / frameBytes;
+            dbgHdr      = millis();
 
             // Clamp the requested window.
             if (vs >= totalFrames) vs = 0;
             if (ve == 0 || ve > totalFrames || ve <= vs) ve = totalFrames;
             uint32_t viewFrames = ve - vs;
-            if (vs && !f.seek(sizeof(hdr) + vs * frameBytes)) break;
 
-            // Min/max of the LEFT channel per bucket, scaled int16 → int8.
-            uint32_t bucket = (viewFrames + SAMPLE_OVERVIEW_N - 1) / SAMPLE_OVERVIEW_N;
-            if (bucket == 0) bucket = 1;
-            uint32_t frame = 0;
-            int      col   = 0;
-            int16_t  mn = 32767, mx = -32768;
-            while (frame < viewFrames && col < SAMPLE_OVERVIEW_N) {
-                int got = f.read((uint8_t*)rdP, 1024 * sizeof(int16_t));
-                if (got <= 0) break;
-                int n = got / (int)frameBytes;
-                for (int i = 0; i < n && col < SAMPLE_OVERVIEW_N; i++) {
-                    if (frame >= viewFrames) break;
-                    int16_t s = rdP[i * numCh];
-                    if (s < mn) mn = s;
-                    if (s > mx) mx = s;
-                    if (++frame % bucket == 0) {
-                        info.peaks[col * 2]     = (int8_t)(mn >> 8);
-                        info.peaks[col * 2 + 1] = (int8_t)(mx >> 8);
-                        col++;
-                        mn = 32767; mx = -32768;
-                    }
-                }
+            dbgSampled = sampleOverviewSampled(viewFrames, numCh);
+            if (dbgSampled) {
+                // Fresh handle with a slice-sized stdio buffer, set before its
+                // first read (see sampleOverviewPeaks).
+                f.close();
+                f = SD.open(path);
+                if (!f) break;
+                f.setBufferSize(SAMPLE_OVERVIEW_SLICE_BYTES);
+            } else if (vs && !f.seek(sizeof(hdr) + vs * frameBytes)) {
+                break;
             }
-            if (col < SAMPLE_OVERVIEW_N && mn != 32767) { // final partial bucket
-                info.peaks[col * 2]     = (int8_t)(mn >> 8);
-                info.peaks[col * 2 + 1] = (int8_t)(mx >> 8);
-            }
+            sampleOverviewPeaks(f, sizeof(hdr), vs, viewFrames, numCh,
+                                rdP, info.peaks, dbgSampled);
+            dbgScan = millis();
+            dbgView = viewFrames;
             info.viewStart = vs;
             info.viewEnd   = ve;
             ok = true;
@@ -1157,13 +1287,29 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
         info.rate        = rate;
         info.startFrame  = tr ? tr->startFrame : 0;
         info.endFrame    = tr ? tr->endFrame   : 0;
+        info.tuneCents   = tr ? tr->tuneCents  : 0;
 
+        uint32_t dbgSend0 = millis();
         gMagiLink.acquireMutex();
         gMagiLink.send(&info, sizeof(info));
         gMagiLink.releaseMutex();
+        uint32_t dbgEnd = millis();
+        SMPDBG("info id=%u %s: %lu KB, %u ch, %lu Hz, %lu frames | waited for SD lock %lu ms, "
+               "open %lu ms, header+size %lu ms, scan %lu ms (%s, %lu frames in view), "
+               "send %lu ms | total %lu ms",
+               (unsigned)id, fname, (unsigned long)(dbgSize / 1024), (unsigned)numCh,
+               (unsigned long)rate, (unsigned long)totalFrames,
+               (unsigned long)(dbgLock - dbgT0), (unsigned long)(dbgOpen - dbgLock),
+               (unsigned long)(dbgHdr - dbgOpen), (unsigned long)(dbgScan - dbgHdr),
+               dbgSampled ? "sampled" : "exact", (unsigned long)dbgView,
+               (unsigned long)(dbgEnd - dbgSend0), (unsigned long)(dbgEnd - dbgT0));
+    } else {
+        SMPDBG("info id=%u %s: FAILED (open/format) after %lu ms",
+               (unsigned)id, fname, (unsigned long)(millis() - dbgT0));
     }
     free(infoP);
     free(rdP);
+
 }
 
 // ── Sample editor: spectrogram (Fairlight Page-D waterfall, display only) ─────
@@ -1451,8 +1597,9 @@ static void sendInstrumentsData() {
         Serial.println("[CMD] sendInstruments: link not connected");
         return;
     }
+    if (!srvInstruments) return;
     const uint8_t* raw   = (const uint8_t*)srvInstruments;
-    uint32_t       total = (uint32_t)sizeof(srvInstruments);
+    uint32_t       total = (uint32_t)SRV_INSTRUMENTS_BYTES;
 
     gMagiLink.acquireMutex();
 
@@ -2610,27 +2757,68 @@ void commandsTick() {
         sequencerAuditionNote(sAuditionPat, sAuditionRow, sAuditionCol);
     }
 
-    // PSRAM sample preload follows the active song.  Deferred until the
-    // sequencer is stopped and the player is quiet — samplePreloadSync
-    // returns false (retry next tick) while anything is still sounding.
-    if (gSamplePreloadDirty && !sequencerIsRunning() && srvHasActive) {
-        Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
-        if (samplePreloadSync(song)) gSamplePreloadDirty = false;
+    // PSRAM sample preload follows the active song, the client's sample
+    // editor and its samples page.
+    //
+    // The client's sample editor adds one more sample to the wanted set (the
+    // one its MIDI keys play) for as long as its key lease is live — with or
+    // without a song loaded.
+    {
+        uint8_t keysId = sequencerSampleKeysId();
+        if (keysId != sKeysPreloadId) {
+            sKeysPreloadId = keysId;
+            samplePreloadSetExtra(keysId);
+            gSamplePreloadDirty = true;
+        }
+    }
+    {
+        bool pads = sPadsLease &&
+                    (uint32_t)(millis() - sPadsLeaseMs) <= SAMPLE_KEYS_LEASE_MS;
+        if (!pads) sPadsLease = false;                 // lapsed
+        if (pads != sPadsWanted) {
+            sPadsWanted = pads;
+            samplePreloadSetPads(pads);
+            gSamplePreloadDirty = true;
+        }
+    }
+    // One step per tick (a 32 KB read at most), so a long load never stalls
+    // this loop; it stays "dirty" until the preloader says it is finished.
+    // It runs while a song plays too — in 8 KB steps, and it stands aside
+    // whenever a sample is streaming — so a sample chosen mid-song (the pads,
+    // or one being played from the keys) still becomes polyphonic.
+    if (gSamplePreloadDirty && (srvHasActive || sKeysPreloadId || sPadsWanted)) {
+        Song* song = srvHasActive
+                   ? (Song*)(srvActiveBuf + sizeof(SongFileHeader)) : nullptr;
+        uint32_t dbgT = millis();
+        bool synced = samplePreloadSync(song, /*gentle=*/sequencerIsRunning());
+        if (synced) gSamplePreloadDirty = false;
+        if (millis() - dbgT >= 5)
+            SMPDBG("preload step %s, took %lu ms (editor sample id=%u)",
+                   synced ? "- all done" : "- more to do",
+                   (unsigned long)(millis() - dbgT), (unsigned)sKeysPreloadId);
     }
 
-    // Sample editor: persist trim edits, serve meta/overview requests.
-    if (sTrimSavePending) {
+    // Sample editor: persist trim/tune edits, serve meta/overview requests.
+    // The save waits until the edits have settled (a held TUNE button sends a
+    // run of them) — unless a sample-list request is waiting: the manifest
+    // sync it runs re-reads trim.txt, which would throw away an edit not yet
+    // written out, so that forces the save first.
+    if (sTrimSavePending &&
+        (srvSampleListPending ||
+         (uint32_t)(millis() - sTrimSaveStampMs) >= TRIM_SAVE_SETTLE_MS)) {
         sTrimSavePending = false;
+        uint32_t dbgT = millis();
         sampleTrimSave();
+        SMPDBG("trim.txt saved, took %lu ms", (unsigned long)(millis() - dbgT));
     }
-    // Sample list AFTER the trim save: the manifest sync it runs re-reads
-    // trim.txt, which would throw away a trim edit not yet written out.
     if (srvSampleListPending) {
         srvSampleListPending = false;
         sendSampleList(srvSampleListPendingPage);
     }
     if (sSampleInfoPending) {
         sSampleInfoPending = false;
+        SMPDBG("info request picked up by the loop %lu ms after it arrived",
+               (unsigned long)(millis() - sSampleInfoRxMs));
         sendSampleInfo(sSampleInfoId, sSampleInfoVs, sSampleInfoVe);
     }
     if (sSampleSpecPending) {
@@ -2828,7 +3016,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 const MsgInstrumentsPatch* p = (const MsgInstrumentsPatch*)data;
                 if (len < hdrLen + (int)p->dataLen) return;
                 uint32_t end = (uint32_t)p->offset + p->dataLen;
-                if (end <= sizeof(srvInstruments)) {
+                if (srvInstruments && end <= SRV_INSTRUMENTS_BYTES) {
                     memcpy((uint8_t*)srvInstruments + p->offset, p->data, p->dataLen);
                     srvInstSavePending = true;
                 }
@@ -2885,7 +3073,6 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 else if (m->op == ORGAN_OP_PARAM)     organSetParam(m->index, m->value);
                 else if (m->op == ORGAN_OP_PROCSEL)   organSetProcSound(m->value);
                 else if (m->op == ORGAN_OP_REVERB)    organSetReverb(m->value);
-                else if (m->op == ORGAN_OP_VOCODER)   organSetVocoder(m->value);
             }
             break;
 
@@ -3045,7 +3232,24 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             if (len < (int)sizeof(MsgSampleEdit)) return;
             {
                 const MsgSampleEdit* m = (const MsgSampleEdit*)data;
+#if SAMPLE_DEBUG
+                {   // KEYS is re-sent every 2 s — log it only when it changes.
+                    static uint8_t sDbgKeys = 0;
+                    static const char* const OPN[] = { "GET", "SET", "STOP", "SPEC", "PLAY", "KEYS", "PADS" };
+                    bool quiet = (m->op == SAMPLE_EDIT_KEYS && m->sampleId == sDbgKeys) ||
+                                 m->op == SAMPLE_EDIT_PADS;
+                    if (m->op == SAMPLE_EDIT_KEYS) sDbgKeys = m->sampleId;
+                    if (!quiet) {
+                        const char* nm = sampleManifestNameFor(m->sampleId);
+                        SMPDBG("rx %s id=%u (%s) start=%lu end=%lu",
+                               m->op < 7 ? OPN[m->op] : "?", (unsigned)m->sampleId,
+                               nm ? nm : "-", (unsigned long)m->startFrame,
+                               (unsigned long)m->endFrame);
+                    }
+                }
+#endif
                 if (m->op == SAMPLE_EDIT_GET) {
+                    sSampleInfoRxMs    = millis();
                     sSampleInfoId      = m->sampleId;   // overview reads SD —
                     sSampleInfoVs      = m->startFrame; // deferred to the loop
                     sSampleInfoVe      = m->endFrame;
@@ -3053,11 +3257,27 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 } else if (m->op == SAMPLE_EDIT_SET) {
                     // RAM table updates inline (playback picks it up on the
                     // next trigger); the SD write + cache re-bake defer.
-                    sampleTrimSet(m->sampleId, m->startFrame, m->endFrame, m->loop);
+                    sampleTrimSet(m->sampleId, m->startFrame, m->endFrame, m->loop,
+                                  m->tuneCents);
+                    sTrimSaveStampMs    = millis();
                     sTrimSavePending    = true;
                     gSamplePreloadDirty = true;
                 } else if (m->op == SAMPLE_EDIT_STOP) {
-                    samplePlayerStop();                 // ends a looping audition
+                    // Ends a looping audition / silences the sample pads.
+                    // While a song plays it stops only what the pads started
+                    // — the song's samples aren't ours to cut.
+                    sequencerSamplePadsStop();
+                } else if (m->op == SAMPLE_EDIT_PLAY) {
+                    sequencerSamplePlay(m->sampleId, m->note);
+                } else if (m->op == SAMPLE_EDIT_PADS) {
+                    // Renews (or, with id 0, ends) the samples-page lease;
+                    // commandsTick turns it into preloading.
+                    sPadsLeaseMs = millis();
+                    sPadsLease   = (m->sampleId != 0);
+                } else if (m->op == SAMPLE_EDIT_KEYS) {
+                    // Renews (or, with id 0, ends) the key lease; commandsTick
+                    // sees the change and preloads / releases the sample.
+                    sequencerSampleKeys(m->sampleId);
                 } else if (m->op == SAMPLE_EDIT_SPEC) {
                     sSampleSpecId      = m->sampleId;   // FFT over SD data —     
                     sSampleSpecPending = true;          // deferred to the loop
