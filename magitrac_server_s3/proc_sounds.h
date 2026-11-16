@@ -13,7 +13,7 @@
 // boot from harmonic tables measured off a reference recording, so a new
 // sound is usually just two rows of numbers + a registry entry.
 
-#define PROC_SOUND_COUNT 3
+#define PROC_SOUND_COUNT 4
 #define PROC_MAX_PARAMS  5       // PROC mode has no drawbars → room for 5 sliders
 #define PROC_WT          1024    // wavetable length (10-bit phase index)
 
@@ -23,6 +23,20 @@
 // rooted on the note (see thx code in proc_sounds.cpp + drawbar_organ.cpp).
 #define PROC_IDX_THX 2
 #define THX_OSC      16          // sub-oscillators per THX voice (the cluster)
+
+// VOCODER is the other special PROC sound: each held note is one oscillator,
+// and the summed notes are the CARRIER of a channel vocoder driven by the
+// microphone — the chord speaks what is said into the mic.  Sliders:
+//   [0] WAVE   0 = sawtooth; 1..8 = pulse, from 50% wide (square) at 1 down
+//              to 6% (thin) at 8
+//   [1] PWM    how far a slow per-note LFO swings the pulse's width (nothing
+//              to do on the sawtooth)
+//   [2] SSS    consonant noise
+//   [3] GATE   how loud the mic must be before the vocoder opens (stage bleed)
+//   [4] SMOOTH how slowly the bands let go: crisp and robotic … smeared and choral
+// None of the shared slider meanings below apply to it.  The oscillator and
+// the vocoder live in drawbar_organ.cpp.
+#define PROC_IDX_VOC 3
 
 // Slider index semantics are partly fixed by the render loop: [0] scales the
 // generator's noise (live), [2] is the global BRIGHT low-pass (live), [4] is

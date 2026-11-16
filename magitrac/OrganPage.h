@@ -37,12 +37,12 @@ static const int OR_VC_N     = 7;     // off, V1-3, C1-3
 static const int OR_LES_N    = 3;     // stop, slow, fast
 static const int OR_DRV_N    = 2;     // off, on
 static const int OR_RVB_N    = 3;     // off, room, hall
-static const int OR_VOC_N    = 2;     // vocoder off, on
 static const int OR_TYPE_PROC = 4;    // the procedural-sounds type
 
 // PROC type — the sound list replaces presets + drawbars.  Count and order
 // must mirror PROC_SOUNDS in the server's proc_sounds.h.
-static const int OR_PROC_N     = 3;
+static const int OR_PROC_N     = 4;
+static const int OR_PROC_VOC   = 3;    // the VOCODER sound (server: PROC_IDX_VOC)
 static const int OR_PROCBTN_W  = 420;
 
 // Preset buttons run down the left edge; the drawbar panel sits to their right.
@@ -113,7 +113,6 @@ private:
     int     _leslie;       // 0=stop, 1=slow, 2=fast
     int     _drive;        // 0=off, 1=on
     int     _reverb;       // 0=off, 1=room, 2=hall
-    int     _vocoder;      // 0=off, 1=on (mic vocoder — organ carrier)
     int     _fxPage;       // which page of effects the top bar shows
     uint8_t _knob[OR_TYPE_N][OR_NKNOB];   // per-type knob values 0..8
     int     _procSel;                     // selected procedural sound (PROC type)

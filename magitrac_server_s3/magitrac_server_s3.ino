@@ -20,11 +20,17 @@
 #include "Battery.h"
 #include "crash_log.h"
 #include "mic_echo_test.h"
+#include "mic_hold_test.h"
 
 // Diagnostic: when defined, setup() runs a record / play loop on the codec
 // forever instead of booting normally.  Confirms the mic is hearing what we
 // think it's hearing.  Uncomment for diagnostics; leave commented for live.
 // #define MIC_ECHO_TEST
+
+// Diagnostic: when defined, setup() stops after the radio is up and the device
+// becomes a mic tester — hold the screen to record, let go to hear it back
+// (mic_hold_test.cpp).  Uncomment for diagnostics; leave commented for live.
+// #define MIC_HOLD_TEST
 #include "hal/uart_ll.h"
 #include "esp_wifi.h"
 
@@ -1410,6 +1416,14 @@ void setup() {
     }
     Serial.printf("[UDP] broadcast destination: %s\n",
                   gBroadcastIp.toString().c_str());
+
+#ifdef MIC_HOLD_TEST
+    // Diagnostic — never returns.  Placed here so the radio is up as it is in
+    // live use (its bursts couple into the audio path), but nothing else that
+    // touches the codec has started.
+    micHoldLoop();
+#endif
+
     crashSetBootStep(BS_NET);
     {
         uint8_t octets[4] = { gBroadcastIp[0], gBroadcastIp[1],

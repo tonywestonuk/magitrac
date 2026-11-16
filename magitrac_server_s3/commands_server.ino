@@ -3073,7 +3073,6 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 else if (m->op == ORGAN_OP_PARAM)     organSetParam(m->index, m->value);
                 else if (m->op == ORGAN_OP_PROCSEL)   organSetProcSound(m->value);
                 else if (m->op == ORGAN_OP_REVERB)    organSetReverb(m->value);
-                else if (m->op == ORGAN_OP_VOCODER)   organSetVocoder(m->value);
             }
             break;
 

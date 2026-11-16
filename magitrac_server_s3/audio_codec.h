@@ -21,6 +21,11 @@ bool audioCodecPlay(const uint8_t* buf, size_t bytes);
 // of 4 (16-bit stereo frames).  Returns false on failure.
 bool audioCodecRecord(uint8_t* buf, size_t bytes);
 
+// Read up to `bytes`, waiting at most `waitMs` for them (0 = only what is
+// already buffered).  Returns the number of bytes read — 0 if none arrived or
+// the codec isn't ready.
+size_t audioCodecRecordSome(uint8_t* buf, size_t bytes, uint32_t waitMs);
+
 // Swap the I2S DMA pool: low=true → small (~8 ms, low latency, for the organ);
 // low=false → large (~45 ms, rides out SD jitter, for SamplePlayer).  Tears the
 // I2S channel down + back up, so the audio task must not be streaming across the

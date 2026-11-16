@@ -92,8 +92,6 @@ int  organGetDrive() { return 0; }
 void organSetDrive(int) {}
 int  organGetReverb() { return 0; }
 void organSetReverb(int) {}
-int  organGetVocoder() { return 0; }
-void organSetVocoder(int) {}
 
 // ── External state required by midi_player.cpp ───────────────────────────────
 #include "TrackerData.h"

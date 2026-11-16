@@ -673,8 +673,6 @@ static void seqOrganApplySongPatch() {
     if (organGetLeslie()    != op.leslie)    organSetLeslie(op.leslie);
     if (organGetDrive()     != op.drive)     organSetDrive(op.drive);
     if (organGetReverb()    != op.reverb)    organSetReverb(op.reverb);
-    int voc = (op.flags & 2) ? 1 : 0;        // vocoder rides flags bit1 (no format bump)
-    if (organGetVocoder()   != voc)          organSetVocoder(voc);
 }
 
 static void seqNoteOff(int col) {
