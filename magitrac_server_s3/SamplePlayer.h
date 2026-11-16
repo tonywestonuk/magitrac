@@ -20,7 +20,7 @@ struct Song;   // TrackerData.h — only needed by samplePreloadSync
 
 void samplePlayerInit();                    // call once in setup() (after audioCodecInit)
 void samplePlayerPlay(const char* path, float pitchSemitones = 0,   // 0 = native pitch (tracker C-4); ±semitones transposes (fractional = cents-accurate root tuning)
-                      uint8_t volume = 127,                         // 0..127, squared taper (GM CC7-ish); 127 = unity
+                      uint8_t volume = 127,                         // squared taper (GM CC7-ish); 127 = unity, up to 255 boosts (and can clip)
                       uint32_t startFrame = 0,                      // trim: first frame to play
                       uint32_t endFrame = 0,                        // trim: stop here (0 = end of file)
                       bool loop = false);                           // wrap start..end until stopped
@@ -29,19 +29,29 @@ void samplePlayerStopStream();              // stop only the SD stream; RAM voic
 bool samplePlayerIsPlaying();
 
 // ── PSRAM sample cache + polyphonic RAM voices ────────────────────────────────
-// SFX samples whose WAV file is under 200 KB are preloaded into PSRAM when the
-// song loads and play from RAM with polyphony (mixed with each other AND with
-// a concurrently streaming big sample).  Larger files keep streaming from SD,
-// single-voice.
+// Samples held in PSRAM play from RAM, polyphonic (8 voices, mixed with each
+// other AND with a concurrently streaming sample).  Anything not in the cache
+// streams from SD, single-voice.
 //
-// samplePreloadSync: diff the cache against the song's SFX columns — evict
-// what's no longer referenced, load what's new.  Does SD reads: call from the
-// LOOP task only (commandsTick), with the sequencer stopped and voices quiet
-// (returns false = busy, call again next tick).
-bool samplePreloadSync(const Song* song);
+// What is kept in the cache: the loaded song's SFX samples, the sample open in
+// the client's editor (samplePreloadSetExtra), and — while the client's
+// samples page is open (samplePreloadSetPads) — every sample on the card,
+// shortest first.  One sample may take up to 2 MB of audio and the cache 6 MB
+// in all; what doesn't fit streams.  Samples nobody wants any more stay until
+// their room is needed.
+//
+// samplePreloadSync does one step of bringing the cache to that state: call
+// it from the LOOP task (it reads SD, 32 KB at a time — 8 KB with `gentle`,
+// for while a song is playing) until it returns true.  false = call again.
+// The Set calls below only record a wish — the caller schedules the sync that
+// acts on it.
+bool samplePreloadSync(const Song* song, bool gentle = false);
+void samplePreloadSetExtra(uint8_t sampleId);   // 0 = none
+void samplePreloadSetPads(bool on);
 // Start a RAM voice (polyphonic, steals the oldest when full).  Returns a
 // voice handle, or -1 if the sample isn't cached (caller falls back to
-// samplePlayerPlay streaming).
+// samplePlayerPlay streaming).  volume as for samplePlayerPlay: 127 = unity,
+// more boosts.
 int  samplePlayRam(uint8_t sampleId, float pitchSemitones = 0, uint8_t volume = 127);
 void sampleStopVoice(int voice);            // release one RAM voice (short fade)
 bool sampleRamVoicesActive();

@@ -4,6 +4,7 @@
 #include "audio_codec.h"
 #include "crash_log.h"
 #include "TrackerData.h"
+#include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
 #include <Arduino.h>
 #include <SD.h>
 #include <string.h>
@@ -134,14 +135,30 @@ struct Resampler {
 };
 
 // ── PSRAM sample cache ────────────────────────────────────────────────────────
-// Whole decoded WAVs (16-bit PCM, mono/stereo) held in PSRAM, keyed by the
-// manifest id the columns reference.  Loaded/evicted by samplePreloadSync on
-// the loop task; read by the RAM voices on the WAV task.  s_cacheLocked makes
-// samplePlayRam refuse (→ stream fallback) while the sync mutates the cache,
-// so a voice can never start on a buffer that's about to be freed.
-#define RAM_CACHE_MAX       16
-#define PRELOAD_MAX_BYTES   (200 * 1024)
-#define PRELOAD_TOTAL_CAP   (4 * 1024 * 1024)
+// Decoded WAVs (16-bit PCM, mono/stereo) held in PSRAM, keyed by manifest id,
+// so they can play as RAM voices — polyphonic, and with no SD card involved at
+// trigger time.  Filled by samplePreloadSync on the loop task, a piece per
+// call; read by samplePlayRam (MIDI task) and the voices (WAV task).
+//
+// What gets a place, in this order: the loaded song's SFX samples, the sample
+// open in the client's editor, then — while the client's samples page is open
+// — every sample on the card, shortest first.  A sample longer than
+// PRELOAD_MAX_BYTES, or one that would take the cache past PRELOAD_TOTAL_CAP,
+// is left out and streams from SD instead (one at a time).  Entries nobody
+// wants any more are NOT thrown out until their room is needed, so going back
+// to a page or a song finds its samples still loaded.
+//
+// Two rules keep the three tasks out of each other's way:
+//   • an entry appears (and a voice starts on it) under s_voiceMux, so a
+//     lookup sees either nothing or a finished entry;
+//   • an entry is only removed while no RAM voice is sounding — checked under
+//     that same lock, so a voice can't start on it in between — which means
+//     nothing can be reading the buffer that is about to be freed.
+#define RAM_CACHE_MAX       64
+#define PRELOAD_MAX_BYTES   (2 * 1024 * 1024)
+#define PRELOAD_TOTAL_CAP   (6 * 1024 * 1024)
+#define PRELOAD_STEP_BYTES  (32 * 1024)        // SD read per samplePreloadSync call (~20 ms)
+#define PRELOAD_STEP_GENTLE (8 * 1024)         // …while a song is playing (~5 ms on the card)
 
 struct RamSample {
     uint8_t   id;       // manifest id, 0 = free slot
@@ -154,15 +171,15 @@ struct RamSample {
     uint32_t  trimStart, trimEnd;   // the trim metadata AS STORED (unclamped) when
     uint8_t   trimLoop;             //   this was baked — re-preload if it moves
 };
-static RamSample     s_ram[RAM_CACHE_MAX] = {};
-static size_t        s_ramBytes    = 0;
-static volatile bool s_cacheLocked = false;
+static RamSample*    s_ram       = nullptr;   // RAM_CACHE_MAX entries, PSRAM (samplePlayerInit)
+static size_t        s_ramBytes  = 0;
+static volatile bool s_streaming = false;     // the WAV task has an SD stream running
 
 // ── Polyphonic RAM voices ─────────────────────────────────────────────────────
 // Fixed-point steppers over the cached buffers, mixed by the WAV task — into
 // the SD stream's chunks when one is playing, or into standalone blocks when
 // not.  Short fade-in kills trigger clicks; stop = short fade-out.
-#define RAM_VOICES      4
+#define RAM_VOICES      8      // (voice handles keep the slot in 3 bits — 8 is the most)
 #define RAM_FADE_FRAMES 256
 
 struct RamVoice {
@@ -238,49 +255,54 @@ static void mixRamInto(int16_t* out, int frames) {
 }
 
 int samplePlayRam(uint8_t sampleId, float pitchSemitones, uint8_t volume) {
-    if (s_cacheLocked || sampleId == 0) return -1;
-    const RamSample* rs = nullptr;
-    for (int i = 0; i < RAM_CACHE_MAX; i++)
-        if (s_ram[i].id == sampleId) { rs = &s_ram[i]; break; }
-    if (!rs) return -1;
+    if (!s_ram || sampleId == 0) return -1;
 
     if (pitchSemitones < -48) pitchSemitones = -48;
     if (pitchSemitones >  48) pitchSemitones =  48;
-    double step = ((double)rs->rate * 65536.0 / AUDIO_CODEC_RATE_HZ)
-                * exp2((double)pitchSemitones / 12.0);
-    uint32_t stepQ16 = (uint32_t)(step + 0.5);
-    if (stepQ16 == 0) stepQ16 = 1;
-    int32_t gain = (int32_t)(volume * volume * 32767L) / (127 * 127);
+    double  ratio = exp2((double)pitchSemitones / 12.0) * 65536.0 / AUDIO_CODEC_RATE_HZ;
+    int32_t gain  = (int32_t)(volume * volume * 32767L) / (127 * 127);
 
-    // Free voice, else steal the oldest.
+    // Lookup and voice start in one critical section: the entry can't be half
+    // written, and it can't be removed in between (removal needs an idle WAV
+    // task, and from here on this voice makes it busy).
+    int handle = -1;
     portENTER_CRITICAL(&s_voiceMux);
-    int pick = -1;
-    uint32_t oldest = 0xFFFFFFFF;
-    for (int i = 0; i < RAM_VOICES; i++) {
-        if (!s_voice[i].active) { pick = i; break; }
-        if (s_voice[i].seq < oldest) { oldest = s_voice[i].seq; pick = i; }
+    const RamSample* rs = nullptr;
+    for (int i = 0; i < RAM_CACHE_MAX; i++)
+        if (s_ram[i].id == sampleId) { rs = &s_ram[i]; break; }
+    if (rs) {
+        uint32_t stepQ16 = (uint32_t)((double)rs->rate * ratio + 0.5);
+        if (stepQ16 == 0) stepQ16 = 1;
+        // Free voice, else steal the oldest.
+        int pick = -1;
+        uint32_t oldest = 0xFFFFFFFF;
+        for (int i = 0; i < RAM_VOICES; i++) {
+            if (!s_voice[i].active) { pick = i; break; }
+            if (s_voice[i].seq < oldest) { oldest = s_voice[i].seq; pick = i; }
+        }
+        RamVoice& v = s_voice[pick];
+        v.active    = false;          // renderer skips it while we rewrite fields
+        v.releasing = false;
+        v.data      = rs->data;
+        v.frames    = rs->frames;
+        v.ch        = rs->ch;
+        v.loop      = rs->loop;
+        v.pos       = 0;
+        v.frac      = 0;
+        v.stepQ16   = stepQ16;
+        v.gainQ15   = gain;
+        v.age       = 0;
+        v.fadeRem   = RAM_FADE_FRAMES;
+        v.seq       = ++s_voiceSeq;
+        v.active    = true;
+        // Handle = generation | slot: a stale handle (voice ended, slot reused)
+        // can never stop the slot's NEW occupant.
+        handle = (int)((v.seq << 3) | (uint32_t)pick);
     }
-    RamVoice& v = s_voice[pick];
-    v.active    = false;          // renderer skips it while we rewrite fields
-    v.releasing = false;
-    v.data      = rs->data;
-    v.frames    = rs->frames;
-    v.ch        = rs->ch;
-    v.loop      = rs->loop;
-    v.pos       = 0;
-    v.frac      = 0;
-    v.stepQ16   = stepQ16;
-    v.gainQ15   = gain;
-    v.age       = 0;
-    v.fadeRem   = RAM_FADE_FRAMES;
-    v.seq       = ++s_voiceSeq;
-    v.active    = true;
     portEXIT_CRITICAL(&s_voiceMux);
 
-    xSemaphoreGive(s_trigger);    // wake the WAV task if it's idle
-    // Handle = generation | slot: a stale handle (voice ended, slot reused)
-    // can never stop the slot's NEW occupant.
-    return (int)((v.seq << 3) | (uint32_t)pick);
+    if (handle >= 0) xSemaphoreGive(s_trigger);    // wake the WAV task if it's idle
+    return handle;
 }
 
 void sampleStopVoice(int voice) {
@@ -339,12 +361,18 @@ static void wavTaskFn(void*) {
         s_playing = true;
         crashSetAudioPhase(CP_SAMPLE_READ);   // breadcrumb: audio active
 
+        uint32_t dbgT0 = millis();          // [SMPDBG] stream start-up timing
+        bool     dbgFirst = true;
+        s_streaming = true;              // the preloader keeps off the card meanwhile
         File f;
         { SdLock _; f = SD.open(activePath); }
         if (!f) {
+            SMPDBG("stream %s: open FAILED", activePath);
+            s_streaming = false;
             s_playing = false;
             continue;
         }
+        uint32_t dbgOpen = millis();
 
         uint8_t hdr[44];
         size_t hdrRead;
@@ -352,6 +380,7 @@ static void wavTaskFn(void*) {
         if (hdrRead != sizeof(hdr)) {
             Serial.println("[SP] WAV too short — no header");
             { SdLock _; f.close(); }
+            s_streaming = false;
             s_playing = false;
             continue;
         }
@@ -371,6 +400,7 @@ static void wavTaskFn(void*) {
             Serial.printf("[SP] unsupported WAV (ch=%u bits=%u) — need 16-bit mono or stereo\n",
                           (unsigned)numCh, (unsigned)bitsPer);
             { SdLock _; f.close(); }
+            s_streaming = false;
             s_playing = false;
             continue;
         }
@@ -391,6 +421,7 @@ static void wavTaskFn(void*) {
             Serial.println("[SP] buffer alloc failed");
             free(inBuf); free(nextBuf); free(outBuf);
             { SdLock _; f.close(); }
+            s_streaming = false;
             s_playing = false;
             continue;
         }
@@ -451,11 +482,23 @@ static void wavTaskFn(void*) {
                 int outFrames = rs.process(inBuf + done * numCh, frames - done,
                                            outBuf, OUT_FRAMES_MAX, consumed);
                 if (outFrames > 0) {
-                    if (activeGainQ15 < 32767) {
-                        for (int k = 0; k < outFrames * 2; k++)
-                            outBuf[k] = (int16_t)(((int32_t)outBuf[k] * activeGainQ15) >> 15);
+                    if (activeGainQ15 != 32767) {          // (above unity it can clip — on purpose)
+                        for (int k = 0; k < outFrames * 2; k++) {
+                            int32_t s = ((int32_t)outBuf[k] * activeGainQ15) >> 15;
+                            if (s >  32767) s =  32767;
+                            if (s < -32768) s = -32768;
+                            outBuf[k] = (int16_t)s;
+                        }
                     }
                     mixRamInto(outBuf, outFrames);   // RAM polyphony rides the stream
+                    if (dbgFirst) {
+                        dbgFirst = false;
+                        SMPDBG("stream %s: open %lu ms, first audio %lu ms after the trigger "
+                               "(start frame %lu)", activePath,
+                               (unsigned long)(dbgOpen - dbgT0),
+                               (unsigned long)(millis() - dbgT0),
+                               (unsigned long)activeStart);
+                    }
                     if (!audioCodecPlay((const uint8_t*)outBuf, outFrames * 4))
                         vTaskDelay(1);          // no codec / reconfiguring — don't spin
                 }
@@ -472,7 +515,10 @@ static void wavTaskFn(void*) {
         free(nextBuf);
         free(outBuf);
         { SdLock _; f.close(); }
+        SMPDBG("stream %s: ended %lu ms after the trigger (%s)", activePath,
+               (unsigned long)(millis() - dbgT0), s_stop ? "stopped" : "ran out");
 
+        s_streaming = false;
         s_playing = false;
 
         portENTER_CRITICAL(&s_pathMux);
@@ -485,6 +531,10 @@ static void wavTaskFn(void*) {
 }
 
 void samplePlayerInit() {
+    // The cache table itself lives in PSRAM too (2 KB of control-rate data).
+    s_ram = (RamSample*)heap_caps_calloc(RAM_CACHE_MAX, sizeof(RamSample), MALLOC_CAP_SPIRAM);
+    if (!s_ram) s_ram = (RamSample*)calloc(RAM_CACHE_MAX, sizeof(RamSample));
+    if (!s_ram) Serial.println("[SP] no memory for the sample cache table — everything streams");
     s_trigger = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(wavTaskFn, "WAV", 4096, nullptr, 5, nullptr, 0);  // Core 0
 }
@@ -520,120 +570,275 @@ bool samplePlayerIsPlaying() {
 }
 
 // ── Preload sync (loop task only — does SD reads) ─────────────────────────────
-bool samplePreloadSync(const Song* song) {
-    // Never mutate buffers a voice might be reading, and don't fight a
-    // feeding stream for the SD bus.  Caller retries next tick.
-    if (s_playing || sampleRamVoicesActive()) return false;
+static volatile uint8_t s_extraId  = 0;       // see samplePreloadSetExtra
+static volatile bool    s_wantPads = false;   // see samplePreloadSetPads
 
-    // Wanted set: every SFX column's sample id, deduped.
-    uint8_t want[MAX_COLUMNS];
-    int nwant = 0;
-    if (song) {
-        for (int c = 1; c < MAX_COLUMNS; c++) {
-            const ColumnSettings& cs = song->columns[c];
-            if (cs.midiChannel != SFX_CHANNEL || cs.program == 0) continue;
-            bool dup = false;
-            for (int i = 0; i < nwant; i++) if (want[i] == cs.program) dup = true;
-            if (!dup) want[nwant++] = cs.program;
+void samplePreloadSetExtra(uint8_t sampleId) { s_extraId = sampleId; }
+void samplePreloadSetPads(bool on)           { s_wantPads = on; }
+
+// One load in progress, fed a piece per samplePreloadSync call.
+static struct PreloadJob {
+    bool     active;
+    File     f;
+    uint8_t  id;
+    int16_t* buf;          // PSRAM, not yet in the cache table
+    uint32_t bytes, done;
+    uint32_t rate;
+    uint8_t  ch;
+    uint32_t trimStart, trimEnd;   // raw metadata this is being baked for
+    uint8_t  trimLoop;
+} s_job;
+
+// Ids that could not be loaded this round (unreadable, unsupported, no room),
+// so a round ends instead of trying them on every call.  Cleared when a round
+// completes: the next change of plans tries them afresh.
+static uint8_t s_failed[16];
+static bool failed(uint8_t id)     { return s_failed[id >> 3] & (1u << (id & 7)); }
+static void markFailed(uint8_t id) { s_failed[id >> 3] |= (uint8_t)(1u << (id & 7)); }
+
+static int cacheFind(uint8_t id) {
+    for (int i = 0; i < RAM_CACHE_MAX; i++) if (s_ram[i].id == id) return i;
+    return -1;
+}
+
+static void rawTrim(uint8_t id, uint32_t& st, uint32_t& en, uint8_t& lp) {
+    const SampleTrim* tr = sampleTrimFor(id);
+    st = tr ? tr->startFrame : 0;
+    en = tr ? tr->endFrame   : 0;
+    lp = tr ? tr->loop       : 0;
+}
+
+// Remove entry i — unless a RAM voice is sounding (see the rules above), in
+// which case nothing happens and it returns false: try again later.
+static bool cacheEvict(int i) {
+    int16_t* d = nullptr;
+    bool busy  = false;
+    portENTER_CRITICAL(&s_voiceMux);
+    for (int v = 0; v < RAM_VOICES; v++) if (s_voice[v].active) { busy = true; break; }
+    if (!busy) {
+        d           = s_ram[i].data;
+        s_ramBytes -= s_ram[i].bytes;
+        s_ram[i]    = RamSample{};
+    }
+    portEXIT_CRITICAL(&s_voiceMux);
+    if (busy) return false;
+    free(d);
+    return true;
+}
+
+// The samples wanted in the cache, most important first.  Returns the count.
+#define PRELOAD_WANT_MAX (MAX_COLUMNS + 1 + SM_MAX_ENTRIES)
+static int buildWanted(const Song* song, uint8_t* want) {
+    uint8_t seen[16] = {};
+    int n = 0;
+    auto add = [&](uint8_t id) {
+        if (id == 0 || id > 127 || (seen[id >> 3] & (1u << (id & 7)))) return;
+        if (n >= PRELOAD_WANT_MAX) return;
+        seen[id >> 3] |= (uint8_t)(1u << (id & 7));
+        want[n++] = id;
+    };
+    if (song)                                      // 1. the song's SFX columns
+        for (int c = 1; c < MAX_COLUMNS; c++)
+            if (song->columns[c].midiChannel == SFX_CHANNEL) add(song->columns[c].program);
+    add(s_extraId);                                // 2. the sample in the editor
+    if (s_wantPads) {                              // 3. the samples page: all, shortest first
+        int total = sampleManifestCount();
+        for (;;) {
+            const SmEntry* best = nullptr;
+            for (int i = 0; i < total; i++) {
+                const SmEntry* e = sampleManifestAt(i);
+                if (!e || (seen[e->id >> 3] & (1u << (e->id & 7)))) continue;
+                if (!best || e->size < best->size) best = e;
+            }
+            if (!best) break;
+            add(best->id);
         }
     }
+    return n;
+}
 
-    s_cacheLocked = true;   // samplePlayRam streams instead while we mutate
+static void jobAbort(bool fail) {
+    { SdLock _; s_job.f.close(); }
+    free(s_job.buf);
+    if (fail) markFailed(s_job.id);
+    s_job.active = false;
+}
 
-    // Evict entries the song no longer references — or whose trim metadata
-    // moved since they were baked (the reload below picks up the new region).
+// Read the next piece of the load in progress; when it is all in, add it to
+// the cache.
+static void preloadStep(uint32_t stepBytes) {
+    PreloadJob& j = s_job;
+    uint32_t want = j.bytes - j.done;
+    if (want > stepBytes) want = stepBytes;
+    size_t got;
+    { SdLock _; got = j.f.read((uint8_t*)j.buf + j.done, want); }
+    if (got != want) { jobAbort(true); return; }
+    j.done += want;
+    if (j.done < j.bytes) return;
+
+    { SdLock _; j.f.close(); }
+    j.active = false;
+
+    // Edited while it loaded?  Drop it; the next pass bakes the new region.
+    uint32_t st, en; uint8_t lp;
+    rawTrim(j.id, st, en, lp);
+    int slot = -1;
+    for (int i = 0; i < RAM_CACHE_MAX; i++) if (s_ram[i].id == 0) { slot = i; break; }
+    if (st != j.trimStart || en != j.trimEnd || lp != j.trimLoop || slot < 0) {
+        free(j.buf);
+        return;
+    }
+
+    RamSample rs = {};
+    rs.id        = j.id;
+    rs.data      = j.buf;
+    rs.frames    = j.bytes / ((uint32_t)j.ch * 2);
+    rs.rate      = j.rate;
+    rs.ch        = j.ch;
+    rs.loop      = j.trimLoop;
+    rs.bytes     = j.bytes;
+    // Raw metadata, not the clamped region: the "has the trim moved?" test
+    // compares against the raw table, and a clamped copy would never match an
+    // out-of-range trim (evict + reload for ever).
+    rs.trimStart = j.trimStart;
+    rs.trimEnd   = j.trimEnd;
+    rs.trimLoop  = j.trimLoop;
+    portENTER_CRITICAL(&s_voiceMux);
+    s_ram[slot]  = rs;                 // appears complete, or not at all
+    s_ramBytes  += rs.bytes;
+    portEXIT_CRITICAL(&s_voiceMux);
+    const char* fname = sampleManifestNameFor(j.id);
+    Serial.printf("[SP] preloaded id=%u %s (%u KB @ %u Hz ch=%u; cache %u KB)\n",
+                  (unsigned)j.id, fname ? fname : "?", (unsigned)(j.bytes / 1024),
+                  (unsigned)j.rate, (unsigned)j.ch, (unsigned)(s_ramBytes / 1024));
+    SMPDBG("preloaded id=%u into RAM (%lu KB)", (unsigned)j.id, (unsigned long)(j.bytes / 1024));
+}
+
+// One step towards "everything wanted that fits is in the cache".  Returns
+// true when there is nothing left to do; false = call again (there is more, or
+// it has to wait — for a stream to finish with the card, or for the voices to
+// fall quiet before it can remove something).  Never blocks for long: a load
+// is read PRELOAD_STEP_BYTES at a time — PRELOAD_STEP_GENTLE with `gentle`,
+// for use while a song is playing, so a sample the song streams is never kept
+// waiting for the card by more than a few milliseconds.
+bool samplePreloadSync(const Song* song, bool gentle) {
+    if (!s_ram) return true;
+    if (s_streaming) return false;                 // the stream has the card
+    if (s_job.active) {
+        preloadStep(gentle ? PRELOAD_STEP_GENTLE : PRELOAD_STEP_BYTES);
+        return false;
+    }
+
+    uint8_t want[PRELOAD_WANT_MAX];
+    int  nwant = buildWanted(song, want);
+    bool idle  = !sampleRamVoicesActive();         // (a hint; cacheEvict decides for real)
+
+    // Entries whose trim has moved since they were baked go (wanted ones are
+    // loaded again below with the new region).
     for (int i = 0; i < RAM_CACHE_MAX; i++) {
         if (s_ram[i].id == 0) continue;
-        bool keep = false;
-        for (int w = 0; w < nwant; w++) if (want[w] == s_ram[i].id) keep = true;
-        if (keep) {
-            const SampleTrim* tr = sampleTrimFor(s_ram[i].id);
-            uint32_t stF = tr ? tr->startFrame : 0;
-            uint32_t enF = tr ? tr->endFrame   : 0;
-            uint8_t  lp  = tr ? tr->loop       : 0;
-            if (s_ram[i].trimStart != stF || s_ram[i].trimEnd != enF ||
-                s_ram[i].trimLoop != lp) keep = false;
-        }
-        if (!keep) {
-            free(s_ram[i].data);
-            s_ramBytes  -= s_ram[i].bytes;
-            s_ram[i]     = RamSample{};
-        }
+        uint32_t st, en; uint8_t lp;
+        rawTrim(s_ram[i].id, st, en, lp);
+        if (s_ram[i].trimStart == st && s_ram[i].trimEnd == en && s_ram[i].trimLoop == lp) continue;
+        if (!idle || !cacheEvict(i)) return false;
     }
 
-    // Load what's wanted and missing — size-gated, PSRAM only.
+    // The most important wanted sample that isn't in yet: start loading it.
     for (int w = 0; w < nwant; w++) {
-        bool have = false;
-        for (int i = 0; i < RAM_CACHE_MAX; i++)
-            if (s_ram[i].id == want[w]) { have = true; break; }
-        if (have) continue;
-        int slot = -1;
-        for (int i = 0; i < RAM_CACHE_MAX; i++)
-            if (s_ram[i].id == 0) { slot = i; break; }
-        if (slot < 0) break;
+        uint8_t id = want[w];
+        if (cacheFind(id) >= 0 || failed(id)) continue;
 
-        const char* fname = sampleManifestNameFor(want[w]);
-        if (!fname) continue;
+        const char* fname = sampleManifestNameFor(id);
+        uint32_t fsize    = sampleManifestSizeFor(id);
+        uint32_t st, en; uint8_t lp;
+        rawTrim(id, st, en, lp);
+        if (!fname || fsize <= 44 + 8) { markFailed(id); continue; }
+        // Too long, and not cut down by a trim: it streams.  (Decided from
+        // the size the manifest scan noted — no need to open the file.)
+        if (st == 0 && en == 0 && fsize - 44 >= PRELOAD_MAX_BYTES) { markFailed(id); continue; }
+
+        // Making room means removing something nobody wants — which has to
+        // wait for the player to be idle.  Judge by the file's size (an upper
+        // bound) before going near the card.
+        bool noSlot = true;
+        for (int i = 0; i < RAM_CACHE_MAX; i++) if (s_ram[i].id == 0) { noSlot = false; break; }
+        uint32_t upper = fsize - 44;
+        if (upper > PRELOAD_MAX_BYTES) upper = PRELOAD_MAX_BYTES;
+        if ((noSlot || s_ramBytes + upper > PRELOAD_TOTAL_CAP) && !idle) return false;
+
         char path[64];
         snprintf(path, sizeof(path), "/samples/%s", fname);
-
-        SdLock _;
-        File f = SD.open(path);
-        if (!f) continue;
-        uint32_t fsize = (uint32_t)f.size();
         uint8_t hdr[44];
-        if (fsize >= PRELOAD_MAX_BYTES || fsize <= sizeof(hdr) + 8 ||
-            f.read(hdr, sizeof(hdr)) != sizeof(hdr)) { f.close(); continue; }
+        bool ok;
+        {
+            SdLock _;
+            s_job.f = SD.open(path);
+            ok = s_job.f && s_job.f.read(hdr, sizeof(hdr)) == sizeof(hdr);
+        }
         // Same canonical-WAV assumptions as the streamer.
-        uint32_t rate = (uint32_t)hdr[24] | ((uint32_t)hdr[25] << 8)
-                      | ((uint32_t)hdr[26] << 16) | ((uint32_t)hdr[27] << 24);
+        uint32_t rate    = (uint32_t)hdr[24] | ((uint32_t)hdr[25] << 8)
+                         | ((uint32_t)hdr[26] << 16) | ((uint32_t)hdr[27] << 24);
         uint16_t numCh   = (uint16_t)hdr[22] | ((uint16_t)hdr[23] << 8);
         uint16_t bitsPer = (uint16_t)hdr[34] | ((uint16_t)hdr[35] << 8);
-        if ((numCh != 1 && numCh != 2) || bitsPer != 16 ||
-            rate < 8000 || rate > 48000) { f.close(); continue; }
+        if (ok) ok = (numCh == 1 || numCh == 2) && bitsPer == 16 && rate >= 8000 && rate <= 48000;
 
-        uint32_t frameBytes  = (uint32_t)numCh * 2;
-        uint32_t totalFrames = (fsize - sizeof(hdr)) / frameBytes;
-
-        // Non-destructive trim: cache only the region playback will use.  (The
-        // whole file must still pass the fsize gate above — a big file with a
-        // small trimmed slice is NOT preloaded; it streams.)
-        const SampleTrim* tr = sampleTrimFor(want[w]);
-        uint32_t stF = tr ? tr->startFrame : 0;
-        uint32_t enF = (tr && tr->endFrame) ? tr->endFrame : totalFrames;
-        if (stF >= totalFrames) stF = 0;
-        if (enF > totalFrames || enF <= stF) enF = totalFrames;
-        uint32_t dataBytes = (enF - stF) * frameBytes;
-        if (dataBytes < frameBytes * 4 || dataBytes >= PRELOAD_MAX_BYTES ||
-            s_ramBytes + dataBytes > PRELOAD_TOTAL_CAP) { f.close(); continue; }
-        if (stF && !f.seek(sizeof(hdr) + stF * frameBytes)) { f.close(); continue; }
-
-        int16_t* buf = (int16_t*)heap_caps_malloc(dataBytes, MALLOC_CAP_SPIRAM);
-        if (!buf) { f.close(); continue; }   // no/full PSRAM → streaming fallback
-        if (f.read((uint8_t*)buf, dataBytes) != dataBytes) {
-            free(buf); f.close(); continue;
+        uint32_t frameBytes = (uint32_t)(numCh ? numCh : 1) * 2, dataBytes = 0, stF = 0;
+        if (ok) {
+            // Non-destructive trim: cache only the region playback will use.
+            uint32_t totalFrames = (fsize - 44) / frameBytes;
+            uint32_t enF = en ? en : totalFrames;
+            stF = st;
+            if (stF >= totalFrames) stF = 0;
+            if (enF > totalFrames || enF <= stF) enF = totalFrames;
+            dataBytes = (enF - stF) * frameBytes;
+            ok = dataBytes >= frameBytes * 4 && dataBytes < PRELOAD_MAX_BYTES;
         }
-        f.close();
 
-        s_ram[slot].id        = want[w];
-        s_ram[slot].data      = buf;
-        s_ram[slot].frames    = dataBytes / frameBytes;
-        s_ram[slot].rate      = rate;
-        s_ram[slot].ch        = (uint8_t)numCh;
-        s_ram[slot].loop      = tr ? tr->loop : 0;
-        s_ram[slot].bytes     = dataBytes;
-        // Raw metadata, not the clamped stF/enF: the keep/evict test above
-        // compares against the raw table, and a clamped copy would never match
-        // an out-of-range trim (evict + reload on every sync).
-        s_ram[slot].trimStart = tr ? tr->startFrame : 0;
-        s_ram[slot].trimEnd   = tr ? tr->endFrame : 0;
-        s_ram[slot].trimLoop  = tr ? tr->loop : 0;
-        s_ramBytes           += dataBytes;
-        Serial.printf("[SP] preloaded id=%u %s (%u KB @ %u Hz ch=%u)\n",
-                      want[w], fname, (unsigned)(dataBytes / 1024),
-                      (unsigned)rate, (unsigned)numCh);
+        // Room: a free slot and the bytes, removing unwanted entries (biggest
+        // first) until there is.  Nothing unwanted left = it doesn't fit.
+        while (ok) {
+            int freeSlot = -1;
+            for (int i = 0; i < RAM_CACHE_MAX; i++) if (s_ram[i].id == 0) { freeSlot = i; break; }
+            if (freeSlot >= 0 && s_ramBytes + dataBytes <= PRELOAD_TOTAL_CAP) break;
+            int victim = -1;
+            for (int i = 0; i < RAM_CACHE_MAX; i++) {
+                if (s_ram[i].id == 0) continue;
+                bool wanted = false;
+                for (int k = 0; k < nwant; k++) if (want[k] == s_ram[i].id) { wanted = true; break; }
+                if (!wanted && (victim < 0 || s_ram[i].bytes > s_ram[victim].bytes)) victim = i;
+            }
+            if (victim < 0) { ok = false; break; }
+            if (!idle || !cacheEvict(victim)) {    // (the pre-check makes this rare)
+                SdLock _; s_job.f.close();
+                return false;
+            }
+        }
+
+        int16_t* buf = ok ? (int16_t*)heap_caps_malloc(dataBytes, MALLOC_CAP_SPIRAM) : nullptr;
+        if (ok && buf) {
+            SdLock _;
+            ok = !stF || s_job.f.seek(44 + stF * frameBytes);
+        }
+        if (!ok || !buf) {                         // unreadable / unsupported / no room / no PSRAM
+            { SdLock _; if (s_job.f) s_job.f.close(); }
+            free(buf);
+            markFailed(id);
+            continue;
+        }
+
+        s_job.active    = true;
+        s_job.id        = id;
+        s_job.buf       = buf;
+        s_job.bytes     = dataBytes;
+        s_job.done      = 0;
+        s_job.rate      = rate;
+        s_job.ch        = (uint8_t)numCh;
+        s_job.trimStart = st;
+        s_job.trimEnd   = en;
+        s_job.trimLoop  = lp;
+        return false;                              // the next calls read it in
     }
 
-    s_cacheLocked = false;
+    memset(s_failed, 0, sizeof(s_failed));         // round complete
     return true;
 }
