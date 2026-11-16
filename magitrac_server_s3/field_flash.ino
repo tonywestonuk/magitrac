@@ -1,11 +1,12 @@
 // field_flash.ino — flash PixelPost units in the field, with no external AP.
 //
 // Flow:
-//   1. Enter USB-MSC transfer mode (USB screen → ENTER), copy pixel_post.ino.bin
-//      onto the SD card — into /firmware/ (tidy) or the root — then EJECT.
-//   2. Ejecting reboots the server out of MSC mode (usb_msc.ino).  On the next
-//      boot the server spots the file and shows a dedicated FLASH screen
-//      (fieldFlashScreen() in magitrac_server_s3.ino).
+//   1. Take the server's SD card to a computer and copy pixel_post.ino.bin onto
+//      it — into /firmware/ (tidy) or the root.  (The server once had a
+//      USB-drive mode for this; it was removed in Nov 2026 because the USB
+//      stack reserved 32 KB of internal RAM whether or not it was in use.)
+//   2. Put the card back and power the server up.  It spots the file and shows
+//      a dedicated FLASH screen (fieldFlashScreen() in magitrac_server_s3.ino).
 //   3. FLASH (re)broadcasts an ESP-NOW OTA packet pointing the posts at the
 //      server's OWN softAP; while that screen is up the server hosts a tiny HTTP
 //      server off the SD card so the posts can pull the bin, flash, and reboot.
@@ -17,10 +18,9 @@
 // already takes the AP creds + URL from the broadcast packet; we just fill it
 // with the server's own softAP instead of an external nginx box.
 //
-// Why SD + reboot rather than a live USB-serial upload: USB-CDC has no usable
+// Why the SD card rather than a live USB-serial upload: USB-CDC has no usable
 // flow control for bulk binary and its tiny RX ring drops bytes under SD-write
-// back-pressure.  USB-MSC block transfer is reliable, and reading the file only
-// *after* the host ejects avoids dual-ownership FAT corruption.
+// back-pressure.
 
 #include <Arduino.h>
 #include <SD.h>
@@ -235,7 +235,7 @@ bool fieldFlashBroadcast() {
 }
 
 // Rename the firmware to *.done so the next boot returns straight to music.
-// Re-drop a fresh pixel_post.ino.bin (via USB-MSC) to arm another flash.
+// Copy a fresh pixel_post.ino.bin onto the card to arm another flash.
 void fieldFlashMarkDone() {
     if (!sFwPath[0]) fieldFlashFirmwareSize();
     if (!sFwPath[0]) return;

@@ -102,7 +102,7 @@ uint16_t gLastBPM        = 0;
 // The bezel strip cycles through these (short tap); a 2 s hold enters pairing
 // (drawn separately by pairing.ino as a serverMode overlay).  Within a screen,
 // the glass area is a drag-scroll list — see pollListTouch().
-enum Screen { SCR_SONGS = 0, SCR_SAMPLES = 1, SCR_CHORD = 2, SCR_SCOPE = 3, SCR_USB = 4, SCR_ORGAN = 5, SCR_COUNT = 6 };
+enum Screen { SCR_SONGS = 0, SCR_SAMPLES = 1, SCR_CHORD = 2, SCR_SCOPE = 3, SCR_ORGAN = 4, SCR_COUNT = 5 };
 static Screen gScreen = SCR_SONGS;
 
 // Remote drawbar-organ control (MSG_ORGAN, from the client over MagiLink).  The
@@ -125,24 +125,40 @@ static bool _touchDown    = false;
 static bool _dragMoved    = false;
 static int  _dragStartY   = 0;
 static int  _dragStartOff = 0;
-static int  _pressX       = 0;   // USB screen: x of the press (button hit-test)
 
 // ── Sample browser ────────────────────────────────────────────────────────────
 #define SRV_SAMPLES_DIR   "/samples"
 #define SRV_MAX_SAMPLES   64
 
-static char sampleNames[SRV_MAX_SAMPLES][SRV_FNAME_MAX];
+// Control-rate tables live in PSRAM — internal RAM is the radios' (it was down
+// to 27 KB free at idle, Nov 2026).  Zeroed; falls back to internal RAM if
+// PSRAM has none to give, and to nullptr only if both fail — callers treat
+// that as "empty list".  Call from setup() onwards (PSRAM joins the heap in
+// the core's start-up, after static initialisers have run).
+static void* srvAllocPsram(size_t bytes) {
+    void* p = heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM);
+    if (!p) p = calloc(1, bytes);
+    if (!p) Serial.printf("[MEM] ALLOC FAILED for %u bytes\n", (unsigned)bytes);
+    return p;
+}
+
+// SRV_MAX_SAMPLES rows; allocated by loadSampleList().
+static char (*sampleNames)[SRV_FNAME_MAX] = nullptr;
 static int  numSamples       = 0;
 static int  sampleScrollOff  = 0;
 static int  samplePlayingIdx = -1;   // row currently playing (green highlight)
 
 // ── Song list (loaded from SD) ────────────────────────────────────────────────
-static char songNames[SRV_MAX_SONGS][SRV_FNAME_MAX];
+// SRV_MAX_SONGS rows; allocated by loadSongList().
+static char (*songNames)[SRV_FNAME_MAX] = nullptr;
 static int  numSongs = 0;
 
 void loadSongList() {
+    if (!songNames)
+        songNames = (char (*)[SRV_FNAME_MAX])srvAllocPsram(SRV_MAX_SONGS * SRV_FNAME_MAX);
     // Enumerate straight into songNames (it is the SRV_MAX_SONGS-sized store),
     // then strip the .mgt extension in place — no second buffer needed.
+    // (srvListSongs returns 0 for a null store.)
     numSongs = srvListSongs(songNames, SRV_MAX_SONGS);
     for (int i = 0; i < numSongs; i++) {
         int len = (int)strlen(songNames[i]);
@@ -195,6 +211,9 @@ static void loadSampleList() {
     numSamples       = 0;
     sampleScrollOff  = 0;
     samplePlayingIdx = -1;
+    if (!sampleNames)
+        sampleNames = (char (*)[SRV_FNAME_MAX])srvAllocPsram(SRV_MAX_SAMPLES * SRV_FNAME_MAX);
+    if (!sampleNames) return;
     File dir = SD.open(SRV_SAMPLES_DIR);
     if (!dir || !dir.isDirectory()) { dir.close(); return; }
     char fname[SRV_FNAME_MAX];
@@ -399,69 +418,10 @@ uint8_t loadSong(int idx) {
     return fail;
 }
 
-// ── USB file-transfer screen ──────────────────────────────────────────────────
-// ENTER sets a one-shot NVS flag and reboots.  On the next boot — before any
-// SD/audio/WiFi init — setup() calls runUsbMsc() (in usb_msc.ino) which owns
-// the device exclusively and never returns.
-extern void runUsbMsc();
-
-#define USB_NVS_NS    "magiboot"
-#define USB_NVS_KEY   "usbmsc"
-
-void requestUsbMscReboot() {
-    Preferences p;
-    p.begin(USB_NVS_NS, false);
-    p.putBool(USB_NVS_KEY, true);
-    p.end();
-    lcd.fillScreen(COL_BG);
-    lcd.setTextColor(TFT_WHITE, COL_BG);
-    lcd.setTextSize(2);
-    lcd.setCursor(10, 130); lcd.print("Rebooting to");
-    lcd.setCursor(10, 158); lcd.print("USB mode...");
-    delay(400);
-    ESP.restart();
-}
-
-static const int USB_BTN_X = 20, USB_BTN_Y = 196, USB_BTN_W = 200, USB_BTN_H = 56;
-
-void drawUsbScreen() {
-    lcd.fillScreen(COL_BG);
-
-    lcd.fillRect(0, 0, 240, UI_HEADER_H, COL_HDR);
-    lcd.setTextColor(TFT_WHITE, COL_HDR);
-    lcd.setTextSize(2);
-    lcd.setCursor(8, (UI_HEADER_H - 16) / 2);
-    lcd.print("USB Transfer");
-    batteryDrawIcon(240 - BATT_ICON_W - 4, (UI_HEADER_H - BATT_ICON_H) / 2, COL_HDR);
-
-    lcd.setTextColor(TFT_WHITE, COL_BG);
-    lcd.setTextSize(1);
-    lcd.setCursor(10, 80);  lcd.print("ENTER reboots and mounts");
-    lcd.setCursor(10, 94);  lcd.print("the SD card on a computer.");
-    lcd.setCursor(10, 116); lcd.print("PixelPost FW: drop the .bin in");
-    lcd.setCursor(10, 130); lcd.print("/firmware/, eject -> tap FLASH.");
-    lcd.setCursor(10, 152); lcd.print("Note: FAT32 cards only.");
-
-    uint16_t btnCol = lgfx::color565(0, 130, 0);
-    lcd.fillRoundRect(USB_BTN_X, USB_BTN_Y, USB_BTN_W, USB_BTN_H, 8, btnCol);
-    lcd.setTextColor(TFT_WHITE, btnCol);
-    lcd.setTextSize(3);
-    const char* lbl = "ENTER";
-    int lw = (int)strlen(lbl) * 18;
-    lcd.setCursor(USB_BTN_X + (USB_BTN_W - lw) / 2, USB_BTN_Y + (USB_BTN_H - 24) / 2);
-    lcd.print(lbl);
-
-    int fy = UI_SCR_H - UI_FOOTER_H;
-    lcd.fillRect(0, fy, 240, UI_FOOTER_H, COL_FOOTER);
-    lcd.setTextColor(TFT_WHITE, COL_FOOTER);
-    lcd.setTextSize(1);
-    lcd.setCursor(8, fy + (UI_FOOTER_H - 8) / 2);
-    lcd.print("Bezel: next   hold 2s: pair");
-}
-
 // ── PixelPost firmware flash screen ───────────────────────────────────────────
 // Called once at the end of setup().  If a fresh pixel_post.ino.bin is sitting
-// on the SD card (copied via USB-MSC), this dedicated screen owns the device:
+// on the SD card (copied there with the card in a computer), this dedicated
+// screen owns the device:
 //   FLASH  — (re)broadcast the OTA packet; press again to catch stragglers.
 //   DONE   — rename the firmware to *.done and REBOOT (clean teardown → music).
 // The HTTP server + DHCP run ONLY while this screen is up, so they never touch
@@ -904,7 +864,6 @@ void drawScreen() {
         case SCR_SAMPLES: drawSampleScreen(); break;
         case SCR_CHORD:   drawChordScreen();  break;
         case SCR_SCOPE:   drawScopeScreen();  break;
-        case SCR_USB:     drawUsbScreen();    break;
         case SCR_ORGAN:   drawOrganScreen();  break;
         case SCR_SONGS:
         default:          drawSongScreen();   break;
@@ -1057,25 +1016,6 @@ static void pollListTouch() {
             int absRow = ((gScreen == SCR_SAMPLES) ? sampleScrollOff : scrollOffset) + visIdx;
             if (gScreen == SCR_SAMPLES) selectSample(absRow);
             else                        selectSong(absRow);
-        }
-    }
-}
-
-// Call only when no bezel button is pressed.
-static void pollUsbTouch() {
-    auto& t   = M5.Touch.getDetail();
-    bool  down = t.isPressed();
-
-    if (down && !_touchDown) {
-        _touchDown   = true;
-        _dragStartY  = t.y;
-        _pressX      = t.x;
-    } else if (!down && _touchDown) {
-        _touchDown = false;
-        bool inBtn = (_pressX     >= USB_BTN_X && _pressX     < USB_BTN_X + USB_BTN_W &&
-                      _dragStartY >= USB_BTN_Y && _dragStartY < USB_BTN_Y + USB_BTN_H);
-        if (inBtn) {
-            requestUsbMscReboot();   // sets the NVS flag and resets into USB mode
         }
     }
 }
@@ -1250,18 +1190,6 @@ static void midiTaskFn(void* /*pv*/) {
     }
 }
 
-// Read + clear the one-shot USB boot flag in NVS (set by the USB page's ENTER
-// button before it resets the device).  Cleared in the same call so the next
-// boot is normal regardless of how this one ends.
-static bool consumeUsbMscBootFlag() {
-    Preferences p;
-    if (!p.begin(USB_NVS_NS, false)) return false;
-    bool want = p.getBool(USB_NVS_KEY, false);
-    if (want) p.putBool(USB_NVS_KEY, false);
-    p.end();
-    return want;
-}
-
 // ── Setup / Loop ──────────────────────────────────────────────────────────────
 // ── Radio bring-up for the paired mode ────────────────────────────────────────
 // Brings WiFi up as stored at pairing: our own hidden softAP (SERVER_AP), a
@@ -1415,13 +1343,6 @@ void setup() {
         }
         delay(crashLogHasCoreDump() ? 9000 : 5000);
         lcd.fillScreen(COL_BG);
-    }
-
-    // ── Boot-time USB mass-storage ───────────────────────────────────────────
-    // Set by the USB page's ENTER button (one-shot NVS flag).  Branch before
-    // anything claims the SD card.  runUsbMsc() never returns.
-    if (consumeUsbMscBootFlag()) {
-        runUsbMsc();
     }
 
     // ── Audio codec (Module Audio v2.2 on M-Bus, ES8388, full-duplex 32 kHz) ──
@@ -1911,11 +1832,6 @@ void loop() {
             case SCR_CHORD:   drawChordHeader();     break;
             case SCR_SCOPE:   drawScopeHeader();     break;
             case SCR_ORGAN:   drawOrganHeader();     break;
-            case SCR_USB:     /* whole-screen draw is heavy; just patch icon */ {
-                batteryDrawIcon(240 - BATT_ICON_W - 4,
-                                (UI_HEADER_H - BATT_ICON_H) / 2, COL_HDR);
-                break;
-            }
             default: break;
         }
     }
@@ -1933,8 +1849,7 @@ void loop() {
         } else if (bz == 2) {
             enterPairingMode();
         } else if (!gBezel.isDown()) {
-            if      (gScreen == SCR_USB)   pollUsbTouch();
-            else if (gScreen == SCR_CHORD) pollChordTouch();
+            if      (gScreen == SCR_CHORD) pollChordTouch();
             else if (gScreen == SCR_SCOPE) pollScopeTouch();
             else if (gScreen == SCR_ORGAN) pollOrganTouch();
             else                           pollListTouch();

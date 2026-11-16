@@ -92,7 +92,13 @@ struct InstrFileHeader {
     uint8_t  _pad[3];
 };
 
-Instrument srvInstruments[MAX_INSTRUMENTS];
+// The instrument bank: MAX_INSTRUMENTS entries in PSRAM (4.6 KB — control-rate
+// data, so not internal RAM).  Allocated at the top of commandsInit(); every
+// user below checks for the nullptr a double allocation failure would leave.
+Instrument* srvInstruments = nullptr;
+#define SRV_INSTRUMENTS_BYTES (sizeof(Instrument) * MAX_INSTRUMENTS)
+// Scratch for a full /songs enumeration (see "Shared scratch" further down).
+static char (*srvSongScratch)[SRV_FNAME_MAX] = nullptr;
 
 // True when the instruments file was on the card at boot but would not load
 // (SD fault, bad header).  srvInstruments then holds the built-in defaults, and
@@ -102,6 +108,7 @@ Instrument srvInstruments[MAX_INSTRUMENTS];
 static bool srvInstFileUnreadable = false;
 
 static void initDefaultInstruments() {
+    if (!srvInstruments) return;
     for (int i = 0; i < MAX_INSTRUMENTS; i++) {
         Instrument& inst = srvInstruments[i];
         memset(&inst, 0, sizeof(inst));
@@ -117,8 +124,9 @@ static void initDefaultInstruments() {
 // the whole file has been read and its header checked — a missing file, a bad
 // header or a short read leaves the in-memory instruments exactly as they were.
 static bool loadInstrumentsFromSD() {
-    uint8_t* tmp = (uint8_t*)heap_caps_malloc(sizeof(srvInstruments), MALLOC_CAP_SPIRAM);
-    if (!tmp) tmp = (uint8_t*)malloc(sizeof(srvInstruments));
+    if (!srvInstruments) return false;
+    uint8_t* tmp = (uint8_t*)heap_caps_malloc(SRV_INSTRUMENTS_BYTES, MALLOC_CAP_SPIRAM);
+    if (!tmp) tmp = (uint8_t*)malloc(SRV_INSTRUMENTS_BYTES);
     if (!tmp) {
         Serial.println("[CMD] loadInstruments: FAIL (no scratch memory)");
         return false;
@@ -133,14 +141,14 @@ static bool loadInstrumentsFromSD() {
                   && hdr.magic   == INSTR_FILE_MAGIC
                   && hdr.version == INSTR_FILE_VERSION);
             if (ok)
-                ok = (f.read(tmp, sizeof(srvInstruments))
-                      == (int)sizeof(srvInstruments));
+                ok = (f.read(tmp, SRV_INSTRUMENTS_BYTES)
+                      == (int)SRV_INSTRUMENTS_BYTES);
             f.close();
         }
     }
     // (no sanitization needed — instruments no longer carry midiChannel)
     if (ok) {
-        memcpy(srvInstruments, tmp, sizeof(srvInstruments));
+        memcpy(srvInstruments, tmp, SRV_INSTRUMENTS_BYTES);
         srvInstFileUnreadable = false;   // what is in memory is the file again
     }
     free(tmp);
@@ -151,6 +159,7 @@ static bool loadInstrumentsFromSD() {
 // Written to a temp file first and renamed into place only if every byte went
 // out, so a failed write can't leave a truncated instruments file behind.
 static void saveInstrumentsToSD() {
+    if (!srvInstruments) return;
     if (srvInstFileUnreadable) {
         Serial.println("[CMD] saveInstruments: REFUSED — " SRV_INSTRUMENTS_PATH
                        " was unreadable at boot and memory holds defaults; "
@@ -166,8 +175,8 @@ static void saveInstrumentsToSD() {
     hdr._pad[0] = hdr._pad[1] = hdr._pad[2] = 0;
     bool ok = (f.write((const uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr));
     if (ok)
-        ok = (f.write((const uint8_t*)srvInstruments, sizeof(srvInstruments))
-              == sizeof(srvInstruments));
+        ok = (f.write((const uint8_t*)srvInstruments, SRV_INSTRUMENTS_BYTES)
+              == SRV_INSTRUMENTS_BYTES);
     f.close();
     if (!ok) {
         SD.remove(SRV_INSTRUMENTS_TMP);
@@ -386,6 +395,8 @@ static void writeDefaultGmMap() {
 // the delete handler).  Recovering a draft, if ever wanted, must be a
 // deliberate user action — never a silent boot step.
 
+// (History: these two were written for the USB-drive mode, since removed.  They
+// stay as cheap insurance against a card left wedged by a reset mid-transfer.)
 // After a USB-MSC session the SD card is left in SPI mode by SdFat (25 MHz,
 // DEDICATED_SPI) and an ESP.restart() does NOT power-cycle it.  If the host
 // ejected while the card was mid (multi-)block read it keeps streaming data and
@@ -436,6 +447,10 @@ void commandsInit() {
     // that distinguishes "bad hardware" from "heap merely full".
     Serial.printf("[CMD] PSRAM: %u bytes total, %u free\n",
                   (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram());
+
+    // Control-rate tables (see srvAllocPsram): before anything below uses them.
+    srvInstruments = (Instrument*)srvAllocPsram(SRV_INSTRUMENTS_BYTES);
+    srvSongScratch = (char (*)[SRV_FNAME_MAX])srvAllocPsram(SRV_MAX_SONGS * SRV_FNAME_MAX);
 
     srvActiveBuf = (uint8_t*)heap_caps_malloc(SRV_SONG_XFER_MAX, MALLOC_CAP_SPIRAM);
     if (!srvActiveBuf) {
@@ -537,14 +552,15 @@ static int srvNameCmp(const void* a, const void* b) {
 // load-local) is deferred to the loop task, so they never run concurrently and
 // a single static buffer is race-free — and at SRV_MAX_SONGS entries it is too
 // big (~3 KB) to want on the loop-task stack.  Same "one task only" rationale
-// as the backup path's static names[] buffer.
-static char srvSongScratch[SRV_MAX_SONGS][SRV_FNAME_MAX];
+// as the backup path's static names[] buffer.  It is srvSongScratch, declared
+// with the instrument bank near the top of this file: SRV_MAX_SONGS rows in
+// PSRAM, allocated in commandsInit(); srvListSongs returns 0 if it is missing.
 
 // ── List .mgt files in /songs ──────────────────────────────────────────────────
 // Returns names sorted alphabetically (case-insensitive) so every paginated
 // list the client assembles is in a stable, sorted order.
 int srvListSongs(char names[][SRV_FNAME_MAX], int maxFiles) {
-    if (!srvSdOk) return 0;
+    if (!srvSdOk || !names) return 0;
     SdLock _;
     File d = SD.open(SRV_SONGS_DIR);
     if (!d || !d.isDirectory()) {
@@ -1451,8 +1467,9 @@ static void sendInstrumentsData() {
         Serial.println("[CMD] sendInstruments: link not connected");
         return;
     }
+    if (!srvInstruments) return;
     const uint8_t* raw   = (const uint8_t*)srvInstruments;
-    uint32_t       total = (uint32_t)sizeof(srvInstruments);
+    uint32_t       total = (uint32_t)SRV_INSTRUMENTS_BYTES;
 
     gMagiLink.acquireMutex();
 
@@ -2828,7 +2845,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 const MsgInstrumentsPatch* p = (const MsgInstrumentsPatch*)data;
                 if (len < hdrLen + (int)p->dataLen) return;
                 uint32_t end = (uint32_t)p->offset + p->dataLen;
-                if (end <= sizeof(srvInstruments)) {
+                if (srvInstruments && end <= SRV_INSTRUMENTS_BYTES) {
                     memcpy((uint8_t*)srvInstruments + p->offset, p->data, p->dataLen);
                     srvInstSavePending = true;
                 }
