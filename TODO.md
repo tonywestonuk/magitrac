@@ -14,7 +14,7 @@ Agreed on 15 Nov 2026 for the next session. Details for each are further down.
 5. **ADD SAMPLE** — record a sample through the mic.
 
 Not in that order yet (below): per-sample transpose; per-sample velocity
-sensitivity.
+sensitivity; a reed organ sound.
 
 ---
 
@@ -177,3 +177,37 @@ wants the same level however it is hit.
 - Where the switch goes in the sample editor. The header already holds LOOP,
   PLAY and BACK and the bottom row holds zoom, tune and SPECTRUM, so one of
   them has to give up some room.
+
+## Later: a reed organ sound (harmonium / accordion)
+
+**Asked:** 16 Nov 2026.
+
+A reed organ voice for the organ, as a PROC sound alongside TWO TRIBES, THX
+and VOCODER.
+
+A free reed chops the air into puffs, so its wave is close to a narrow pulse:
+bright, with odd and even harmonics, and a nasal lump from the reed chamber.
+Every stop is a whole harmonic series, not one sine like a drawbar. It also
+starts softly (a few ms, slightly flat, no key click), gets brighter, not
+just louder, when blown harder, and ranks are often tuned a few cents apart
+(céleste, accordion "musette") so they beat.
+
+**Why PROC and not a drawbar type:** a drawbar type would put a pulse-like
+wave on every footage. High footages would then alias (a harmonic-rich table
+can't just be switched off at Nyquist the way a sine is), and the cure —
+several band-limited tables per octave, about 16 KB — would come out of the
+organ's internal RAM. As a PROC sound it can reuse the VOCODER's oscillator
+(`vocOsc` in `drawbar_organ.cpp`: sawtooth or pulse, polyBLEP-smoothed, so
+no aliasing), one oscillator per note, and PROC tables already live in PSRAM.
+The cost: no free mixing of stops as with drawbars.
+
+**To settle when this is picked up:**
+
+- The five sliders. A first guess: WAVE (pulse width — reedy to thin),
+  CELESTE (detune of a second rank), STOPS (a few fixed footage mixes, e.g.
+  8', 8'+4', 16'+8', 16'+8'+4'), BRIGHT (the chamber filter), ATTACK.
+- Whether the stops come from a second (and third) oscillator per note an
+  octave away, and what that costs in render time at full polyphony.
+- Bellows: whether velocity, the expression pedal, or nothing sets the
+  brightness.
+- Whether the chamber resonance is one fixed filter or follows the note.
