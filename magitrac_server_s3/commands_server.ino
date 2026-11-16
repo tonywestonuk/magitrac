@@ -10,6 +10,7 @@
 #include "SongMigration.h"
 #include "midi_player.h"
 #include "SampleManifest.h"
+#include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
 #include "esp32s3_dsp.h"   // ESP32S3_FFT — spectrogram (same engine as pixelpost bands)
 
 // ── Direct-from-Mac PixelPost OTA (client FW button) ──────────────────────────
@@ -63,9 +64,15 @@ static void wifiChannelApply(uint8_t idx) {
 }
 
 // CoreS3 SD: SCLK=G36, MISO=G35, MOSI=G37, CS=G4.  SPI.begin() with those
-// pins runs in setup() before commandsInit(); SD.begin(cs) then picks up
-// the default SPI bus we just configured.
+// pins runs in setup() before commandsInit(); SD.begin() then picks up the
+// default SPI bus we just configured.
 #define SRV_SD_CS      4
+// SD bus clock.  SD.begin() defaults to 4 MHz, which measured 423 KB/s on this
+// card — a 2.8 MB sample took 7 s just to scan for its waveform.  25 MHz is
+// what the former USB-drive mode (SdFat) ran this card and wiring at, and it
+// measures about 1.5 MB/s.  The library keeps CRC checking on, so a marginal
+// bus shows up as failed reads, not as bad data.
+#define SRV_SD_HZ      25000000
 #define SRV_SONGS_DIR  "/songs"
 // Autosave drafts land here, NOT /songs/.  They are never promoted or
 // recovered automatically (see the autosave-policy note below) — an explicit
@@ -503,7 +510,7 @@ void commandsInit() {
     srvSdOk = false;
     for (int attempt = 0; attempt < 4 && !srvSdOk; ++attempt) {
         sdRecoverBus();                            // idle the card before each try
-        srvSdOk = SD.begin(SRV_SD_CS);
+        srvSdOk = SD.begin(SRV_SD_CS, SPI, SRV_SD_HZ);
         if (!srvSdOk) {
             Serial.printf("[CMD] SD.begin attempt %d failed\n", attempt + 1);
             delay(100);
@@ -1086,10 +1093,109 @@ static bool sendSongDataByName(const char* name) {
     return sendSongDataFromPath(path, display);
 }
 
+// ── Sample editor: waveform overview peaks ────────────────────────────────────
+// Min/max of the LEFT channel for each of the SAMPLE_OVERVIEW_N columns across
+// viewFrames frames starting at frame vs, scaled int16 → int8 into peaks[]
+// (min,max pairs; the caller zeroes it first).  `rd` is a scratch buffer of
+// SAMPLE_OVERVIEW_RD int16s.
+//
+// Two ways to do it, chosen by sampleOverviewSampled():
+//   exact   — read every frame of the window, in order.  `f` must already be
+//             positioned at frame vs.  Costs time in proportion to the window.
+//   sampled — seek to each column and read one buffer-load from its start.
+//             Costs SAMPLE_OVERVIEW_N seeks however big the window is, and the
+//             picture is an estimate: a click shorter than the gap between
+//             slices can be missed.  It turns exact again as the client zooms
+//             in, because it re-requests peaks for just its visible window.
+//
+// Measured on the CoreS3 (SD at 25 MHz, 2.8 MB stereo WAV, Nov 2026):
+//   sequential read            ≈ 1.5 MB/s, whatever the request or stdio
+//                                buffer size (4 KB … 64 KB all the same)
+//   seek + 2 KB read           7.4 ms through the library's 4 KB stdio buffer
+//                              4.3 ms with a 2 KB stdio buffer and the seek
+//                                     rounded to a 512-byte sector boundary
+// So 400 sampled columns cost about 1.7 s, which a full read matches at about
+// 2.6 MB.  Exact is the better picture, so it is kept up to 3 MB (≈ 2 s);
+// beyond that the scan samples and no sample takes longer than that to open.
+// For the sampled figure to hold, the caller opens the file afresh and calls
+// setBufferSize(SAMPLE_OVERVIEW_SLICE_BYTES) before the first read.
+#define SAMPLE_OVERVIEW_RD            1024                       // int16s in `rd`
+#define SAMPLE_OVERVIEW_SLICE_BYTES   (SAMPLE_OVERVIEW_RD * 2)   // 2048
+#define SAMPLE_OVERVIEW_SAMPLED_BYTES (3UL * 1024UL * 1024UL)
+
+static bool sampleOverviewSampled(uint32_t viewFrames, uint16_t numCh) {
+    return (uint64_t)viewFrames * numCh * 2 > SAMPLE_OVERVIEW_SAMPLED_BYTES;
+}
+
+static void sampleOverviewPeaks(File& f, uint32_t dataOffset, uint32_t vs,
+                                uint32_t viewFrames, uint16_t numCh,
+                                int16_t* rd, int8_t* peaks, bool sampled) {
+    const uint32_t frameBytes = (uint32_t)numCh * 2;
+
+    if (sampled) {
+        const uint32_t sliceFrames = SAMPLE_OVERVIEW_RD / numCh;
+        const uint32_t viewPos     = dataOffset + vs * frameBytes;   // window start
+        for (int col = 0; col < SAMPLE_OVERVIEW_N; col++) {
+            uint32_t f0  = (uint32_t)(((uint64_t)col * viewFrames) / SAMPLE_OVERVIEW_N);
+            // Round down to a sector boundary (one clean multi-sector read
+            // instead of three); 512 is a whole number of frames from the
+            // 44-byte header for mono and stereo alike.  Never back past the
+            // window start — for the first column that would be the header.
+            uint32_t pos = (viewPos + f0 * frameBytes) & ~511UL;
+            if (pos < viewPos) pos = viewPos;
+            uint32_t first = (pos - dataOffset) / frameBytes - vs;   // frame in window
+            if (!f.seek(pos)) break;
+            int got = f.read((uint8_t*)rd, sliceFrames * frameBytes);
+            int n = got / (int)frameBytes;
+            if (n <= 0) break;
+            if ((uint32_t)n > viewFrames - first) n = (int)(viewFrames - first);
+            int16_t mn = 32767, mx = -32768;
+            for (int i = 0; i < n; i++) {
+                int16_t s = rd[i * numCh];
+                if (s < mn) mn = s;
+                if (s > mx) mx = s;
+            }
+            peaks[col * 2]     = (int8_t)(mn >> 8);
+            peaks[col * 2 + 1] = (int8_t)(mx >> 8);
+        }
+        return;
+    }
+
+    // Exact: every frame of the window, in order.
+    uint32_t bucket = (viewFrames + SAMPLE_OVERVIEW_N - 1) / SAMPLE_OVERVIEW_N;
+    if (bucket == 0) bucket = 1;
+    uint32_t frame = 0;
+    int      col   = 0;
+    int16_t  mn = 32767, mx = -32768;
+    while (frame < viewFrames && col < SAMPLE_OVERVIEW_N) {
+        int got = f.read((uint8_t*)rd, SAMPLE_OVERVIEW_RD * sizeof(int16_t));
+        if (got <= 0) break;
+        int n = got / (int)frameBytes;
+        for (int i = 0; i < n && col < SAMPLE_OVERVIEW_N; i++) {
+            if (frame >= viewFrames) break;
+            int16_t s = rd[i * numCh];
+            if (s < mn) mn = s;
+            if (s > mx) mx = s;
+            if (++frame % bucket == 0) {
+                peaks[col * 2]     = (int8_t)(mn >> 8);
+                peaks[col * 2 + 1] = (int8_t)(mx >> 8);
+                col++;
+                mn = 32767; mx = -32768;
+            }
+        }
+    }
+    if (col < SAMPLE_OVERVIEW_N && mn != 32767) { // final partial bucket
+        peaks[col * 2]     = (int8_t)(mn >> 8);
+        peaks[col * 2 + 1] = (int8_t)(mx >> 8);
+    }
+}
+
 // ── Sample editor: build + send meta + waveform overview ──────────────────────
-// Windowed SD read (min/max peaks per bucket over [vs, ve); 0,0 = whole file)
+// Windowed SD read (min/max peaks per column over [vs, ve); 0,0 = whole file)
 // — called from commandsTick on the loop task only.  A zoomed-in client asks
-// for its visible window and gets full-resolution peaks for it.
+// for its visible window and gets full-resolution peaks for it; a window of
+// more than 3 MB is sampled rather than read end to end (see
+// sampleOverviewPeaks).
 static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
     const char* fname = sampleManifestNameFor(id);
     if (!fname) return;
@@ -1100,7 +1206,8 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
     // spectrogram builder below for the incident that taught us this).
     MsgSampleInfo* infoP =
         (MsgSampleInfo*)heap_caps_malloc(sizeof(MsgSampleInfo), MALLOC_CAP_SPIRAM);
-    int16_t* rdP = (int16_t*)heap_caps_malloc(1024 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t* rdP = (int16_t*)heap_caps_malloc(SAMPLE_OVERVIEW_RD * sizeof(int16_t),
+                                              MALLOC_CAP_SPIRAM);
     if (!infoP || !rdP) { free(infoP); free(rdP); return; }
     MsgSampleInfo& info = *infoP;
     info = MsgSampleInfo();      // NSDMI: id + length
@@ -1108,10 +1215,16 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
     uint32_t totalFrames = 0, rate = 0;
     uint16_t numCh = 0;
     bool ok = false;
+    // [SMPDBG] step timings
+    uint32_t dbgT0 = millis(), dbgLock = 0, dbgOpen = 0, dbgHdr = 0, dbgScan = 0;
+    uint32_t dbgSize = 0, dbgView = 0;
+    bool     dbgSampled = false;
     memset(info.peaks, 0, sizeof(info.peaks));
     {
         SdLock _;
+        dbgLock = millis();
         File f = SD.open(path);
+        dbgOpen = millis();
         if (f) do {
             uint8_t hdr[44];
             if (f.read(hdr, sizeof(hdr)) != sizeof(hdr)) break;
@@ -1121,41 +1234,30 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
             uint16_t bitsPer = (uint16_t)hdr[34] | ((uint16_t)hdr[35] << 8);
             if ((numCh != 1 && numCh != 2) || bitsPer != 16) break;
             uint32_t frameBytes = (uint32_t)numCh * 2;
-            totalFrames = ((uint32_t)f.size() - sizeof(hdr)) / frameBytes;
+            dbgSize     = (uint32_t)f.size();
+            totalFrames = (dbgSize - sizeof(hdr)) / frameBytes;
+            dbgHdr      = millis();
 
             // Clamp the requested window.
             if (vs >= totalFrames) vs = 0;
             if (ve == 0 || ve > totalFrames || ve <= vs) ve = totalFrames;
             uint32_t viewFrames = ve - vs;
-            if (vs && !f.seek(sizeof(hdr) + vs * frameBytes)) break;
 
-            // Min/max of the LEFT channel per bucket, scaled int16 → int8.
-            uint32_t bucket = (viewFrames + SAMPLE_OVERVIEW_N - 1) / SAMPLE_OVERVIEW_N;
-            if (bucket == 0) bucket = 1;
-            uint32_t frame = 0;
-            int      col   = 0;
-            int16_t  mn = 32767, mx = -32768;
-            while (frame < viewFrames && col < SAMPLE_OVERVIEW_N) {
-                int got = f.read((uint8_t*)rdP, 1024 * sizeof(int16_t));
-                if (got <= 0) break;
-                int n = got / (int)frameBytes;
-                for (int i = 0; i < n && col < SAMPLE_OVERVIEW_N; i++) {
-                    if (frame >= viewFrames) break;
-                    int16_t s = rdP[i * numCh];
-                    if (s < mn) mn = s;
-                    if (s > mx) mx = s;
-                    if (++frame % bucket == 0) {
-                        info.peaks[col * 2]     = (int8_t)(mn >> 8);
-                        info.peaks[col * 2 + 1] = (int8_t)(mx >> 8);
-                        col++;
-                        mn = 32767; mx = -32768;
-                    }
-                }
+            dbgSampled = sampleOverviewSampled(viewFrames, numCh);
+            if (dbgSampled) {
+                // Fresh handle with a slice-sized stdio buffer, set before its
+                // first read (see sampleOverviewPeaks).
+                f.close();
+                f = SD.open(path);
+                if (!f) break;
+                f.setBufferSize(SAMPLE_OVERVIEW_SLICE_BYTES);
+            } else if (vs && !f.seek(sizeof(hdr) + vs * frameBytes)) {
+                break;
             }
-            if (col < SAMPLE_OVERVIEW_N && mn != 32767) { // final partial bucket
-                info.peaks[col * 2]     = (int8_t)(mn >> 8);
-                info.peaks[col * 2 + 1] = (int8_t)(mx >> 8);
-            }
+            sampleOverviewPeaks(f, sizeof(hdr), vs, viewFrames, numCh,
+                                rdP, info.peaks, dbgSampled);
+            dbgScan = millis();
+            dbgView = viewFrames;
             info.viewStart = vs;
             info.viewEnd   = ve;
             ok = true;
