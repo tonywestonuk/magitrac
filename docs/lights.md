@@ -101,7 +101,7 @@ grabbed look holds until you RELEASE.
 ## Updating light-node firmware at a gig
 
 No router or laptop-on-stage needed: drop the new `pixel_post.ino.bin`
-into `/firmware/` on the server's SD card (over USB), and the server
-reboots into its **FLASH** screen — it serves the image from its own WiFi
+into `/firmware/` on the server's SD card (in a card reader), and the
+server boots into its **FLASH** screen — it serves the image from its own WiFi
 while the nodes pull it. Full steps in the
 [Server Guide](server-guide.md#pixelpost-flash-screen-firmware-for-the-light-nodes).

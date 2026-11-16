@@ -35,8 +35,7 @@ band. See the [Reference](reference.md) for how the cues work.
 - **M5Stack Module MIDI** — plugs into **Grove Port A** (the only Grove
   port still reachable with Module Audio stacked). MIDI IN comes from the
   performer's keyboard; MIDI OUT goes to your synth.
-- MicroSD card, **FAT32, ≤32 GB** (larger exFAT cards won't mount over
-  USB).
+- MicroSD card, **FAT32, ≤32 GB**.
 
 ### Light nodes (optional)
 Original **M5Stick** (ESP32-PICO-D4, the one with the small OLED) plus a
@@ -73,7 +72,7 @@ Symlink (or copy) these into `~/Documents/Arduino/libraries/`:
 | Sketch | Board | Notes |
 |---|---|---|
 | `magitrac/` (client) | ESP32S3 Dev Module | **PSRAM enabled (OPI)** — the song lives in PSRAM |
-| `magitrac_server_s3/` (server) | M5Stack CoreS3 | **USB Mode = USB-OTG (TinyUSB)**, USB CDC On Boot = Disabled — required for the SD-over-USB feature |
+| `magitrac_server_s3/` (server) | M5Stack CoreS3 | **PSRAM enabled**; USB Mode = Hardware CDC and JTAG with USB CDC On Boot = Enabled gives the serial log over USB-C |
 | `magitrac_dmx/`, `magitrac_gigbar_dmx/` (lights) | M5Stick-C / ESP32 PICO | no PSRAM |
 
 ### Server secrets file (optional)
@@ -87,8 +86,8 @@ your home WiFi + firmware URL. The gig-time light-flashing route
 
 ## Preparing the server's SD card
 
-Format FAT32 and create these folders (or copy files over USB later —
-see the Server Guide's USB screen):
+Format FAT32 in a computer's card reader and create these folders. The
+card comes out of the server whenever you want to add files later:
 
 | Folder | Contents |
 |---|---|

@@ -33,7 +33,7 @@ column editor:
 |---|---|---|
 | `OFF` (0) | muted | produces nothing |
 | 1–16 | **MIDI out** | notes go out the MIDI DIN on that channel. Channel 10 is GM drums — the PROGRAM field becomes a drum-kit picker |
-| `SFX` (17) | **sample player** | notes trigger WAV samples on the server's speaker. PROGRAM = sample ID from `/samples/samples.txt`. The sample plays at native pitch on **C-4** and is repitched by semitones either side. `OFF` stops it |
+| `SFX` (17) | **sample player** | notes trigger WAV samples on the server's speaker. PROGRAM = sample ID from `/samples/samples.txt`. The sample plays at native pitch on **C-4** and is repitched by semitones either side; the column's TUNE and the sample's own TUNE (set in the [sample editor](tracker-guide.md#sample-editor)) are added. `OFF` stops it |
 | `PXL` (18) | **PixelPost lights** | notes drive the light rig — see [Lights](lights.md). Note picks the effect (C-0 = effect 0, C#0 = 1, …), velocity is the brightness/intensity slider, and the effect+param hex bytes act as X/Y pad coordinates. `OFF` = "lift finger" |
 
 Other per-column settings (shared by every block in the song): bank,

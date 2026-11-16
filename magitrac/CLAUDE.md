@@ -168,10 +168,13 @@ tracker and Block Settings go through `PageManager`).
 - **SongPage** — the server's song list: load, NEW, SAVE, SAVE AS, swipe a
   row left to delete.
 - **PerformancePage** — 8 pads for live block switching (immediate or
-  queued), a light-control strip, and the way into **SetlistPage** (master
-  song catalog + 4 setlists, stored on the server).
+  queued), a light-control strip, the way into **SetlistPage** (master
+  song catalog + 4 setlists, stored on the server), and two icon buttons
+  that open the organ and samples pages and come back here afterwards.
 - **InstrumentsPage** (the instrument bank), **OrganPage** (drawbar organ
-  on the server), **SampleEditPage** (sample trim/loop),
+  on the server), **SamplesPage** (the server's samples as tappable
+  squares; hold one to edit it), **SampleEditPage** (sample trim/loop/tune,
+  opened from a square or from an SFX column),
   **PixelPostManualPage** / **PixelPostSettingsPage** (lights),
   **SettingsPage** / **WiFiSettingsPage** (clock, MIDI limits, WiFi,
   pairing), **BackupRestorePage**, and **BootMenu** (the MENU popup that

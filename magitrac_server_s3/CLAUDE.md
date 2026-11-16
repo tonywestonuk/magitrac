@@ -180,9 +180,9 @@ do not re-add any of it unless the owner asks.
 | `pairing.ino` | Pairing ceremony + client session state |
 | `pixelpost_send.ino` | PixelPost light state broadcast over ESP-NOW |
 | `field_flash.ino` | Flash PixelPost units at a gig, firmware served from the SD card |
-| `usb_msc.ino` | SD card as USB mass storage (boot-time mode; board settings listed in the file) |
-| `SamplePlayer.cpp/.h` | WAV playback via the shared codec: one SD stream + PSRAM-preloaded voices |
-| `SampleManifest.cpp/.h` | `/samples/samples.txt` — stable sample ids; trim/loop metadata |
+| `SamplePlayer.cpp/.h` | WAV playback via the shared codec: one SD stream + 8 voices from the PSRAM sample cache (filled a step at a time) |
+| `test_sample_cache.cpp` | Host tests for that cache (mocks in `test_mocks/cache/`); build line in the file |
+| `SampleManifest.cpp/.h` | `/samples/samples.txt` — stable sample ids; trim/loop/tune metadata (`trim.txt`) |
 | `drawbar_organ.cpp/.h` | Additive drawbar organ synth (own task, takes the codec while active) |
 | `proc_sounds.cpp/.h` | Procedural sounds for the organ's PROC type |
 | `audio_codec.cpp/.h` | Thin wrapper around the shared ES8388 (Module Audio v2.2) |
@@ -253,7 +253,7 @@ Same as the client (`TrackerData.h` is shared):
 Arduino IDE targeting the M5Stack CoreS3 (ESP32-S3).  No
 PlatformIO config in tree.  `.ino` files are compiled together with
 the `.cpp/.h` files.  Needs the M5Unified, M5Module-Audio,
-pixelpost_proto and SdFat libraries besides `magitrac_lib`.
+pixelpost_proto libraries besides `magitrac_lib`.
 
 ## Working here
 
@@ -262,7 +262,12 @@ pixelpost_proto and SdFat libraries besides `magitrac_lib`.
 - Client and server are always flashed together.  The wire format may
   change freely, but both ends must change in the same commit.
 - Internal RAM is the radios' budget on the ESP32-S3: anything over ~1 KB
-  (buffers, queues, big statics) goes in PSRAM.
+  (buffers, queues, big statics) goes in PSRAM.  The deliberate exception
+  is the organ synth's audio-rate buffers (reverb lines, voice scratch,
+  wavetables — about 69 KB), which need fast internal RAM.  Measured Nov
+  2026 with the client connected: 77 KB free at idle, 59 KB at the lowest
+  point of a song load and play.  Don't link the core's `USB.h` classes
+  (USBMSC and friends): the TinyUSB stack they pull in reserves 32 KB.
 - The `.ino` files are concatenated into one unit (the main one first) and
   function prototypes are auto-generated ahead of the code, before the
   types those files define.  Never use a type defined in an `.ino` in a

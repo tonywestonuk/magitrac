@@ -17,7 +17,7 @@ The CoreS3 has no physical buttons. There are two touch surfaces:
 
 Screens cycle in a fixed loop:
 
-**Songs → Samples → Chord → Scope → USB → Organ → back to Songs**
+**Songs → Samples → Chord → Scope → Organ → back to Songs**
 
 Every screen has a coloured header (title + battery icon) and a footer hint
 line reminding you what touches do.
@@ -36,7 +36,7 @@ line reminding you what touches do.
 
 ### Tempo idle screen
 
-After 10 seconds without a touch (on the list/USB screens), the display
+After 10 seconds without a touch (on the list screens), the display
 flips to a giant BPM readout with an average of recent readings — readable
 from across the stage. Any touch returns to where you were.
 
@@ -71,23 +71,16 @@ in green). Shows **"listening..."** until it locks on.
 A live oscilloscope of the microphone with a peak-to-peak level readout.
 **Tap the glass** to freeze/run the trace.
 
-## USB screen — getting files on and off the SD card
+## Getting files on and off the SD card
 
-Tap the green **ENTER** button and the server reboots as a USB
-mass-storage device: plug it into a computer over USB-C and the SD card
-mounts as a drive called **"MagiTrac SD"**. Copy songs, samples, or
-PixelPost firmware on or off, then **eject on the computer** (the server
-reboots back to normal) or tap the screen to exit.
+Take the card out of the server and put it in a computer's card reader:
+songs go in `/songs/`, samples in `/samples/`, PixelPost firmware in
+`/firmware/`. Power the server down first, and put the card back before
+powering up — it is read at boot.
 
-Things to know:
-
-- **FAT32 cards only (≤32 GB).** Larger exFAT cards enumerate but won't
-  mount reliably.
-- USB mode is a full handoff — the sequencer, audio, WiFi and MIDI are all
-  offline while the card is mounted.
-- Builders: the sketch must be compiled with **Tools → USB Mode →
-  USB-OTG (TinyUSB)** (and USB CDC On Boot disabled), or the ENTER button
-  will tell you so instead of mounting.
+(Earlier versions had a USB screen that mounted the card over USB-C. It
+was removed: it needed a reboot each way, and its USB stack held 32 KB of
+the memory the WiFi radio needs, whether or not it was in use.)
 
 ## Organ screen
 
@@ -117,9 +110,9 @@ brown **DONE** button.
 
 Field-updating your lights at a gig, with no router needed:
 
-1. USB screen → ENTER → copy the new `pixel_post.ino.bin` into
-   `/firmware/` → eject.
-2. The server reboots into the FLASH screen. Tap **FLASH** — the light
+1. With the server off, put its SD card in a computer and copy the new
+   `pixel_post.ino.bin` into `/firmware/`. Put the card back.
+2. The server boots into the FLASH screen. Tap **FLASH** — the light
    nodes join the server's own WiFi and pull the firmware; the Posts
    counter ticks up as each one finishes. Tap FLASH again for stragglers.
 3. Tap **DONE** — the file is renamed `*.done` and the server reboots into
