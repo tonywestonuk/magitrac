@@ -88,7 +88,10 @@ public:
 
     enum class Result : uint8_t { NONE, HOME };
 
-    void   open();      // draw + tell the server to enter organ mode
+    // draw + tell the server to enter organ mode.  backLabel: the corner
+    // button reads BACK instead of HOME (opened from the performance page —
+    // the sketch decides where Result::HOME leads).
+    void   open(bool backLabel = false);
     void   draw();
     Result poll();
 
@@ -99,6 +102,7 @@ private:
 
     uint8_t _bars[OR_N];   // 0..8 per drawbar
     bool    _open;
+    bool    _backLabel = false;   // corner button says BACK, not HOME
     bool    _wasDown;
     int     _dragCol;      // drawbar column locked on finger-down (-1 = none)
     int     _dragKnob;     // knob locked on finger-down (-1 = none)

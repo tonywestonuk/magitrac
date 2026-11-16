@@ -151,8 +151,9 @@ void OrganPage::adoptFromSong() {
     _activePreset = -1;   // registration came from the song, not a preset
 }
 
-void OrganPage::open() {
-    _open    = true;
+void OrganPage::open(bool backLabel) {
+    _open      = true;
+    _backLabel = backLabel;
     _wasDown = _touch.isTouched;
     _dragCol  = -1;
     _dragKnob = -1;      // a drag cut short by leaving the page must not resume
@@ -302,7 +303,8 @@ void OrganPage::drawHeader() {
     snprintf(buf, sizeof(buf), "FX %d/%d", _fxPage + 1, orFxPages());
     uiButton(_d, orFxX(4), OR_BTN_Y, OR_FX_W, OR_BTN_H, buf, COL_LTGREY, COL_BLACK, 2);
 
-    uiButton(_d, OR_HOME_X, OR_BTN_Y, OR_HOME_W, OR_BTN_H, "HOME", COL_WHITE, COL_BLACK, 3);
+    uiButton(_d, OR_HOME_X, OR_BTN_Y, OR_HOME_W, OR_BTN_H, _backLabel ? "BACK" : "HOME",
+             COL_WHITE, COL_BLACK, 3);
 }
 
 void OrganPage::drawKnobs() {

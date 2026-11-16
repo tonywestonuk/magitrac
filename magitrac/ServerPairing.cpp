@@ -6,6 +6,7 @@
 #include "MagiUdpLink.h"
 #include "MagiLink.h"
 #include "MagiMsg.h"
+#include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <string.h>
@@ -138,6 +139,8 @@ void ServerPairing::begin() {
             if (len < sizeof(MsgSampleInfo)) return;
             const MsgSampleInfo* mi = (const MsgSampleInfo*)msg;
             if (mi->kind == 0) {
+                SMPDBG("link: waveform for id=%u arrived from the server",
+                       (unsigned)mi->sampleId);
                 memcpy(&sp->_sampleInfo, msg, sizeof(MsgSampleInfo));
                 sp->_sampleInfoPending = true;
             } else if (mi->kind <= SAMPLE_SPEC_PAGES) {
@@ -551,7 +554,8 @@ bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t v
 
 bool ServerPairing::sendSampleEdit(uint8_t op, uint8_t sampleId,
                                    uint32_t startFrame, uint32_t endFrame,
-                                   uint8_t loop) {
+                                   uint8_t loop, int16_t tuneCents,
+                                   uint8_t note) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgSampleEdit msg;
     msg.op         = op;
@@ -559,6 +563,8 @@ bool ServerPairing::sendSampleEdit(uint8_t op, uint8_t sampleId,
     msg.startFrame = startFrame;
     msg.endFrame   = endFrame;
     msg.loop       = loop;
+    msg.tuneCents  = tuneCents;
+    msg.note       = note;
     return _sendLocked(&msg, sizeof(msg));
 }
 

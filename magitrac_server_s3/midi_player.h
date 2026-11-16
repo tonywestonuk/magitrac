@@ -41,6 +41,21 @@ void sequencerAuditionNote(uint8_t pattern, uint8_t row, uint8_t col);
 void sequencerAuditionRawNote(uint8_t channel, uint8_t note, uint8_t velocity,
                               uint8_t col = 0xFF);  // col: SFX sample source column
 
+// Client sample page: play a sample with no song column.  `note` sets the
+// pitch (60 = native + the sample's own TUNE).  Works while a song runs — see
+// seqSamplePlayImpl for what that does to the song's own samples.
+void sequencerSamplePlay(uint8_t sampleId, uint8_t note = 60);
+// The sample page's STOP: everything when stopped, only the pads' own sounds
+// while a song runs.
+void sequencerSamplePadsStop();
+// Client has a sample on the keys: while the lease is live, MIDI-in keys play
+// `sampleId` — see SAMPLE_EDIT_KEYS.  Stopped, that is all a key then does;
+// with a song running it is the performer's cue as well.  Each call renews
+// the lease; 0 ends it.  sequencerSampleKeysId() = the sample, or 0 once
+// expired.
+void    sequencerSampleKeys(uint8_t sampleId);
+uint8_t sequencerSampleKeysId();
+
 // True while the SEQUENCER holds the organ (song with an ORGAN column playing)
 // — screen navigation must not deactivate the organ out from under it.
 bool sequencerOrganOwned();

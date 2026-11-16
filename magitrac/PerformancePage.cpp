@@ -41,6 +41,19 @@ void PerformancePage::open(uint8_t currentPattern, bool stopped) {
     _titleOverride[0] = '\0';
 }
 
+void PerformancePage::resume(bool stopped) {
+    _wasDown       = _touch.isTouched;
+    _holdTarget    = HoldTarget::NONE;
+    _holdFired     = false;
+    _holdPadIdx    = -1;
+    _lightArmedBtn = -1;
+    _editing       = false;
+    if (stopped) {
+        _playingPattern = -1;
+        _queuedPattern  = -1;
+    }
+}
+
 void PerformancePage::setTitleOverride(const char* name) {
     if (!name || !*name) {
         _titleOverride[0] = '\0';
@@ -57,6 +70,7 @@ void PerformancePage::draw() {
     } else {
         drawPerfHeader();
         drawPads();
+        drawSideButtons();
         drawLightStrip();
     }
 }
@@ -102,6 +116,7 @@ PerformancePage::Result PerformancePage::poll() {
             _d.fillScreen(COL_WHITE);
             drawPerfHeader();
             drawPads();
+            drawSideButtons();
             drawLightStrip();
             _d.paint();
         }
@@ -160,6 +175,14 @@ PerformancePage::Result PerformancePage::pollPerf() {
                 _holdTarget = HoldTarget::NONE;
                 return Result::SETLIST;
             }
+            if (_holdTarget == HoldTarget::ORGAN) {
+                _holdTarget = HoldTarget::NONE;
+                return Result::ORGAN;
+            }
+            if (_holdTarget == HoldTarget::SAMPLES) {
+                _holdTarget = HoldTarget::NONE;
+                return Result::SAMPLES;
+            }
             if (_holdTarget == HoldTarget::EDIT) {
                 _editing = true;
                 _wasDown = true;
@@ -211,6 +234,11 @@ PerformancePage::Result PerformancePage::pollPerf() {
             _holdTarget  = HoldTarget::SETLIST;
             _holdStartMs = millis();
             _holdFired   = false;
+        } else if (hitSide(sx, sy) >= 0) {
+            _holdTarget  = (hitSide(sx, sy) == 0) ? HoldTarget::ORGAN
+                                                  : HoldTarget::SAMPLES;
+            _holdStartMs = millis();
+            _holdFired   = false;
         } else if (hitLightBtn(sx, sy) >= 0) {
             // Arm on press; FX/RELEASE fire on release (tap), WHITE is momentary.
             _lightArmedBtn = (int8_t)hitLightBtn(sx, sy);
@@ -257,10 +285,11 @@ PerformancePage::Result PerformancePage::pollPerf() {
         _holdTarget = HoldTarget::NONE;
         _holdFired  = false;
 
-        // Header buttons: any release (held or not) is swallowed — the held
-        // action already fired, and a brief tap is intentionally a no-op.
+        // Header + side buttons: any release (held or not) is swallowed — the
+        // held action already fired, and a brief tap is intentionally a no-op.
         if (tgt == HoldTarget::HOME || tgt == HoldTarget::EDIT
-            || tgt == HoldTarget::SETLIST) {
+            || tgt == HoldTarget::SETLIST || tgt == HoldTarget::ORGAN
+            || tgt == HoldTarget::SAMPLES) {
             return Result::NONE;
         }
 
@@ -427,14 +456,19 @@ void PerformancePage::drawPad(int idx) {
         _d.setCursor(x + (PP_PAD_W - labelW) / 2, y + 25);
         _d.print(numStr);
 
-        _d.setTextSize(3);
+        // Size 3 if the name fits the pad, else size 2 — the pads are
+        // narrower than the longest name (11 characters) at size 3.
+        int ts = ((int)strlen(cfg.name) * 18 <= PP_PAD_W - 20) ? 3 : 2;
+        int cw = ts * 6;
+        _d.setTextSize(ts);
         _d.setTextColor(fg);
-        int maxChars = (PP_PAD_W - 20) / 18;
+        int maxChars = (PP_PAD_W - 20) / cw;
+        if (maxChars > PERF_PAD_NAME_LEN - 1) maxChars = PERF_PAD_NAME_LEN - 1;
         char truncName[PERF_PAD_NAME_LEN];
         strncpy(truncName, cfg.name, maxChars);
         truncName[maxChars] = '\0';
-        int nw = (int)strlen(truncName) * 18;
-        _d.setCursor(x + (PP_PAD_W - nw) / 2, y + PP_PAD_H - 55);
+        int nw = (int)strlen(truncName) * cw;
+        _d.setCursor(x + (PP_PAD_W - nw) / 2, y + PP_PAD_H - 55 + (24 - ts * 8) / 2);
         _d.print(truncName);
     } else {
         // Just the number, centred
@@ -485,6 +519,69 @@ int PerformancePage::hitPad(int sx, int sy) const {
             return i;
     }
     return -1;
+}
+
+// ── Side column: organ + samples ─────────────────────────────────────────────
+// Two buttons the height of a pad row, directly under HOME.  Icons rather than
+// words: "SAMPLES" would not fit the width at a readable size.
+
+int PerformancePage::hitSide(int sx, int sy) const {
+    if (sx < PP_SIDE_X || sx >= PP_SIDE_X + PP_SIDE_W) return -1;
+    for (int i = 0; i < 2; i++) {
+        int y = PP_PAD_Y0 + i * (PP_PAD_H + PP_PAD_ROW_GAP);
+        if (sy >= y && sy < y + PP_PAD_H) return i;
+    }
+    return -1;
+}
+
+void PerformancePage::drawSideButtons() {
+    for (int i = 0; i < 2; i++) {
+        int y = PP_PAD_Y0 + i * (PP_PAD_H + PP_PAD_ROW_GAP);
+        _d.fillRect(PP_SIDE_X, y, PP_SIDE_W, PP_PAD_H, COL_WHITE);
+        _d.drawRect(PP_SIDE_X,     y,     PP_SIDE_W,     PP_PAD_H,     COL_BLACK);
+        _d.drawRect(PP_SIDE_X + 1, y + 1, PP_SIDE_W - 2, PP_PAD_H - 2, COL_BLACK);
+        int cx = PP_SIDE_X + PP_SIDE_W / 2;
+        int cy = y + PP_PAD_H / 2;
+        if (i == 0) drawOrganIcon(cx, cy);
+        else        drawSampleIcon(cx, cy);
+    }
+}
+
+// Organ: a row of drawbars pulled out to different lengths, over a keyboard.
+// 98 px wide, 118 px tall.
+void PerformancePage::drawOrganIcon(int cx, int cy) {
+    const int W = 98, H = 118;
+    int x0 = cx - W / 2, y0 = cy - H / 2;
+
+    // Drawbars: stem + knob, hanging from a top rail.
+    static const uint8_t LEN[7] = { 30, 44, 22, 38, 16, 34, 26 };
+    _d.fillRect(x0, y0, W, 4, COL_BLACK);                    // rail
+    for (int i = 0; i < 7; i++) {
+        int bx = x0 + 7 + i * 14;                            // stem centre
+        _d.fillRect(bx - 1, y0 + 4, 3, LEN[i], COL_BLACK);            // stem
+        _d.fillRect(bx - 5, y0 + 4 + LEN[i], 11, 9, COL_BLACK);       // knob
+    }
+
+    // Keyboard: 7 white keys with 5 black keys between them.
+    const int ky = y0 + 64, kh = H - 64;                     // 54 px tall
+    _d.drawRect(x0, ky, W, kh, COL_BLACK);
+    _d.drawRect(x0 + 1, ky + 1, W - 2, kh - 2, COL_BLACK);
+    for (int k = 1; k < 7; k++)                              // white-key gaps
+        _d.fillRect(x0 + k * 14 - 1, ky, 2, kh, COL_BLACK);
+    static const uint8_t BLACK_AFTER[5] = { 1, 2, 4, 5, 6 }; // C# D#  F# G# A#
+    for (int b = 0; b < 5; b++)
+        _d.fillRect(x0 + BLACK_AFTER[b] * 14 - 4, ky, 9, 32, COL_BLACK);
+}
+
+// Sample: a slice of audio waveform — bars mirrored about a centre line.
+// 102 px wide, up to 96 px tall.
+void PerformancePage::drawSampleIcon(int cx, int cy) {
+    static const uint8_t HALF[15] = { 6, 14, 26, 40, 30, 18, 34, 48, 28, 16, 24, 12, 20, 8, 4 };
+    const int N = 15, PITCH = 7, BAR = 4;
+    int x0 = cx - (N * PITCH - (PITCH - BAR)) / 2;
+    _d.fillRect(x0 - 4, cy, N * PITCH + 4, 1, COL_BLACK);    // centre line
+    for (int i = 0; i < N; i++)
+        _d.fillRect(x0 + i * PITCH, cy - HALF[i], BAR, HALF[i] * 2 + 1, COL_BLACK);
 }
 
 // ── Light-control strip (PixelPost) ──────────────────────────────────────────

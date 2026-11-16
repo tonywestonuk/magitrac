@@ -895,6 +895,11 @@ static void setScreen(Screen s) {
     if (s == SCR_ORGAN) {
         samplePlayerStop();      // free the codec before the organ task writes
         organSetActive(true);
+        // With a song running, the sequencer can trigger a sample during the
+        // ~60 ms the switch-over takes (organActive() only turns true at its
+        // end).  Stop that one too, or it and the organ would both be writing
+        // the codec; from here on the sequencer sees the organ and stays off.
+        samplePlayerStop();
     }
     drawScreen();
 }
@@ -1748,11 +1753,14 @@ void loop() {
     // client always lands, even while the idle BPM screensaver is showing.
     // (Previously the request sat queued in gOrganScreenReq until the server
     // itself was touched, which is why it "only worked after visiting organ on
-    // the server".)  Only auto-switch while STOPPED — during live playback we
-    // leave the server display alone.
+    // the server".)  The request is honoured while a song is PLAYING too: the
+    // performer's keys then sound the organ and still act as the song's cues
+    // (the MIDI parser feeds both).  The price is the song's samples — organ
+    // and sample player share the one output, so SFX columns stay silent
+    // until the organ page is left (see setScreen).
     if (gOrganScreenReq) {
         int req = gOrganScreenReq; gOrganScreenReq = 0;
-        if (req == 1 && gScreen != SCR_ORGAN && !sequencerIsRunning()) {
+        if (req == 1 && gScreen != SCR_ORGAN) {
             gTempoMode   = false;    // drop the screensaver if it's up
             gLastInputMs = millis();
             setScreen(SCR_ORGAN);

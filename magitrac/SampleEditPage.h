@@ -3,14 +3,24 @@
 #include "EPD_Painter_Adafruit.h"
 #include "gt911_lite.h"
 #include "MagiMsg.h"
+#include "HoldRepeat.h"
 
-// ── SampleEditPage — non-destructive sample trim/loop editor ─────────────────
+// ── SampleEditPage — non-destructive sample trim/loop/tune editor ────────────
 //
-// Opened from the ColumnEditor's EDIT button on an SFX column.  Shows a
-// waveform overview fetched from the server (MSG_SAMPLE_INFO); START/END
-// markers are touch-and-drag (grab near the line, drag, release to store);
-// LOOP makes a held key wrap the region.  Metadata lives on the server
-// (/samples/trim.txt) — the WAV never changes.
+// Shows a waveform overview fetched from the server (MSG_SAMPLE_INFO);
+// START/END markers are touch-and-drag (grab near the line, drag, release to
+// store); LOOP makes a held key wrap the region; TUNE −/+ shifts the sample's
+// own pitch in cents.  Metadata lives on the server (/samples/trim.txt) — the
+// WAV never changes — and belongs to the SAMPLE, so it applies in every song.
+//
+// Two ways in:
+//   • SamplesPage (hold a square): no column — col = SE_NO_COL.  PLAY sounds
+//     the bare sample, and while the page is open the MIDI-in keyboard plays
+//     it at the played pitch (the server does that itself; this page only
+//     keeps the SAMPLE_EDIT_KEYS lease alive).
+//   • ColumnEditor's EDIT button on an SFX column: PLAY auditions through the
+//     column (its TUNE / TRANSPOSE / VOLUME on top); the sketch relays MIDI
+//     keys the same way.
 //
 // ZOOM ± halves/doubles the visible window; every zoom or scroll re-requests
 // the overview for just the visible window, so the server re-scans that slice
@@ -42,8 +52,16 @@ static const int SE_SCROLL_H = 44;
 static const int SE_ZOOM_Y   = 462;                   // bottom controls row
 static const int SE_ZOOM_H   = 60;
 static const int SE_ZOUT_X   = 80;                    // [ZOOM −]
-static const int SE_ZIN_X    = 240;                   // [ZOOM +]
-static const int SE_ZBTN_W   = 140;
+static const int SE_ZIN_X    = 200;                   // [ZOOM +]
+static const int SE_ZBTN_W   = 110;
+// TUNE: [−] value [+], between the zoom readout and SPECTRUM.
+static const int SE_TUNE_DN_X  = 400;
+static const int SE_TUNE_BTN_W = 70;
+static const int SE_TUNE_VAL_X = SE_TUNE_DN_X + SE_TUNE_BTN_W;    // 470
+static const int SE_TUNE_VAL_W = 170;
+static const int SE_TUNE_UP_X  = SE_TUNE_VAL_X + SE_TUNE_VAL_W;   // 640
+
+static const uint8_t SE_NO_COL = 0xFF;                // opened without a column
 
 // Stop zooming in once the window is this small (≈2 frames per pixel).
 static const uint32_t SE_MIN_VIEW_FRAMES = 1600;
@@ -53,17 +71,21 @@ public:
     SampleEditPage(EPD_PainterAdafruit& d, GT911_Lite& touch)
         : _d(d), _touch(touch) {}
 
-    // tuneCents: the column's TUNE — playback speed shifts the audition's
+    // col: the SFX column the sample is being edited through, or SE_NO_COL.
+    // tuneCents: that column's TUNE — playback speed shifts the audition's
     // real duration, which drives the PLAY button's auto-reset.
-    void open(uint8_t sampleId, const char* name, uint8_t col,
+    void open(uint8_t sampleId, const char* name, uint8_t col = SE_NO_COL,
               int16_t tuneCents = 0);
-    bool poll();        // returns true when BACK tapped (return to ColumnEditor)
+    bool poll();        // returns true when BACK tapped (caller picks where to)
 
 private:
     void draw();
     void drawWave();
     void drawScrollbar();
     void drawZoomRow();
+    void drawTune();           // TUNE −/value/+ (part of the zoom row)
+    void stepTune(int cents);  // adjust + repaint; stored on release
+    bool standalone() const { return _col == SE_NO_COL; }
     void drawHeader();
     void adopt();              // copy meta out of the arrived MsgSampleInfo
     void sendMeta();           // live-apply (SAMPLE_EDIT_SET)
@@ -99,6 +121,10 @@ private:
     int      _dragAnchorX  = 0;           // finger x at grab
     uint32_t _dragAnchorVs = 0;           // viewStart at grab
     int16_t  _tuneCents  = 0;             // column TUNE (audition speed)
+    int16_t  _sampleTune = 0;             // the sample's own TUNE, ± cents
+    HoldRepeat _tuneHold;                 // TUNE −/+ held: delta = direction
+    int      _tuneStep   = 1;             // cents per repeat — grows while held
+    uint32_t _keysLastMs = 0;             // last SAMPLE_EDIT_KEYS lease renewal
     uint32_t _playEndMs  = 0;             // when a non-looping audition ends
     bool     _backArmed  = false;         // BACK pressed; fires on RELEASE so the
                                           // reopened ColumnEditor (HOME shares the
@@ -107,5 +133,5 @@ private:
 };
 
 // Spectrogram popup: [SPECTRUM] button position (in the zoom row).
-static const int SE_SPEC_X = 700;
-static const int SE_SPEC_W = 220;
+static const int SE_SPEC_X = 740;
+static const int SE_SPEC_W = 180;

@@ -3,12 +3,19 @@
 #include <Arduino.h>
 #include <SD.h>
 #include <string.h>
+#include "esp_heap_caps.h"
 
 static const char* SM_DIR  = "/samples";
 static const char* SM_PATH = "/samples/samples.txt";
 
-static SmEntry s_entries[SM_MAX_ENTRIES];
-static int     s_count = 0;
+// Both tables (this one and s_trim below) live in PSRAM — control-rate data,
+// and internal RAM is the radios'.  Allocated on first use by tablesReady();
+// the counts stay 0 while a table is missing, so readers never touch it.
+static SmEntry*    s_entries = nullptr;   // SM_MAX_ENTRIES
+static int         s_count = 0;
+struct SampleTrim;                        // SampleManifest.h
+static SampleTrim* s_trim = nullptr;      // SM_MAX_ENTRIES
+static bool tablesReady();
 
 // ── Parsing ────────────────────────────────────────────────────────────────
 
@@ -77,6 +84,7 @@ static void loadManifest() {
         s_entries[s_count].id = id;
         strncpy(s_entries[s_count].name, name, SM_NAME_LEN - 1);
         s_entries[s_count].name[SM_NAME_LEN - 1] = '\0';
+        s_entries[s_count].size = 0;            // filled in by the folder scan
         s_count++;
     }
     f.close();
@@ -104,7 +112,7 @@ static bool scanAndAppend() {
     if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return false; }
 
     bool added = false;
-    while (s_count < SM_MAX_ENTRIES) {
+    for (;;) {                   // every file: known ones still need their size noted
         File f = dir.openNextFile();
         if (!f) break;
         if (f.isDirectory()) { f.close(); continue; }
@@ -116,15 +124,19 @@ static bool scanAndAppend() {
                      len < SM_NAME_LEN;
         if (!isWav) { f.close(); continue; }
 
-        if (findByName(n) < 0) {
+        int at = findByName(n);
+        if (at < 0) {
+            if (s_count >= SM_MAX_ENTRIES) { f.close(); continue; }   // table full
             uint8_t id = nextFreeId();
-            if (id == 0) { f.close(); break; }   // 127 ids used up
+            if (id == 0) { f.close(); continue; }   // 127 ids used up
+            at = s_count;
             s_entries[s_count].id = id;
             strncpy(s_entries[s_count].name, n, SM_NAME_LEN - 1);
             s_entries[s_count].name[SM_NAME_LEN - 1] = '\0';
             s_count++;
             added = true;
         }
+        s_entries[at].size = (uint32_t)f.size();   // the cache's "will it fit" figure
         f.close();
     }
     dir.close();
@@ -149,8 +161,20 @@ static void sortById() {
 // ── Trim/loop metadata (/samples/trim.txt) ───────────────────────────────────
 
 static const char* ST_PATH = "/samples/trim.txt";
-static SampleTrim  s_trim[SM_MAX_ENTRIES];
 static int         s_trimCount = 0;
+
+// PSRAM first, internal RAM as a fallback; zeroed.  False only if both fail.
+static bool tablesReady() {
+    if (!s_entries) {
+        s_entries = (SmEntry*)heap_caps_calloc(SM_MAX_ENTRIES, sizeof(SmEntry), MALLOC_CAP_SPIRAM);
+        if (!s_entries) s_entries = (SmEntry*)calloc(SM_MAX_ENTRIES, sizeof(SmEntry));
+    }
+    if (!s_trim) {
+        s_trim = (SampleTrim*)heap_caps_calloc(SM_MAX_ENTRIES, sizeof(SampleTrim), MALLOC_CAP_SPIRAM);
+        if (!s_trim) s_trim = (SampleTrim*)calloc(SM_MAX_ENTRIES, sizeof(SampleTrim));
+    }
+    return s_entries && s_trim;
+}
 
 static void loadTrims() {
     SdLock _;
@@ -159,16 +183,20 @@ static void loadTrims() {
     if (!f) return;
     char line[64];
     while (s_trimCount < SM_MAX_ENTRIES && readLine(f, line, sizeof(line))) {
-        // <id>=<startFrame>:<endFrame>:<loop>
+        // <id>=<startFrame>:<endFrame>:<loop>[:<tuneCents>]
         const char* eq = strchr(line, '=');
         if (!eq) continue;
         int id = atoi(line);
         if (id < 1 || id > 127) continue;
-        uint32_t st = 0, en = 0; int lp = 0;
-        if (sscanf(eq + 1, "%lu:%lu:%d",
-                   (unsigned long*)&st, (unsigned long*)&en, &lp) != 3) continue;
+        uint32_t st = 0, en = 0; int lp = 0, tune = 0;
+        // Three fields = a file written before TUNE existed (tune stays 0).
+        if (sscanf(eq + 1, "%lu:%lu:%d:%d",
+                   (unsigned long*)&st, (unsigned long*)&en, &lp, &tune) < 3) continue;
+        if (tune < -4800) tune = -4800;
+        if (tune >  4800) tune =  4800;
         SampleTrim& t = s_trim[s_trimCount++];
         t.id = (uint8_t)id; t.startFrame = st; t.endFrame = en; t.loop = (uint8_t)(lp != 0);
+        t.tuneCents = (int16_t)tune;
     }
     f.close();
     Serial.printf("[SM] trim.txt: %d entr%s\n", s_trimCount, s_trimCount == 1 ? "y" : "ies");
@@ -180,19 +208,26 @@ const SampleTrim* sampleTrimFor(uint8_t id) {
     return nullptr;
 }
 
-void sampleTrimSet(uint8_t id, uint32_t startFrame, uint32_t endFrame, uint8_t loop) {
-    bool remove = (startFrame == 0 && endFrame == 0 && !loop);   // back to defaults
+void sampleTrimSet(uint8_t id, uint32_t startFrame, uint32_t endFrame, uint8_t loop,
+                   int16_t tuneCents) {
+    if (!tablesReady()) return;
+    if (tuneCents < -4800) tuneCents = -4800;
+    if (tuneCents >  4800) tuneCents =  4800;
+    bool remove = (startFrame == 0 && endFrame == 0 && !loop &&
+                   tuneCents == 0);                            // back to defaults
     for (int i = 0; i < s_trimCount; i++) {
         if (s_trim[i].id != id) continue;
         if (remove) { s_trim[i] = s_trim[--s_trimCount]; }
         else        { s_trim[i].startFrame = startFrame;
                       s_trim[i].endFrame   = endFrame;
-                      s_trim[i].loop       = loop; }
+                      s_trim[i].loop       = loop;
+                      s_trim[i].tuneCents  = tuneCents; }
         return;
     }
     if (remove || s_trimCount >= SM_MAX_ENTRIES) return;
     SampleTrim& t = s_trim[s_trimCount++];
     t.id = id; t.startFrame = startFrame; t.endFrame = endFrame; t.loop = loop;
+    t.tuneCents = tuneCents;
 }
 
 bool sampleTrimSave() {
@@ -201,16 +236,18 @@ bool sampleTrimSave() {
     File f = SD.open(ST_PATH, FILE_WRITE);
     if (!f) return false;
     for (int i = 0; i < s_trimCount; i++)
-        f.printf("%u=%lu:%lu:%u\n", (unsigned)s_trim[i].id,
+        f.printf("%u=%lu:%lu:%u:%d\n", (unsigned)s_trim[i].id,
                  (unsigned long)s_trim[i].startFrame,
                  (unsigned long)s_trim[i].endFrame,
-                 (unsigned)s_trim[i].loop);
+                 (unsigned)s_trim[i].loop,
+                 (int)s_trim[i].tuneCents);
     f.close();
     return true;
 }
 
 bool sampleManifestSync() {
     s_count = 0;
+    if (!tablesReady()) { s_trimCount = 0; return false; }
     {
         SdLock _;
         File dir = SD.open(SM_DIR);
@@ -232,6 +269,13 @@ int sampleManifestCount() { return s_count; }
 const SmEntry* sampleManifestAt(int idx) {
     if (idx < 0 || idx >= s_count) return nullptr;
     return &s_entries[idx];
+}
+
+uint32_t sampleManifestSizeFor(uint8_t id) {
+    for (int i = 0; i < s_count; i++) {
+        if (s_entries[i].id == id) return s_entries[i].size;
+    }
+    return 0;
 }
 
 const char* sampleManifestNameFor(uint8_t id) {

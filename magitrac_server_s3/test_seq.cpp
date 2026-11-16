@@ -29,15 +29,35 @@ HardwareSerial midi;
 // Sketch-side functions that midi_player.cpp references but the test doesn't
 // exercise — stub them out so the link succeeds.
 void debugPrintf(const char* /*fmt*/, ...) {}
+// Sample player stub.  By default nothing is cached and the manifest is empty
+// (as before: SFX plays go nowhere).  A test sets _mockRamCached to make RAM
+// plays succeed and be recorded, _mockHaveFiles to make every sample id
+// resolve to a file (so uncached plays reach the stream), and _mockTrim to
+// give one sample metadata.
+static int  _mockStreamPlays = 0, _mockStreamStops = 0, _mockStopAlls = 0;
+static bool _mockHaveFiles   = false;
 void samplePlayerPlay(const char* /*path*/, float /*pitch*/, uint8_t /*vol*/,
-                      uint32_t /*startFrame*/, uint32_t /*endFrame*/, bool /*loop*/) {}
-void samplePlayerStop() {}
-void samplePlayerStopStream() {}
-int  samplePlayRam(uint8_t /*id*/, float /*pitch*/, uint8_t /*vol*/) { return -1; }
-void sampleStopVoice(int /*voice*/) {}
-const char* sampleManifestNameFor(uint8_t /*id*/) { return nullptr; }
+                      uint32_t /*startFrame*/, uint32_t /*endFrame*/, bool /*loop*/) { _mockStreamPlays++; }
+void samplePlayerStop()       { _mockStopAlls++; }
+void samplePlayerStopStream() { _mockStreamStops++; }
+static bool    _mockRamCached   = false;
+static int     _mockRamPlays    = 0;
+static int     _mockVoiceStops  = 0;
+static uint8_t _mockRamId       = 0;
+static uint8_t _mockRamVol      = 0;
+static float   _mockRamPitch    = 0;
+int  samplePlayRam(uint8_t id, float pitch, uint8_t vol) {
+    if (!_mockRamCached) return -1;
+    _mockRamId = id; _mockRamPitch = pitch; _mockRamVol = vol;
+    return ++_mockRamPlays;                  // a distinct voice handle each time
+}
+void sampleStopVoice(int /*voice*/) { _mockVoiceStops++; }
+const char* sampleManifestNameFor(uint8_t /*id*/) { return _mockHaveFiles ? "x.wav" : nullptr; }
 #include "SampleManifest.h"   // SampleTrim type for the stub below
-const SampleTrim* sampleTrimFor(uint8_t /*id*/) { return nullptr; }
+static SampleTrim _mockTrim = {};            // id 0 = no metadata for anything
+const SampleTrim* sampleTrimFor(uint8_t id) {
+    return (_mockTrim.id && _mockTrim.id == id) ? &_mockTrim : nullptr;
+}
 void pixelpostSetTouchpad(uint8_t, uint8_t, bool) {}
 void pixelpostSetSlider(uint8_t) {}
 void pixelpostSetEffect(uint8_t) {}
@@ -1195,6 +1215,232 @@ static void test_pan_effect_ignored_where_it_does_not_apply() {
     sequencerStop();
 }
 
+// ── Sample page: MIDI keys play a sample, pads, and the sample's own TUNE ────
+
+// Queue raw MIDI-in bytes and run the parser over them.
+static void midiIn(const uint8_t* b, size_t n) {
+    memcpy(_mockUartRx, b, n);
+    _mockUartRxLen = n; _mockUartRxPos = 0;
+    sequencerPollMidiIn();
+}
+static void midiInNoteOn(uint8_t note, uint8_t vel)  { uint8_t m[3] = { 0x90, note, vel }; midiIn(m, 3); }
+static void midiInNoteOff(uint8_t note)              { uint8_t m[3] = { 0x80, note, 0 };   midiIn(m, 3); }
+
+static int     gStepInCalls = 0;
+static uint8_t gStepInNote  = 0;
+static void stepInCallback(uint8_t note, uint8_t /*vel*/) { gStepInCalls++; gStepInNote = note; }
+
+static void sampleMockReset() {
+    _mockHaveFiles = false; _mockStreamPlays = 0; _mockStreamStops = 0; _mockStopAlls = 0;
+    _mockRamCached = true; _mockRamPlays = 0; _mockVoiceStops = 0;
+    _mockRamId = 0; _mockRamPitch = 0;
+    _mockTrim = SampleTrim{};
+    gStepInCalls = 0;
+    seqSetMidiNoteInCallback(stepInCallback);
+}
+static void sampleMockDone() {
+    sequencerSampleKeys(0);
+    seqSetMidiNoteInCallback(nullptr);
+    _mockRamCached = false;
+    _mockHaveFiles = false;
+    _mockTrim = SampleTrim{};
+}
+static bool near(float a, float b) { return fabsf(a - b) < 0.001f; }
+
+// While the client's sample editor holds the key lease, keys play its sample
+// at the played pitch and are NOT step input; each key's release stops its
+// own voice.
+static void test_sample_keys_play_the_sample_not_step_input() {
+    printf("\ntest_sample_keys_play_the_sample_not_step_input\n");
+    buildPlainSong();
+    sampleMockReset();
+    _mockMs = 1000;
+
+    midiInNoteOn(64, 90);
+    CHECK(gStepInCalls == 1 && _mockRamPlays == 0, "no lease: the key is step input, no sample");
+
+    sequencerSampleKeys(7);
+    midiInNoteOn(60, 90);
+    CHECK(_mockRamPlays == 1 && _mockRamId == 7, "lease: the key plays the sample");
+    CHECK(near(_mockRamPitch, 0.0f),             "middle C = native pitch");
+    CHECK(_mockRamVol == 114,                    "…at velocity 90, a little under the sample's own level");
+    midiInNoteOff(60);
+    midiInNoteOn(60, 100);
+    CHECK(_mockRamVol == 127,                    "velocity 100 = the sample's own level exactly");
+    midiInNoteOff(60);
+    midiInNoteOn(60, 127);
+    CHECK(_mockRamVol == 161,                    "velocity 127 = louder than that (boost)");
+    midiInNoteOff(60);
+    midiInNoteOn(67, 5);
+    CHECK(_mockRamPlays == 4 && near(_mockRamPitch, 7.0f), "G above = +7 semitones, even played softly");
+    CHECK(_mockRamVol == 6,                      "…and softly it is");
+    CHECK(gStepInCalls == 1,                     "no key reached step input");
+    int stopsBefore = _mockVoiceStops;
+    midiInNoteOn(67, 0);                         // note-on velocity 0 = note-off
+    CHECK(_mockVoiceStops == stopsBefore + 1 && _mockRamPlays == 4, "velocity-0 note-on is a release, not a play");
+
+    sequencerSampleKeys(0);
+    midiInNoteOn(62, 90);
+    CHECK(gStepInCalls == 2 && _mockRamPlays == 4, "lease ended: keys are step input again");
+    sampleMockDone();
+}
+
+// The lease runs out by itself if the client stops renewing it.
+static void test_sample_keys_lease_expires() {
+    printf("\ntest_sample_keys_lease_expires\n");
+    buildPlainSong();
+    sampleMockReset();
+    _mockMs = 1000;
+    sequencerSampleKeys(7);
+    _mockMs = 1000 + SAMPLE_KEYS_LEASE_MS - 1;
+    CHECK(sequencerSampleKeysId() == 7, "lease still live just inside the window");
+    sequencerSampleKeys(7);                      // renewal restarts the clock
+    _mockMs += SAMPLE_KEYS_LEASE_MS - 1;
+    midiInNoteOn(60, 90);
+    CHECK(_mockRamPlays == 1,           "renewed lease: keys still play the sample");
+    midiInNoteOff(60);
+    _mockMs += 2;                                // now past the renewed lease
+    midiInNoteOn(60, 90);
+    CHECK(_mockRamPlays == 1 && gStepInCalls == 1, "expired: the key is step input again");
+    CHECK(sequencerSampleKeysId() == 0, "and the lease reports off");
+    sampleMockDone();
+}
+
+// With a sample on the keys, a running song gets both: the key is still the
+// performer's cue, and it plays the sample — and its release stops that note.
+// Pads play over the song too.
+static void test_sample_keys_and_pads_over_a_running_song() {
+    printf("\ntest_sample_keys_and_pads_over_a_running_song\n");
+    Song* song = buildPlainSong();
+    putNote(song, 0, 0, INPUT_COLUMN, NOTE_ANY, EFFECT_WAIT);     // waits at row 0 for any key
+    song->midiInNoteMin = 0; song->midiInNoteMax = 127;           // every key is in the cue range
+    sampleMockReset();
+    _mockMs = 0;
+    sequencerSampleKeys(7);
+    sequencerStart();
+    sequencerTick();
+    CHECK(_test_isWaiting(), "the song is waiting on its cue");
+    midiInNoteOn(60, 90);
+    CHECK(_mockRamPlays == 1 && _mockRamId == 7, "running: the key plays the sample");
+    CHECK(!_test_isWaiting(),                    "…and is still the song's cue");
+    midiInNoteOff(60);
+    CHECK(_mockVoiceStops == 1,                  "releasing the key stops its note, song running or not");
+
+    sequencerSamplePlay(7, 60);
+    CHECK(_mockRamPlays == 2, "running: a pad plays too");
+    midiInNoteOff(60);
+    CHECK(_mockVoiceStops == 1, "a pad has no key: a note-off for 60 doesn't cut it");
+    midiInNoteOn(64, 90);                        // a held key…
+    sequencerSamplePadsStop();
+    CHECK(_mockVoiceStops >= 3 && _mockStopAlls == 0,
+          "running: STOP releases the page's pad and key voices, not the whole player");
+    sequencerStop();
+    sequencerSamplePlay(7, 60);
+    CHECK(_mockRamPlays == 4, "stopped: the pad plays too");
+    sequencerSamplePadsStop();
+    CHECK(_mockStopAlls == 1, "stopped: STOP silences the whole player");
+    sampleMockDone();
+}
+
+// A key whose (uncached) sample was streaming: once the song takes the stream
+// for one of its own samples, that key's release must not cut the song's.
+static void test_key_release_does_not_cut_a_song_stream() {
+    printf("\ntest_key_release_does_not_cut_a_song_stream\n");
+    Song* song = buildPlainSong();
+    sampleMockReset();
+    _mockRamCached = false;                      // everything streams
+    _mockHaveFiles = true;
+    song->columns[3].midiChannel = SFX_CHANNEL;
+    song->columns[3].program     = 5;
+    song->columns[3].volume      = 127;
+    putNote(song, 0, 2, 3, makeNote(0, 4));      // the song streams sample 5 at row 2
+    _mockMs = 0;
+    sequencerSampleKeys(9);
+    sequencerStart();
+    sequencerTick();
+    midiInNoteOn(60, 90);
+    CHECK(_mockStreamPlays == 1, "the key's sample streams");
+    for (int i = 0; i < 2; i++) { _mockMs = _test_getNextRowMs(); sequencerTick(); }
+    CHECK(_mockStreamPlays == 2, "the song's sample takes the stream at row 2");
+    midiInNoteOff(60);
+    CHECK(_mockStreamStops == 0, "releasing the key leaves the song's stream alone");
+    midiInNoteOn(62, 90);
+    midiInNoteOff(62);
+    CHECK(_mockStreamPlays == 3 && _mockStreamStops == 1, "a fresh key still starts and stops its own");
+    sequencerStop();
+    sampleMockDone();
+}
+
+// An uncached pad sample takes the single SD stream.  The song column whose
+// streamed sample it replaced must not cut it with its own note-off, and the
+// pads' STOP must stop it; once the song takes the stream back, the pads' STOP
+// leaves it alone.
+static void test_pad_on_the_stream_while_running() {
+    printf("\ntest_pad_on_the_stream_while_running\n");
+    Song* song = buildPlainSong();
+    sampleMockReset();
+    _mockRamCached = false;                      // nothing preloaded: everything streams
+    _mockHaveFiles = true;
+    song->columns[3].midiChannel = SFX_CHANNEL;
+    song->columns[3].program     = 5;
+    song->columns[3].volume      = 127;
+    putNote(song, 0, 0, 3, makeNote(0, 4));      // row 0: the song streams sample 5
+    putNote(song, 0, 2, 3, NOTE_OFF);            // row 2: and stops it
+    putNote(song, 0, 4, 3, makeNote(0, 4));      // row 4: streams it again
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();
+    CHECK(_mockStreamPlays == 1, "song starts its streamed sample");
+
+    sequencerSamplePlay(9, 60);                  // pad: takes the stream
+    CHECK(_mockStreamPlays == 2, "pad sample streams (replacing the song's)");
+    uint32_t rowMs = _test_getNextRowMs();       // step to row 2 (the column's OFF)
+    for (int i = 0; i < 2; i++) { _mockMs = _test_getNextRowMs(); sequencerTick(); }
+    CHECK(_test_getRow() >= 2 && _mockStreamStops == 0,
+          "the column's note-off does not cut the pad's stream");
+    (void)rowMs;
+
+    sequencerSamplePadsStop();
+    CHECK(_mockStreamStops == 1 && _mockStopAlls == 0, "pads' STOP stops the pad's stream");
+
+    for (int i = 0; i < 2; i++) { _mockMs = _test_getNextRowMs(); sequencerTick(); }
+    CHECK(_mockStreamPlays == 3, "song streams its sample again at row 4");
+    sequencerSamplePadsStop();
+    CHECK(_mockStreamStops == 1, "pads' STOP now leaves the song's stream alone");
+    sequencerStop();
+    sampleMockDone();
+}
+
+// The sample's own TUNE applies wherever it plays, on top of a column's TUNE.
+static void test_sample_tune_adds_to_pitch() {
+    printf("\ntest_sample_tune_adds_to_pitch\n");
+    Song* song = buildPlainSong();
+    sampleMockReset();
+    _mockTrim.id = 7; _mockTrim.tuneCents = -150;
+    _mockMs = 1000;
+
+    sequencerSamplePlay(7, 60);
+    CHECK(near(_mockRamPitch, -1.5f), "pad: native pitch + the sample's TUNE");
+    CHECK(_mockRamVol == 127,         "a pad is always full level");
+    sequencerSamplePlay(8, 60);
+    CHECK(near(_mockRamPitch, 0.0f),  "another sample is untouched");
+
+    song->columns[3].midiChannel  = SFX_CHANNEL;
+    song->columns[3].program      = 7;
+    song->columns[3].volume       = 127;
+    song->columns[3].sfxTuneCents = 50;
+    sequencerAuditionRawNote(SFX_CHANNEL, 62, 100, 3);
+    CHECK(near(_mockRamPitch, 2.0f - 1.5f + 0.5f), "column audition: key + sample TUNE + column TUNE");
+
+    putNote(song, 0, 0, 3, makeNote(0, 4));      // C-4 = the sample's root note
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();
+    CHECK(near(_mockRamPitch, -1.5f + 0.5f), "song: a C-4 cell plays at sample TUNE + column TUNE");
+    sequencerStop();
+    sampleMockDone();
+}
+
 // ── Block switch inside the snap cooldown ────────────────────────────────────
 
 // A stray key caught just BEFORE the key that switches block: the stray one
@@ -1469,6 +1715,12 @@ int main() {
     test_fumble_e_f_g_lands_on_g_block();
     test_pan_effect_sends_cc10();
     test_pan_effect_ignored_where_it_does_not_apply();
+    test_sample_keys_play_the_sample_not_step_input();
+    test_sample_keys_lease_expires();
+    test_sample_keys_and_pads_over_a_running_song();
+    test_key_release_does_not_cut_a_song_stream();
+    test_pad_on_the_stream_while_running();
+    test_sample_tune_adds_to_pitch();
     printf("\n%d passed, %d failed\n", gPassed, gFailed);
     return gFailed > 0 ? 1 : 0;
 }

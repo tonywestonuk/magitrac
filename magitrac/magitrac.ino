@@ -35,6 +35,7 @@
 #include "PixelPostManualPage.h"
 #include "SetlistPage.h"
 #include "OrganPage.h"
+#include "SamplesPage.h"
 #include "WiFiSettingsPage.h"
 #include "Battery.h"
 #include "BatteryGauge.h"
@@ -101,6 +102,7 @@ PerformancePage    performancePage(display, touch, song);
 PixelPostManualPage pixelpostManualPage(display, touch);
 SetlistPage        setlistPage(display, touch, song);
 OrganPage          organPage(display, touch, song);
+SamplesPage        samplesPage(display, touch);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
 WiFiSettingsPage   wifiSettingsPage(display, touch);
@@ -258,6 +260,22 @@ static bool     performancePageOpen   = false;
 static bool     pixelpostManualPageOpen = false;
 static bool     setlistPageOpen       = false;
 static bool     organPageOpen         = false;
+static bool     samplesPageOpen       = false;
+static bool     sampleEditFromPads    = false;   // sample editor opened from the
+                                                 // samples page, not a column
+static bool     perfReturn            = false;   // organ / samples page was opened
+                                                 // from the performance page: its
+                                                 // BACK goes there, not the tracker
+
+// Back to the performance page from a page opened off it.
+static void returnToPerformance() {
+    perfReturn          = false;
+    performancePageOpen = true;
+    performancePage.resume(/*stopped=*/!gServerPairing.serverPlaying());
+    display.clear();
+    performancePage.draw();
+    display.paint();
+}
 
 // ── Temporary header note ─────────────────────────────────────────────────────
 // A short message in the tracker header's status slot (where "Connected" /
@@ -676,7 +694,7 @@ void loop() {
         !wifiSettingsPageOpen && !backupRestorePageOpen &&
         !drumTrackImportOpen && !drumEditorOpen &&
         !performancePageOpen && !pixelpostManualPageOpen && !setlistPageOpen &&
-        !organPageOpen && !pasteConfirmOpen &&
+        !organPageOpen && !samplesPageOpen && !pasteConfirmOpen &&
         !noteEditor.isOpen() &&
         pageManager.currentPage() == Page::TRACKER) {
         const char* srvName = songPage.srvLoadedName();
@@ -800,8 +818,14 @@ void loop() {
                 display.paint();
                 break;
             case BootMenuResult::DRAWBAR_ORGAN:
+                perfReturn    = false;
                 organPageOpen = true;
                 organPage.open();   // draws + tells the server to enter organ mode
+                break;
+            case BootMenuResult::SAMPLES:
+                perfReturn      = false;
+                samplesPageOpen = true;
+                samplesPage.open();   // fetches the sample list + draws
                 break;
             case BootMenuResult::DISMISSED:
                 display.clear();
@@ -969,9 +993,39 @@ void loop() {
     if (organPageOpen) {
         if (organPage.poll() == OrganPage::Result::HOME) {
             organPageOpen = false;   // page already sent ORGAN_OP_EXIT to the server
-            display.clear();
-            ui.drawAll();
-            display.paintLater();
+            if (perfReturn) {
+                returnToPerformance();
+            } else {
+                display.clear();
+                ui.drawAll();
+                display.paintLater();
+            }
+        }
+        return;
+    }
+
+    // ── Samples page (tappable sample squares) ───────────────────────────────
+    if (samplesPageOpen) {
+        // Keys played here are not step input: don't let one sit pending and
+        // land in the tracker when the page closes.
+        { uint8_t n; gServerPairing.pollMidiNoteIn(&n); }
+        SamplesPage::Result r = samplesPage.poll();
+        if (r == SamplesPage::Result::HOME) {
+            samplesPageOpen = false;
+            if (perfReturn) {
+                returnToPerformance();
+            } else {
+                display.clear();
+                ui.drawAll();
+                display.paintLater();
+            }
+        } else if (r == SamplesPage::Result::EDIT) {
+            // A square was held: edit that sample.  The editor's BACK comes
+            // back here (see the sampleEditOpen block).
+            samplesPageOpen    = false;
+            sampleEditOpen     = true;
+            sampleEditFromPads = true;
+            sampleEditPage.open(samplesPage.editId(), samplesPage.editName());
         }
         return;
     }
@@ -1015,6 +1069,20 @@ void loop() {
             display.clear();
             setlistPage.draw();
             display.paint();
+        } else if (pres == PerformancePage::Result::ORGAN ||
+                   pres == PerformancePage::Result::SAMPLES) {
+            // Off to the organ / samples page; its BACK comes back here.  The
+            // performance page is marked closed meanwhile so the page blocks
+            // below it in this loop (the sample editor) still get polled.
+            performancePageOpen = false;
+            perfReturn          = true;
+            if (pres == PerformancePage::Result::ORGAN) {
+                organPageOpen = true;
+                organPage.open(/*backLabel=*/true);
+            } else {
+                samplesPageOpen = true;
+                samplesPage.open(/*backLabel=*/true);
+            }
         }
         return;
     }
@@ -1184,7 +1252,8 @@ void loop() {
             } else if (columnEditor.sampleEditRequested()) {
                 columnEditor.clearSampleEditRequest();
                 uint8_t c = columnEditor.editCol();
-                sampleEditOpen = true;
+                sampleEditOpen     = true;
+                sampleEditFromPads = false;
                 sampleEditPage.open(song.columns[c].program,
                                     song.columns[c].name, c,
                                     song.columns[c].sfxTuneCents);
@@ -1197,15 +1266,34 @@ void loop() {
         return;
     }
 
-    // ── Sample trim/loop editor ─────────────────────────────────────────────
+    // ── Sample trim/loop/tune editor ────────────────────────────────────────
     if (sampleEditOpen) {
+        // MIDI keys play the sample being edited.  From the samples page the
+        // server does it by itself (SAMPLE_EDIT_KEYS), so here the notes are
+        // only drained; from a column they are relayed as tune-by-ear
+        // auditions through that column, as in the column editor.
+        {
+            uint8_t inNote, inVel;
+            if (gServerPairing.pollMidiNoteIn(&inNote, &inVel) &&
+                !sampleEditFromPads && !gServerPairing.serverPlaying()) {
+                gServerPairing.sendAuditionRawNote(SFX_CHANNEL, inNote,
+                                                   inVel ? inVel : 100,
+                                                   columnEditor.editCol());
+            }
+        }
         if (sampleEditPage.poll()) {
-            sampleEditOpen   = false;
-            columnEditorOpen = true;    // back to the column that opened it
-            columnEditor.open(columnEditor.editPattern(), columnEditor.editCol());
-            display.clear();            // open() doesn't draw — same recipe as
-            columnEditor.draw();        // the tracker's entry point
-            display.paint();
+            sampleEditOpen = false;
+            if (sampleEditFromPads) {
+                sampleEditFromPads = false;
+                samplesPageOpen    = true;     // back to the squares
+                samplesPage.reopen();
+            } else {
+                columnEditorOpen = true;    // back to the column that opened it
+                columnEditor.open(columnEditor.editPattern(), columnEditor.editCol());
+                display.clear();            // open() doesn't draw — same recipe as
+                columnEditor.draw();        // the tracker's entry point
+                display.paint();
+            }
         }
         return;
     }

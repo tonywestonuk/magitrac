@@ -283,9 +283,10 @@ static volatile bool sSongListDirty = false;
 static volatile bool sAuditionPending = false;
 static uint8_t       sAuditionPat = 0, sAuditionRow = 0, sAuditionCol = 0;
 
-// PSRAM sample-preload sync: set whenever the active song (or its column
-// settings) changes; commandsTick runs samplePreloadSync on the loop task when
-// the sequencer is stopped and the player is quiet (SD reads + buffer frees).
+// PSRAM sample-preload sync: set whenever what should be in the sample cache
+// may have changed (the active song or its column settings, a trim edit, the
+// client's samples page or editor opening or closing); commandsTick then
+// steps samplePreloadSync on the loop task until it reports done.
 static volatile bool gSamplePreloadDirty = false;
 
 // Sample-editor requests, deferred to the loop task (overview = a windowed
@@ -294,7 +295,18 @@ static volatile bool     sSampleInfoPending = false;
 static volatile uint8_t  sSampleInfoId      = 0;
 static volatile uint32_t sSampleInfoVs      = 0;   // requested view window
 static volatile uint32_t sSampleInfoVe      = 0;   // 0,0 = whole file
+static volatile uint32_t sSampleInfoRxMs    = 0;   // [SMPDBG] when the request arrived
 static volatile bool     sTrimSavePending   = false;
+static volatile uint32_t sTrimSaveStampMs   = 0;   // last edit — the save waits
+                                                   // for the edits to settle
+static const uint32_t    TRIM_SAVE_SETTLE_MS = 1500;
+static uint8_t           sKeysPreloadId     = 0;   // editor sample being kept preloaded
+// Client's samples page open (SAMPLE_EDIT_PADS lease): every sample that fits
+// is wanted in memory.  Stamp = last renewal; sPadsWanted = what the preloader
+// was last told.
+static volatile bool     sPadsLease         = false;
+static volatile uint32_t sPadsLeaseMs       = 0;
+static bool              sPadsWanted        = false;
 static volatile bool     sSampleSpecPending = false;   // spectrogram request
 static volatile uint8_t  sSampleSpecId      = 0;
 
@@ -1275,13 +1287,29 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
         info.rate        = rate;
         info.startFrame  = tr ? tr->startFrame : 0;
         info.endFrame    = tr ? tr->endFrame   : 0;
+        info.tuneCents   = tr ? tr->tuneCents  : 0;
 
+        uint32_t dbgSend0 = millis();
         gMagiLink.acquireMutex();
         gMagiLink.send(&info, sizeof(info));
         gMagiLink.releaseMutex();
+        uint32_t dbgEnd = millis();
+        SMPDBG("info id=%u %s: %lu KB, %u ch, %lu Hz, %lu frames | waited for SD lock %lu ms, "
+               "open %lu ms, header+size %lu ms, scan %lu ms (%s, %lu frames in view), "
+               "send %lu ms | total %lu ms",
+               (unsigned)id, fname, (unsigned long)(dbgSize / 1024), (unsigned)numCh,
+               (unsigned long)rate, (unsigned long)totalFrames,
+               (unsigned long)(dbgLock - dbgT0), (unsigned long)(dbgOpen - dbgLock),
+               (unsigned long)(dbgHdr - dbgOpen), (unsigned long)(dbgScan - dbgHdr),
+               dbgSampled ? "sampled" : "exact", (unsigned long)dbgView,
+               (unsigned long)(dbgEnd - dbgSend0), (unsigned long)(dbgEnd - dbgT0));
+    } else {
+        SMPDBG("info id=%u %s: FAILED (open/format) after %lu ms",
+               (unsigned)id, fname, (unsigned long)(millis() - dbgT0));
     }
     free(infoP);
     free(rdP);
+
 }
 
 // ── Sample editor: spectrogram (Fairlight Page-D waterfall, display only) ─────
@@ -2729,27 +2757,68 @@ void commandsTick() {
         sequencerAuditionNote(sAuditionPat, sAuditionRow, sAuditionCol);
     }
 
-    // PSRAM sample preload follows the active song.  Deferred until the
-    // sequencer is stopped and the player is quiet — samplePreloadSync
-    // returns false (retry next tick) while anything is still sounding.
-    if (gSamplePreloadDirty && !sequencerIsRunning() && srvHasActive) {
-        Song* song = (Song*)(srvActiveBuf + sizeof(SongFileHeader));
-        if (samplePreloadSync(song)) gSamplePreloadDirty = false;
+    // PSRAM sample preload follows the active song, the client's sample
+    // editor and its samples page.
+    //
+    // The client's sample editor adds one more sample to the wanted set (the
+    // one its MIDI keys play) for as long as its key lease is live — with or
+    // without a song loaded.
+    {
+        uint8_t keysId = sequencerSampleKeysId();
+        if (keysId != sKeysPreloadId) {
+            sKeysPreloadId = keysId;
+            samplePreloadSetExtra(keysId);
+            gSamplePreloadDirty = true;
+        }
+    }
+    {
+        bool pads = sPadsLease &&
+                    (uint32_t)(millis() - sPadsLeaseMs) <= SAMPLE_KEYS_LEASE_MS;
+        if (!pads) sPadsLease = false;                 // lapsed
+        if (pads != sPadsWanted) {
+            sPadsWanted = pads;
+            samplePreloadSetPads(pads);
+            gSamplePreloadDirty = true;
+        }
+    }
+    // One step per tick (a 32 KB read at most), so a long load never stalls
+    // this loop; it stays "dirty" until the preloader says it is finished.
+    // It runs while a song plays too — in 8 KB steps, and it stands aside
+    // whenever a sample is streaming — so a sample chosen mid-song (the pads,
+    // or one being played from the keys) still becomes polyphonic.
+    if (gSamplePreloadDirty && (srvHasActive || sKeysPreloadId || sPadsWanted)) {
+        Song* song = srvHasActive
+                   ? (Song*)(srvActiveBuf + sizeof(SongFileHeader)) : nullptr;
+        uint32_t dbgT = millis();
+        bool synced = samplePreloadSync(song, /*gentle=*/sequencerIsRunning());
+        if (synced) gSamplePreloadDirty = false;
+        if (millis() - dbgT >= 5)
+            SMPDBG("preload step %s, took %lu ms (editor sample id=%u)",
+                   synced ? "- all done" : "- more to do",
+                   (unsigned long)(millis() - dbgT), (unsigned)sKeysPreloadId);
     }
 
-    // Sample editor: persist trim edits, serve meta/overview requests.
-    if (sTrimSavePending) {
+    // Sample editor: persist trim/tune edits, serve meta/overview requests.
+    // The save waits until the edits have settled (a held TUNE button sends a
+    // run of them) — unless a sample-list request is waiting: the manifest
+    // sync it runs re-reads trim.txt, which would throw away an edit not yet
+    // written out, so that forces the save first.
+    if (sTrimSavePending &&
+        (srvSampleListPending ||
+         (uint32_t)(millis() - sTrimSaveStampMs) >= TRIM_SAVE_SETTLE_MS)) {
         sTrimSavePending = false;
+        uint32_t dbgT = millis();
         sampleTrimSave();
+        SMPDBG("trim.txt saved, took %lu ms", (unsigned long)(millis() - dbgT));
     }
-    // Sample list AFTER the trim save: the manifest sync it runs re-reads
-    // trim.txt, which would throw away a trim edit not yet written out.
     if (srvSampleListPending) {
         srvSampleListPending = false;
         sendSampleList(srvSampleListPendingPage);
     }
     if (sSampleInfoPending) {
         sSampleInfoPending = false;
+        SMPDBG("info request picked up by the loop %lu ms after it arrived",
+               (unsigned long)(millis() - sSampleInfoRxMs));
         sendSampleInfo(sSampleInfoId, sSampleInfoVs, sSampleInfoVe);
     }
     if (sSampleSpecPending) {
@@ -3164,7 +3233,24 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             if (len < (int)sizeof(MsgSampleEdit)) return;
             {
                 const MsgSampleEdit* m = (const MsgSampleEdit*)data;
+#if SAMPLE_DEBUG
+                {   // KEYS is re-sent every 2 s — log it only when it changes.
+                    static uint8_t sDbgKeys = 0;
+                    static const char* const OPN[] = { "GET", "SET", "STOP", "SPEC", "PLAY", "KEYS", "PADS" };
+                    bool quiet = (m->op == SAMPLE_EDIT_KEYS && m->sampleId == sDbgKeys) ||
+                                 m->op == SAMPLE_EDIT_PADS;
+                    if (m->op == SAMPLE_EDIT_KEYS) sDbgKeys = m->sampleId;
+                    if (!quiet) {
+                        const char* nm = sampleManifestNameFor(m->sampleId);
+                        SMPDBG("rx %s id=%u (%s) start=%lu end=%lu",
+                               m->op < 7 ? OPN[m->op] : "?", (unsigned)m->sampleId,
+                               nm ? nm : "-", (unsigned long)m->startFrame,
+                               (unsigned long)m->endFrame);
+                    }
+                }
+#endif
                 if (m->op == SAMPLE_EDIT_GET) {
+                    sSampleInfoRxMs    = millis();
                     sSampleInfoId      = m->sampleId;   // overview reads SD —
                     sSampleInfoVs      = m->startFrame; // deferred to the loop
                     sSampleInfoVe      = m->endFrame;
@@ -3172,11 +3258,27 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 } else if (m->op == SAMPLE_EDIT_SET) {
                     // RAM table updates inline (playback picks it up on the
                     // next trigger); the SD write + cache re-bake defer.
-                    sampleTrimSet(m->sampleId, m->startFrame, m->endFrame, m->loop);
+                    sampleTrimSet(m->sampleId, m->startFrame, m->endFrame, m->loop,
+                                  m->tuneCents);
+                    sTrimSaveStampMs    = millis();
                     sTrimSavePending    = true;
                     gSamplePreloadDirty = true;
                 } else if (m->op == SAMPLE_EDIT_STOP) {
-                    samplePlayerStop();                 // ends a looping audition
+                    // Ends a looping audition / silences the sample pads.
+                    // While a song plays it stops only what the pads started
+                    // — the song's samples aren't ours to cut.
+                    sequencerSamplePadsStop();
+                } else if (m->op == SAMPLE_EDIT_PLAY) {
+                    sequencerSamplePlay(m->sampleId, m->note);
+                } else if (m->op == SAMPLE_EDIT_PADS) {
+                    // Renews (or, with id 0, ends) the samples-page lease;
+                    // commandsTick turns it into preloading.
+                    sPadsLeaseMs = millis();
+                    sPadsLease   = (m->sampleId != 0);
+                } else if (m->op == SAMPLE_EDIT_KEYS) {
+                    // Renews (or, with id 0, ends) the key lease; commandsTick
+                    // sees the change and preloads / releases the sample.
+                    sequencerSampleKeys(m->sampleId);
                 } else if (m->op == SAMPLE_EDIT_SPEC) {
                     sSampleSpecId      = m->sampleId;   // FFT over SD data —     
                     sSampleSpecPending = true;          // deferred to the loop

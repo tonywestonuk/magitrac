@@ -15,7 +15,7 @@
 //
 // Row 1: [SONG] [INSTRUMENTS] [SETTINGS]
 // Row 2: [BACKUP] [PERFORM] [POSTS]
-// Row 3: [        ORGAN        ]
+// Row 3:          [ORGAN] [SAMPLES]
 //
 // PAIR lives on SettingsPage (WIFI section) — it's a once-per-device action,
 // not worth a slot on the menu you hit mid-gig.
@@ -29,6 +29,7 @@ enum class BootMenuResult : uint8_t {
     PERFORM,
     PIXELPOST,
     DRAWBAR_ORGAN,
+    SAMPLES,
     DISMISSED,
 };
 
@@ -52,11 +53,14 @@ static const int BM_BACKUP_X    = BM_SONG_X;   // = 150
 static const int BM_PERFORM_X   = BM_INST_X;   // = 375
 static const int BM_PIXELPOST_X = BM_SETT_X;   // = 600
 
-// Row 3: ORGAN, centred (full additive drawbar organ on the server)
+// Row 3: ORGAN in the centre column (full additive drawbar organ on the
+// server — it has always sat there), SAMPLES in the right column.
 static const int BM_BTN3_Y  = BM_BTN2_Y + BM_BTN2_H + 18;   // = 405
 static const int BM_BTN3_H  = 95;
 static const int BM_ORGAN_X = BM_BOX_X + (BM_BOX_W - BM_BTN_W) / 2;   // = 375
 static const int BM_ORGAN_W = BM_BTN_W;
+static const int BM_SAMPLES_X = BM_SETT_X;                            // = 600
+static const int BM_SAMPLES_W = BM_BTN_W;
 
 class BootMenu {
 public:
@@ -83,5 +87,6 @@ private:
     bool hitBackup     (int sx, int sy) const;
     bool hitPixelpost  (int sx, int sy) const;
     bool hitOrgan      (int sx, int sy) const;
+    bool hitSamples    (int sx, int sy) const;
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };
