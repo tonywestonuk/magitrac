@@ -10,6 +10,8 @@
 #include "SongMigration.h"
 #include "midi_player.h"
 #include "SampleManifest.h"
+#include "sample_record.h"
+#include "pitch_detect.h"
 #include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
 #include "esp32s3_dsp.h"   // ESP32S3_FFT — spectrogram (same engine as pixelpost bands)
 
@@ -342,14 +344,21 @@ static const char* fileKindToPath(uint8_t kind) {
 // backup (read) and restore (write) sides in lockstep so each file round-trips
 // to the directory it came from.  instruments.mgt is handled separately (it
 // lives at the root path, not under a directory).
-//   .txt → /drumtracks   .set → /setlists   everything else → /songs
+//   .txt → /drumtracks   .set → /setlists   .wav → /samples
+//   everything else → /songs
+// (So a drumtrack can't be called samples.txt or trim.txt — the sample
+// list's own files, routed by name below.)
 static const char* backupDirForName(const char* name) {
     int n = (int)strlen(name);
     // The setlist master catalog is a .txt but belongs with the setlists, not
     // the drumtracks — route it by name before the extension rules below.
     if (strcasecmp(name, "master.txt") == 0) return SRV_SETLISTS_DIR;
+    if (strcasecmp(name, "samples.txt") == 0 ||
+        strcasecmp(name, "trim.txt") == 0) return SRV_SAMPLES_DIR;
     if (n >= 4 && name[n - 4] == '.') {
         char c3 = name[n - 3], c2 = name[n - 2], c1 = name[n - 1];
+        if ((c3 == 'w' || c3 == 'W') && (c2 == 'a' || c2 == 'A') && (c1 == 'v' || c1 == 'V'))
+            return SRV_SAMPLES_DIR;
         if ((c3 == 't' || c3 == 'T') && (c2 == 'x' || c2 == 'X') && (c1 == 't' || c1 == 'T'))
             return SRV_DRUMTRACKS_DIR;
         if ((c3 == 's' || c3 == 'S') && (c2 == 'e' || c2 == 'E') && (c1 == 't' || c1 == 'T'))
@@ -801,15 +810,16 @@ static void sendFile(uint8_t kind, const char* name) {
 }
 
 // ── Send sample list page to client ────────────────────────────────────────────
-// Each request runs a full manifest sync first: scans /samples/*.wav, appends
-// any new files to /samples/samples.txt with the next free id, then pages the
-// updated list out.  This means the picker on the client is always fresh
-// without needing a separate "refresh samples" command.
+// A request for page 0 runs a full manifest sync first: scans /samples/*.wav,
+// appends any new files to /samples/samples.txt with the next free id, then
+// pages the updated list out.  The client always starts a list at page 0 and
+// then follows the pages, so that is one sync per list — the later pages are
+// served from the table it built.  This means the picker on the client is
+// always fresh without needing a separate "refresh samples" command.
 // Loop task only (commandsTick) — a directory scan plus a manifest rewrite is
-// too much SD work for the link worker.  The sync also re-reads trim.txt, so
-// commandsTick writes out any pending trim edit before calling this.
+// too much SD work for the link worker.
 static void sendSampleList(uint8_t page) {
-    sampleManifestSync();
+    if (page == 0) sampleManifestSync();
     int total = sampleManifestCount();
 
     int totalPages = total > 0 ? (total + SAMPLES_PER_PKT - 1) / SAMPLES_PER_PKT : 1;
@@ -1288,6 +1298,8 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
         info.startFrame  = tr ? tr->startFrame : 0;
         info.endFrame    = tr ? tr->endFrame   : 0;
         info.tuneCents   = tr ? tr->tuneCents  : 0;
+        info.velOff      = tr ? tr->velOff     : 0;
+        info.keepLen     = tr ? tr->keepLen    : 0;
 
         uint32_t dbgSend0 = millis();
         gMagiLink.acquireMutex();
@@ -1645,6 +1657,12 @@ static uint32_t sMagiRestoreReceivedBytes       = 0;
 static bool     sMagiRestoreWriteOk             = true;   // every chunk written in full
 static volatile bool sRestoreInstReloadPending  = false;  // instruments.mgt was replaced
 static volatile bool sRestoreSongReloadPending  = false;  // the active song's file was replaced
+// A file landed in /samples (a WAV, samples.txt or trim.txt).  The loop task
+// re-reads the sample list and settings and empties the sample cache — once
+// the restore has gone quiet (sRestoreLastMs: last restore traffic), not
+// after every file, since a "restore all" brings them one after another.
+static volatile bool     sRestoreSamplesPending = false;
+static volatile uint32_t sRestoreLastMs         = 0;
 
 // Runs on the worker once the last byte of a restore upload has been written
 // and the temp closed.  Moves the temp to its destination and flags the
@@ -1686,6 +1704,8 @@ static void finaliseMagiLinkRestore() {
 
     if (sMagiRestoreIsInstruments) {
         sRestoreInstReloadPending = true;
+    } else if (strcmp(backupDirForName(sMagiRestoreName), SRV_SAMPLES_DIR) == 0) {
+        sRestoreSamplesPending = true;
     } else {
         sSongListDirty = true;
         // srvActiveName belongs to the loop task; this is an unlocked read of
@@ -1758,6 +1778,7 @@ void onMagiLinkRestoreBody(const uint8_t* msg, size_t len, void* /*ctx*/) {
             sMagiRestoreWriteOk = false;
     }
     sMagiRestoreReceivedBytes += b->data_len;
+    sRestoreLastMs = millis();
     if (sMagiRestoreReceivedBytes >= sMagiRestoreExpectedBytes) {
         {
             SdLock _;
@@ -2260,6 +2281,16 @@ static bool backupIsSetlist(const char* nm) {
     return isSet || strcasecmp(nm, "master.txt") == 0;
 }
 
+// /samples: the sample list and per-sample settings always; the WAVs only when
+// the client asked for them (sendBackupToClient sets the flag for the run).
+static bool sBkWithSamples = false;
+static bool backupIsSampleFile(const char* nm) {
+    if (!backupNameOk(nm)) return false;
+    if (strcasecmp(nm, "samples.txt") == 0 || strcasecmp(nm, "trim.txt") == 0) return true;
+    int n = (int)strlen(nm);
+    return sBkWithSamples && n >= 4 && strcasecmp(nm + n - 4, ".wav") == 0;
+}
+
 // Diagnostic: print a raw name as text + hex so a corrupt directory entry
 // (non-printable bytes, lost LFN → 8.3 alias) is unmistakable on the log.
 static void backupDumpName(const char* tag, const char* nm, uint32_t size, bool match) {
@@ -2415,7 +2446,7 @@ static bool backupStreamDir(const char* dir, bool (*pred)(const char*),
     return ok;
 }
 
-void sendBackupToClient() {
+void sendBackupToClient(bool withSamples) {
     if (!srvSdOk) {
         Serial.println("[BK-SRV] SD not available — sending bare END_OF_DATA");
         MsgEndOfData eod;
@@ -2427,15 +2458,18 @@ void sendBackupToClient() {
     // sources, same order as the streaming pass below.
     uint16_t total = 0;
     sBkFileFailures = 0;
+    sBkWithSamples  = withSamples;
     total += backupCountDir(SRV_SONGS_DIR, backupIsSong);
     { SdLock _; if (SD.exists(SRV_INSTRUMENTS_PATH)) total++; }
     total += backupCountDir(SRV_DRUMTRACKS_DIR, backupIsDrumtrack);
     total += backupCountDir(SRV_SETLISTS_DIR, backupIsSetlist);
+    total += backupCountDir(SRV_SAMPLES_DIR, backupIsSampleFile);
     Serial.printf("[BK-SRV] sending %u files\n", (unsigned)total);
 
     // Pass 2 — stream everything, in the same order the count visited it.
     // The client restore routes each file back by extension: .mgt → /songs
-    // (instruments.mgt → root), .txt → /drumtracks, .set → /setlists.
+    // (instruments.mgt → root), .txt → /drumtracks, .set → /setlists,
+    // .wav + samples.txt + trim.txt → /samples.
     uint16_t idx = 0;
     bool ok = backupStreamDir(SRV_SONGS_DIR, backupIsSong, total, &idx);
     if (ok) {                                   // instruments.mgt (root)
@@ -2447,6 +2481,7 @@ void sendBackupToClient() {
     }
     if (ok) ok = backupStreamDir(SRV_DRUMTRACKS_DIR, backupIsDrumtrack, total, &idx);
     if (ok) ok = backupStreamDir(SRV_SETLISTS_DIR, backupIsSetlist, total, &idx);
+    if (ok) ok = backupStreamDir(SRV_SAMPLES_DIR, backupIsSampleFile, total, &idx);
 
     if (idx != total)
         Serial.printf("[BK-SRV] COUNT/STREAM MISMATCH counted=%u streamed=%u\n",
@@ -2798,14 +2833,38 @@ void commandsTick() {
                    (unsigned long)(millis() - dbgT), (unsigned)sKeysPreloadId);
     }
 
+    // ADD SAMPLE: recording, the take, saving it into /samples.
+    if (sampleRecTick()) gSamplePreloadDirty = true;
+    samplePitchTick(sampleRecState() == SAMPLE_REC_IDLE);
+    {   // AUTO TUNE's answer, for the sample editor's TUNE dialog
+        uint8_t id, res; float hz;
+        if (sampleAutoTuneTake(id, res, hz)) {
+            MsgSampleTune t;
+            t.sampleId  = id;
+            t.result    = res;
+            t.note      = 0;
+            t.cents     = 0;
+            t.tuneCents = 0;
+            t.pitchCHz  = 0;
+            if (res == SAMPLE_TUNE_FOUND) {
+                pitchNearestNote(hz, t.note, t.cents);
+                t.tuneCents = pitchTuneToMiddleC(hz);
+                t.pitchCHz  = (uint32_t)lrintf(hz * 100.0f);
+            }
+            Serial.printf("[SE] AUTO TUNE sample %u: result %u, %.2f Hz, tune %+d c\n",
+                          (unsigned)id, (unsigned)res, (double)hz, (int)t.tuneCents);
+            gMagiLink.send(&t, sizeof(t));
+        }
+    }
+
     // Sample editor: persist trim/tune edits, serve meta/overview requests.
     // The save waits until the edits have settled (a held TUNE button sends a
-    // run of them) — unless a sample-list request is waiting: the manifest
-    // sync it runs re-reads trim.txt, which would throw away an edit not yet
-    // written out, so that forces the save first.
-    if (sTrimSavePending &&
-        (srvSampleListPending ||
-         (uint32_t)(millis() - sTrimSaveStampMs) >= TRIM_SAVE_SETTLE_MS)) {
+    // run of them).  The table in memory is the authority — trim.txt is only
+    // read at boot — so a list request no longer has to force the save first.
+    // (Not while a restore into /samples is settling: the trim.txt it brought
+    // wins over edits made before it — see the restore follow-ups below.)
+    if (sTrimSavePending && !sRestoreSamplesPending &&
+        (uint32_t)(millis() - sTrimSaveStampMs) >= TRIM_SAVE_SETTLE_MS) {
         sTrimSavePending = false;
         uint32_t dbgT = millis();
         sampleTrimSave();
@@ -2860,6 +2919,22 @@ void commandsTick() {
         bool ok = loadInstrumentsFromSD();
         Serial.printf("[CMD] instruments %s after restore\n",
                       ok ? "reloaded" : "NOT reloaded — restored file did not load, memory unchanged");
+    }
+    // Sample files restored: once the upload traffic has stopped, re-read
+    // trim.txt (the restored settings replace any unsaved edits), rescan the
+    // list (samples.txt keeps every id, so songs find the same samples), and
+    // empty the sample cache — a restored WAV may be new audio under an id
+    // that is already cached.
+    if (sRestoreSamplesPending && sMagiRestoreExpectedBytes == 0 &&
+        (uint32_t)(millis() - sRestoreLastMs) >= 2000) {
+        sRestoreSamplesPending = false;
+        sTrimSavePending       = false;
+        sampleTrimReload();
+        bool ok = sampleManifestSync();
+        samplePreloadForgetAll();
+        gSamplePreloadDirty = true;
+        Serial.printf("[CMD] samples restored — list %s, %d samples, cache emptied\n",
+                      ok ? "re-read" : "NOT re-read", sampleManifestCount());
     }
     if (sRestoreSongReloadPending) {
         sRestoreSongReloadPending = false;
@@ -3228,6 +3303,17 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             }
             break;
 
+        case MSG_SAMPLE_REC:
+            if (len < (int)sizeof(MsgSampleRec)) return;
+            {
+                const MsgSampleRec* m = (const MsgSampleRec*)data;
+                char nm[SAMPLE_NAME_LEN];
+                memcpy(nm, m->name, sizeof(nm));
+                nm[sizeof(nm) - 1] = '\0';
+                sampleRecRequest(m->op, nm);   // card + mic work: on the loop task
+            }
+            break;
+
         case MSG_SAMPLE_EDIT:
             if (len < (int)sizeof(MsgSampleEdit)) return;
             {
@@ -3258,10 +3344,12 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                     // RAM table updates inline (playback picks it up on the
                     // next trigger); the SD write + cache re-bake defer.
                     sampleTrimSet(m->sampleId, m->startFrame, m->endFrame, m->loop,
-                                  m->tuneCents);
+                                  m->tuneCents, m->velOff, m->keepLen);
                     sTrimSaveStampMs    = millis();
                     sTrimSavePending    = true;
                     gSamplePreloadDirty = true;
+                } else if (m->op == SAMPLE_EDIT_AUTOTUNE) {
+                    sampleAutoTuneRequest(m->sampleId);   // answered from commandsTick
                 } else if (m->op == SAMPLE_EDIT_STOP) {
                     // Ends a looping audition / silences the sample pads.
                     // While a song plays it stops only what the pads started

@@ -38,3 +38,22 @@ uint32_t scopeResultSeq();        // bumps once per captured frame
 // The scope reads the LEFT channel (the mic) — same source as the chord
 // recogniser and the pixelpost bands.
 void     scopeGetTrace(int16_t* out, int cols);
+
+// ── Recorder (ADD SAMPLE) ─────────────────────────────────────────────────
+// A fourth consumer: appends the mic (LEFT, DC removed) to `buf` until
+// micRecStop() or `maxFrames`.  The first ~64 ms read after the start are
+// dropped (audio queued before the button was pressed).  Loop task only.
+bool     micRecStart(int16_t* buf, uint32_t maxFrames);
+// Ends the take.  Returns once the mic task has finished with `buf`, so the
+// caller may then read (or free) it.
+void     micRecStop();
+bool     micRecRunning();             // false once stopped or full
+uint32_t micRecFrames();              // frames captured so far
+int32_t  micRecPeakTake();            // largest |sample| since the last call (then reset)
+bool     micRecClipped();             // any sample at full scale this take
+
+// Keeps the mic running without recording, for a level meter before the take
+// (the ADD SAMPLE hold screen) — and so a micRecStart() after it begins with
+// current audio, no start-up reads to drop.  Loop task only.
+void     micMonitor(bool on);
+int32_t  micMonitorPeak();            // largest |sample| since the last call (then reset)

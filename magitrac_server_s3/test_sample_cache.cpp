@@ -53,9 +53,15 @@ const SmEntry* sampleManifestAt(int i)    { return (i >= 0 && i < (int)gManifest
 const char*    sampleManifestNameFor(uint8_t id) { for (auto& e : gManifest) if (e.id == id) return e.name; return nullptr; }
 uint32_t       sampleManifestSizeFor(uint8_t id) { for (auto& e : gManifest) if (e.id == id) return e.size; return 0; }
 const SampleTrim* sampleTrimFor(uint8_t id)      { for (auto& t : gTrims) if (t.id == id) return &t; return nullptr; }
+void sampleTrimSetPitch(uint8_t id, uint32_t chz) { for (auto& t : gTrims) if (t.id == id) t.pitchCHz = chz; }
+bool sampleTrimSave() { return true; }
 
 // ── The code under test ──────────────────────────────────────────────────────
 #include "SamplePlayer.cpp"
+#include "psola.cpp"
+#undef free              // pitch_detect allocates with plain malloc on the host
+#include "pitch_detect.cpp"
+#define free(p) mockFree(p)
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 static int gPassed = 0, gFailed = 0;
@@ -311,6 +317,62 @@ static void test_failures_do_not_loop_or_leak() {
     CHECK(gMockSdOpenNow == 0, "no file left open");
 }
 
+// KEEP LENGTH: a cached sample's pitch is found once, then other notes keep
+// its length; without it they play faster / slower.
+static uint32_t framesPlayed(uint8_t id, float semis) {
+    static int16_t buf[512];
+    int h = samplePlayRam(id, semis, 127);
+    if (h < 0) return 0;
+    uint32_t n = 0;
+    while (sampleRamVoicesActive() && n < 60 * 32000) { memset(buf, 0, sizeof(buf)); mixRamInto(buf, 256); n += 256; }
+    return n;
+}
+static void test_keep_length() {
+    printf("\ntest_keep_length\n");
+    emptyCache();
+    samplePreloadSetExtra(9);
+    CHECK(syncAll(nullptr) > 0 && cached(9), "sample 9 is cached");
+    uint32_t native = framesPlayed(9, 0);
+    uint32_t up     = framesPlayed(9, 12);
+    CHECK(up < native * 0.55 && up > native * 0.45, "without KEEP LENGTH an octave up plays in half the time");
+
+    setTrim(9, 0, 0, 0);
+    for (auto& t : gTrims) if (t.id == 9) t.keepLen = 1;
+    int steps = 0;
+    _mockMs += 1000;
+    while (steps < 200) { samplePitchTick(true); steps++; const SampleTrim* t = sampleTrimFor(9); if (t->pitchCHz) break; }
+    CHECK(sampleTrimFor(9)->pitchCHz != 0, "its pitch is found (or marked unclear) by the pitch pass");
+    CHECK(!s_pitchPin, "the pitch pass let go of the sample");
+
+    uint32_t kUp   = framesPlayed(9, 12);
+    uint32_t kDown = framesPlayed(9, -12);
+    CHECK(kUp   > native * 0.97 && kUp   < native * 1.05, "with KEEP LENGTH an octave up lasts as long as native");
+    CHECK(kDown > native * 0.97 && kDown < native * 1.05, "with KEEP LENGTH an octave down lasts as long as native");
+
+    // AUTO TUNE: asked for a cached sample, answered once; not cached → NOT_READY.
+    {
+        sampleAutoTuneRequest(9);
+        uint8_t id = 0, res = 99; float hz = 0; bool got = false;
+        for (int n = 0; n < 200 && !got; n++) { samplePitchTick(true); got = sampleAutoTuneTake(id, res, hz); }
+        CHECK(got && id == 9 && (res == SAMPLE_TUNE_FOUND || res == SAMPLE_TUNE_UNCLEAR),
+              "AUTO TUNE answers for a cached sample");
+        CHECK(!sampleAutoTuneTake(id, res, hz), "...once");
+        sampleAutoTuneRequest(8);                           // not in the cache
+        got = false;
+        for (int n = 0; n < 50 && !got; n++) { _mockMs += 200; samplePitchTick(true); got = sampleAutoTuneTake(id, res, hz); }
+        CHECK(got && id == 8 && res == SAMPLE_TUNE_NOT_READY, "AUTO TUNE gives up on a sample that never arrives");
+    }
+
+    // ADD SAMPLE drops the cache: the pass gives way rather than pinning it.
+    for (auto& t : gTrims) if (t.id == 9) t.pitchCHz = 0;
+    _mockMs += 1000;
+    samplePitchTick(true);
+    CHECK(s_pitchPin == 9, "a fresh pass pins the sample it is reading");
+    CHECK(samplePreloadDropAllNow() && !cached(9) && !s_pitchPin && !pitchBusy(),
+          "dropping the cache cancels the pass and frees the sample");
+    emptyCache();
+}
+
 int main() {
     // A scratch "SD card" with the sizes of a real one.
     char tmpl[] = "/tmp/magitrac_cache_test_XXXXXX";
@@ -345,6 +407,7 @@ int main() {
     test_eviction_refuses_while_a_voice_sounds();
     test_trim_edited_during_a_load();
     test_failures_do_not_loop_or_leak();
+    test_keep_length();
 
     printf("\nfinal checks\n");
     emptyCache();

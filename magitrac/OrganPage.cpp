@@ -17,6 +17,10 @@ static const char* const OR_RVB_NAMES[OR_RVB_N] = { "OFF", "ROOM", "HALL" };
 
 static int orFxX(int i) { return OR_FX_X0 + i * (OR_FX_W + OR_FX_GAP); }
 
+// PROC sound button i: two to a row, left to right then down.
+static int orProcX(int i) { return OR_PRESET_X + (i % OR_PROC_COLS) * (OR_PROCBTN_W + OR_PROC_GAP); }
+static int orProcY(int i) { return OR_PRESET_Y0 + (i / OR_PROC_COLS) * (OR_PRESET_H + OR_PRESET_GAP); }
+
 // Paged effects (top bar slots 1..3).  Add new effects here and they page
 // automatically.
 enum { FX_VIB = 0, FX_LES, FX_DRIVE, FX_VERB, FX_COUNT };
@@ -33,15 +37,18 @@ static const OrKnobCfg OR_KNOBCFG[OR_TYPE_N] = {
 };
 
 // PROC sounds — name + sliders + defaults; mirror of the server's PROC_SOUNDS
-// registry in proc_sounds.h (same order).
+// registry in proc_sounds.h (same order — songs store the position).
 struct OrProcCfg { const char* name; OrKnobCfg knobs; uint8_t defs[OR_NKNOB]; };
 static const OrProcCfg OR_PROC[OR_PROC_N] = {
-    { "TWO TRIBES", { 5, { "ATTACK", "CHORUS", "BRIGHT", "SCOOP", "THROAT" } },
-                    { 4, 4, 8, 4, 4 } },
+    // Reed organ (harmonium / accordion).  WAVE is the reeds' pulse width
+    // (0 hollow … 8 thin and nasal), CELESTE a second rank tuned sharp so the
+    // two beat, BRIGHT the tone, STOPS which ranks sound (the tooltip names
+    // them), CHAMBER the nasal resonance of the reed cells — right up, with
+    // WAVE 8, BRIGHT 1 and STOPS 8', it is an oboe.
+    { "REED",       { 5, { "WAVE", "CELESTE", "BRIGHT", "STOPS", "CHAMBER" } },
+                    { 4, 2, 6, 1, 2 } },
     { "CHOIR",      { 5, { "BREATH", "ENSMBL", "BRIGHT", "ATTACK", "AHH" } },
                     { 4, 4, 8, 4, 4 } },
-    { "THX",        { 5, { "SWEEP", "SPREAD", "BRIGHT", "STACK", "DETUNE" } },
-                    { 5, 4, 6, 6, 3 } },
     // The mic vocoder: the held notes speak what goes into the server's mic.
     // WAVE is the tone being vocoded: 0 = sawtooth, 1..8 = pulse from square
     // down to thin.  PWM is a slow LFO on the pulse's width.  SSS is the
@@ -49,6 +56,13 @@ static const OrProcCfg OR_PROC[OR_PROC_N] = {
     // how slowly the bands let go.
     { "VOCODER",    { 5, { "WAVE", "PWM", "SSS", "GATE", "SMOOTH" } },
                     { 0, 0, 4, 1, 3 } },
+};
+
+// REED's STOPS slider, 0..8 — mirror of REED_STOPS in the server's
+// drawbar_organ.cpp.
+static const char* const OR_REED_STOPS[9] = {
+    "8'", "8' 4'", "16' 8'", "16' 8' 4'", "8' 4' 2'",
+    "16' 8' 4' 2'", "8' 2 2/3'", "16' 8' 2 2/3'", "16' 8' 4' 2 2/3'",
 };
 
 // PROC's 5-slider column starts further left (no drawbars in that mode).
@@ -201,19 +215,19 @@ void OrganPage::drawProcList() {
     _d.setCursor(OR_PRESET_X + 8, OR_HDR_H + 4);
     _d.print("SOUNDS");
     for (int i = 0; i < OR_PROC_N; i++) {
-        int y = OR_PRESET_Y0 + i * (OR_PRESET_H + OR_PRESET_GAP);
         bool active = (i == _procSel);
         uint8_t bg = active ? COL_BLACK : COL_WHITE;
         uint8_t fg = active ? COL_WHITE : COL_BLACK;
-        uiButton(_d, OR_PRESET_X, y, OR_PROCBTN_W, OR_PRESET_H, OR_PROC[i].name, bg, fg, 3);
+        uiButton(_d, orProcX(i), orProcY(i), OR_PROCBTN_W, OR_PRESET_H,
+                 OR_PROC[i].name, bg, fg, 3);
     }
 }
 
 int OrganPage::hitProc(int sx, int sy) const {
-    if (sx < OR_PRESET_X || sx >= OR_PRESET_X + OR_PROCBTN_W) return -1;
     for (int i = 0; i < OR_PROC_N; i++) {
-        int y = OR_PRESET_Y0 + i * (OR_PRESET_H + OR_PRESET_GAP);
-        if (sy >= y && sy < y + OR_PRESET_H) return i;
+        int x = orProcX(i), y = orProcY(i);
+        if (sx >= x && sx < x + OR_PROCBTN_W && sy >= y && sy < y + OR_PRESET_H)
+            return i;
     }
     return -1;
 }
@@ -363,13 +377,17 @@ void OrganPage::drawKnobTip(int k) {
         // The vocoder's WAVE slider picks a waveform, not an amount: name it.
         if (v == 0) snprintf(buf, sizeof(buf), "SAWTOOTH");
         else        snprintf(buf, sizeof(buf), "PULSE %d", v);
+    } else if (_type == OR_TYPE_PROC && _procSel == OR_PROC_REED && k == 3) {
+        // REED's STOPS slider picks ranks: name them by footage.
+        snprintf(buf, sizeof(buf), "%s", OR_REED_STOPS[(v >= 0 && v <= 8) ? v : 0]);
     } else {
         snprintf(buf, sizeof(buf), "%s  %d", cfg.names[k], v);
     }
-    _d.setTextSize(3);
+    int sz = ((int)strlen(buf) * 18 <= OR_TIP_W - 12) ? 3 : 2;   // REED's longest stop
+    _d.setTextSize(sz);
     _d.setTextColor(COL_BLACK);
-    int tw = (int)strlen(buf) * 18;
-    _d.setCursor(x + (OR_TIP_W - tw) / 2, OR_TIP_Y + (OR_TIP_H - 24) / 2);
+    int tw = (int)strlen(buf) * 6 * sz;
+    _d.setCursor(x + (OR_TIP_W - tw) / 2, OR_TIP_Y + (OR_TIP_H - 8 * sz) / 2);
     _d.print(buf);
 
     _tipShown = true;

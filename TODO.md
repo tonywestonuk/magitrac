@@ -6,81 +6,29 @@ Things agreed but not started.
 
 Agreed on 15 Nov 2026 for the next session. Details for each are further down.
 
-1. **Commit the work from 15 Nov.** Nothing from that session is in git.
-2. **Fix the gap when the sample list is rebuilt** — a song sample can fail to
-   sound for a moment.
-3. **Back up the samples folder.**
+1. ~~Commit the work from 15 Nov.~~ Done 16 Nov (PR #4).
+2. ~~Fix the gap when the sample list is rebuilt.~~ Done 16 Nov: the table
+   is built to one side and swapped in, rescanned once per list, and
+   `trim.txt` is read only at boot. Host test: `test_manifest.cpp`.
+3. ~~Back up the samples folder.~~ Done 16 Nov: BACKUP asks whether to
+   include the WAVs; `samples.txt` and `trim.txt` always go in. Restore
+   streams files of any size, puts them back in `/samples/`, then the server
+   re-reads the list and settings (numbers kept) and empties its sample
+   cache. A backup folder now lists up to 256 files for restore (was 33).
 4. **Soak test** — play a whole set on the new server build while logging.
-5. **ADD SAMPLE** — record a sample through the mic.
+5. ~~ADD SAMPLE.~~ Done 17 Nov: ADD on the samples screen arms the server,
+   which shows PRESS AND HOLD TO RECORD with a live mic level; hold its glass
+   to record (30 s limit), let go and it plays straight back with KEEP /
+   CANCEL / RESAMPLE (hold) on the server (a bezel tap cancels). KEEP hands
+   it to the client, which names it on the keyboard
+   (default `recNN`) and saves it into `/samples`, then opens the sample
+   editor on it. Refused while a song plays or the organ is open.
 
-Not in that order yet (below): per-sample transpose; per-sample velocity
-sensitivity; a reed organ sound.
+Also done 16 Nov: per-sample transpose (±ST buttons) and velocity switch
+(VEL ON/OFF) in the sample editor; the REED organ PROC sound, with its
+CHAMBER resonance fitted to an oboe recording.
 
 ---
-
-## 1. Commit the work from 15 Nov
-
-Everything from that session is uncommitted in one working tree, on `main`:
-about fifty changed or new files, and `usb_msc.ino` deleted. Branch first,
-then commit — split by feature rather than as one lump:
-
-- the samples page, the sample editor's tune and keys, per-sample tune;
-- the SD card at 25 MHz and the waveform scan;
-- internal RAM: USB-drive mode removed, tables moved to PSRAM;
-- the performance page's organ and sample buttons, organ over a running song;
-- the vocoder (now a PROC sound) and the hold-to-record mic test;
-- the sample cache (polyphonic squares, eight voices, samples on the keys,
-  velocity) and its host test;
-- the paper's experiment script, guides, and this file.
-
-## 2. Fix the gap when the sample list is rebuilt
-
-When the client asks for the sample list, the server rebuilds its table of
-sample numbers and names from the card (`sampleManifestSync`, called from
-`sendSampleList`). The rebuild empties the table and fills it again, and it
-runs once for every page of the list the client asks for. While it is empty,
-a sample that has to play from the SD card cannot be found by name, so a song
-sample triggered at that instant is silent. Samples already in memory are not
-affected.
-
-It was hard to hit while the list was only asked for from a stopped song.
-The samples page now opens mid-song from the performance page, which asks
-for the list.
-
-Ways to fix it, to choose between: build the new table to one side and swap
-it in; rescan the card once per request rather than once per page; or leave
-the table alone while a song is playing.
-
-## 3. Back up the samples folder
-
-**Asked:** 15 Nov 2026.
-
-The client's BACKUP covers songs, instruments, drum tracks and setlists, but
-nothing in the server's `/samples/` folder. That leaves two kinds of thing
-with no copy anywhere but the server's SD card:
-
-- the sample WAVs themselves;
-- the two small text files beside them: `samples.txt` (which number each
-  sample has — songs refer to samples by that number) and `trim.txt` (every
-  sample's start, end, loop and tune from the sample editor).
-
-Since the USB-drive mode was removed, the only other way to copy them is to
-take the card out.
-
-**The idea:** samples are large, so when BACKUP is chosen, ask whether to
-back up the samples as well.
-
-**To settle when this is picked up:**
-
-- Whether `samples.txt` and `trim.txt` should always be included, whatever
-  the answer to the prompt. They are a few hundred bytes, and without them a
-  restored set of songs points at the wrong samples and loses its trims and
-  tunings. (Suggestion, not yet agreed.)
-- Where the backup is kept and how much room it has: the 12 samples on the
-  card today come to about 14 MB.
-- How long it takes over the link. Songs are about 36 KB each; a 4.8 MB
-  sample is over a hundred times that.
-- Restore: putting samples back must keep each one's number in `samples.txt`.
 
 ## 4. Soak test before a gig
 
@@ -97,117 +45,3 @@ Play a full set with the server on USB while the log is captured, watching:
 - samples arriving in memory, and anything that fails to;
 - backup and restore, which read the tables that moved to PSRAM and have not
   been run since.
-
-## 5. ADD SAMPLE on the samples screen — record through the mic
-
-**Asked:** 15 Nov 2026.
-
-Add an "ADD SAMPLE" control to the samples screen that records a new sample
-through the server's microphone.
-
-Some of this exists already. The hold-to-record mic test
-(`mic_hold_test.cpp`) records the mic into PSRAM and plays it back, and that
-is what proved the mic path is clean; it is a separate boot mode, though, and
-it never writes a file. The sample editor can then trim, loop and tune
-whatever gets recorded.
-
-**To settle when this is picked up:**
-
-- How recording starts and stops from the client: hold to record, or tap to
-  start and tap to stop. And whether there is a count-in or a level meter.
-- How long a take may be. The mic test allows 30 seconds (about 1.9 MB at the
-  codec's 32 kHz, mono); anything over 2 MB of audio would not fit the
-  sample cache and would play one note at a time.
-- What the new file is called, and how it gets a name. File names are limited
-  to 23 characters including `.wav`. The client has an on-screen keyboard.
-- Whether you hear the take and can accept or discard it before it is saved,
-  and whether saving drops you into the sample editor to trim it.
-- Level: the mic test showed loud speech close to the mic reaching full scale
-  at the present gain, so a take can clip.
-- Limits: the sample list holds 50 entries, and the server is busy with the
-  mic for the vocoder and the chord and scope screens, so recording has to
-  take turns with those. Recording while a song plays is probably out.
-
-## Later: per-sample transpose
-
-**Asked:** 15 Nov 2026.
-
-A sample has a TUNE; it also needs a TRANSPOSE.
-
-TUNE in the sample editor moves in cents (a tap is one cent, holding speeds
-up). It can reach four octaves either way, so a transpose is possible with it
-today, but only by holding the button through hundreds of cents. What is
-missing is a control that moves in whole semitones.
-
-**To settle when this is picked up:**
-
-- Whether TRANSPOSE is a second stored value or simply semitone steps on the
-  same one. (Suggestion: the same one. The stored tune is already in cents
-  and already shown as semitones.cents, e.g. `+7.05`; TRANSPOSE −/+ would
-  move it by 100 and TUNE −/+ by 1. Nothing new to store, and no change to
-  `trim.txt` or to the messages between the two devices.)
-- If they are kept separate: the range of each, and that TUNE would then
-  stay within a semitone.
-- Where the buttons go in the sample editor — the same shortage of room as
-  the velocity switch below. The two are worth laying out together.
-- Whether a sample column in a song, which has its own TRANSPOSE and TUNE,
-  needs anything changed. (As it stands the sample's own value is added to
-  the column's.)
-
-## Later: per-sample velocity sensitivity on/off
-
-**Asked:** 15 Nov 2026.
-
-A sample needs a flag saying whether velocity sensitivity is enabled for it.
-
-Today every sample played from the MIDI keys (a square on the keys, or the
-sample editor) follows how hard the key is struck: velocity 100 is the
-sample's own level, harder is louder (and can clip), softer is quieter. That
-suits some samples and not others — a thunderclap or a spoken phrase probably
-wants the same level however it is hit.
-
-**To settle when this is picked up:**
-
-- What "off" plays at. (Suggestion: the sample's own level, as velocity 100
-  does now.)
-- Whether a new sample starts with it on or off.
-- Where the flag is kept. The natural place is with the sample's other
-  settings in `/samples/trim.txt`, as a fifth field after tune, so it follows
-  the sample into every song like trim and tune do.
-- Where the switch goes in the sample editor. The header already holds LOOP,
-  PLAY and BACK and the bottom row holds zoom, tune and SPECTRUM, so one of
-  them has to give up some room.
-
-## Later: a reed organ sound (harmonium / accordion)
-
-**Asked:** 16 Nov 2026.
-
-A reed organ voice for the organ, as a PROC sound alongside TWO TRIBES, THX
-and VOCODER.
-
-A free reed chops the air into puffs, so its wave is close to a narrow pulse:
-bright, with odd and even harmonics, and a nasal lump from the reed chamber.
-Every stop is a whole harmonic series, not one sine like a drawbar. It also
-starts softly (a few ms, slightly flat, no key click), gets brighter, not
-just louder, when blown harder, and ranks are often tuned a few cents apart
-(céleste, accordion "musette") so they beat.
-
-**Why PROC and not a drawbar type:** a drawbar type would put a pulse-like
-wave on every footage. High footages would then alias (a harmonic-rich table
-can't just be switched off at Nyquist the way a sine is), and the cure —
-several band-limited tables per octave, about 16 KB — would come out of the
-organ's internal RAM. As a PROC sound it can reuse the VOCODER's oscillator
-(`vocOsc` in `drawbar_organ.cpp`: sawtooth or pulse, polyBLEP-smoothed, so
-no aliasing), one oscillator per note, and PROC tables already live in PSRAM.
-The cost: no free mixing of stops as with drawbars.
-
-**To settle when this is picked up:**
-
-- The five sliders. A first guess: WAVE (pulse width — reedy to thin),
-  CELESTE (detune of a second rank), STOPS (a few fixed footage mixes, e.g.
-  8', 8'+4', 16'+8', 16'+8'+4'), BRIGHT (the chamber filter), ATTACK.
-- Whether the stops come from a second (and third) oscillator per note an
-  octave away, and what that costs in render time at full polyphony.
-- Bellows: whether velocity, the expression pedal, or nothing sets the
-  brightness.
-- Whether the chamber resonance is one fixed filter or follows the note.

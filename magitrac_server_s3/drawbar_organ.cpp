@@ -234,6 +234,42 @@ static inline int32_t vocOsc(uint32_t phase, uint32_t inc, bool pulse, float wid
     return (int32_t)(s * VOC_PULSE_PEAK);                // (its DC goes in the band filters)
 }
 
+// ── REED (PROC_IDX_REED) ──────────────────────────────────────────────────────
+// Each held note sounds up to REED_MAX_RANKS pulse-wave ranks (the STOPS
+// slider picks which) plus, with CELESTE up, a second 8' rank tuned sharp.
+// The ranks reuse the voice's drawbar oscillator slots — a PROC sound never
+// uses them: phase[k] runs the rank, inc[k] is its increment for this block
+// (worked out from vocInc, the note's 8' pitch, so STOPS / CELESTE moved with
+// a note held apply at once).  glideQ16 is the speaking scoop: a note starts
+// REED_SCOOP_CENTS flat and settles over ~15 ms.
+#define REED_MAX_RANKS   4
+#define REED_SCOOP_CENTS 15.0f
+struct ReedStop { uint8_t n; float ratio[REED_MAX_RANKS]; float level[REED_MAX_RANKS]; };
+// Ratios to the 8' pitch: 16' = 0.5, 4' = 2, 2 2/3' = 3, 2' = 4.  The 8' is the
+// loudest rank, as on a harmonium.
+static const ReedStop REED_STOPS[9] = {
+    { 1, { 1.0f },                   { 1.0f } },                     // 0: 8'
+    { 2, { 1.0f, 2.0f },             { 1.0f, 0.8f } },               // 1: 8' 4'
+    { 2, { 0.5f, 1.0f },             { 0.8f, 1.0f } },               // 2: 16' 8'
+    { 3, { 0.5f, 1.0f, 2.0f },       { 0.8f, 1.0f, 0.8f } },         // 3: 16' 8' 4'
+    { 3, { 1.0f, 2.0f, 4.0f },       { 1.0f, 0.8f, 0.6f } },         // 4: 8' 4' 2'
+    { 4, { 0.5f, 1.0f, 2.0f, 4.0f }, { 0.8f, 1.0f, 0.8f, 0.6f } },   // 5: 16' 8' 4' 2'
+    { 2, { 1.0f, 3.0f },             { 1.0f, 0.6f } },               // 6: 8' 2 2/3' (nasal)
+    { 3, { 0.5f, 1.0f, 3.0f },       { 0.8f, 1.0f, 0.6f } },         // 7: 16' 8' 2 2/3'
+    { 4, { 0.5f, 1.0f, 2.0f, 3.0f }, { 0.8f, 1.0f, 0.8f, 0.6f } },   // 8: 16' 8' 4' 2 2/3'
+};
+
+// One rank: a pulse `width` of the cycle high, polyBLEP-smoothed, with its DC
+// (2·width − 1) taken off so a narrow pulse doesn't push the mix off centre.
+// About ±1.
+static inline float reedPulse(uint32_t phase, uint32_t inc, float width) {
+    float t  = (float)phase * (1.0f / 4294967296.0f);
+    float dt = (float)inc   * (1.0f / 4294967296.0f);
+    float t2 = t - width; if (t2 < 0.0f) t2 += 1.0f;
+    float s  = ((t < width) ? 1.0f : -1.0f) + vocBlep(t, dt) - vocBlep(t2, dt);
+    return s - (2.0f * width - 1.0f);
+}
+
 // carrier = organ sample, mod = mic sample (both int, int16-ish range).
 static int32_t vocoderProcess(int32_t carrier, int32_t mod) {
     float c = (float)carrier, m = (float)mod;
@@ -312,13 +348,8 @@ static volatile int s_type = ORGAN_DRAWBAR;
 
 // PROC type: hand-written procedural generators (see proc_sounds.cpp) — no
 // drawbars; the client picks a sound from a list and its param sliders map to
-// s_param.  Each voice reads a per-voice morphed wavetable rebuilt per block.
-// alignas(4): the THX sound reinterprets each voice's scratch row as a ThxVoice
-// (which has uint32 members) to avoid a second 24 KB buffer — needs 4-byte
-// alignment, and each 2048-byte row then stays aligned.
-alignas(4) static int16_t s_voiceScratch[ORGAN_VOICES][PROC_WT];   // current morphed wavetable per voice
-static_assert(sizeof(ThxVoice) <= sizeof(s_voiceScratch[0]),
-              "ThxVoice must fit inside one voice scratch row");
+// s_param.  A CHOIR voice reads a per-voice morphed wavetable rebuilt per block.
+static int16_t s_voiceScratch[ORGAN_VOICES][PROC_WT];   // current morphed wavetable per voice
 static int32_t s_procLp   = 0;    // BRIGHT one-pole state (global, PROC only)
 static volatile int s_procSel = 0;    // selected procedural sound
 
@@ -418,11 +449,17 @@ static void voiceStart(Voice& v, uint8_t note) {
     if (s_type == ORGAN_PROC) {
         if (s_procSel == PROC_IDX_VOC) {
             // just the carrier oscillator set up above
-        } else if (s_procSel == PROC_IDX_THX) {
-            int vi = (int)(&v - voices);   // this voice's index → its scratch row
-            ThxVoice* tv = (ThxVoice*)s_voiceScratch[vi];
-            if (tv->rng == 0) tv->rng = 0x1234567u ^ (note * 2654435761u);
-            thxNoteOn(*tv, midiHz(note), s_param);
+        } else if (s_procSel == PROC_IDX_REED) {
+            // Ranks start at scattered points in their cycles (no phase-locked
+            // click as a chord lands); increments are set per block.
+            for (int k = 0; k <= REED_MAX_RANKS; k++) {
+                v.rng = v.rng * 1664525u + 1013904223u;
+                v.phase[k] = v.rng;
+                v.inc[k]   = 0;
+            }
+            v.clickEnv = 0;
+            v.glideQ16 = (int32_t)(65536.0f * powf(2.0f, -REED_SCOOP_CENTS / 1200.0f));
+            return;
         } else {
             if (v.proc.rng == 0) v.proc.rng = 0x1234567u ^ (note * 2654435761u);
             procNoteOn(s_procSel, v.proc, midiHz(note), s_param);
@@ -564,6 +601,9 @@ static void renderBlock(int16_t* out) {
             int ms = 5 + sv * sv * 12;                    // 5..773 ms
             envAtkInc = 32767 / (ms * (int)(AUDIO_CODEC_RATE_HZ / 1000));
             if (envAtkInc < 1) envAtkInc = 1;
+        } else if (si.atkMs) {
+            envAtkInc = 32767 / ((int)si.atkMs * (int)(AUDIO_CODEC_RATE_HZ / 1000));
+            if (envAtkInc < 1) envAtkInc = 1;
         }
         if (si.relMs) {
             envRelDec = 32767 / ((int)si.relMs * (int)(AUDIO_CODEC_RATE_HZ / 1000));
@@ -625,6 +665,31 @@ static void renderBlock(int16_t* out) {
         if (smooth != lastSmooth) { lastSmooth = smooth; vocSetSmooth(smooth); }
     }
 
+    // REED sound: its stops, céleste, width and level, once per block.
+    bool  reedSel  = proc && procSel == PROC_IDX_REED;
+    const ReedStop* reedStop = &REED_STOPS[0];
+    float reedWidth = 0.5f, reedCeleste = 0.0f, reedScale = 0.0f;
+    if (reedSel) {
+        reedStop  = &REED_STOPS[s_param[3] <= 8 ? s_param[3] : 8];
+        reedWidth = 0.45f - (float)s_param[0] * (0.37f / 8.0f);   // 0.45 .. 0.08
+        int cel   = s_param[1];
+        reedCeleste = cel ? powf(2.0f, (float)(cel * 3) / 1200.0f) : 0.0f;
+        // Level: the same RMS whatever the width (a DC-free pulse has RMS
+        // 2·sqrt(w(1−w))) and however many ranks sound (they're unrelated in
+        // phase, so their powers add).  × 8 × gain = drawbar units, as for
+        // the other PROC sounds.
+        float pw = 0.0f;
+        for (int k = 0; k < reedStop->n; k++) pw += reedStop->level[k] * reedStop->level[k];
+        if (cel) pw += 1.0f;
+        float pulseRms = 2.0f * sqrtf(reedWidth * (1.0f - reedWidth));
+        reedScale = 32767.0f * 8.0f * (float)procGain / (pulseRms * sqrtf(pw));
+        // CHAMBER boosts up to +24 dB: take back half of it (in dB) here, so
+        // turning it up changes the tone more than the loudness and a
+        // four-note chord at CHAMBER 8 still clears the int16 clamp after
+        // the formant (simulated: peaks ~14k).
+        reedScale *= powf(10.0f, -0.075f * (float)s_param[4]);
+    }
+
     int rvb      = s_reverb;
     int rvFb     = RV_FB_Q15[rvb];
     int rvDamp   = RV_DAMP_Q8[rvb];
@@ -637,14 +702,13 @@ static void renderBlock(int16_t* out) {
     uint32_t leslieInc = (uint32_t)((double)s_leslieRate * 4294967296.0 / AUDIO_CODEC_RATE_HZ);
 
     for (int n = 0; n < BLOCK_FRAMES; n++) {
-        int32_t mixL = 0, mixR = 0;
+        int32_t mix = 0;
 
         for (int i = 0; i < ORGAN_VOICES; i++) {
             Voice& v = voices[i];
             if (v.stage == ENV_IDLE) continue;
 
-            int32_t acc = 0, accR = 0;   // accR + vStereo used only by THX (stereo pan)
-            bool    vStereo = false;
+            int32_t acc = 0;
             if (neb) {
                 // Advance the attack glide once per block (creep up to settled).
                 if (n == 0 && v.glideQ16 < 65536) {
@@ -680,14 +744,35 @@ static void renderBlock(int16_t* out) {
                 v.vocPhase += v.vocInc;
                 // × 8 = one drawbar fully out; × the registry gain (4) = 32 units.
                 acc = vocOsc(v.vocPhase, v.vocInc, vocPulse, v.vocWidth) * (8 * procGain);
-            } else if (proc && procSel == PROC_IDX_THX) {
-                // THX DEEP NOTE: a converging cluster of detuned saws sharing the
-                // voice's scratch row as its ThxVoice state.  Glide advances once
-                // per block; the oscillator bank is summed per sample.
-                ThxVoice* tv = (ThxVoice*)s_voiceScratch[i];
-                if (n == 0) thxBlockPrep(*tv);
-                int32_t tl, tr; thxSampleStereo(*tv, tl, tr);
-                acc = tl * procGain; accR = tr * procGain; vStereo = true;
+            } else if (reedSel) {
+                // REED: the ranks' increments once per block — the 8' pitch
+                // (vocInc) × each rank's ratio × the speaking scoop.  A rank
+                // at or past Nyquist is left silent.
+                if (n == 0) {
+                    if (v.glideQ16 < 32768 || v.glideQ16 > 65536) v.glideQ16 = 65536;
+                    if (v.glideQ16 < 65536) {
+                        v.glideQ16 += ((65536 - v.glideQ16) >> 2) + 1;
+                        if (v.glideQ16 > 65536) v.glideQ16 = 65536;
+                    }
+                    float base = (float)v.vocInc * ((float)v.glideQ16 * (1.0f / 65536.0f));
+                    for (int k = 0; k < reedStop->n; k++) {
+                        float f = base * reedStop->ratio[k];
+                        v.inc[k] = (f >= 2147483648.0f) ? 0 : (uint32_t)f;
+                    }
+                    float fc = base * reedCeleste;
+                    v.inc[REED_MAX_RANKS] = (fc >= 2147483648.0f) ? 0 : (uint32_t)fc;
+                }
+                float sum = 0.0f;
+                for (int k = 0; k < reedStop->n; k++) {
+                    if (v.inc[k] == 0) continue;
+                    v.phase[k] += v.inc[k];
+                    sum += reedPulse(v.phase[k], v.inc[k], reedWidth) * reedStop->level[k];
+                }
+                if (v.inc[REED_MAX_RANKS]) {
+                    v.phase[REED_MAX_RANKS] += v.inc[REED_MAX_RANKS];
+                    sum += reedPulse(v.phase[REED_MAX_RANKS], v.inc[REED_MAX_RANKS], reedWidth);
+                }
+                acc = (int32_t)(sum * reedScale);
             } else if (proc) {
                 // PROC: rebuild this voice's morphed wavetable once per block,
                 // then the generator's oscillators read it.  Gain comes from
@@ -715,12 +800,8 @@ static void renderBlock(int16_t* out) {
                     break;
                 default: break;
             }
-            // 64-bit: acc*env overflows int32.  Centred voices apply the same
-            // value to both channels; THX carries its stereo pan in accR.
-            int32_t eL = (int32_t)(((int64_t)acc  * v.env) >> 15);
-            int32_t eR = vStereo ? (int32_t)(((int64_t)accR * v.env) >> 15) : eL;
-            mixL += eL;
-            mixR += eR;
+            // 64-bit: acc*env overflows int32.
+            mix += (int32_t)(((int64_t)acc * v.env) >> 15);
 
             // Key click — a fast-decaying noise burst on attack, added outside
             // the tonal envelope so it isn't swallowed by the attack ramp.  Mono.
@@ -728,18 +809,15 @@ static void renderBlock(int16_t* out) {
                 v.rng = v.rng * 1664525u + 1013904223u;       // LCG noise
                 int16_t noise = (int16_t)(v.rng >> 16);
                 int32_t cn = (((int32_t)noise * v.clickEnv) >> 15) * s_param[0];   // CLICK knob
-                mixL += cn; mixR += cn;
+                mix += cn;
                 v.clickEnv -= CLICK_DECAY;
                 if (v.clickEnv < 0) v.clickEnv = 0;
             }
         }
 
-        // Mid/side: the FX chain stays mono (processes the mid); THX's stereo pan
-        // lives in the side, re-added at the output.  Every other (centred) sound
-        // has mixL==mixR → side==0 → bit-identical to the old mono path.
-        int32_t mid  = (mixL + mixR) >> 1;
-        int32_t side = (mixL - mixR) >> 1;
-        int32_t s = mid >> (vocSel ? ORGAN_MASTER_SHIFT + VOC_CARRIER_SHIFT : ORGAN_MASTER_SHIFT);
+        // The voices and the FX chain are mono; the Leslie and reverb make the
+        // stereo at the output.
+        int32_t s = mix >> (vocSel ? ORGAN_MASTER_SHIFT + VOC_CARRIER_SHIFT : ORGAN_MASTER_SHIFT);
         if (s >  32767) s =  32767;
         if (s < -32768) s = -32768;
 
@@ -844,9 +922,6 @@ static void renderBlock(int16_t* out) {
             }
         }
 
-        // Add the stereo side (THX pan width) — dry, on top of the FX stereo.
-        int32_t sd = side >> ORGAN_MASTER_SHIFT;
-        l += sd; r -= sd;
         if (l >  32767) l =  32767;
         if (l < -32768) l = -32768;
         if (r >  32767) r =  32767;
@@ -1052,17 +1127,11 @@ int organGetParam(int idx) {
 
 void organSetProcSound(int i) {
     if (i < 0 || i >= PROC_SOUND_COUNT || i == s_procSel) return;
-    // THX overlays its oscillator bank on the per-voice scratch that the other
-    // sounds use as a wavetable — so crossing the THX boundary with notes still
-    // held would reinterpret stale bytes (a loud blast).  Release sounding
-    // voices cleanly across that boundary; other switches morph in place.
-    // Same for VOCODER: its voices carry no wavetable state, and a wavetable
-    // voice carried into it would stop making sense.
-    if (i == PROC_IDX_THX || s_procSel == PROC_IDX_THX ||
-        i == PROC_IDX_VOC || s_procSel == PROC_IDX_VOC) {
-        for (int v = 0; v < ORGAN_VOICES; v++)
-            if (voices[v].stage != ENV_IDLE) voices[v].stage = ENV_RELEASE;
-    }
+    // Each sound keeps different state in its voices (REED its ranks, VOCODER
+    // its carrier, CHOIR a wavetable), so a voice carried across would stop
+    // making sense: release whatever is sounding.
+    for (int v = 0; v < ORGAN_VOICES; v++)
+        if (voices[v].stage != ENV_IDLE) voices[v].stage = ENV_RELEASE;
     s_procSel = i;   // applies to notes played next
 }
 int organGetProcSound() { return s_procSel; }

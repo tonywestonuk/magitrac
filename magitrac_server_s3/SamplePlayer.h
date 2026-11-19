@@ -48,10 +48,37 @@ bool samplePlayerIsPlaying();
 bool samplePreloadSync(const Song* song, bool gentle = false);
 void samplePreloadSetExtra(uint8_t sampleId);   // 0 = none
 void samplePreloadSetPads(bool on);
+// Empty the cache and forget which samples failed to load — after a restore
+// replaced WAVs (new audio under ids already cached).  Done by the following
+// samplePreloadSync calls, once the RAM voices are quiet.  Loop task.
+void samplePreloadForgetAll();
+// Empty the cache right now, to free its PSRAM for something bigger (the ADD
+// SAMPLE take buffer).  false = a voice or the stream is still sounding; stop
+// them, wait a moment and call again.  Loop task only.  The next
+// samplePreloadSync reloads whatever is still wanted.
+bool samplePreloadDropAllNow();
 // Start a RAM voice (polyphonic, steals the oldest when full).  Returns a
 // voice handle, or -1 if the sample isn't cached (caller falls back to
 // samplePlayerPlay streaming).  volume as for samplePlayerPlay: 127 = unity,
 // more boosts.
 int  samplePlayRam(uint8_t sampleId, float pitchSemitones = 0, uint8_t volume = 127);
+// A RAM voice on a caller's mono PCM buffer (ADD SAMPLE plays its take from
+// the keys this way, before it is a sample).  The buffer must outlive the
+// voice: stop it and wait for sampleRamVoicesActive() to go false before
+// freeing.
+int  samplePlayBuffer(const int16_t* data, uint32_t frames, uint32_t rate,
+                      float pitchSemitones = 0, uint8_t volume = 127);
 void sampleStopVoice(int voice);            // release one RAM voice (short fade)
 bool sampleRamVoicesActive();
+
+// KEEP LENGTH's pitch pass: finds (one FFT per call) the pitch of any cached
+// sample with KEEP LENGTH on and none recorded yet.  mayStart = false keeps it
+// from starting one (ADD SAMPLE is using the pitch detector).  Loop task.
+// True when a result was just stored.
+bool samplePitchTick(bool mayStart);
+
+// AUTO TUNE (sample editor): find sampleId's pitch — from the cache, waiting
+// a few seconds for it to arrive there.  Any task.  The answer comes back from
+// sampleAutoTuneTake (loop task) once: result is a SampleTuneResult.
+void sampleAutoTuneRequest(uint8_t sampleId);
+bool sampleAutoTuneTake(uint8_t& sampleId, uint8_t& result, float& hz);

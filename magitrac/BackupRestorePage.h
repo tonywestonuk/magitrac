@@ -12,13 +12,17 @@
 //  y=  0  ┌─ Header: "BACKUP / RESTORE"  [HOME]  (50px)
 //  y= 50  └─ Content area (490px) — varies by state
 
-#define BR_MAX_FILES    (SRV_MAX_FILES + 1)  // songs + instruments
+// Files one backup folder can list for restore: songs, instruments,
+// drumtracks, setlists and samples.  ~17 KB with the restore list — the page
+// is new'd, so it lands in PSRAM.
+#define BR_MAX_FILES    256
 #define BR_MAX_FOLDERS  128  // list scrolls; keep ~every backup rather than silently dropping (~4KB heap)
 #define BR_FOLDER_MAX   32  // max folder name length
 #define BR_BACKUPS_DIR  "/backups"
 
 enum class BRState : uint8_t {
     MENU,
+    BACKUP_ASK,          // include the sample WAVs?
     BACKUP_PROGRESS,
     BACKUP_DONE,
     FOLDER_LIST,
@@ -101,6 +105,7 @@ private:
     // Drawing
     void drawHeader(const char* title, bool withBack = false);
     void drawMenu();
+    void drawBackupAsk();
     void drawBackupProgress();
     void drawBackupDone();
     void drawFolderList();
@@ -117,7 +122,7 @@ private:
     bool hitHeaderBack(int sx, int sy) const;
 
     // Backup logic
-    void startBackup();
+    void startBackup(bool withSamples);
 
     // Restore logic
     void scanBackupFolders();

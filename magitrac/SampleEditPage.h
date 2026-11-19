@@ -10,8 +10,11 @@
 // Shows a waveform overview fetched from the server (MSG_SAMPLE_INFO);
 // START/END markers are touch-and-drag (grab near the line, drag, release to
 // store); LOOP makes a held key wrap the region; TUNE −/+ shifts the sample's
-// own pitch in cents.  Metadata lives on the server (/samples/trim.txt) — the
-// WAV never changes — and belongs to the SAMPLE, so it applies in every song.
+// own pitch a cent at a time and −ST/+ST a semitone at a time (TRANSPOSE —
+// the same stored value, which is in cents); VEL ON/OFF says whether MIDI keys
+// play it louder/softer with velocity or always at its own level.  Metadata
+// lives on the server (/samples/trim.txt) — the WAV never changes — and
+// belongs to the SAMPLE, so it applies in every song.
 //
 // Two ways in:
 //   • SamplesPage (hold a square): no column — col = SE_NO_COL.  PLAY sounds
@@ -32,6 +35,9 @@
 static const int SE_HDR_H    = 70;
 static const int SE_BTN_H    = 54;
 static const int SE_BTN_Y    = 8;
+static const int SE_VEL_X    = 340;
+static const int SE_VEL_W    = 140;
+static const int SE_NAME_MAXW = SE_VEL_X - 12 - 12;   // name area left of VEL
 static const int SE_LOOP_X   = 500;
 static const int SE_LOOP_W   = 140;
 static const int SE_PLAY_X   = 660;
@@ -45,21 +51,40 @@ static const int SE_WAVE_Y   = 100;
 static const int SE_WAVE_H   = 250;
 
 static const int SE_TIME_Y   = 360;                   // view-window readout line
+static const int SE_TIME_W   = 580;                   // readout area (left of KEEP LENGTH)
+
+// [x] KEEP LENGTH checkbox, right of the readout line: other notes change the
+// sample's pitch, not its length.  Its tap beats the wave's marker grab zone.
+static const int SE_KEEP_X   = 680;
+static const int SE_KEEP_Y   = 358;
+static const int SE_KEEP_BOX = 28;
+static const int SE_KEEP_HIT_X0 = 670, SE_KEEP_HIT_X1 = 900;
+static const int SE_KEEP_HIT_Y0 = 352, SE_KEEP_HIT_Y1 = 392;
 
 static const int SE_SCROLL_Y = 392;                   // drag scrollbar
 static const int SE_SCROLL_H = 44;
 
 static const int SE_ZOOM_Y   = 462;                   // bottom controls row
 static const int SE_ZOOM_H   = 60;
-static const int SE_ZOUT_X   = 80;                    // [ZOOM −]
-static const int SE_ZIN_X    = 200;                   // [ZOOM +]
-static const int SE_ZBTN_W   = 110;
-// TUNE: [−] value [+], between the zoom readout and SPECTRUM.
-static const int SE_TUNE_DN_X  = 400;
-static const int SE_TUNE_BTN_W = 70;
-static const int SE_TUNE_VAL_X = SE_TUNE_DN_X + SE_TUNE_BTN_W;    // 470
-static const int SE_TUNE_VAL_W = 170;
-static const int SE_TUNE_UP_X  = SE_TUNE_VAL_X + SE_TUNE_VAL_W;   // 640
+static const int SE_ZOUT_X   = 20;                    // [ZOOM −]
+static const int SE_ZIN_X    = 130;                   // [ZOOM +]
+static const int SE_ZBTN_W   = 100;
+// [TUNE +7.05] on the bottom row opens the TUNE dialog (full screen):
+// the value, [−ST] [−] [+] [+ST] [ZERO], and [AUTO TUNE].
+static const int SE_TUNE_X     = 330;
+static const int SE_TUNE_W     = 380;
+static const int SE_TD_VAL_Y   = 110;                 // big value
+static const int SE_TD_BTN_Y   = 250;                 // −ST − + +ST ZERO
+static const int SE_TD_BTN_H   = 80;
+static const int SE_TD_BTN_W   = 150;
+static const int SE_TD_BTN_X0  = 65;                  // then every 170
+static const int SE_TD_BTN_STEP = 170;
+static const int SE_TD_AUTO_X  = 280;
+static const int SE_TD_AUTO_Y  = 370;
+static const int SE_TD_AUTO_W  = 400;
+static const int SE_TD_AUTO_H  = 80;
+static const int SE_TD_MSG_Y   = 478;                 // AUTO TUNE's result line
+static const uint32_t SE_AUTO_TIMEOUT_MS = 12000;
 
 static const uint8_t SE_NO_COL = 0xFF;                // opened without a column
 
@@ -82,8 +107,13 @@ private:
     void draw();
     void drawWave();
     void drawScrollbar();
+    void drawKeepLen();
     void drawZoomRow();
-    void drawTune();           // TUNE −/value/+ (part of the zoom row)
+    void drawTune();           // the TUNE button (zoom row) / the dialog's value
+    void drawTuneDialog();     // the whole TUNE dialog
+    void drawAutoStatus();     // the dialog's AUTO TUNE button + result line
+    bool pollTuneDialog(bool down, int tx, int ty);   // its touches
+    void startAudition();      // PLAY
     void stepTune(int cents);  // adjust + repaint; stored on release
     bool standalone() const { return _col == SE_NO_COL; }
     void drawHeader();
@@ -112,6 +142,8 @@ private:
     MsgSampleInfo _info = {};             // last arrived overview + meta
     uint32_t _start = 0, _end = 0;        // trim, frames; _end 0 = end of file
     bool     _loop  = false;
+    bool     _velOff = false;             // keys play it at its own level
+    bool     _keepLen = false;            // KEEP LENGTH: pitch moves, length stays
     uint32_t _viewStart = 0, _viewEnd = 0;   // visible window, frames
 
     bool     _wasDown    = false;
@@ -122,7 +154,8 @@ private:
     uint32_t _dragAnchorVs = 0;           // viewStart at grab
     int16_t  _tuneCents  = 0;             // column TUNE (audition speed)
     int16_t  _sampleTune = 0;             // the sample's own TUNE, ± cents
-    HoldRepeat _tuneHold;                 // TUNE −/+ held: delta = direction
+    HoldRepeat _tuneHold;                 // TUNE −/+ held: field 0 = cents,
+                                          // 1 = semitones; delta = direction
     int      _tuneStep   = 1;             // cents per repeat — grows while held
     uint32_t _keysLastMs = 0;             // last SAMPLE_EDIT_KEYS lease renewal
     uint32_t _playEndMs  = 0;             // when a non-looping audition ends
@@ -130,8 +163,15 @@ private:
                                           // reopened ColumnEditor (HOME shares the
                                           // corner) never sees this gesture
     int      _specMode   = 0;             // 0=off, 1=waiting for data, 2=showing
+    bool     _tuneMode   = false;         // the TUNE dialog is up
+    bool     _doneArmed  = false;         // its DONE pressed; fires on release
+    uint8_t  _autoState  = 0;             // AUTO TUNE: 0 idle, 1 asking, 2 found,
+                                          // 3 no clear pitch, 4 not ready, 5 no answer
+    uint32_t _autoSentMs = 0;
+    uint8_t  _autoNote   = 0;             // found: nearest note + its cents
+    int8_t   _autoCents  = 0;
 };
 
 // Spectrogram popup: [SPECTRUM] button position (in the zoom row).
-static const int SE_SPEC_X = 740;
+static const int SE_SPEC_X = 750;
 static const int SE_SPEC_W = 180;

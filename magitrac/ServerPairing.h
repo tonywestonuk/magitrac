@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <IPAddress.h>
+#include <FS.h>
 #include "MagiMsg.h"
 #include "TrackerData.h"   // for Song / SongFileHeader
 
@@ -134,12 +135,22 @@ public:
     // Sample editor / sample page: GET requests meta+overview (arrives via
     // sampleInfo*), SET stores trim/loop/tune metadata, STOP silences the
     // sample player, PLAY sounds the sample at `note` (60 = native), KEYS
-    // makes the server's MIDI-in keys play it (see SampleEditOp).
+    // makes the server's MIDI-in keys play it (see SampleEditOp).  velOff
+    // (SET): 1 = keys play it at its own level whatever the velocity.
+    // keepLen (SET): 1 = other notes change its pitch, not its length.
     bool sendSampleEdit(uint8_t op, uint8_t sampleId,
                         uint32_t startFrame = 0, uint32_t endFrame = 0,
                         uint8_t loop = 0, int16_t tuneCents = 0,
-                        uint8_t note = 60);
+                        uint8_t note = 60, uint8_t velOff = 0, uint8_t keepLen = 0);
     bool sampleInfoPending() const   { return _sampleInfoPending; }
+
+    // ADD SAMPLE: ask the server to record / play / save / discard a take
+    // (SampleRecOp; `name` for SAVE).  Its answers arrive as statuses —
+    // takeSampleRecStatus hands over the newest one not yet taken.
+    bool sendSampleRec(uint8_t op, const char* name = nullptr);
+    bool takeSampleRecStatus(MsgSampleRecStatus& out);
+    // AUTO TUNE (SAMPLE_EDIT_AUTOTUNE): the server's answer, once.
+    bool takeSampleTune(MsgSampleTune& out);
     void clearSampleInfo()           { _sampleInfoPending = false; }
     const MsgSampleInfo& sampleInfo() const { return _sampleInfo; }
 
@@ -203,8 +214,11 @@ public:
                       const uint8_t* data, uint32_t dataLen);
 
     // ── Restore ───────────────────────────────────────────────────────────────
+    // Streams `size` bytes of the open file `f` — read a chunk at a time, so
+    // a multi-megabyte sample WAV needs no buffer.  False = a read came up
+    // short or the link failed.
     bool sendRestoreFile(const char* name, bool isInstruments,
-                         const uint8_t* data, uint32_t dataLen);
+                         fs::File& f, uint32_t size);
 
     // ── MIDI passthrough ──────────────────────────────────────────────────────
     bool sendMidi(const uint8_t* bytes, uint8_t len);
@@ -364,6 +378,10 @@ private:
     uint8_t  _midiVelocityIn = 0;
     bool     _midiNoteInPending = false;
 
+    MsgSampleRecStatus _recStatus = {};    // last MSG_SAMPLE_REC_STATUS received
+    volatile bool      _recStatusPending = false;
+    MsgSampleTune      _sampleTune = {};   // last MSG_SAMPLE_TUNE received
+    volatile bool      _sampleTunePending = false;
     MsgSampleInfo _sampleInfo = {};        // last MSG_SAMPLE_INFO received
     volatile bool _sampleInfoPending = false;
     uint8_t*         _specData = nullptr;  // PSRAM, lazily allocated — internal

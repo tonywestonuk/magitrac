@@ -42,19 +42,58 @@ static bool          sReady = false;
 static i2s_chan_handle_t sTx = nullptr;
 static i2s_chan_handle_t sRx = nullptr;
 
+// ── ES8388 ALC + noise gate: OFF ─────────────────────────────────────────────
+// M5ModuleAudio's begin() switches on the ES8388's ALC (auto gain, PGA swung
+// between 0 and +23.5 dB towards near full scale) and its noise gate (ADC
+// output MUTED below about -40 dBFS).  The gate chopped quiet speech into
+// pieces in ADD SAMPLE takes, and the ALC made levels pump and clip — and it
+// overrode setMicGain() entirely.  Both off (Nov 2026): the mic now runs at a
+// fixed PGA gain, for sampling and for the vocoder / chords / scope / beat
+// detection alike.  Written straight to the codec (the library keeps its
+// ES8388 object private); nothing in the library rewrites them after begin().
+#define ES8388_I2C_ADDR   0x10
+#define ES_ADCCONTROL10   0x12   // [7:6] ALCSEL (00 = off) [5:3] max gain [2:0] min gain
+#define ES_ADCCONTROL14   0x16   // [7:3] gate threshold [2:1] gate type [0] gate enable
+#define ES_ALC_OFF        0x2A   // ALCSEL 00; the gain limits as the library had them
+#define ES_GATE_OFF       0xC2   // the library's 0xC3 with the enable bit cleared
+
+static bool esWrite(uint8_t reg, uint8_t v) {
+    Wire1.beginTransmission(ES8388_I2C_ADDR);
+    Wire1.write(reg);
+    Wire1.write(v);
+    return Wire1.endTransmission() == 0;
+}
+
+static int esRead(uint8_t reg) {
+    Wire1.beginTransmission(ES8388_I2C_ADDR);
+    Wire1.write(reg);
+    if (Wire1.endTransmission(false) != 0) return -1;
+    if (Wire1.requestFrom((uint8_t)ES8388_I2C_ADDR, (uint8_t)1) != 1) return -1;
+    return Wire1.read();
+}
+
+// True when both read back as written.
+static bool disableAlcAndGate() {
+    esWrite(ES_ADCCONTROL10, ES_ALC_OFF);
+    esWrite(ES_ADCCONTROL14, ES_GATE_OFF);
+    return esRead(ES_ADCCONTROL10) == ES_ALC_OFF && esRead(ES_ADCCONTROL14) == ES_GATE_OFF;
+}
+
 // Apply the full ES8388 + STM32 input/output config.  Idempotent — safe to
 // re-run, which is exactly what the boot-time verify loop below relies on.
 static void configureCodec() {
     sDev.setHPMode(AUDIO_HPMODE_NATIONAL);             // National TRRS — quietest coupling (verified on rig)
     sDev.setMICStatus(AUDIO_MIC_OPEN);                 // PB7 high → mic bias on → MIC mode
     sDev.setMicInputLine(ADC_INPUT_LINPUT1_RINPUT1);   // mic + line-in share this pair
-    sDev.setMicGain(MIC_GAIN_15DB);              // 15 dB — 24 dB overdrove the input into clipping/distortion
+    sDev.setMicGain(MIC_GAIN_24DB);              // the PGA's maximum, fixed — roughly where the ALC
+                                                 // held quiet sources (15 dB was too quiet without it)
     sDev.setMicAdcVolume(100);
     sDev.setSpeakerVolume(100);
     sDev.setSpeakerOutput(DAC_OUTPUT_ALL);       // OUT1 + OUT2 — speaker + line out (live amp needs OUT2)
     sDev.setBitsSample(ES_MODULE_ADC_DAC, BIT_LENGTH_16BITS);
     sDev.setSampleRate(SAMPLE_RATE_32K);
     sDev.setMICStatus(AUDIO_MIC_OPEN);            // belt-and-braces re-assert
+    disableAlcAndGate();
 }
 
 // DMA pool sizes (frames).  LARGE rides out SD read jitter for SamplePlayer;
@@ -175,8 +214,11 @@ bool audioCodecInit() {
                           attempt + 1);
     }
 
-    Serial.printf("[CODEC] ES8388 ready @ 32 kHz / 16-bit stereo; mic-bias verified=%d\n",
-                  biasOk ? 1 : 0);
+    bool alcOff = false;
+    for (int attempt = 0; attempt < 3 && !alcOff; attempt++) alcOff = disableAlcAndGate();
+    Serial.printf("[CODEC] ES8388 ready @ 32 kHz / 16-bit stereo; mic-bias verified=%d; "
+                  "ALC+gate off=%d (0x12=%02X 0x16=%02X)\n",
+                  biasOk ? 1 : 0, alcOff ? 1 : 0, esRead(ES_ADCCONTROL10), esRead(ES_ADCCONTROL14));
 
     sReady = true;       // bias verify is non-fatal; the I2S init above is the hard gate
     return true;

@@ -1,5 +1,6 @@
 // MagiLink.cpp — see header for purpose / scope.
 #include "MagiLink.h"
+#include "esp_heap_caps.h"
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -90,8 +91,13 @@ void MagiLink::beginAccept(uint16_t port) {
     if (_impl->task) return;            // already started
     _role = Role::Accept;
     _port = port;
-    xTaskCreate(&MagiLink::_trampoline, "magilink_acc",
-                LINK_TASK_STACK, this, LINK_TASK_PRIO, &_impl->task);
+    if (xTaskCreate(&MagiLink::_trampoline, "magilink_acc",
+                    LINK_TASK_STACK, this, LINK_TASK_PRIO, &_impl->task) != pdPASS) {
+        _impl->task = nullptr;
+        Serial.printf("[LINK-ACC] worker task NOT created (stack %u, internal free %u)\n",
+                      (unsigned)LINK_TASK_STACK,
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
 }
 
 void MagiLink::beginConnect(uint16_t port, IPAddress peer) {
@@ -114,8 +120,14 @@ void MagiLink::beginConnect(uint16_t port, IPAddress peer) {
     _role = Role::Connect;
     _port = port;
     _peer = peer;
-    xTaskCreate(&MagiLink::_trampoline, "magilink_con",
-                LINK_TASK_STACK, this, LINK_TASK_PRIO, &_impl->task);
+    if (xTaskCreate(&MagiLink::_trampoline, "magilink_con",
+                    LINK_TASK_STACK, this, LINK_TASK_PRIO, &_impl->task) != pdPASS) {
+        _impl->task = nullptr;
+        Serial.printf("[LINK-CON] worker task NOT created (stack %u, internal free %u, largest %u)\n",
+                      (unsigned)LINK_TASK_STACK,
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
 }
 
 // ── Worker task ─────────────────────────────────────────────────────────────

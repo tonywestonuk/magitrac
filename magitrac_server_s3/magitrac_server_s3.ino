@@ -21,6 +21,8 @@
 #include "crash_log.h"
 #include "mic_echo_test.h"
 #include "mic_hold_test.h"
+#include "freq_resp_test.h"
+#include "sample_record.h"
 
 // Diagnostic: when defined, setup() runs a record / play loop on the codec
 // forever instead of booting normally.  Confirms the mic is hearing what we
@@ -31,6 +33,12 @@
 // becomes a mic tester — hold the screen to record, let go to hear it back
 // (mic_hold_test.cpp).  Uncomment for diagnostics; leave commented for live.
 // #define MIC_HOLD_TEST
+
+// Diagnostic: when defined, setup() stops after the radio is up and the device
+// loops a stepped-sine test sequence out of the codec, for measuring the output
+// frequency response (freq_resp_test.cpp; analysis in tools/freq_resp/).
+// Leave commented for live.
+// #define FREQ_RESP_TEST
 #include "hal/uart_ll.h"
 #include "esp_wifi.h"
 
@@ -110,6 +118,11 @@ uint16_t gLastBPM        = 0;
 // the glass area is a drag-scroll list — see pollListTouch().
 enum Screen { SCR_SONGS = 0, SCR_SAMPLES = 1, SCR_CHORD = 2, SCR_SCOPE = 3, SCR_ORGAN = 4, SCR_COUNT = 5 };
 static Screen gScreen = SCR_SONGS;
+
+// ADD SAMPLE review screen (see recScreenTick) — here so the Arduino IDE's
+// generated function prototypes, which go near the top, can see them.
+struct RecBox { int x, y, w, h; };
+enum RecHit { RH_NONE, RH_INFO, RH_RESAMPLE, RH_KEEP, RH_CANCEL };
 
 // Remote drawbar-organ control (MSG_ORGAN, from the client over MagiLink).  The
 // MagiLink callback runs on the link worker task, so it only sets these; the
@@ -1290,6 +1303,13 @@ void setup() {
     auto cfg = M5.config();
     cfg.serial_baudrate = 115200;
     M5.begin(cfg);
+    // With USB plugged into a computer that isn't reading the port, the
+    // core's USB serial waits up to 2 s (20 x 100 ms) per print before giving
+    // up — that stalled ADD SAMPLE's hold screen ~4 s on a println.  Drop the
+    // output instead when nobody is listening.
+#if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
+    Serial.setTxTimeoutMs(0);
+#endif
     delay(200);
 
     batteryInit();
@@ -1423,6 +1443,9 @@ void setup() {
     // touches the codec has started.
     micHoldLoop();
 #endif
+#ifdef FREQ_RESP_TEST
+    freqRespLoop();   // diagnostic — never returns (see MIC_HOLD_TEST above)
+#endif
 
     crashSetBootStep(BS_NET);
     {
@@ -1439,11 +1462,14 @@ void setup() {
     });
     gTransportEspNow.begin();
 
-    extern void sendBackupToClient();
+    extern void sendBackupToClient(bool withSamples);
     gMagiLink.registerCallback(MSG_START_BACKUP,
-        [](const uint8_t* /*msg*/, size_t /*len*/, void* /*ctx*/) {
-            Serial.println("[BK-SRV] MSG_START_BACKUP received");
-            sendBackupToClient();
+        [](const uint8_t* msg, size_t len, void* /*ctx*/) {
+            bool withSamples = len >= sizeof(MsgStartBackup) &&
+                               ((const MsgStartBackup*)msg)->withSamples != 0;
+            Serial.printf("[BK-SRV] MSG_START_BACKUP received (WAVs %s)\n",
+                          withSamples ? "included" : "left out");
+            sendBackupToClient(withSamples);
         },
         nullptr);
 
@@ -1479,6 +1505,7 @@ void setup() {
     gMagiLink.registerCallback(MSG_AUDITION_RAW_NOTE, controlCb, nullptr);
     gMagiLink.registerCallback(MSG_AUDITION_PROGRAM,  controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SAMPLE_EDIT,       controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_SAMPLE_REC,        controlCb, nullptr);
     gMagiLink.registerCallback(MSG_PIXELPOST_SET_EFFECT,     controlCb, nullptr);
     gMagiLink.registerCallback(MSG_PIXELPOST_SET_SLIDER,     controlCb, nullptr);
     gMagiLink.registerCallback(MSG_PIXELPOST_SET_TOUCHPAD,   controlCb, nullptr);
@@ -1644,6 +1671,313 @@ void setup() {
     crashSetPhase(CP_IDLE);   // main-context breadcrumb: out of boot, nothing in progress
 }
 
+// ── ADD SAMPLE hold screen ───────────────────────────────────────────────────
+// Up while the client's ADD SAMPLE has armed a take (sample_record.cpp):
+//   ARMED      press and hold the glass to record
+//   RECORDING  red, the seconds counting; letting go writes the take
+//   REVIEW     the take plays straight back; tap the top to hear it again,
+//              or play it from the MIDI keys (sampleRecKeysNote).
+//              RESAMPLE (held) records over it, KEEP hands it to the client
+//              (which names and saves it), CANCEL throws it away.
+// A bezel tap cancels too.  It sits over whatever screen was up (that screen
+// is redrawn when it goes) and keeps the idle screensaver off.
+static const uint16_t COL_REC_BG   = lgfx::color565(150, 0, 0);
+static const uint16_t COL_REC_KEEP = lgfx::color565(0, 120, 0);
+static const uint16_t COL_REC_BTN  = lgfx::color565(70, 70, 70);
+static const int REC_MTR_X = 20, REC_MTR_Y = 222, REC_MTR_W = 200, REC_MTR_H = 26;
+
+// REVIEW layout (the glass ends at UI_SCR_H - UI_FOOTER_H = 280).
+// (RecBox / RecHit are declared up by the Screen enum — the IDE's generated
+// prototypes land above this point.)
+static const RecBox REC_INFO     = {   0,  40, 240,  86 };   // tap: play it again
+static const RecBox REC_RESAMPLE = {  10, 130, 220,  70 };
+static const RecBox REC_KEEP     = {  10, 208, 105,  66 };
+static const RecBox REC_CANCEL   = { 125, 208, 105,  66 };
+
+static bool     gRecShown       = false;
+static bool     gRecHolding     = false;   // this press is recording
+static bool     gRecIgnore      = false;   // a finger already down: wait for it to lift
+static RecHit   gRecTapped      = RH_NONE; // REVIEW: the button a tap started on
+static uint8_t  gRecDrawnState  = 0xFF;
+static uint8_t  gRecDrawnErr    = 0xFF;
+static int      gRecDrawnLevel  = -1;
+static uint32_t gRecDrawnTenths = 0xFFFFFFFF;
+static int      gRecDrawnPlay   = -1;
+static int      gRecDrawnPitch  = -1;
+
+static bool recIn(const RecBox& b, int x, int y) {
+    return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h;
+}
+
+static RecHit recHitAt(int x, int y) {
+    if (recIn(REC_RESAMPLE, x, y)) return RH_RESAMPLE;
+    if (recIn(REC_KEEP, x, y))     return RH_KEEP;
+    if (recIn(REC_CANCEL, x, y))   return RH_CANCEL;
+    if (recIn(REC_INFO, x, y))     return RH_INFO;
+    return RH_NONE;
+}
+
+static void recCentred(const char* s, int y, int ts, uint16_t fg, uint16_t bg) {
+    lcd.setTextSize(ts);
+    lcd.setTextColor(fg, bg);
+    lcd.setCursor((240 - (int)strlen(s) * 6 * ts) / 2, y);
+    lcd.print(s);
+}
+
+static void recButton(const RecBox& b, const char* label, int ts, uint16_t bg, const char* sub = nullptr) {
+    lcd.fillRoundRect(b.x, b.y, b.w, b.h, 8, bg);
+    lcd.drawRoundRect(b.x, b.y, b.w, b.h, 8, TFT_WHITE);
+    lcd.setTextSize(ts);
+    lcd.setTextColor(TFT_WHITE, bg);
+    int tw = (int)strlen(label) * 6 * ts, th = 8 * ts;
+    int ty = sub ? b.y + (b.h - th - 14) / 2 : b.y + (b.h - th) / 2;
+    lcd.setCursor(b.x + (b.w - tw) / 2, ty);
+    lcd.print(label);
+    if (sub) {
+        lcd.setTextSize(1);
+        lcd.setCursor(b.x + (b.w - (int)strlen(sub) * 6) / 2, ty + th + 6);
+        lcd.print(sub);
+    }
+}
+
+static uint16_t recBodyBg(uint8_t st) {
+    return st == SAMPLE_REC_RECORDING ? COL_REC_BG : COL_BG;
+}
+
+static void drawRecMeter(uint8_t st, int level, bool clip) {
+    uint16_t bg = recBodyBg(st);
+    lcd.drawRect(REC_MTR_X, REC_MTR_Y, REC_MTR_W, REC_MTR_H, TFT_WHITE);
+    int inner = REC_MTR_W - 4;
+    int w = inner * (level > 100 ? 100 : level) / 100;
+    uint16_t c = (clip || level >= 98) ? TFT_RED
+               : level >= 70           ? TFT_YELLOW
+               :                         TFT_GREEN;
+    if (st == SAMPLE_REC_RECORDING && c == TFT_RED) c = TFT_WHITE;   // red on red
+    lcd.fillRect(REC_MTR_X + 2,     REC_MTR_Y + 2, w,         REC_MTR_H - 4, c);
+    lcd.fillRect(REC_MTR_X + 2 + w, REC_MTR_Y + 2, inner - w, REC_MTR_H - 4, bg);
+}
+
+static void drawRecTime(uint32_t tenths, bool clip) {
+    char b[16];
+    snprintf(b, sizeof(b), "%lu.%lu", (unsigned long)(tenths / 10), (unsigned long)(tenths % 10));
+    lcd.fillRect(0, 110, 240, 40, COL_REC_BG);
+    recCentred(b, 110, 5, TFT_WHITE, COL_REC_BG);
+    lcd.fillRect(0, 160, 240, 20, COL_REC_BG);
+    recCentred(clip ? "TOO LOUD" : "let go to stop", 162, 2,
+               clip ? TFT_YELLOW : TFT_WHITE, COL_REC_BG);
+}
+
+// REVIEW: the line under the length — playing, or how to hear it again.
+static void drawRecPlayLine(bool playing) {
+    lcd.fillRect(0, 72, 240, 18, COL_BG);
+    if (playing) recCentred("playing...", 72, 2, TFT_GREEN, COL_BG);
+    else         recCentred("tap here to hear it", 72, 2, TFT_LIGHTGREY, COL_BG);
+}
+
+// REVIEW: the take's pitch, and that it is now tuned to C.
+static void drawRecPitchLine(uint8_t ps) {
+    static const char* const NAMES[12] =
+        { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+    char b[32];
+    uint16_t fg = TFT_WHITE;
+    if (ps == SAMPLE_REC_PITCH_FOUND) {
+        uint8_t n = sampleRecPitchNote();
+        snprintf(b, sizeof(b), "%s%d %+dc > C", NAMES[n % 12], n / 12 - 1,
+                 (int)sampleRecPitchCents());
+        fg = TFT_CYAN;
+    } else if (ps == SAMPLE_REC_PITCH_UNCLEAR) {
+        snprintf(b, sizeof(b), "no clear pitch");
+        fg = TFT_LIGHTGREY;
+    } else {
+        snprintf(b, sizeof(b), "finding pitch...");
+        fg = TFT_LIGHTGREY;
+    }
+    lcd.fillRect(0, 92, 240, 18, COL_BG);
+    recCentred(b, 92, 2, fg, COL_BG);
+}
+
+static void drawRecHeaderFooter() {
+    lcd.fillRect(0, 0, 240, UI_HEADER_H, COL_HDR);
+    lcd.setTextColor(TFT_WHITE, COL_HDR);
+    lcd.setTextSize(2);
+    lcd.setCursor(8, (UI_HEADER_H - 16) / 2);
+    lcd.print("Add sample");
+    batteryDrawIcon(240 - BATT_ICON_W - 4, (UI_HEADER_H - BATT_ICON_H) / 2, COL_HDR);
+    int y = UI_SCR_H - UI_FOOTER_H;
+    lcd.fillRect(0, y, 240, UI_FOOTER_H, COL_FOOTER);
+    recCentred("tap here to cancel", y + (UI_FOOTER_H - 16) / 2, 2, TFT_WHITE, COL_FOOTER);
+}
+
+static void drawRecScreen(uint8_t st, uint8_t err) {
+    uint16_t bg = recBodyBg(st);
+    drawRecHeaderFooter();
+    lcd.fillRect(0, UI_HEADER_H, 240, UI_SCR_H - UI_HEADER_H - UI_FOOTER_H, bg);
+    gRecDrawnLevel  = -1;
+    gRecDrawnTenths = 0xFFFFFFFF;
+    gRecDrawnPlay   = -1;
+    if (st == SAMPLE_REC_REVIEW) {
+        char b[24];
+        uint32_t tenths = sampleRecFrames() / (AUDIO_CODEC_RATE_HZ / 10);
+        snprintf(b, sizeof(b), "%lu.%lu s", (unsigned long)(tenths / 10), (unsigned long)(tenths % 10));
+        recCentred(b, 46, 3, TFT_WHITE, bg);
+        if (err == SAMPLE_REC_ERR_SHORT)
+            recCentred("too short - kept this", 114, 1, TFT_YELLOW, bg);
+        else if (sampleRecClipped())
+            recCentred("TOO LOUD - it clipped", 114, 1, TFT_YELLOW, bg);
+        else
+            recCentred("your MIDI keys play it", 114, 1, TFT_LIGHTGREY, bg);
+        gRecDrawnPitch = -1;
+        recButton(REC_RESAMPLE, "RESAMPLE", 3, COL_REC_BG, "hold to record again");
+        recButton(REC_KEEP,     "KEEP",     2, COL_REC_KEEP);
+        recButton(REC_CANCEL,   "CANCEL",   2, COL_REC_BTN);
+        return;                                    // the play line is the tick's
+    }
+    if (st == SAMPLE_REC_RECORDING) {
+        recCentred("RECORDING", 66, 3, TFT_WHITE, bg);   // the time is the tick's
+    } else {
+        recCentred("PRESS",     62, 3, TFT_WHITE, bg);
+        recCentred("AND HOLD",  96, 3, TFT_WHITE, bg);
+        recCentred("TO RECORD", 130, 3, TFT_WHITE, bg);
+        if (err == SAMPLE_REC_ERR_SHORT)
+            recCentred("Too short - hold it", 176, 2, TFT_YELLOW, bg);
+        else
+            recCentred("up to 30 s", 176, 2, TFT_LIGHTGREY, bg);
+    }
+    recCentred("mic level", REC_MTR_Y - 18, 1, TFT_LIGHTGREY, bg);
+    drawRecMeter(st, 0, false);
+}
+
+static void drawRecSaving() {
+    lcd.fillRect(0, UI_HEADER_H, 240, UI_SCR_H - UI_HEADER_H - UI_FOOTER_H, COL_BG);
+    recCentred("Saving...", 130, 3, TFT_WHITE, COL_BG);
+}
+
+static bool recScreenWanted(uint8_t st) {
+    return st == SAMPLE_REC_ARMED || st == SAMPLE_REC_RECORDING || st == SAMPLE_REC_REVIEW;
+}
+
+// Loop task, each pass.  True while the screen owns this pass (the caller
+// returns): it is up, or has just gone and put the old screen back.
+static bool recScreenTick(bool anyTouch) {
+    uint8_t st = sampleRecState();
+    if (!recScreenWanted(st)) {
+        if (!gRecShown) return false;
+        gRecShown   = false;
+        gRecHolding = false;
+        gRecTapped  = RH_NONE;
+        gTempoExitLatched = anyTouch;    // a finger still down taps nothing underneath
+        gLastInputMs = millis();
+        gBezel.reset();
+        _touchDown = false;
+        _dragMoved = false;
+        gLastBPM   = 0;
+        drawScreen();
+        return true;
+    }
+    {   // A stalled loop delays the take's start: say so if it happens.
+        static uint32_t lastPass = 0;
+        uint32_t now = millis();
+        if (gRecShown && now - lastPass > 150)
+            Serial.printf("[REC] loop stalled %lu ms on the hold screen\n",
+                          (unsigned long)(now - lastPass));
+        lastPass = now;
+    }
+    gLastInputMs = millis();             // no screensaver over it
+    if (!gRecShown) {
+        gRecShown      = true;
+        gTempoMode     = false;
+        gRecHolding    = false;
+        gRecTapped     = RH_NONE;
+        gRecIgnore     = anyTouch;
+        gRecDrawnState = 0xFF;
+        gBezel.reset();
+    }
+
+    auto& t = M5.Touch.getDetail();
+    bool pressed = t.isPressed();
+    if (gRecHolding) {
+        // Wherever the finger goes, the take lasts until it lifts.
+        gBezel.reset();
+        if (!pressed) {
+            gRecHolding = false;
+            if (sampleRecState() == SAMPLE_REC_RECORDING) {
+                drawRecSaving();
+                sampleRecRelease();      // writes it, then REVIEW plays it
+            }
+        }
+    } else if (gRecIgnore) {
+        gBezel.reset();
+        if (!pressed) gRecIgnore = false;
+    } else if (gRecTapped != RH_NONE) {
+        // A REVIEW button: acts when the finger lifts.
+        gBezel.reset();
+        if (!pressed) {
+            RecHit h = gRecTapped;
+            gRecTapped = RH_NONE;
+            if (sampleRecState() == SAMPLE_REC_REVIEW) {
+                if      (h == RH_KEEP)   sampleRecKeep();
+                else if (h == RH_CANCEL) sampleRecCancel();
+                else if (h == RH_INFO)   sampleRecReplay();
+            }
+            return true;                 // the next pass draws what follows
+        }
+    } else {
+        if (gBezel.poll()) { sampleRecCancel(); return true; }   // next pass tidies up
+        if (pressed && !gBezel.isDown() && t.y < UI_SCR_H - UI_FOOTER_H) {
+            if (st == SAMPLE_REC_ARMED) {
+                gRecHolding = true;
+                sampleRecPress();
+            } else if (st == SAMPLE_REC_REVIEW) {
+                RecHit h = recHitAt(t.x, t.y);
+                if (h == RH_RESAMPLE) {
+                    gRecHolding = true;
+                    sampleRecPress();
+                } else if (h != RH_NONE) {
+                    gRecTapped = h;
+                } else {
+                    gRecIgnore = true;   // a gap: nothing until it lifts
+                }
+            }
+        }
+    }
+
+    st = sampleRecState();
+    if (!recScreenWanted(st)) return true;
+    uint8_t err = sampleRecLastErr();
+    if (st != gRecDrawnState || err != gRecDrawnErr) {
+        gRecDrawnState = st;
+        gRecDrawnErr   = err;
+        drawRecScreen(st, err);
+    }
+    if (st == SAMPLE_REC_REVIEW) {
+        int playing = samplePlayerIsPlaying() ? 1 : 0;
+        if (playing != gRecDrawnPlay) {
+            gRecDrawnPlay = playing;
+            drawRecPlayLine(playing);
+        }
+        int ps = sampleRecPitchState();
+        if (ps != gRecDrawnPitch) {
+            gRecDrawnPitch = ps;
+            drawRecPitchLine((uint8_t)ps);
+        }
+        return true;
+    }
+    bool clip  = sampleRecClipped();
+    int  level = sampleRecLevel();
+    if (level != gRecDrawnLevel) {
+        gRecDrawnLevel = level;
+        drawRecMeter(st, level, clip);
+    }
+    if (st == SAMPLE_REC_RECORDING) {
+        uint32_t tenths = sampleRecFrames() / (AUDIO_CODEC_RATE_HZ / 10);
+        if (tenths != gRecDrawnTenths) {
+            gRecDrawnTenths = tenths;
+            drawRecTime(tenths, clip);
+        }
+    }
+    return true;
+}
+
 void loop() {
     M5.update();   // drives BtnA/B/C touch-zone state machines
     crashMarkAlive();   // heartbeat → approximate uptime-before-crash
@@ -1669,7 +2003,7 @@ void loop() {
             gMagiLink.send(&msg, sizeof(msg));
             gMagiLink.releaseMutex();
         }
-        if (gScreen == SCR_SONGS && cursor >= scrollOffset &&
+        if (gScreen == SCR_SONGS && !gRecShown && !gTempoMode && cursor >= scrollOffset &&
             cursor < scrollOffset + UI_VISIBLE_ROWS) {
             drawRow(cursor - scrollOffset);
         }
@@ -1745,8 +2079,13 @@ void loop() {
     // SONGS footer, so only repaint it when that is what's on screen).
     if (sLoadFailShown && millis() - sLoadFailAtMs >= LOAD_FAIL_BANNER_MS) {
         sLoadFailShown = false;
-        if (gScreen == SCR_SONGS && !gTempoMode && !pairingIsActive()) drawFooter();
+        if (gScreen == SCR_SONGS && !gTempoMode && !gRecShown && !pairingIsActive()) drawFooter();
     }
+
+    // ADD SAMPLE's hold screen, while the client has a take armed.  Before the
+    // full redraw and the screensaver: it sits over both (a redraw asked for
+    // meanwhile waits until it goes).
+    if (!pairingIsActive() && recScreenTick(anyTouch)) return;
 
     if (needsFullRedraw) {
         needsFullRedraw = false;

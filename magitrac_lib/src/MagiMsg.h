@@ -226,6 +226,11 @@ enum MagiMsgType : uint8_t {
     MSG_SAMPLE_EDIT  = 0xA1,   // client → server: GET / SET / STOP
     MSG_SAMPLE_INFO  = 0xA2,   // server → client: meta + waveform overview
 
+    // ADD SAMPLE — record a new sample through the server's mic.
+    MSG_SAMPLE_REC        = 0xA3,   // client → server: START / STOP / PLAY / SAVE …
+    MSG_SAMPLE_REC_STATUS = 0xA4,   // server → client: state, level, length, result
+    MSG_SAMPLE_TUNE       = 0xA5,   // server → client: AUTO TUNE's answer
+
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
 
@@ -702,9 +707,10 @@ struct MsgMidiNoteIn {
 };
 
 // ── Sample editor (non-destructive trim/loop) ─────────────────────────────────
-// The WAV files never change: per-sample metadata (start/end frame, loop flag
-// and a TUNE offset) lives in /samples/trim.txt on the server and is applied
-// at playback (and at PSRAM preload — the cache holds just the trimmed region).
+// The WAV files never change: per-sample metadata (start/end frame, loop flag,
+// a TUNE offset and the velocity switch) lives in /samples/trim.txt on the
+// server and is applied at playback (and at PSRAM preload — the cache holds
+// just the trimmed region).
 enum SampleEditOp : uint8_t {
     SAMPLE_EDIT_GET  = 0,   // reply with MsgSampleInfo; startFrame/endFrame =
                             // the VIEW window to render peaks for (0,0 = all),
@@ -731,9 +737,31 @@ enum SampleEditOp : uint8_t {
                             // open — load every sample that fits into memory
                             // so the squares are polyphonic.  A lease like
                             // KEYS, renewed the same way; 0 = closed.
+    SAMPLE_EDIT_AUTOTUNE = 7, // find sampleId's pitch and reply MsgSampleTune
+                            // with the TUNE that puts it on middle C (as ADD
+                            // SAMPLE does).  Analyses the cached (trimmed)
+                            // sample, so the editor's sample must be in memory.
 };
 #define SAMPLE_KEYS_RENEW_MS  2000
 #define SAMPLE_KEYS_LEASE_MS  6000
+
+// AUTO TUNE's answer (SAMPLE_EDIT_AUTOTUNE).  The client applies tuneCents
+// itself (and stores it with SET) — the server only measures.
+enum SampleTuneResult : uint8_t {
+    SAMPLE_TUNE_FOUND     = 0,   // tuneCents puts it on middle C
+    SAMPLE_TUNE_UNCLEAR   = 1,   // no clear pitch (noise, a hit, a chord)
+    SAMPLE_TUNE_NOT_READY = 2,   // not in memory (too big, or still loading) / busy
+};
+struct MsgSampleTune {
+    uint8_t  id     = MSG_SAMPLE_TUNE;
+    uint16_t length = sizeof(MsgSampleTune);
+    uint8_t  sampleId;
+    uint8_t  result;        // SampleTuneResult
+    uint8_t  note;          // FOUND: nearest MIDI note to its pitch
+    int8_t   cents;         //        and how far off it, ± cents
+    int16_t  tuneCents;     //        the TUNE for middle C at note 60
+    uint32_t pitchCHz;      //        its pitch, centi-Hz
+};
 
 // Spectrogram (Fairlight Page-D waterfall — display only): SLICES time steps
 // × BINS log-spaced frequency bins (60 Hz .. 8 kHz), one magnitude byte each.
@@ -752,6 +780,10 @@ struct MsgSampleEdit {
     uint8_t  loop;          // SET only; 0/1
     int16_t  tuneCents;     // SET only; the sample's own TUNE, ± cents
     uint8_t  note;          // PLAY only; MIDI note, 60 = native pitch
+    uint8_t  velOff;        // SET only; 1 = a key plays it at its own level
+                            // however hard it is struck (0 = follows velocity)
+    uint8_t  keepLen;       // SET only; 1 = KEEP LENGTH: other notes change its
+                            // pitch, not its length (cached samples — PSOLA)
 };
 
 // Waveform overview: min/max peak pairs, int8 (-127..127), one pair per
@@ -772,6 +804,8 @@ struct MsgSampleInfo {
     uint32_t viewStart;     // window the peaks cover (echoes the GET request)
     uint32_t viewEnd;
     int16_t  tuneCents;     // stored meta: the sample's own TUNE, ± cents
+    uint8_t  velOff;        // stored meta: 1 = velocity sensitivity off
+    uint8_t  keepLen;       // stored meta: 1 = KEEP LENGTH on
     int8_t   peaks[SAMPLE_OVERVIEW_N * 2];   // min,max per column of the window
 };
 
@@ -805,13 +839,92 @@ struct MsgSampleListResp {
     MsgSampleListEntry entries[SAMPLES_PER_PKT];
 };
 
+// ── ADD SAMPLE (record through the server's mic) ─────────────────────────────
+// The recording itself is done on the SERVER's screen.  ARM puts up its
+// "PRESS AND HOLD TO RECORD" screen (state ARMED); holding the glass records
+// (RECORDING, up to SAMPLE_REC_MAX_SECONDS), letting go writes the take to a
+// scratch WAV on the card and plays it back (REVIEW) with KEEP / CANCEL /
+// RESAMPLE on the server's screen; the MIDI keys play it too, pitched.  While
+// it plays the first time the server finds its pitch (pitch_detect.cpp) and
+// tunes it so note 60 plays a middle C; the status carries the result, and
+// SAVE stores that TUNE with the sample.  RESAMPLE held records again; CANCEL throws
+// it away (IDLE, ERR_CANCEL); KEEP hands it to the client (TAKE) and the
+// server goes back to its own screen.
+// The client then has it: PLAY / PLAY_STOP audition it, ARM again redoes it,
+// SAVE moves it into /samples under `name` (".wav" added) and answers SAVED
+// with its new id; DISCARD throws it away (and takes the server out of the
+// hold screen).  ARM is refused (err, state IDLE) while a song plays or the
+// organ holds the audio, or when the list is full.  A tap on the server's
+// bezel while ARMED cancels (IDLE, ERR_CANCEL).  Statuses come on every
+// change, and about 4 times a second while RECORDING with the level.
+#define SAMPLE_REC_MAX_SECONDS 30
+enum SampleRecOp : uint8_t {
+    SAMPLE_REC_ARM       = 0,
+    SAMPLE_REC_PLAY      = 1,
+    SAMPLE_REC_PLAY_STOP = 2,
+    SAMPLE_REC_SAVE      = 3,
+    SAMPLE_REC_DISCARD   = 4,
+};
+enum SampleRecState : uint8_t {
+    SAMPLE_REC_IDLE      = 0,   // not armed, no take (refused, cancelled, discarded)
+    SAMPLE_REC_ARMED     = 1,   // the server shows PRESS AND HOLD
+    SAMPLE_REC_RECORDING = 2,   // the server's screen is being held
+    SAMPLE_REC_REVIEW    = 3,   // the server plays the take: KEEP / CANCEL / RESAMPLE
+    SAMPLE_REC_TAKE      = 4,   // kept: waiting for the client to name / save it
+    SAMPLE_REC_SAVED     = 5,   // sampleId = the new sample (then back to IDLE)
+};
+enum SampleRecErr : uint8_t {
+    SAMPLE_REC_OK         = 0,
+    SAMPLE_REC_ERR_SONG   = 1,   // a song is playing
+    SAMPLE_REC_ERR_ORGAN  = 2,   // the organ has the audio
+    SAMPLE_REC_ERR_FULL   = 3,   // the sample list is full
+    SAMPLE_REC_ERR_MEMORY = 4,   // no room for the recording
+    SAMPLE_REC_ERR_SHORT  = 5,   // held under 0.2 s — back to ARMED / REVIEW, nothing new kept
+    SAMPLE_REC_ERR_SD     = 6,   // the card write failed
+    SAMPLE_REC_ERR_NAME   = 7,   // a sample with that name exists (or the name is empty)
+    SAMPLE_REC_ERR_CANCEL = 8,   // cancelled on the server (CANCEL or the bezel)
+};
+enum SampleRecPitch : uint8_t {
+    SAMPLE_REC_PITCH_NONE      = 0,   // no take yet
+    SAMPLE_REC_PITCH_ANALYSING = 1,
+    SAMPLE_REC_PITCH_FOUND     = 2,
+    SAMPLE_REC_PITCH_UNCLEAR   = 3,   // noisy / unpitched / silent: left as recorded
+};
+struct MsgSampleRec {
+    uint8_t  id     = MSG_SAMPLE_REC;
+    uint16_t length = sizeof(MsgSampleRec);
+    uint8_t  op;                        // SampleRecOp
+    char     name[SAMPLE_NAME_LEN];     // SAVE only; ".wav" optional
+};
+struct MsgSampleRecStatus {
+    uint8_t  id     = MSG_SAMPLE_REC_STATUS;
+    uint16_t length = sizeof(MsgSampleRecStatus);
+    uint8_t  state;      // SampleRecState
+    uint8_t  err;        // SampleRecErr — about the op just asked for
+    uint8_t  peak;       // 0..100 % of full scale: since the last status while
+                         // recording; the whole take's after
+    uint8_t  clipped;    // 1 = the take touched full scale
+    uint8_t  sampleId;   // SAVED: the new sample's id
+    uint32_t frames;     // length so far / of the take
+    uint32_t rate;       // Hz
+    // The take's pitch (REVIEW / TAKE): the server analyses it while it plays
+    // back, and tunes it so MIDI note 60 plays a middle C.
+    uint8_t  pitchState; // SampleRecPitch
+    uint8_t  pitchNote;  // FOUND: the nearest MIDI note to it...
+    int8_t   pitchCents; //   ...and how far off that it is
+    int16_t  tuneCents;  // FOUND: the sample's TUNE (saved with it), else 0
+};
+
 // ── New struct-driven backup messages (v2 transport) ──────────────────────────
 // Every message starts with {id, length} so the receiver always knows how
 // many bytes follow, even for types it doesn't recognise.
 
+// The sample list and per-sample settings (samples.txt, trim.txt) always go
+// in; the WAVs only with withSamples — they can be 100 MB+ and take minutes.
 struct MsgStartBackup {
     uint8_t  id     = MSG_START_BACKUP;
     uint16_t length = sizeof(MsgStartBackup);
+    uint8_t  withSamples = 0;
 };
 
 struct MsgBackupHeader {

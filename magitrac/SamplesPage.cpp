@@ -97,6 +97,10 @@ void SamplesPage::open(bool backLabel) {
 void SamplesPage::reopen() {
     _keysId = 0;           // the editor had the keys, and gave them up on BACK
     resetTouch();
+    if (_refetch) {        // ADD may have put a new sample in /samples
+        _refetch = false;
+        gServerPairing.requestSampleList();
+    }
     sendLeases();
     _d.clear();
     draw();
@@ -116,6 +120,8 @@ int SamplesPage::pageCount() const {
 void SamplesPage::drawHeader() {
     _d.fillRect(0, 0, 960, SMP_HDR_H, COL_BLACK);
     uiButton(_d, SMP_STOP_X, SMP_BTN_Y, SMP_STOP_W, SMP_BTN_H, "STOP",
+             COL_WHITE, COL_BLACK, 3);
+    uiButton(_d, SMP_ADD_X, SMP_BTN_Y, SMP_ADD_W, SMP_BTN_H, "ADD",
              COL_WHITE, COL_BLACK, 3);
 
     int pages = pageCount();
@@ -273,6 +279,16 @@ SamplesPage::Result SamplesPage::poll() {
                 _homeArmed = true;       // fires on release (see below)
             } else if (sx >= SMP_STOP_X && sx < SMP_STOP_X + SMP_STOP_W) {
                 gServerPairing.sendSampleEdit(SAMPLE_EDIT_STOP, 0);
+            } else if (sx >= SMP_ADD_X && sx < SMP_ADD_X + SMP_ADD_W) {
+                // Off to record a new sample.  Silence the page and give up
+                // the leases: the server frees the squares' samples, which
+                // leaves room for the take (30 s of it is 1.9 MB).
+                gServerPairing.sendSampleEdit(SAMPLE_EDIT_STOP, 0);
+                if (_keysId) gServerPairing.sendSampleEdit(SAMPLE_EDIT_KEYS, 0);
+                gServerPairing.sendSampleEdit(SAMPLE_EDIT_PADS, 0);
+                _keysId  = 0;
+                _refetch = true;
+                return Result::ADD;
             } else if (pages > 1 && sx >= SMP_PREV_X && sx < SMP_PREV_X + SMP_PREV_W) {
                 if (_page > 0) { _page--; draw(); _d.paintLater(); }
             } else if (pages > 1 && sx >= SMP_NEXT_X && sx < SMP_NEXT_X + SMP_NEXT_W) {

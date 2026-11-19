@@ -6,25 +6,24 @@
 // SD, no samples.  The registry (name + param sliders) is mirrored by the
 // client's OrganPage list; keep the two in the same order.
 //
-// Voice model shared by all generators: two wavetable oscillators (main +
+// The order is also what songs store: OrganPatch.voice = 4 + the index, and a
+// number past the end plays the last sound.  REED took over index 0 when TWO
+// TRIBES and THX were removed (16 Nov 2026), so CHOIR kept its number and the
+// old VOCODER number (7) still lands on VOCODER.  Append new sounds at the end.
+//
+// CHOIR's voice model (REED and VOCODER have their own, in drawbar_organ.cpp):
+// two wavetable oscillators (main +
 // chorus twin) reading a per-voice "morphed" table that crossfades from an
 // ATTACK frame to a SUSTAIN frame over the first ~80 ms of the note, plus an
 // optional filtered-noise pick transient.  The frames are built additively at
 // boot from harmonic tables measured off a reference recording, so a new
 // sound is usually just two rows of numbers + a registry entry.
 
-#define PROC_SOUND_COUNT 4
+#define PROC_SOUND_COUNT 3
 #define PROC_MAX_PARAMS  5       // PROC mode has no drawbars → room for 5 sliders
 #define PROC_WT          1024    // wavetable length (10-bit phase index)
 
-// THX DEEP NOTE is a special PROC sound: instead of the shared two-oscillator
-// wavetable voice, each held note is a whole cluster of detuned sawtooths that
-// start as a random low "mumble" and glide/converge to a stacked-octave chord
-// rooted on the note (see thx code in proc_sounds.cpp + drawbar_organ.cpp).
-#define PROC_IDX_THX 2
-#define THX_OSC      16          // sub-oscillators per THX voice (the cluster)
-
-// VOCODER is the other special PROC sound: each held note is one oscillator,
+// VOCODER is a special PROC sound: each held note is one oscillator,
 // and the summed notes are the CARRIER of a channel vocoder driven by the
 // microphone — the chord speaks what is said into the mic.  Sliders:
 //   [0] WAVE   0 = sawtooth; 1..8 = pulse, from 50% wide (square) at 1 down
@@ -36,7 +35,27 @@
 //   [4] SMOOTH how slowly the bands let go: crisp and robotic … smeared and choral
 // None of the shared slider meanings below apply to it.  The oscillator and
 // the vocoder live in drawbar_organ.cpp.
-#define PROC_IDX_VOC 3
+#define PROC_IDX_VOC 2
+
+// CHOIR — the Orchestron disc choir, the one wavetable sound (proc_sounds.cpp).
+#define PROC_IDX_CHOIR 1
+
+// REED — a reed organ (harmonium / accordion), the other special PROC sound.
+// A free reed chops the air into puffs, so each rank is a pulse wave (the
+// VOCODER's polyBLEP oscillator, so high notes don't alias), several ranks an
+// octave or a fifth apart per note.  Sliders:
+//   [0] WAVE    pulse width: 0 = near square (hollow) … 8 = thin (nasal)
+//   [1] CELESTE a second 8' rank tuned sharp: 0 = off, 1..8 = 3..24 cents
+//   [2] BRIGHT  the shared PROC low-pass (as for every sound but VOCODER)
+//   [3] STOPS   which ranks sound — see REED_STOPS in drawbar_organ.cpp
+//   [4] CHAMBER the reed chamber's nasal resonance (the shared formant slot,
+//               one peak at 1.4 kHz, +3 dB a step).  Turned right up it is an
+//               oboe: WAVE 8, CELESTE 0, BRIGHT 1, STOPS 0, CHAMBER 8, and the
+//               organ's V1 scanner vibrato (~±14 cents at 6.9 Hz — the
+//               recording's was ±15-20 cents at 5-6 Hz).
+// A fixed soft attack (atkMs) and a short pitch scoop from slightly flat give
+// the reed "speaking"; no key click.  Not velocity-sensitive (no organ sound is).
+#define PROC_IDX_REED 0
 
 // Slider index semantics are partly fixed by the render loop: [0] scales the
 // generator's noise (live), [2] is the global BRIGHT low-pass (live), [4] is
@@ -55,6 +74,8 @@ struct ProcSoundInfo {
     uint8_t     envParam;  // slider index driving the amp-attack time (swell),
                            // 0xFF = organ default (~3 ms).  ms = 5 + v²·12.
     uint16_t    relMs;     // amp release ms, 0 = organ default (~12 ms)
+    uint16_t    atkMs;     // fixed amp attack ms when envParam is 0xFF;
+                           // 0 = organ default (~3 ms)
 };
 extern const ProcSoundInfo PROC_SOUNDS[PROC_SOUND_COUNT];
 
@@ -72,59 +93,6 @@ struct ProcVoiceState {
     uint32_t lfoInc1, lfoInc2;  // per-BLOCK phase increments, randomised per note
     int32_t  lastBreath;        // BREATH value baked into scratch (CHOIR; -1 = none)
 };
-
-// ── THX DEEP NOTE cluster voice ───────────────────────────────────────────────
-// A bank of THX_OSC sawtooth oscillators per note.  Each starts at a random
-// absolute frequency (centred ~280 Hz, width set by SPREAD — the iconic
-// mumble) and glides to a target on a stacked-octave chord built from the
-// played note.  All oscillators share one eased glide curve (rateQ8 is set to
-// 256 for every osc), so they arrive together.  A fading random detune wobble
-// gives the "living" cluster.
-// Stored by overlaying the (otherwise unused-in-THX) per-voice s_voiceScratch
-// buffer, so it costs no extra RAM.  Sliders: [0]SWEEP [1]SPREAD [2]BRIGHT
-// (the shared PROC low-pass) [3]STACK [4]DETUNE.
-struct ThxVoice {
-    uint32_t ph[THX_OSC];         // Q32 phase per oscillator
-    uint32_t incStart[THX_OSC];   // Q32 increment at note-on (random mumble)
-    uint32_t incTarget[THX_OSC];  // Q32 increment at the settled chord
-    uint32_t incCur[THX_OSC];     // live increment (glide + wobble), read per sample
-    int32_t  wob[THX_OSC];        // smoothed per-osc detune random-walk (Q16 cents-ish)
-    uint16_t rateQ8[THX_OSC];     // per-osc glide speed (256 = nominal; thxNoteOn sets all to 256)
-    uint16_t ampLQ8[THX_OSC];     // per-osc LEFT gain  (constant-power pan, recomputed per block)
-    uint16_t ampRQ8[THX_OSC];     // per-osc RIGHT gain
-    // Per-osc stereo WANDER: the pan position drifts (like the freq wobble) and
-    // L/R are read at a wandering inter-channel phase offset → each oscillator
-    // swims + breathes in width independently.  Gains recomputed per block.
-    uint16_t ampBaseQ8[THX_OSC];  // base amplitude weight (pan gains derived from it)
-    uint8_t  wanderWQ8[THX_OSC];  // pan-wander width by octave (bass narrow, highs wide)
-    int32_t  panWob[THX_OSC];     // smoothed random-walk stereo POSITION (±32768)
-    int32_t  phOffWob[THX_OSC];   // smoothed random-walk driving the L/R phase offset
-    uint32_t phOff[THX_OSC];      // current inter-channel phase offset (Q32) — the "wide"
-    uint32_t glidePos;            // Q16 master convergence 0..65536
-    uint32_t glideInc;            // Q16 per-block advance (from SWEEP)
-    uint32_t rng;
-};
-
-extern int16_t gThxSaw[PROC_WT];   // band-limited sawtooth table (built at init)
-
-// Start a THX cluster for a note (rootHz = the played pitch = chord root).
-void thxNoteOn(ThxVoice& tv, float rootHz, const volatile int* param);
-// Once per block per voice: advance the convergence glide + wobble increments.
-void thxBlockPrep(ThxVoice& tv);
-
-// One STEREO THX output sample (the oscillator bank panned across L/R), int16-ish
-// scaled — the organ envelope/master gain are applied after.
-static inline void thxSampleStereo(ThxVoice& tv, int32_t& outL, int32_t& outR) {
-    int32_t l = 0, r = 0;
-    for (int j = 0; j < THX_OSC; j++) {
-        tv.ph[j] += tv.incCur[j];
-        int32_t sL = gThxSaw[tv.ph[j] >> 22];                    // LEFT read
-        int32_t sR = gThxSaw[(tv.ph[j] + tv.phOff[j]) >> 22];    // RIGHT — wandering offset
-        l += (sL * (int32_t)tv.ampLQ8[j]) >> 8;
-        r += (sR * (int32_t)tv.ampRQ8[j]) >> 8;
-    }
-    outL = l; outR = r;
-}
 
 // Build the additive frames.  Called from organInit().
 void procSoundsInit();
@@ -154,8 +122,8 @@ extern int16_t* gProcTabS[PROC_SOUND_COUNT];   // SUSTAIN frame
 
 // Per-sound formant stack — up to 3 global peaking biquads on the PROC output
 // (pitch-INDEPENDENT, like a vocal tract; a wavetable bump would move with the
-// note).  TWO TRIBES: one stage at 900 Hz ("throat"); CHOIR: 590/1050/2800 Hz
-// (the "ahh" vowel + singer's formant).  Slider [4] 0..8 scales the stage
+// note).  CHOIR: 590/1050/2800 Hz (the "ahh" vowel + singer's formant); REED:
+// one stage at 1.4 kHz (the chamber).  Slider [4] 0..8 scales the stage
 // gains via a coefficient table built at init.  Caller must clamp after this —
 // the boost can exceed int16.
 #define PROC_FORMANT_STAGES 3

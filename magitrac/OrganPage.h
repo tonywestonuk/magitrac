@@ -41,9 +41,15 @@ static const int OR_TYPE_PROC = 4;    // the procedural-sounds type
 
 // PROC type — the sound list replaces presets + drawbars.  Count and order
 // must mirror PROC_SOUNDS in the server's proc_sounds.h.
-static const int OR_PROC_N     = 4;
-static const int OR_PROC_VOC   = 3;    // the VOCODER sound (server: PROC_IDX_VOC)
-static const int OR_PROCBTN_W  = 420;
+static const int OR_PROC_N     = 3;
+static const int OR_PROC_REED  = 0;    // the REED sound (server: PROC_IDX_REED)
+static const int OR_PROC_VOC   = 2;    // the VOCODER sound (server: PROC_IDX_VOC)
+// The sound buttons are a grid, two to a row, filled left to right then down
+// (OR_PRESET_N rows → room for 10).  Together they span the old single
+// column's 420 px, so the list still ends at 435.
+static const int OR_PROC_COLS  = 2;
+static const int OR_PROC_GAP   = 10;
+static const int OR_PROCBTN_W  = (420 - OR_PROC_GAP) / OR_PROC_COLS;   // 205
 
 // Preset buttons run down the left edge; the drawbar panel sits to their right.
 static const int OR_PRESET_N   = 5;
@@ -76,7 +82,7 @@ static const int OR_KCOL_GAP     = 5;
 // also shown big in a box to the LEFT of the whole slider column.  Transient:
 // wiped on release, and whatever it covered is redrawn.
 // Width is bounded by PROC mode: its slider column starts at 720 and the sound
-// list ends at OR_PRESET_X + OR_PROCBTN_W (435), so 270 is the widest that
+// list ends at OR_PRESET_X + 420 (435), so 270 is the widest that
 // still clears the buttons.
 static const int OR_TIP_W = 270;
 static const int OR_TIP_H = 62;

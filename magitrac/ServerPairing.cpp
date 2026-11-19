@@ -11,6 +11,9 @@
 #include <esp_wifi.h>
 #include <string.h>
 
+// Guards _recStatus between the link worker (writer) and the UI task.
+static portMUX_TYPE sRecStatusMux = portMUX_INITIALIZER_UNLOCKED;
+
 #define CLI_NVS_NS "magitrac_cli"
 
 // PROBE broadcast cadence while in PAIRING_REQUEST.  Both sides are on
@@ -151,6 +154,30 @@ void ServerPairing::begin() {
                        mi->peaks, SAMPLE_SPEC_PAGE_BYTES);
                 sp->_specMask |= (uint8_t)(1u << (mi->kind - 1));
             }
+        }, this);
+
+    // MagiLink: ADD SAMPLE statuses (level while recording, the take, the
+    // result of a save).  The page takes the newest; any in between are
+    // superseded.
+    gMagiLink.registerCallback(MSG_SAMPLE_REC_STATUS,
+        [](const uint8_t* msg, size_t len, void* ctx) {
+            ServerPairing* sp = static_cast<ServerPairing*>(ctx);
+            if (len < sizeof(MsgSampleRecStatus)) return;
+            portENTER_CRITICAL(&sRecStatusMux);
+            memcpy(&sp->_recStatus, msg, sizeof(MsgSampleRecStatus));
+            sp->_recStatusPending = true;
+            portEXIT_CRITICAL(&sRecStatusMux);
+        }, this);
+
+    // MagiLink: AUTO TUNE's answer (sample editor's TUNE dialog).
+    gMagiLink.registerCallback(MSG_SAMPLE_TUNE,
+        [](const uint8_t* msg, size_t len, void* ctx) {
+            ServerPairing* sp = static_cast<ServerPairing*>(ctx);
+            if (len < sizeof(MsgSampleTune)) return;
+            portENTER_CRITICAL(&sRecStatusMux);
+            memcpy(&sp->_sampleTune, msg, sizeof(MsgSampleTune));
+            sp->_sampleTunePending = true;
+            portEXIT_CRITICAL(&sRecStatusMux);
         }, this);
 
     // MagiLink: generic file list + load.  Load is a 3-part stream (HEADER,
@@ -555,7 +582,7 @@ bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t v
 bool ServerPairing::sendSampleEdit(uint8_t op, uint8_t sampleId,
                                    uint32_t startFrame, uint32_t endFrame,
                                    uint8_t loop, int16_t tuneCents,
-                                   uint8_t note) {
+                                   uint8_t note, uint8_t velOff, uint8_t keepLen) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgSampleEdit msg;
     msg.op         = op;
@@ -565,7 +592,42 @@ bool ServerPairing::sendSampleEdit(uint8_t op, uint8_t sampleId,
     msg.loop       = loop;
     msg.tuneCents  = tuneCents;
     msg.note       = note;
+    msg.velOff     = velOff;
+    msg.keepLen    = keepLen;
     return _sendLocked(&msg, sizeof(msg));
+}
+
+bool ServerPairing::sendSampleRec(uint8_t op, const char* name) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgSampleRec msg;
+    msg.op = op;
+    memset(msg.name, 0, sizeof(msg.name));
+    if (name) strncpy(msg.name, name, sizeof(msg.name) - 1);
+    return _sendLocked(&msg, sizeof(msg));
+}
+
+bool ServerPairing::takeSampleTune(MsgSampleTune& out) {
+    bool got = false;
+    portENTER_CRITICAL(&sRecStatusMux);
+    if (_sampleTunePending) {
+        out = _sampleTune;
+        _sampleTunePending = false;
+        got = true;
+    }
+    portEXIT_CRITICAL(&sRecStatusMux);
+    return got;
+}
+
+bool ServerPairing::takeSampleRecStatus(MsgSampleRecStatus& out) {
+    bool got = false;
+    portENTER_CRITICAL(&sRecStatusMux);
+    if (_recStatusPending) {
+        out = _recStatus;
+        _recStatusPending = false;
+        got = true;
+    }
+    portEXIT_CRITICAL(&sRecStatusMux);
+    return got;
 }
 
 bool ServerPairing::sendAuditionProgram(uint8_t channel, uint8_t program) {
@@ -691,7 +753,7 @@ void ServerPairing::resetInstruments() {
 // ── Backup / Restore ─────────────────────────────────────────────────────────
 
 bool ServerPairing::sendRestoreFile(const char* name, bool isInstruments,
-                                     const uint8_t* data, uint32_t dataLen) {
+                                     fs::File& f, uint32_t size) {
     if (_pairState != PairClientState::SUCCESS) return false;
     if (!gMagiLink.isConnected()) return false;
 
@@ -699,27 +761,31 @@ bool ServerPairing::sendRestoreFile(const char* name, bool isInstruments,
     memset(hdr.name, 0, sizeof(hdr.name));
     if (name) strncpy(hdr.name, name, sizeof(hdr.name) - 1);
     hdr.isInstruments = isInstruments ? 1 : 0;
-    hdr.total_size    = dataLen;
+    hdr.total_size    = size;
+
+    MsgRestoreBody body;
 
     gMagiLink.acquireMutex();
     bool ok = gMagiLink.send(&hdr, sizeof(hdr));
-
-    MsgRestoreBody body;
-    const uint8_t* p = data;
-    uint32_t remaining = dataLen;
+    bool readOk = true;
+    uint32_t remaining = size;
     while (ok && remaining > 0) {
-        uint16_t chunk = remaining > 1024 ? 1024 : (uint16_t)remaining;
+        uint16_t chunk = remaining > sizeof(body.data) ? sizeof(body.data) : (uint16_t)remaining;
+        if (f.read(body.data, chunk) != chunk) {
+            // The server is owed `remaining` more bytes; it keeps waiting and
+            // drops the half-file when the next upload's header arrives.
+            readOk = false;
+            break;
+        }
         body.data_len = chunk;
-        memcpy(body.data, p, chunk);
         ok = gMagiLink.send(&body, sizeof(body));
-        p         += chunk;
         remaining -= chunk;
     }
-
     gMagiLink.releaseMutex();
-    Serial.printf("[SP] restore '%s' %u bytes (%s)\n",
-                  hdr.name, (unsigned)dataLen, ok ? "OK" : "FAIL");
-    return ok;
+
+    Serial.printf("[SP] restore '%s' %u bytes (%s)\n", hdr.name, (unsigned)size,
+                  !readOk ? "SD READ FAILED" : ok ? "OK" : "FAIL");
+    return ok && readOk;
 }
 
 bool ServerPairing::sendFileSave(uint8_t kind, const char* name,

@@ -36,6 +36,7 @@
 #include "SetlistPage.h"
 #include "OrganPage.h"
 #include "SamplesPage.h"
+#include "SampleRecordPage.h"
 #include "WiFiSettingsPage.h"
 #include "Battery.h"
 #include "BatteryGauge.h"
@@ -103,6 +104,7 @@ PixelPostManualPage pixelpostManualPage(display, touch);
 SetlistPage        setlistPage(display, touch, song);
 OrganPage          organPage(display, touch, song);
 SamplesPage        samplesPage(display, touch);
+SampleRecordPage   sampleRecordPage(display, touch);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
 WiFiSettingsPage   wifiSettingsPage(display, touch);
@@ -261,6 +263,7 @@ static bool     pixelpostManualPageOpen = false;
 static bool     setlistPageOpen       = false;
 static bool     organPageOpen         = false;
 static bool     samplesPageOpen       = false;
+static bool     sampleRecordOpen      = false;   // ADD SAMPLE (from the samples page)
 static bool     sampleEditFromPads    = false;   // sample editor opened from the
                                                  // samples page, not a column
 static bool     perfReturn            = false;   // organ / samples page was opened
@@ -341,9 +344,51 @@ static bool     gLastBattChg   = false;
 
 // ── setup() ───────────────────────────────────────────────────────────────────
 
+// The display's direct-transition sweep lists (26 KB) go in PSRAM: the
+// internal RAM is worth more to WiFi and the link task's stack.  Measured
+// 2026-11-18: refresh timing unchanged (row loop 61 ms, cycle ~287 ms);
+// internal free once linked 16.6 -> 43.2 KB, largest block 7.1 -> 31.7 KB.
+#define EPD_SWEEPS_IN_PSRAM 1
+
+
+// Internal RAM checkpoint: free, and the largest block (a task stack or a
+// WiFi buffer needs one piece — free can be ample while that is too small).
+// Kept and printed again at the end of setup(): USB serial is usually not
+// re-attached on the Mac until boot is well under way.
+struct MemMark { const char* where; uint32_t freeI, bigI, freeP; };
+static MemMark sMemMarks[14];
+static int     sMemMarkN = 0;
+static void memLog(const char* where) {
+    MemMark m = { where,
+                  (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                  (uint32_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) };
+    if (sMemMarkN < 14) sMemMarks[sMemMarkN++] = m;
+    Serial.printf("[MEM] %-28s internal free %6u largest %6u | PSRAM free %u\n", m.where,
+                  (unsigned)m.freeI, (unsigned)m.bigI, (unsigned)m.freeP);
+}
+static void memLogReplay() {
+    for (int i = 0; i < sMemMarkN; i++)
+        Serial.printf("[MEM] %-28s internal free %6u largest %6u | PSRAM free %u\n",
+                      sMemMarks[i].where, (unsigned)sMemMarks[i].freeI,
+                      (unsigned)sMemMarks[i].bigI, (unsigned)sMemMarks[i].freeP);
+}
+
 void setup() {
     Serial.begin(115200);
+    // With USB plugged into a computer that isn't reading the port, the
+    // core's USB serial waits up to 2 s (20 x 100 ms) per print before giving
+    // up — that stalled ADD SAMPLE's hold screen ~4 s on a println.  Drop the
+    // output instead when nobody is listening.
+    // NOT 0 on this core (m5stack 3.2.5): HWCDC::write counts its retries in a
+    // uint32 that starts at the timeout and is decremented before the == 0
+    // test, so 0 wraps and a print with an unread port hangs forever — the
+    // white screen at boot with USB plugged in.  1 ms gives up at once.
+#if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
+    Serial.setTxTimeoutMs(1);
+#endif
     delay(200);
+    memLog("boot");
 
     // Pre-init the WiFi driver BEFORE display.begin() takes LCD_CAM.
     // This claims WiFi's internal resources (netifs, driver structs) so
@@ -361,9 +406,7 @@ void setup() {
     // worth it for a live-performance client.
     WiFi.setSleep(false);
 
-    Serial.printf("[MEM] Before display.begin() — internal: %u  PSRAM: %u\n",
-        heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-        heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    memLog("WiFi driver up");
     if (!display.begin()) {
         Serial.printf("[MEM] After fail — internal: %u  PSRAM: %u\n",
             heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -371,24 +414,28 @@ void setup() {
         Serial.println("Display init failed — halting");
         while (1) {}
     }
+    memLog("display.begin()");
     display.setQuality(EPD_Painter::Quality::QUALITY_NORMAL);
     // Drive changed greys straight to their new level with the board's
     // tuned NORMAL direct trains — no erase-to-white two-step flash on
     // every UI repaint. Pairs without a train keep the two-step.
-    if (!display.driver().setDirectTransitions(true))
+    if (!display.driver().setDirectTransitions(true, EPD_SWEEPS_IN_PSRAM))
         Serial.println("[EPD] direct transitions refused (allocation) — two-step path");
     // Power-cycle ghosts root-caused and fixed in the library (powerOn
     // SPH re-arm, decision-engine 1e7ebe2) — the 120 s mitigation timeout
     // is no longer needed. Short timeout for now to exercise the fix with
     // frequent rail cycles; raise/remove once trusted.
     display.driver().setIdleTimeout(3);
+    memLog("direct transitions");
     display.clear();
+    memLog("display.clear()");
 
     // Display is up.  Bring up the pairing transport + (if paired) the
     // WiFi STA association to the server's AP.  Server is the AP at
     // 192.168.0.1; we get the static slot 192.168.0.2 issued at pair time.
     loadWifiChannel();   // populates gWifiChannelIdx for the settings UI
     gServerPairing.begin();
+    memLog("ServerPairing.begin()");
 
     // ── MagiLink (reliable TCP transport) ───────────────────────────────────
     //
@@ -416,9 +463,11 @@ void setup() {
                                       MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
                             IPAddress(255, 255, 255, 0));
                 WiFi.begin(creds_ssid, creds_psk);
+                memLog("WiFi.begin()");
                 gMagiLink.beginConnect(MAGI_PORT,
                     IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
                               MAGI_SERVER_IP_2, MAGI_SERVER_IP_3));
+                memLog("link task started");
             } else {
                 // EXTERNAL_AP — DHCP everywhere; server IP comes via
                 // MSG_SERVER_ANNOUNCE discovery beacon.
@@ -474,6 +523,7 @@ void setup() {
     int sdMosi   = m5paper ? SD_MOSI_M5  : SD_MOSI_LILYGO;
     SPI.begin(sdSclk, sdMiso, sdMosi, gSdCs);
     gSdAvailable = SD.begin(gSdCs);
+    memLog("touch, RTC, SD");
     Serial.printf("[SD] %s\n", gSdAvailable ? "OK" : "not found / no card?");
 
     // gServerPairing.begin() and loadWifiChannel() (which only reads the saved
@@ -512,12 +562,26 @@ void setup() {
     ui.drawAll();
     display.paintLater();
 
+    memLog("setup done");
     Serial.println("MagiTrac ready.");
 }
 
 // ── loop() ────────────────────────────────────────────────────────────────────
 
 void loop() {
+    {   // [MEM] once linked and settled, and again a minute in
+        static uint8_t memStage = 0;
+        static uint32_t linkedMs = 0;
+        if (memStage < 2 && gMagiLink.isConnected()) {
+            if (!linkedMs) linkedMs = millis();
+            uint32_t due = memStage == 0 ? 10000 : 60000;
+            if (millis() - linkedMs >= due) {
+                memLogReplay();
+                memLog(memStage == 0 ? "linked +10 s" : "linked +60 s");
+                memStage++;
+            }
+        }
+    }
     uint32_t now = millis();
 
     // ── Debug tick (2 s) — paired/link/STA snapshot + EPD engine state.
@@ -694,7 +758,7 @@ void loop() {
         !wifiSettingsPageOpen && !backupRestorePageOpen &&
         !drumTrackImportOpen && !drumEditorOpen &&
         !performancePageOpen && !pixelpostManualPageOpen && !setlistPageOpen &&
-        !organPageOpen && !samplesPageOpen && !pasteConfirmOpen &&
+        !organPageOpen && !samplesPageOpen && !sampleRecordOpen && !pasteConfirmOpen &&
         !noteEditor.isOpen() &&
         pageManager.currentPage() == Page::TRACKER) {
         const char* srvName = songPage.srvLoadedName();
@@ -1004,6 +1068,25 @@ void loop() {
         return;
     }
 
+    // ── ADD SAMPLE (opened from the samples page) ────────────────────────────
+    if (sampleRecordOpen) {
+        { uint8_t n; gServerPairing.pollMidiNoteIn(&n); }
+        SampleRecordPage::Result r = sampleRecordPage.poll();
+        if (r == SampleRecordPage::Result::BACK) {
+            sampleRecordOpen = false;
+            samplesPageOpen  = true;
+            samplesPage.reopen();
+        } else if (r == SampleRecordPage::Result::SAVED) {
+            // Straight into the editor on the new sample (trim it, tune it);
+            // its BACK leads to the squares, which fetch the list again.
+            sampleRecordOpen   = false;
+            sampleEditOpen     = true;
+            sampleEditFromPads = true;
+            sampleEditPage.open(sampleRecordPage.savedId(), sampleRecordPage.savedName());
+        }
+        return;
+    }
+
     // ── Samples page (tappable sample squares) ───────────────────────────────
     if (samplesPageOpen) {
         // Keys played here are not step input: don't let one sit pending and
@@ -1026,6 +1109,10 @@ void loop() {
             sampleEditOpen     = true;
             sampleEditFromPads = true;
             sampleEditPage.open(samplesPage.editId(), samplesPage.editName());
+        } else if (r == SamplesPage::Result::ADD) {
+            samplesPageOpen  = false;
+            sampleRecordOpen = true;
+            sampleRecordPage.open();
         }
         return;
     }

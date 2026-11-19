@@ -4,6 +4,7 @@
 #include "TrackerData.h"
 #include "NoteGrid.h"
 #include "MagiMsg.h"
+#include "sample_record.h"
 #include "midi_player.h"
 #include "debug_log.h"
 #include "hal/uart_ll.h"
@@ -531,7 +532,10 @@ static void sfxAudStart(uint8_t sampleId, float semis, uint8_t volume,
 // level (127); harder than that is louder — up to 161 at velocity 127, which is
 // +4 dB and will clip a sample that is already recorded hot — and softer is
 // quieter, on the squared taper (velocity 50 = a quarter of the level).
-static inline uint8_t seqKeyVolume(uint8_t velocity) {
+// A sample whose velocity sensitivity is switched off (sample editor, VEL OFF)
+// always plays at its own level.
+static inline uint8_t seqKeyVolume(uint8_t sampleId, uint8_t velocity) {
+    if (sampleVelOffFor(sampleId)) return 127;
     return (uint8_t)(((int)velocity * 127 + 50) / 100);
 }
 
@@ -1484,6 +1488,8 @@ static void sequencerPollMidiInBody() {
                 // Raw monitor first — sees every note on any channel (organ).
                 if (seqRawNoteCallback) seqRawNoteCallback(velocity > 0, midiByte1, velocity);
                 if (velocity == 0) seqSfxAudNoteOff(midiByte1);   // running-status note-off
+                // ADD SAMPLE's review screen is up: the keys play the new take.
+                if (sampleRecKeysNote(midiByte1, velocity)) continue;
                 // The client has a sample on the keys (its editor is open, or a
                 // square was held during a song): the key plays it, on any
                 // channel at any velocity.  Stopped, that is all the key does
@@ -1491,7 +1497,7 @@ static void sequencerPollMidiInBody() {
                 // performer's cue, as with the organ.
                 uint8_t keysId = sequencerSampleKeysId();
                 if (keysId && velocity > 0)
-                    seqSamplePlayImpl(keysId, midiByte1, true, seqKeyVolume(velocity));
+                    seqSamplePlayImpl(keysId, midiByte1, true, seqKeyVolume(keysId, velocity));
                 if (keysId && !seqRunning) {
                     // (the sample's key only)
                 } else if (velocity >= SEQ_MIN_PERFORMER_VEL && srvActiveBuf) {
@@ -1520,6 +1526,7 @@ static void sequencerPollMidiInBody() {
             } else {
                 midiCount = 0;       // velocity byte — message complete
                 if (seqRawNoteCallback) seqRawNoteCallback(false, midiByte1, 0);
+                if (sampleRecKeysNote(midiByte1, 0)) continue;   // ADD SAMPLE's take
                 seqSfxAudNoteOff(midiByte1);
             }
         } else if ((midiStatus & 0xF0) == 0xB0) {

@@ -37,7 +37,96 @@ static volatile bool     sBandsActive = false;   // pixelpost SoundSpectrum gate
 static volatile bool     sChordActive = false;   // chord recogniser screen gate
 static volatile bool     sScopeActive = false;   // oscilloscope screen gate
 static bool              sBuffersUp   = false;
-static inline bool wantActive() { return sBandsActive || sChordActive || sScopeActive; }
+static volatile bool     sRecActive   = false;   // ADD SAMPLE recorder gate
+static volatile bool     sMonActive   = false;   // ADD SAMPLE level monitor gate
+static volatile int32_t  sMonPeak     = 0;
+static inline bool wantActive() {
+    return sBandsActive || sChordActive || sScopeActive || sRecActive || sMonActive;
+}
+
+// ── Recorder ──────────────────────────────────────────────────────────────
+// The take goes into the caller's PSRAM buffer.  sRecInBlock brackets the
+// task's copy so micRecStop() can wait it out before the buffer is touched.
+static int16_t*          sRecBuf     = nullptr;
+static uint32_t          sRecMax     = 0;
+static volatile uint32_t sRecFrames  = 0;
+static volatile int32_t  sRecPeak    = 0;
+static volatile bool     sRecClip    = false;
+static volatile bool     sRecInBlock = false;
+static int               sRecSkip    = 0;       // reads still to drop at the start
+static bool              sRecDcInit  = false;
+static float             sRecX1 = 0.0f, sRecY1 = 0.0f;   // DC blocker state
+
+static void processRecord() {
+    if (sRecSkip > 0) { sRecSkip--; return; }
+    uint32_t n = sRecFrames;
+    int32_t  pk = sRecPeak;
+    bool     clip = false;
+    if (!sRecDcInit) { sRecX1 = (float)stereoBuf[0]; sRecY1 = 0.0f; sRecDcInit = true; }
+    for (int i = 0; i < SAMPLES_PER_READ && n < sRecMax; i++) {
+        int32_t raw = stereoBuf[i * 2 + 0];
+        if (raw >= 32760 || raw <= -32760) clip = true;
+        // One-pole DC blocker (~25 Hz): a mic offset left in would click at
+        // the start and end of every note the sample plays.
+        float x = (float)raw;
+        float y = x - sRecX1 + 0.995f * sRecY1;
+        sRecX1 = x; sRecY1 = y;
+        int32_t s = (int32_t)lrintf(y);
+        if (s >  32767) s =  32767;
+        if (s < -32768) s = -32768;
+        sRecBuf[n++] = (int16_t)s;
+        int32_t a = s < 0 ? -s : s;
+        if (a > pk) pk = a;
+    }
+    sRecPeak   = pk;
+    if (clip) sRecClip = true;
+    sRecFrames = n;
+    if (n >= sRecMax) sRecActive = false;   // full: the take ends itself
+}
+
+bool micRecStart(int16_t* buf, uint32_t maxFrames) {
+    if (!buf || !maxFrames || !sActiveSem) return false;
+    micRecStop();
+    sRecBuf    = buf;
+    sRecMax    = maxFrames;
+    sRecFrames = 0;
+    sRecPeak   = 0;
+    sRecClip   = false;
+    sRecSkip   = sMonActive ? 0 : 2;   // monitoring: the reads are already current
+    sRecDcInit = false;
+    __sync_synchronize();
+    sRecActive = true;
+    xSemaphoreGive(sActiveSem);
+    return true;
+}
+
+void micRecStop() {
+    sRecActive = false;
+    __sync_synchronize();
+    for (int i = 0; i < 200 && sRecInBlock; i++) vTaskDelay(1);
+}
+
+bool     micRecRunning() { return sRecActive; }
+
+void micMonitor(bool on) {
+    if (!sActiveSem || on == sMonActive) return;
+    sMonPeak   = 0;
+    sMonActive = on;
+    if (on) xSemaphoreGive(sActiveSem);
+}
+
+int32_t micMonitorPeak() {
+    int32_t p = sMonPeak;
+    sMonPeak = 0;
+    return p;
+}
+uint32_t micRecFrames()  { return sRecFrames; }
+bool     micRecClipped() { return sRecClip; }
+int32_t  micRecPeakTake() {
+    int32_t p = sRecPeak;
+    sRecPeak = 0;
+    return p;
+}
 
 static float gain[PP_AUDIO_BANDS];   // per-band AGC; seeded to 60 in spectrumInit()
 
@@ -316,6 +405,7 @@ static void spectrumTask(void*) {
         // null buffer: on failure drop every consumer and go back to sleep.
         if (!sBuffersUp && !allocBuffers()) {
             sBandsActive = false; sChordActive = false; sScopeActive = false;
+            sRecActive = false; sMonActive = false;
             continue;
         }
 
@@ -343,6 +433,20 @@ static void spectrumTask(void*) {
         if (sBandsActive)                    processBands();
         if (sChordActive && chordBuffersUp)  processChord();
         if (sScopeActive)                    processScope();
+        if (sMonActive) {
+            int32_t pk = sMonPeak;
+            for (int i = 0; i < SAMPLES_PER_READ; i++) {
+                int32_t a = stereoBuf[i * 2 + 0];
+                if (a < 0) a = -a;
+                if (a > pk) pk = a;
+            }
+            sMonPeak = pk;
+        }
+
+        sRecInBlock = true;
+        __sync_synchronize();
+        if (sRecActive) processRecord();
+        sRecInBlock = false;
     }
 }
 

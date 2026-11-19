@@ -52,6 +52,7 @@ int  samplePlayRam(uint8_t id, float pitch, uint8_t vol) {
     return ++_mockRamPlays;                  // a distinct voice handle each time
 }
 void sampleStopVoice(int /*voice*/) { _mockVoiceStops++; }
+bool sampleRecKeysNote(uint8_t, uint8_t) { return false; }   // no ADD SAMPLE review up
 const char* sampleManifestNameFor(uint8_t /*id*/) { return _mockHaveFiles ? "x.wav" : nullptr; }
 #include "SampleManifest.h"   // SampleTrim type for the stub below
 static SampleTrim _mockTrim = {};            // id 0 = no metadata for anything
@@ -1409,6 +1410,31 @@ static void test_pad_on_the_stream_while_running() {
     sampleMockDone();
 }
 
+// VEL OFF in the sample editor: a key plays the sample at its own level,
+// however hard it is struck.  Other samples still follow velocity.
+static void test_sample_velocity_switch() {
+    printf("\ntest_sample_velocity_switch\n");
+    buildPlainSong();
+    sampleMockReset();
+    _mockTrim.id = 7; _mockTrim.velOff = 1;
+    _mockMs = 1000;
+
+    sequencerSampleKeys(7);
+    midiInNoteOn(60, 20);
+    CHECK(_mockRamPlays == 1 && _mockRamVol == 127, "soft key: the sample's own level");
+    midiInNoteOff(60);
+    midiInNoteOn(60, 127);
+    CHECK(_mockRamVol == 127,                       "hard key: no boost either");
+    midiInNoteOff(60);
+
+    sequencerSampleKeys(8);                         // no metadata: velocity on
+    midiInNoteOn(60, 127);
+    CHECK(_mockRamId == 8 && _mockRamVol == 161,    "another sample still follows velocity");
+    midiInNoteOff(60);
+    sequencerSampleKeys(0);
+    sampleMockDone();
+}
+
 // The sample's own TUNE applies wherever it plays, on top of a column's TUNE.
 static void test_sample_tune_adds_to_pitch() {
     printf("\ntest_sample_tune_adds_to_pitch\n");
@@ -1719,6 +1745,7 @@ int main() {
     test_key_release_does_not_cut_a_song_stream();
     test_pad_on_the_stream_while_running();
     test_sample_tune_adds_to_pitch();
+    test_sample_velocity_switch();
     printf("\n%d passed, %d failed\n", gPassed, gFailed);
     return gFailed > 0 ? 1 : 0;
 }

@@ -173,8 +173,11 @@ tracker and Block Settings go through `PageManager`).
   that open the organ and samples pages and come back here afterwards.
 - **InstrumentsPage** (the instrument bank), **OrganPage** (drawbar organ
   on the server), **SamplesPage** (the server's samples as tappable
-  squares; hold one to edit it), **SampleEditPage** (sample trim/loop/tune,
-  opened from a square or from an SFX column),
+  squares; hold one to edit it), **SampleRecordPage** (ADD on the samples
+  page: arms the server's hold-to-record screen, follows its KEEP / CANCEL /
+  RESAMPLE review, then names / saves the take it hands back),
+  **SampleEditPage** (sample trim/loop/tune, opened from a square, from an
+  SFX column, or straight after a new sample is saved),
   **PixelPostManualPage** / **PixelPostSettingsPage** (lights),
   **SettingsPage** / **WiFiSettingsPage** (clock, MIDI limits, WiFi,
   pairing), **BackupRestorePage**, and **BootMenu** (the MENU popup that

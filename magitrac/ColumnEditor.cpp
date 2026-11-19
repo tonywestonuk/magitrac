@@ -16,7 +16,7 @@ static inline bool isOrgan(uint8_t ch) { return ch == ORGAN_CHANNEL; }
 // sound k).  The voice (and
 // the rest of the organ patch) lives ONCE per song in Song::organ.
 static const char* const ORGAN_VOICES[] =
-    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "TWO TRIBES", "CHOIR", "THX", "VOCODER" };
+    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "REED", "CHOIR", "VOCODER" };   // 4.. = PROC sounds, server order
 #define ORGAN_VOICE_COUNT ((int)(sizeof(ORGAN_VOICES) / sizeof(ORGAN_VOICES[0])))
 
 // First ORGAN column creates the song's organ patch with playable defaults

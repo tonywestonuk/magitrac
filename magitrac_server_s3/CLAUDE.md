@@ -182,7 +182,8 @@ do not re-add any of it unless the owner asks.
 | `field_flash.ino` | Flash PixelPost units at a gig, firmware served from the SD card |
 | `SamplePlayer.cpp/.h` | WAV playback via the shared codec: one SD stream + 8 voices from the PSRAM sample cache (filled a step at a time) |
 | `test_sample_cache.cpp` | Host tests for that cache (mocks in `test_mocks/cache/`); build line in the file |
-| `SampleManifest.cpp/.h` | `/samples/samples.txt` — stable sample ids; trim/loop/tune metadata (`trim.txt`) |
+| `SampleManifest.cpp/.h` | `/samples/samples.txt` — stable sample ids; trim/loop/tune metadata (`trim.txt`).  The id table is rebuilt to one side and swapped in, so lookups never see it empty; `trim.txt` is read once at boot |
+| `test_manifest.cpp` | Host tests for the manifest (mocks in `test_mocks/manifest/`); build line in the file |
 | `drawbar_organ.cpp/.h` | Additive drawbar organ synth (own task, takes the codec while active) |
 | `proc_sounds.cpp/.h` | Procedural sounds for the organ's PROC type |
 | `audio_codec.cpp/.h` | Thin wrapper around the shared ES8388 (Module Audio v2.2) |
@@ -193,7 +194,13 @@ do not re-add any of it unless the owner asks.
 | `crash_log.cpp/.h` | Reset reason + breadcrumbs kept across a crash, shown on the LCD at next boot |
 | `debug_log.cpp/.h` | `debugPrintf` — queued, printed by a background task |
 | `Battery.cpp/.h` | Battery meter (AXP2101 via `M5.Power`) |
+| `sample_record.cpp/.h` | ADD SAMPLE: armed by the client; the .ino's hold screen (`recScreenTick`) records while the glass is held (a `mic_spectrum` consumer, `micMonitor` for the level before it), writes the take to `/rec_take.wav` on release and plays it back (REVIEW: KEEP / CANCEL / RESAMPLE on the server's screen; the MIDI keys play it via `samplePlayBuffer`), finds its pitch and tunes it to middle C, and on SAVE renames it into `/samples` with that TUNE |
+| `pitch_detect.cpp/.h` | Take pitch detection: averaged FFT of the loudest frames, harmonic-series candidate score + multiple check + interpolated-harmonic refinement; stepped one FFT per loop pass |
+| `test_pitch.cpp` | Host tests for `pitch_detect` (synthetic tones, noise, clicks); build line in the file |
+| `psola.cpp/.h` | KEEP LENGTH (sample editor checkbox, `keepLen` in `trim.txt`): pitch-synchronous overlap-add so a cached sample's other notes change pitch, not length.  Grains are cut on the sample's pitch period (`pitchCHz` in `trim.txt` — from ADD SAMPLE, or `samplePitchTick` analyses it once); SD-streamed samples still resample |
+| `test_psola.cpp` | Host tests for `psola` (length, pitch, level, steadiness across ±2 octaves); build line in the file |
 | `mic_echo_test.cpp/.h` | Parked bench diagnostic (`MIC_ECHO_TEST`) |
+| `freq_resp_test.cpp/.h` | Bench diagnostic (`FREQ_RESP_TEST`): loops stepped sines out of the codec; record and analyse with `tools/freq_resp/` |
 | `test_seq.cpp`, `test_mocks/` | Sequencer host test (see above) |
 | `wifi_secrets.h` | Local-only credentials, not committed (copy the `.example`) |
 

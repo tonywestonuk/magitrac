@@ -22,6 +22,10 @@
 //   • STOP            → silences everything (the only way to end a sample
 //                       whose LOOP is on).  While a song is playing it stops
 //                       only what this page started.
+//   • ADD             → poll() returns ADD: the sketch opens SampleRecordPage
+//                       (record a new sample through the server's mic), and
+//                       calls reopen() when it's done — which fetches the
+//                       list again, so a new sample shows up.
 //
 // Nothing here touches the song: the page plays samples directly
 // (SAMPLE_EDIT_PLAY / SAMPLE_EDIT_KEYS), with no column involved.
@@ -36,6 +40,8 @@ static const int SMP_BTN_Y    = 8;
 static const int SMP_BTN_H    = 44;
 static const int SMP_STOP_X   = 12;
 static const int SMP_STOP_W   = 150;
+static const int SMP_ADD_X    = 180;
+static const int SMP_ADD_W    = 150;
 static const int SMP_PREV_X   = 560;
 static const int SMP_PREV_W   = 80;
 static const int SMP_PAGE_X   = 640;    // "2/3" readout between PREV and NEXT
@@ -60,13 +66,13 @@ public:
     SamplesPage(EPD_PainterAdafruit& display, GT911_Lite& touch)
         : _d(display), _touch(touch) {}
 
-    enum class Result : uint8_t { NONE, HOME, EDIT };
+    enum class Result : uint8_t { NONE, HOME, EDIT, ADD };
 
     // re-fetch the sample list + draw.  backLabel: the corner button reads
     // BACK instead of HOME (opened from the performance page — the sketch
     // decides where Result::HOME leads).  reopen() keeps it.
     void   open(bool backLabel = false);
-    void   reopen();    // back from the editor: same page, list as it was
+    void   reopen();    // back from the editor or ADD: same page (list re-fetched after ADD)
     Result poll();
 
     // Valid after poll() returned EDIT.
@@ -87,6 +93,7 @@ private:
     uint8_t  _keysId    = 0;       // manifest id of the sample on the keys; 0 = none
     uint32_t _leaseMs   = 0;       // last lease renewal
     uint8_t  _editId    = 0;
+    bool     _refetch   = false;   // ADD was used: fetch the list again on reopen()
     char     _editName[SAMPLE_NAME_LEN] = {};
 
     void draw();

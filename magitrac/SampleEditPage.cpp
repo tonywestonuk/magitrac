@@ -28,6 +28,9 @@ void SampleEditPage::open(uint8_t sampleId, const char* name, uint8_t col,
     _dragWave   = false;
     _backArmed  = false;
     _specMode   = 0;       // a previous visit's spectrogram does not carry over
+    _tuneMode   = false;
+    _doneArmed  = false;
+    _autoState  = 0;
     _viewStart  = 0;
     _viewEnd    = 0;   // whole file
     _sampleTune = 0;       // until the server's meta arrives
@@ -65,6 +68,8 @@ void SampleEditPage::adopt() {
     _start = _info.startFrame;
     _end   = _info.endFrame;          // 0 = end of file
     _loop  = _info.loop != 0;
+    _velOff = _info.velOff != 0;
+    _keepLen = _info.keepLen != 0;
     _sampleTune = _info.tuneCents;
     if (_start >= _info.totalFrames) _start = 0;
     if (_end > _info.totalFrames)    _end   = 0;
@@ -73,7 +78,8 @@ void SampleEditPage::adopt() {
 
 void SampleEditPage::sendMeta() {
     gServerPairing.sendSampleEdit(SAMPLE_EDIT_SET, _sampleId,
-                                  _start, _end, _loop ? 1 : 0, _sampleTune);
+                                  _start, _end, _loop ? 1 : 0, _sampleTune,
+                                  60, _velOff ? 1 : 0, _keepLen ? 1 : 0);
 }
 
 void SampleEditPage::fetchView() {
@@ -91,12 +97,37 @@ void SampleEditPage::formatTime(uint32_t frame, char* out, int outLen) const {
 
 void SampleEditPage::drawHeader() {
     _d.fillRect(0, 0, 960, SE_HDR_H, COL_BLACK);
-    _d.setTextSize(3);
+    if (_tuneMode) {
+        _d.setTextSize(3);
+        _d.setTextColor(COL_WHITE);
+        _d.setCursor(12, (SE_HDR_H - 24) / 2);
+        _d.print("TUNE");
+        _d.setTextSize(2);
+        _d.setTextColor(COL_LTGREY);
+        _d.setCursor(12 + 4 * 18 + 18, (SE_HDR_H - 16) / 2);
+        _d.print(_name);
+        uiButton(_d, SE_PLAY_X, SE_BTN_Y, SE_PLAY_W, SE_BTN_H,
+                 _playing ? "STOP" : "PLAY",
+                 _playing ? COL_BLACK : COL_WHITE,
+                 _playing ? COL_WHITE : COL_BLACK, 2);
+        uiButton(_d, SE_BACK_X, SE_BTN_Y, SE_BACK_W, SE_BTN_H, "DONE",
+                 COL_WHITE, COL_BLACK, 3);
+        return;
+    }
+    // Big if it fits left of VEL, otherwise smaller (23 chars at size 2 do).
+    int sz = ((int)strlen(_name) * 18 <= SE_NAME_MAXW) ? 3 : 2;
+    _d.setTextSize(sz);
     _d.setTextColor(COL_WHITE);
-    _d.setCursor(12, (SE_HDR_H - 24) / 2);
+    _d.setCursor(12, (SE_HDR_H - 8 * sz) / 2);
     _d.print(_name);
 
     if (!_loading) {
+        // VEL ON = keys follow velocity (normal, so drawn plain); VEL OFF =
+        // always the sample's own level (the exception, so highlighted).
+        uiButton(_d, SE_VEL_X, SE_BTN_Y, SE_VEL_W, SE_BTN_H,
+                 _velOff ? "VEL OFF" : "VEL ON",
+                 _velOff ? COL_BLACK : COL_WHITE,
+                 _velOff ? COL_WHITE : COL_BLACK, 2);
         uiButton(_d, SE_LOOP_X, SE_BTN_Y, SE_LOOP_W, SE_BTN_H,
                  _loop ? "LOOP ON" : "LOOP OFF",
                  _loop ? COL_BLACK : COL_WHITE,
@@ -178,7 +209,7 @@ void SampleEditPage::drawWave() {
 
     // View-window readout: window times, trim times, total.
     char a[16], b[16], t[96];
-    _d.fillRect(SE_WAVE_X, SE_TIME_Y, SE_WAVE_W, 22, COL_WHITE);
+    _d.fillRect(SE_WAVE_X, SE_TIME_Y, SE_TIME_W, 22, COL_WHITE);
     formatTime(_start, a, sizeof(a));
     formatTime(endF, b, sizeof(b));
     snprintf(t, sizeof(t), "TRIM %s - %s", a, b);
@@ -189,6 +220,20 @@ void SampleEditPage::drawWave() {
     _d.setTextColor(COL_DKGREY);
     _d.setCursor(SE_WAVE_X, SE_TIME_Y);
     _d.print(t);
+    drawKeepLen();
+}
+
+void SampleEditPage::drawKeepLen() {
+    _d.fillRect(SE_KEEP_HIT_X0, SE_KEEP_HIT_Y0, SE_KEEP_HIT_X1 - SE_KEEP_HIT_X0,
+                SE_KEEP_HIT_Y1 - SE_KEEP_HIT_Y0 - 2, COL_WHITE);
+    _d.drawRect(SE_KEEP_X, SE_KEEP_Y, SE_KEEP_BOX, SE_KEEP_BOX, COL_BLACK);
+    _d.drawRect(SE_KEEP_X + 1, SE_KEEP_Y + 1, SE_KEEP_BOX - 2, SE_KEEP_BOX - 2, COL_BLACK);
+    if (_keepLen)
+        _d.fillRect(SE_KEEP_X + 6, SE_KEEP_Y + 6, SE_KEEP_BOX - 12, SE_KEEP_BOX - 12, COL_BLACK);
+    _d.setTextSize(2);
+    _d.setTextColor(COL_BLACK);
+    _d.setCursor(SE_KEEP_X + SE_KEEP_BOX + 10, SE_KEEP_Y + (SE_KEEP_BOX - 16) / 2);
+    _d.print("KEEP LENGTH");
 }
 
 void SampleEditPage::drawScrollbar() {
@@ -232,28 +277,72 @@ void SampleEditPage::drawZoomRow() {
 }
 
 // TUNE: the sample's own pitch offset, shown as semitones.cents ("+7.05").
-void SampleEditPage::drawTune() {
-    int btnY = SE_ZOOM_Y + (SE_ZOOM_H - SE_BTN_H) / 2;
-    uiButton(_d, SE_TUNE_DN_X, btnY, SE_TUNE_BTN_W, SE_BTN_H, "-",
-             COL_WHITE, COL_BLACK, 3);
-    uiButton(_d, SE_TUNE_UP_X, btnY, SE_TUNE_BTN_W, SE_BTN_H, "+",
-             COL_WHITE, COL_BLACK, 3);
+static void fmtTune(int16_t t, char* v, int n) {
+    int a = (t < 0) ? -t : t;
+    snprintf(v, n, "%c%d.%02d", (t < 0) ? '-' : '+', a / 100, a % 100);
+}
 
-    _d.fillRect(SE_TUNE_VAL_X, btnY, SE_TUNE_VAL_W, SE_BTN_H, COL_WHITE);
+static void noteName(uint8_t note, char* out, int n) {
+    static const char* NM[12] = { "C", "C#", "D", "D#", "E", "F",
+                                  "F#", "G", "G#", "A", "A#", "B" };
+    snprintf(out, n, "%s%d", NM[note % 12], (int)note / 12 - 1);
+}
+
+// The zoom row's [TUNE +7.05] button, or — in the dialog — the big value.
+void SampleEditPage::drawTune() {
+    char v[16];
+    fmtTune(_sampleTune, v, sizeof(v));
+    if (!_tuneMode) {
+        int btnY = SE_ZOOM_Y + (SE_ZOOM_H - SE_BTN_H) / 2;
+        char l[24];
+        snprintf(l, sizeof(l), "TUNE %s", v);
+        uiButton(_d, SE_TUNE_X, btnY, SE_TUNE_W, SE_BTN_H, l, COL_WHITE, COL_BLACK, 3);
+        return;
+    }
+    _d.fillRect(0, SE_TD_VAL_Y - 10, 960, 130, COL_WHITE);
+    _d.setTextSize(8);
+    _d.setTextColor(COL_BLACK);
+    _d.setCursor(480 - (int)strlen(v) * 48 / 2, SE_TD_VAL_Y);
+    _d.print(v);
     _d.setTextSize(2);
     _d.setTextColor(COL_DKGREY);
-    _d.setCursor(SE_TUNE_VAL_X + (SE_TUNE_VAL_W - 4 * 12) / 2, btnY + 2);
-    _d.print("TUNE");
+    const char* cap = "SEMITONES . CENTS   (0 = as recorded)";
+    _d.setCursor(480 - (int)strlen(cap) * 6, SE_TD_VAL_Y + 84);
+    _d.print(cap);
+}
 
-    char v[16];
-    int a = (_sampleTune < 0) ? -_sampleTune : _sampleTune;
-    snprintf(v, sizeof(v), "%c%d.%02d", (_sampleTune < 0) ? '-' : '+',
-             a / 100, a % 100);
-    _d.setTextSize(3);
-    _d.setTextColor(COL_BLACK);
-    _d.setCursor(SE_TUNE_VAL_X + (SE_TUNE_VAL_W - (int)strlen(v) * 18) / 2,
-                 btnY + 26);
-    _d.print(v);
+void SampleEditPage::drawAutoStatus() {
+    bool asking = _autoState == 1;
+    uiButton(_d, SE_TD_AUTO_X, SE_TD_AUTO_Y, SE_TD_AUTO_W, SE_TD_AUTO_H,
+             asking ? "LISTENING..." : "AUTO TUNE",
+             COL_WHITE, asking ? COL_DKGREY : COL_BLACK, 3);
+    char m[96], nn[8];
+    switch (_autoState) {
+        case 1:  snprintf(m, sizeof(m), "Finding its pitch..."); break;
+        case 2:  noteName(_autoNote, nn, sizeof(nn));
+                 snprintf(m, sizeof(m), "It is %s %+d cents - tuned so C4 plays middle C",
+                          nn, (int)_autoCents); break;
+        case 3:  snprintf(m, sizeof(m), "No clear pitch - tuning left as it was"); break;
+        case 4:  snprintf(m, sizeof(m), "Not in memory (still loading, or too big) - try again"); break;
+        case 5:  snprintf(m, sizeof(m), "No answer from the server"); break;
+        default: snprintf(m, sizeof(m), "AUTO TUNE finds its pitch and tunes it to middle C"); break;
+    }
+    _d.fillRect(0, SE_TD_MSG_Y - 8, 960, 40, COL_WHITE);
+    _d.setTextSize(2);
+    _d.setTextColor(_autoState == 0 ? COL_DKGREY : COL_BLACK);
+    _d.setCursor(480 - (int)strlen(m) * 6, SE_TD_MSG_Y);
+    _d.print(m);
+}
+
+void SampleEditPage::drawTuneDialog() {
+    _d.fillScreen(COL_WHITE);
+    drawHeader();
+    drawTune();
+    static const char* LBL[5] = { "-ST", "-", "+", "+ST", "ZERO" };
+    for (int i = 0; i < 5; i++)
+        uiButton(_d, SE_TD_BTN_X0 + i * SE_TD_BTN_STEP, SE_TD_BTN_Y, SE_TD_BTN_W, SE_TD_BTN_H,
+                 LBL[i], COL_WHITE, COL_BLACK, (i == 1 || i == 2) ? 4 : 3);
+    drawAutoStatus();
 }
 
 // Repaint only — the value goes to the server when the finger lifts
@@ -417,6 +506,86 @@ void SampleEditPage::scrollTo(int tx) {
     }
 }
 
+void SampleEditPage::startAudition() {
+    _playing = true;
+    // Predict the end so the button resets itself: trimmed length at the
+    // audition's playback speed (TUNE), plus a little margin for the wire +
+    // the release fade.
+    uint32_t endF   = _end ? _end : _info.totalFrames;
+    uint32_t frames = (endF > _start) ? endF - _start : 0;
+    uint32_t rate   = _info.rate ? _info.rate : 32000;
+    float    spd    = _keepLen ? 1.0f      // KEEP LENGTH: same length at any pitch
+                     : exp2f((float)(_tuneCents + _sampleTune) / 1200.0f);
+    uint32_t ms     = (uint32_t)((float)frames * 1000.0f / ((float)rate * spd));
+    _playEndMs = millis() + ms + 400;
+    if (standalone())      // the bare sample, through its own TUNE
+        gServerPairing.sendSampleEdit(SAMPLE_EDIT_PLAY, _sampleId);
+    else                   // through the column's settings
+        gServerPairing.sendAuditionRawNote(SFX_CHANNEL, 60, 100, _col);
+}
+
+// The TUNE dialog's touches.  The value is stored (sendMeta) when a −/+ is
+// let go, on ZERO, and when AUTO TUNE's answer arrives.
+bool SampleEditPage::pollTuneDialog(bool down, int tx, int ty) {
+    if (down && !_wasDown) {
+        _wasDown = true;
+        if (ty < SE_HDR_H) {
+            if (tx >= SE_BACK_X) { _doneArmed = true; return false; }   // on release
+            if (tx >= SE_PLAY_X && tx < SE_PLAY_X + SE_PLAY_W) {
+                if (_playing) auditionStop();
+                else          startAudition();
+                drawHeader();
+                _d.paintLater();
+            }
+            return false;
+        }
+        if (ty >= SE_TD_BTN_Y && ty < SE_TD_BTN_Y + SE_TD_BTN_H && tx >= SE_TD_BTN_X0) {
+            int i   = (tx - SE_TD_BTN_X0) / SE_TD_BTN_STEP;
+            int off = (tx - SE_TD_BTN_X0) % SE_TD_BTN_STEP;
+            if (i > 4 || off >= SE_TD_BTN_W) return false;
+            switch (i) {
+                case 0: stepTune(-100); _tuneHold.start(1, -1); break;          // a semitone
+                case 1: _tuneStep = 1; stepTune(-1); _tuneHold.start(0, -1); break;   // a cent,
+                case 2: _tuneStep = 1; stepTune(+1); _tuneHold.start(0, +1); break;   // faster held
+                case 3: stepTune(+100); _tuneHold.start(1, +1); break;
+                case 4:
+                    if (_sampleTune) {
+                        _sampleTune = 0;
+                        sendMeta();
+                        drawTune();
+                        _d.paintLater();
+                    }
+                    break;
+            }
+            return false;
+        }
+        if (tx >= SE_TD_AUTO_X && tx < SE_TD_AUTO_X + SE_TD_AUTO_W &&
+            ty >= SE_TD_AUTO_Y && ty < SE_TD_AUTO_Y + SE_TD_AUTO_H && _autoState != 1) {
+            MsgSampleTune stale;
+            gServerPairing.takeSampleTune(stale);
+            _autoState  = 1;
+            _autoSentMs = millis();
+            gServerPairing.sendSampleEdit(SAMPLE_EDIT_AUTOTUNE, _sampleId);
+            drawAutoStatus();
+            _d.paintLater();
+        }
+    } else if (!down && _wasDown) {
+        _wasDown = false;
+        if (_tuneHold.active()) {
+            _tuneHold.release();
+            sendMeta();
+        }
+        if (_doneArmed) {
+            _doneArmed = false;
+            _tuneMode  = false;
+            _d.clear();
+            draw();
+            _d.paintLater();
+        }
+    }
+    return false;
+}
+
 void SampleEditPage::auditionStop() {
     if (!_playing) return;
     _playing = false;
@@ -461,6 +630,33 @@ bool SampleEditPage::poll() {
         }
     }
 
+    // AUTO TUNE's answer: apply it (and store it) even if the dialog was left.
+    if (_autoState == 1) {
+        MsgSampleTune at;
+        bool got = gServerPairing.takeSampleTune(at) && at.sampleId == _sampleId;
+        if (got || (uint32_t)(millis() - _autoSentMs) > SE_AUTO_TIMEOUT_MS) {
+            if (!got) {
+                _autoState = 5;
+            } else if (at.result == SAMPLE_TUNE_FOUND) {
+                _autoState  = 2;
+                _autoNote   = at.note;
+                _autoCents  = at.cents;
+                _sampleTune = at.tuneCents;
+                sendMeta();
+            } else {
+                _autoState = (at.result == SAMPLE_TUNE_UNCLEAR) ? 3 : 4;
+            }
+            if (_tuneMode) {
+                drawTune();
+                drawAutoStatus();
+                _d.paintLater();
+            } else if (_specMode == 0 && !_loading) {
+                drawTune();
+                _d.paintLater();
+            }
+        }
+    }
+
     // Spectrogram popup: render when the pages have all arrived; any touch
     // returns to the editor.
     if (_specMode == 1 && gServerPairing.specComplete()) {
@@ -483,17 +679,24 @@ bool SampleEditPage::poll() {
     bool ev   = _touch.read();
     bool down = _touch.isTouched;
 
-    // TUNE −/+ held: repeat, accelerating to a semitone per step.  Gated on
-    // the finger still being down so a stalled loop can't run on after it.
+    // TUNE −/+ held: repeat, accelerating to a semitone per step; −ST/+ST
+    // held: a semitone per step.  Gated on the finger still being down so a
+    // stalled loop can't run on after it.
     if (down && _tuneHold.active() && _tuneHold.tickFast()) {
-        _tuneStep += _tuneStep / 4 + 1;
-        if (_tuneStep > 100) _tuneStep = 100;
-        stepTune(_tuneHold.delta() * _tuneStep);
+        if (_tuneHold.field() == 1) {
+            stepTune(_tuneHold.delta() * 100);
+        } else {
+            _tuneStep += _tuneStep / 4 + 1;
+            if (_tuneStep > 100) _tuneStep = 100;
+            stepTune(_tuneHold.delta() * _tuneStep);
+        }
     }
 
     if (!ev) return false;              // no new touch event this frame
     int  tx, ty;
     rawToScreen(_touch.x, _touch.y, tx, ty);
+
+    if (_tuneMode) return pollTuneDialog(down, tx, ty);
 
     if (_specMode > 0) {
         if (down && !_wasDown) {
@@ -583,38 +786,34 @@ bool SampleEditPage::poll() {
                 return false;
             }
             if (_loading) return false;
-            if (tx >= SE_LOOP_X && tx < SE_LOOP_X + SE_LOOP_W) {
+            if (tx >= SE_VEL_X && tx < SE_VEL_X + SE_VEL_W) {
+                _velOff = !_velOff;
+                sendMeta();
+                drawHeader();
+                _d.paintLater();
+            } else if (tx >= SE_LOOP_X && tx < SE_LOOP_X + SE_LOOP_W) {
                 _loop = !_loop;
                 sendMeta();
                 drawHeader();
                 _d.paintLater();
             } else if (tx >= SE_PLAY_X && tx < SE_PLAY_X + SE_PLAY_W) {
-                if (_playing) {
-                    auditionStop();
-                } else {
-                    _playing = true;
-                    // Predict the end so the button resets itself: trimmed
-                    // length at the audition's playback speed (TUNE), plus a
-                    // little margin for the wire + the release fade.
-                    uint32_t endF   = _end ? _end : _info.totalFrames;
-                    uint32_t frames = (endF > _start) ? endF - _start : 0;
-                    uint32_t rate   = _info.rate ? _info.rate : 32000;
-                    float    spd    = exp2f((float)(_tuneCents + _sampleTune)
-                                            / 1200.0f);
-                    uint32_t ms     = (uint32_t)((float)frames * 1000.0f
-                                                 / ((float)rate * spd));
-                    _playEndMs = millis() + ms + 400;
-                    if (standalone())      // the bare sample at native pitch
-                        gServerPairing.sendSampleEdit(SAMPLE_EDIT_PLAY, _sampleId);
-                    else                   // through the column's settings
-                        gServerPairing.sendAuditionRawNote(SFX_CHANNEL, 60, 100, _col);
-                }
+                if (_playing) auditionStop();
+                else          startAudition();
                 drawHeader();
                 _d.paintLater();
             }
             return false;
         }
         if (_loading) return false;
+
+        if (tx >= SE_KEEP_HIT_X0 && tx < SE_KEEP_HIT_X1 &&
+            ty >= SE_KEEP_HIT_Y0 && ty < SE_KEEP_HIT_Y1) {
+            _keepLen = !_keepLen;
+            sendMeta();
+            drawKeepLen();
+            _d.paintLater();
+            return false;
+        }
 
         // Touch-down near a marker line grabs it; it then follows the drag
         // and locks in (meta stored) on release.  Away from the markers (and
@@ -647,14 +846,13 @@ bool SampleEditPage::poll() {
         if (ty >= btnY && ty < btnY + SE_BTN_H) {
             if (tx >= SE_ZOUT_X && tx < SE_ZOUT_X + SE_ZBTN_W)     zoom(-1);
             else if (tx >= SE_ZIN_X && tx < SE_ZIN_X + SE_ZBTN_W)  zoom(+1);
-            else if ((tx >= SE_TUNE_DN_X && tx < SE_TUNE_DN_X + SE_TUNE_BTN_W) ||
-                     (tx >= SE_TUNE_UP_X && tx < SE_TUNE_UP_X + SE_TUNE_BTN_W)) {
-                // A tap is one cent; holding repeats and accelerates.  The
-                // new value is stored when the finger lifts.
-                int dir = (tx >= SE_TUNE_UP_X) ? +1 : -1;
-                _tuneStep = 1;
-                stepTune(dir);
-                _tuneHold.start(0, dir);
+            else if (tx >= SE_TUNE_X && tx < SE_TUNE_X + SE_TUNE_W) {
+                _tuneMode  = true;              // the TUNE dialog
+                _doneArmed = false;
+                if (_autoState != 1) _autoState = 0;
+                _d.clear();
+                drawTuneDialog();
+                _d.paintLater();
             }
             else if (tx >= SE_SPEC_X && tx < SE_SPEC_X + SE_SPEC_W) {
                 auditionStop();

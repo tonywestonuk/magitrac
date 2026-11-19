@@ -8,14 +8,31 @@
 static const char* SM_DIR  = "/samples";
 static const char* SM_PATH = "/samples/samples.txt";
 
-// Both tables (this one and s_trim below) live in PSRAM — control-rate data,
+// The id ↔ filename table is double-buffered.  sampleManifestSync() (loop task)
+// builds a fresh table in s_build, then publishes it by swapping one pointer, so
+// the readers — the MIDI task looking a song sample up by id among them — always
+// see a complete table, never an empty or half-written one.  The table it
+// replaces becomes the next build buffer; that is safe because a reader holds
+// its table only for one lookup (microseconds) and syncs are seconds apart (one
+// per sample-list request).
+//
+// All tables (these two and s_trim below) live in PSRAM — control-rate data,
 // and internal RAM is the radios'.  Allocated on first use by tablesReady();
-// the counts stay 0 while a table is missing, so readers never touch it.
-static SmEntry*    s_entries = nullptr;   // SM_MAX_ENTRIES
-static int         s_count = 0;
+// until the first sync publishes, there is no live table and lookups find
+// nothing.
+struct SmTable {
+    int     count;
+    SmEntry e[SM_MAX_ENTRIES];
+};
+static SmTable*    s_live  = nullptr;     // published — readers look only here
+static SmTable*    s_build = nullptr;     // the next sync's workspace (loop task)
 struct SampleTrim;                        // SampleManifest.h
 static SampleTrim* s_trim = nullptr;      // SM_MAX_ENTRIES
 static bool tablesReady();
+
+static inline const SmTable* liveTable() {
+    return __atomic_load_n(&s_live, __ATOMIC_ACQUIRE);
+}
 
 // ── Parsing ────────────────────────────────────────────────────────────────
 
@@ -46,58 +63,58 @@ static bool parseLine(const char* line, uint8_t& outId, char* outName, int nameL
     return true;
 }
 
-static int findByName(const char* name) {
-    for (int i = 0; i < s_count; i++) {
-        if (strcasecmp(s_entries[i].name, name) == 0) return i;
+static int findByName(const SmTable* t, const char* name) {
+    for (int i = 0; i < t->count; i++) {
+        if (strcasecmp(t->e[i].name, name) == 0) return i;
     }
     return -1;
 }
 
-static uint8_t nextFreeId() {
+static uint8_t nextFreeId(const SmTable* t) {
     bool used[128] = {};
-    for (int i = 0; i < s_count; i++) used[s_entries[i].id] = true;
+    for (int i = 0; i < t->count; i++) used[t->e[i].id] = true;
     for (int id = 1; id < 128; id++) if (!used[id]) return (uint8_t)id;
     return 0;  // exhausted
 }
 
 // ── Manifest I/O ───────────────────────────────────────────────────────────
 
-static void loadManifest() {
+static void loadManifest(SmTable* t) {
     SdLock _;
-    s_count = 0;
+    t->count = 0;
     File f = SD.open(SM_PATH, FILE_READ);
     if (!f) return;
     char line[SM_NAME_LEN + 16];
-    while (s_count < SM_MAX_ENTRIES && readLine(f, line, sizeof(line))) {
+    while (t->count < SM_MAX_ENTRIES && readLine(f, line, sizeof(line))) {
         uint8_t id;
         char    name[SM_NAME_LEN];
         if (!parseLine(line, id, name, SM_NAME_LEN)) continue;
 
         // Reject duplicates (id or name) — keep first occurrence.
         bool dup = false;
-        for (int i = 0; i < s_count; i++) {
-            if (s_entries[i].id == id ||
-                strcasecmp(s_entries[i].name, name) == 0) { dup = true; break; }
+        for (int i = 0; i < t->count; i++) {
+            if (t->e[i].id == id ||
+                strcasecmp(t->e[i].name, name) == 0) { dup = true; break; }
         }
         if (dup) continue;
 
-        s_entries[s_count].id = id;
-        strncpy(s_entries[s_count].name, name, SM_NAME_LEN - 1);
-        s_entries[s_count].name[SM_NAME_LEN - 1] = '\0';
-        s_entries[s_count].size = 0;            // filled in by the folder scan
-        s_count++;
+        SmEntry& e = t->e[t->count++];
+        e.id = id;
+        strncpy(e.name, name, SM_NAME_LEN - 1);
+        e.name[SM_NAME_LEN - 1] = '\0';
+        e.size = 0;                             // filled in by the folder scan
     }
     f.close();
 }
 
-static bool writeManifest() {
+static bool writeManifest(const SmTable* t) {
     SdLock _;
     SD.remove(SM_PATH);
     File f = SD.open(SM_PATH, FILE_WRITE);
     if (!f) return false;
     char line[SM_NAME_LEN + 16];
-    for (int i = 0; i < s_count; i++) {
-        snprintf(line, sizeof(line), "%u=%s\n", s_entries[i].id, s_entries[i].name);
+    for (int i = 0; i < t->count; i++) {
+        snprintf(line, sizeof(line), "%u=%s\n", t->e[i].id, t->e[i].name);
         f.print(line);
     }
     f.close();
@@ -106,7 +123,7 @@ static bool writeManifest() {
 
 // Walks /samples/ for .wav files and appends any not already in the manifest.
 // Returns true if new entries were added.
-static bool scanAndAppend() {
+static bool scanAndAppend(SmTable* t) {
     SdLock _;
     File dir = SD.open(SM_DIR);
     if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return false; }
@@ -124,19 +141,18 @@ static bool scanAndAppend() {
                      len < SM_NAME_LEN;
         if (!isWav) { f.close(); continue; }
 
-        int at = findByName(n);
+        int at = findByName(t, n);
         if (at < 0) {
-            if (s_count >= SM_MAX_ENTRIES) { f.close(); continue; }   // table full
-            uint8_t id = nextFreeId();
+            if (t->count >= SM_MAX_ENTRIES) { f.close(); continue; }   // table full
+            uint8_t id = nextFreeId(t);
             if (id == 0) { f.close(); continue; }   // 127 ids used up
-            at = s_count;
-            s_entries[s_count].id = id;
-            strncpy(s_entries[s_count].name, n, SM_NAME_LEN - 1);
-            s_entries[s_count].name[SM_NAME_LEN - 1] = '\0';
-            s_count++;
+            at = t->count++;
+            t->e[at].id = id;
+            strncpy(t->e[at].name, n, SM_NAME_LEN - 1);
+            t->e[at].name[SM_NAME_LEN - 1] = '\0';
             added = true;
         }
-        s_entries[at].size = (uint32_t)f.size();   // the cache's "will it fit" figure
+        t->e[at].size = (uint32_t)f.size();   // the cache's "will it fit" figure
         f.close();
     }
     dir.close();
@@ -144,15 +160,15 @@ static bool scanAndAppend() {
 }
 
 // Sort by id ascending (stable order for client paging).
-static void sortById() {
-    for (int i = 1; i < s_count; i++) {
-        SmEntry e = s_entries[i];
+static void sortById(SmTable* t) {
+    for (int i = 1; i < t->count; i++) {
+        SmEntry e = t->e[i];
         int j = i;
-        while (j > 0 && s_entries[j - 1].id > e.id) {
-            s_entries[j] = s_entries[j - 1];
+        while (j > 0 && t->e[j - 1].id > e.id) {
+            t->e[j] = t->e[j - 1];
             j--;
         }
-        s_entries[j] = e;
+        t->e[j] = e;
     }
 }
 
@@ -162,18 +178,25 @@ static void sortById() {
 
 static const char* ST_PATH = "/samples/trim.txt";
 static int         s_trimCount = 0;
+static bool        s_trimLoaded = false;   // trim.txt is read once, by the first sync
 
 // PSRAM first, internal RAM as a fallback; zeroed.  False only if both fail.
+static SmTable* s_tabs[2] = { nullptr, nullptr };   // the two buffers behind s_live / s_build
+
+static SmTable* allocTable() {
+    SmTable* t = (SmTable*)heap_caps_calloc(1, sizeof(SmTable), MALLOC_CAP_SPIRAM);
+    if (!t) t = (SmTable*)calloc(1, sizeof(SmTable));
+    return t;
+}
+
 static bool tablesReady() {
-    if (!s_entries) {
-        s_entries = (SmEntry*)heap_caps_calloc(SM_MAX_ENTRIES, sizeof(SmEntry), MALLOC_CAP_SPIRAM);
-        if (!s_entries) s_entries = (SmEntry*)calloc(SM_MAX_ENTRIES, sizeof(SmEntry));
-    }
+    for (int i = 0; i < 2; i++) if (!s_tabs[i]) s_tabs[i] = allocTable();
+    if (!s_build && !s_live) s_build = s_tabs[0];   // first sync builds in [0]
     if (!s_trim) {
         s_trim = (SampleTrim*)heap_caps_calloc(SM_MAX_ENTRIES, sizeof(SampleTrim), MALLOC_CAP_SPIRAM);
         if (!s_trim) s_trim = (SampleTrim*)calloc(SM_MAX_ENTRIES, sizeof(SampleTrim));
     }
-    return s_entries && s_trim;
+    return s_tabs[0] && s_tabs[1] && s_trim;
 }
 
 static void loadTrims() {
@@ -183,20 +206,25 @@ static void loadTrims() {
     if (!f) return;
     char line[64];
     while (s_trimCount < SM_MAX_ENTRIES && readLine(f, line, sizeof(line))) {
-        // <id>=<startFrame>:<endFrame>:<loop>[:<tuneCents>]
+        // <id>=<startFrame>:<endFrame>:<loop>[:<tuneCents>[:<velOff>[:<keepLen>[:<pitchCHz>]]]]
         const char* eq = strchr(line, '=');
         if (!eq) continue;
         int id = atoi(line);
         if (id < 1 || id > 127) continue;
-        uint32_t st = 0, en = 0; int lp = 0, tune = 0;
-        // Three fields = a file written before TUNE existed (tune stays 0).
-        if (sscanf(eq + 1, "%lu:%lu:%d:%d",
-                   (unsigned long*)&st, (unsigned long*)&en, &lp, &tune) < 3) continue;
+        unsigned long st = 0, en = 0;   // %lu's own type (64-bit on the host test)
+        int lp = 0, tune = 0, vo = 0, kl = 0;
+        unsigned long pc = 0;
+        // Fewer fields = a file written before TUNE / the velocity switch /
+        // KEEP LENGTH existed (they stay 0).
+        if (sscanf(eq + 1, "%lu:%lu:%d:%d:%d:%d:%lu", &st, &en, &lp, &tune, &vo, &kl, &pc) < 3) continue;
         if (tune < -4800) tune = -4800;
         if (tune >  4800) tune =  4800;
         SampleTrim& t = s_trim[s_trimCount++];
         t.id = (uint8_t)id; t.startFrame = st; t.endFrame = en; t.loop = (uint8_t)(lp != 0);
         t.tuneCents = (int16_t)tune;
+        t.velOff    = (uint8_t)(vo != 0);
+        t.keepLen   = (uint8_t)(kl != 0);
+        t.pitchCHz  = (uint32_t)pc;
     }
     f.close();
     Serial.printf("[SM] trim.txt: %d entr%s\n", s_trimCount, s_trimCount == 1 ? "y" : "ies");
@@ -209,25 +237,43 @@ const SampleTrim* sampleTrimFor(uint8_t id) {
 }
 
 void sampleTrimSet(uint8_t id, uint32_t startFrame, uint32_t endFrame, uint8_t loop,
-                   int16_t tuneCents) {
+                   int16_t tuneCents, uint8_t velOff, uint8_t keepLen) {
+    velOff  = velOff ? 1 : 0;
+    keepLen = keepLen ? 1 : 0;
     if (!tablesReady()) return;
     if (tuneCents < -4800) tuneCents = -4800;
     if (tuneCents >  4800) tuneCents =  4800;
-    bool remove = (startFrame == 0 && endFrame == 0 && !loop &&
-                   tuneCents == 0);                            // back to defaults
+    bool deflt = (startFrame == 0 && endFrame == 0 && !loop &&
+                  tuneCents == 0 && !velOff && !keepLen);      // back to defaults
     for (int i = 0; i < s_trimCount; i++) {
         if (s_trim[i].id != id) continue;
-        if (remove) { s_trim[i] = s_trim[--s_trimCount]; }
+        if (deflt && s_trim[i].pitchCHz == 0) { s_trim[i] = s_trim[--s_trimCount]; }
         else        { s_trim[i].startFrame = startFrame;
                       s_trim[i].endFrame   = endFrame;
                       s_trim[i].loop       = loop;
-                      s_trim[i].tuneCents  = tuneCents; }
+                      s_trim[i].tuneCents  = tuneCents;
+                      s_trim[i].velOff     = velOff;
+                      s_trim[i].keepLen    = keepLen; }
         return;
     }
-    if (remove || s_trimCount >= SM_MAX_ENTRIES) return;
+    if (deflt || s_trimCount >= SM_MAX_ENTRIES) return;
     SampleTrim& t = s_trim[s_trimCount++];
     t.id = id; t.startFrame = startFrame; t.endFrame = endFrame; t.loop = loop;
     t.tuneCents = tuneCents;
+    t.velOff    = velOff;
+    t.keepLen   = keepLen;
+    t.pitchCHz  = 0;
+}
+
+void sampleTrimSetPitch(uint8_t id, uint32_t pitchCHz) {
+    if (!tablesReady()) return;
+    for (int i = 0; i < s_trimCount; i++)
+        if (s_trim[i].id == id) { s_trim[i].pitchCHz = pitchCHz; return; }
+    if (s_trimCount >= SM_MAX_ENTRIES) return;
+    SampleTrim& t = s_trim[s_trimCount++];
+    t = SampleTrim{};
+    t.id = id;
+    t.pitchCHz = pitchCHz;
 }
 
 bool sampleTrimSave() {
@@ -236,51 +282,82 @@ bool sampleTrimSave() {
     File f = SD.open(ST_PATH, FILE_WRITE);
     if (!f) return false;
     for (int i = 0; i < s_trimCount; i++)
-        f.printf("%u=%lu:%lu:%u:%d\n", (unsigned)s_trim[i].id,
+        f.printf("%u=%lu:%lu:%u:%d:%u:%u:%lu\n", (unsigned)s_trim[i].id,
                  (unsigned long)s_trim[i].startFrame,
                  (unsigned long)s_trim[i].endFrame,
                  (unsigned)s_trim[i].loop,
-                 (int)s_trim[i].tuneCents);
+                 (int)s_trim[i].tuneCents,
+                 (unsigned)s_trim[i].velOff,
+                 (unsigned)s_trim[i].keepLen,
+                 (unsigned long)s_trim[i].pitchCHz);
     f.close();
     return true;
 }
 
+void sampleTrimReload() {
+    if (!tablesReady()) return;
+    loadTrims();
+    s_trimLoaded = true;
+}
+
 bool sampleManifestSync() {
-    s_count = 0;
-    if (!tablesReady()) { s_trimCount = 0; return false; }
+    if (!tablesReady()) return false;
     {
         SdLock _;
         File dir = SD.open(SM_DIR);
         bool dirOk = dir && dir.isDirectory();
         if (dir) dir.close();
-        if (!dirOk) return false;
+        if (!dirOk) return false;          // the live table stays as it was
     }
 
-    loadManifest();
-    bool changed = scanAndAppend();
-    sortById();
-    if (changed) writeManifest();
-    loadTrims();
+    SmTable* t = s_build;
+    loadManifest(t);
+    bool changed = scanAndAppend(t);
+    sortById(t);
+    if (changed) writeManifest(t);
+
+    // Publish: one pointer store.  The table it replaces is the next build
+    // buffer (or, on the first sync, the second buffer is).
+    SmTable* old = s_live ? s_live : s_tabs[1];
+    __atomic_store_n(&s_live, t, __ATOMIC_RELEASE);
+    s_build = old;
+
+    // trim.txt only on the first sync.  After that the table in memory is the
+    // authority (edits land there first, sampleTrimSave writes it out), and
+    // nothing else changes the file while the server runs — so re-reading it
+    // would only open a window in which song samples play untrimmed.
+    if (!s_trimLoaded) {
+        loadTrims();
+        s_trimLoaded = true;
+    }
     return true;
 }
 
-int sampleManifestCount() { return s_count; }
+int sampleManifestCount() {
+    const SmTable* t = liveTable();
+    return t ? t->count : 0;
+}
 
 const SmEntry* sampleManifestAt(int idx) {
-    if (idx < 0 || idx >= s_count) return nullptr;
-    return &s_entries[idx];
+    const SmTable* t = liveTable();
+    if (!t || idx < 0 || idx >= t->count) return nullptr;
+    return &t->e[idx];
 }
 
 uint32_t sampleManifestSizeFor(uint8_t id) {
-    for (int i = 0; i < s_count; i++) {
-        if (s_entries[i].id == id) return s_entries[i].size;
+    const SmTable* t = liveTable();
+    if (!t) return 0;
+    for (int i = 0; i < t->count; i++) {
+        if (t->e[i].id == id) return t->e[i].size;
     }
     return 0;
 }
 
 const char* sampleManifestNameFor(uint8_t id) {
-    for (int i = 0; i < s_count; i++) {
-        if (s_entries[i].id == id) return s_entries[i].name;
+    const SmTable* t = liveTable();
+    if (!t) return nullptr;
+    for (int i = 0; i < t->count; i++) {
+        if (t->e[i].id == id) return t->e[i].name;
     }
     return nullptr;
 }

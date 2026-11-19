@@ -148,6 +148,7 @@ void BackupRestorePage::draw() {
     _d.fillScreen(COL_WHITE);
     switch (_state) {
         case BRState::MENU:                drawMenu();            break;
+        case BRState::BACKUP_ASK:          drawBackupAsk();       break;
         case BRState::BACKUP_PROGRESS:     drawBackupProgress();  break;
         case BRState::BACKUP_DONE:         drawBackupDone();      break;
         case BRState::FOLDER_LIST:         drawFolderList();      break;
@@ -179,6 +180,29 @@ void BackupRestorePage::drawMenu() {
     drawHeader("BACKUP / RESTORE");
     uiButton(_d, BR_BTN1_X, BR_BTN_Y, BR_BTN_W, BR_BTN_H, "BACKUP",  COL_WHITE, COL_BLACK, 3);
     uiButton(_d, BR_BTN2_X, BR_BTN_Y, BR_BTN_W, BR_BTN_H, "RESTORE", COL_WHITE, COL_BLACK, 3);
+}
+
+// Same layout as the restore confirm.  The sample list and per-sample
+// settings go in either way — only the WAVs are optional.
+void BackupRestorePage::drawBackupAsk() {
+    drawHeader("BACKUP", true);
+
+    const char* title = "Include the sample WAVs?";
+    _d.setTextSize(4);
+    _d.setTextColor(COL_BLACK);
+    _d.setCursor((960 - (int)strlen(title) * 24) / 2, BR_CONF_TITLE_Y);
+    _d.print(title);
+
+    const char* body = "Large - can take minutes.  The sample list and settings are always saved.";
+    _d.setTextSize(2);
+    _d.setTextColor(COL_DKGREY);
+    _d.setCursor((960 - (int)strlen(body) * 12) / 2, BR_CONF_BODY_Y);
+    _d.print(body);
+
+    uiButton(_d, BR_CONF_YES_X, BR_CONF_BTN_Y, BR_CONF_BTN_W, BR_CONF_BTN_H,
+             "YES", COL_WHITE, COL_BLACK, 4);
+    uiButton(_d, BR_CONF_NO_X,  BR_CONF_BTN_Y, BR_CONF_BTN_W, BR_CONF_BTN_H,
+             "NO",  COL_BLACK, COL_WHITE, 4);
 }
 
 void BackupRestorePage::drawProgressBar(int x, int y, int w, int h,
@@ -455,7 +479,7 @@ void BackupRestorePage::drawError() {
 
 // ── Backup logic ─────────────────────────────────────────────────────────────
 
-void BackupRestorePage::startBackup() {
+void BackupRestorePage::startBackup(bool withSamples) {
     // Real backup over MagiLink.  Synchronous — UI freezes for the
     // duration (~10-20 s for a typical 28-file backup).  Pattern:
     //   acquire mutex
@@ -524,6 +548,7 @@ void BackupRestorePage::startBackup() {
 
     gMagiLink.acquireMutex();
     MsgStartBackup req;
+    req.withSamples = withSamples ? 1 : 0;
     if (!gMagiLink.send(&req, sizeof(req))) {
         Serial.println("[BK] send MSG_START_BACKUP failed");
         gMagiLink.releaseMutex();
@@ -844,14 +869,16 @@ void BackupRestorePage::scanFolderFiles(const char* folder) {
             const char* slash = strrchr(name, '/');
             if (slash) name = slash + 1;
             // Accept every backup file type so they all restore: .mgt
-            // (songs + instruments), .set (setlists), .txt (drumtracks).
-            // The server routes each back to the right dir by extension.
+            // (songs + instruments), .set (setlists), .txt (drumtracks, the
+            // master catalog, samples.txt, trim.txt), .wav (samples).  The
+            // server routes each back to the right dir by name/extension.
             int len = (int)strlen(name);
             if (len >= 4 && name[len - 4] == '.') {
                 const char* ext = name + len - 3;
                 if (strcasecmp(ext, "mgt") == 0 ||
                     strcasecmp(ext, "set") == 0 ||
-                    strcasecmp(ext, "txt") == 0) {
+                    strcasecmp(ext, "txt") == 0 ||
+                    strcasecmp(ext, "wav") == 0) {
                     strncpy(_rsFileNames[_rsFileTotal], name, BK_FNAME_MAX - 1);
                     _rsFileNames[_rsFileTotal][BK_FNAME_MAX - 1] = '\0';
                     _rsFileTotal++;
@@ -909,19 +936,6 @@ void BackupRestorePage::restoreTick() {
         return;
     }
 
-    // One whole file is read into RAM before it is sent.  ~36 KB — PSRAM,
-    // allocated on the first restore and kept.
-    static uint8_t* restoreBuf = nullptr;
-    if (!restoreBuf) restoreBuf = (uint8_t*)ps_malloc(SONG_TRANSFER_MAX);
-    if (!restoreBuf) {
-        Serial.println("[RS] no PSRAM for the restore buffer — restore abandoned");
-        _rsFilesFailed += _rsRestoreCount - _rsFileCurrent;
-        _rsFileCurrent  = _rsRestoreCount;
-        _state = BRState::RESTORE_DONE;
-        draw(); _d.paint();
-        return;
-    }
-
     int idx = _rsRestoreList[_rsFileCurrent];
     const char* name = _rsFileNames[idx];
 
@@ -936,27 +950,11 @@ void BackupRestorePage::restoreTick() {
         restoreTick();
         return;
     }
+    // Streamed off the card a chunk at a time (sample WAVs run to megabytes).
     uint32_t fileSize = (uint32_t)f.size();
-    if (fileSize > SONG_TRANSFER_MAX) {
-        f.close();
-        Serial.printf("[RS] too big to restore '%s' (%u bytes)\n", path, (unsigned)fileSize);
-        _rsFilesFailed++;
-        _rsFileCurrent++;
-        restoreTick();
-        return;
-    }
-    uint32_t got = (uint32_t)f.read(restoreBuf, fileSize);
-    f.close();
-    if (got != fileSize) {
-        Serial.printf("[RS] short read '%s' (%u of %u)\n", path, (unsigned)got, (unsigned)fileSize);
-        _rsFilesFailed++;
-        _rsFileCurrent++;
-        restoreTick();
-        return;
-    }
-
     bool isInstr = (strcmp(name, "instruments.mgt") == 0);
-    bool sent = gServerPairing.sendRestoreFile(name, isInstr, restoreBuf, fileSize);
+    bool sent = gServerPairing.sendRestoreFile(name, isInstr, f, fileSize);
+    f.close();
     if (sent) _rsFilesSent++; else _rsFilesFailed++;
     Serial.printf("[RS] %s '%s' %u bytes instr=%d\n", sent ? "sent" : "SEND FAILED",
                   name, fileSize, isInstr);
@@ -1091,7 +1089,8 @@ bool BackupRestorePage::poll() {
                 // BACKUP button
                 if (sx >= BR_BTN1_X && sx < BR_BTN1_X + BR_BTN_W &&
                     sy >= BR_BTN_Y  && sy < BR_BTN_Y  + BR_BTN_H) {
-                    startBackup();
+                    _state = BRState::BACKUP_ASK;
+                    draw(); _d.paint();
                     return false;
                 }
                 // RESTORE button
@@ -1165,6 +1164,20 @@ bool BackupRestorePage::poll() {
                         draw(); _d.paint();
                         return false;
                     }
+                }
+                break;
+            }
+
+            case BRState::BACKUP_ASK: {
+                bool yes = sx >= BR_CONF_YES_X && sx < BR_CONF_YES_X + BR_CONF_BTN_W &&
+                           sy >= BR_CONF_BTN_Y && sy < BR_CONF_BTN_Y + BR_CONF_BTN_H;
+                bool no  = sx >= BR_CONF_NO_X  && sx < BR_CONF_NO_X  + BR_CONF_BTN_W &&
+                           sy >= BR_CONF_BTN_Y && sy < BR_CONF_BTN_Y + BR_CONF_BTN_H;
+                if (yes || no) { startBackup(yes); return false; }
+                if (hitHeaderBack(sx, sy)) {
+                    _state = BRState::MENU;
+                    draw(); _d.paint();
+                    return false;
                 }
                 break;
             }

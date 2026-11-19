@@ -4,6 +4,9 @@
 #include "audio_codec.h"
 #include "crash_log.h"
 #include "TrackerData.h"
+#include "psola.h"
+#include "pitch_detect.h"
+#include "MagiMsg.h"
 #include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
 #include <Arduino.h>
 #include <SD.h>
@@ -39,6 +42,8 @@ static const int                 IN_BYTES     = IN_SAMPLES * 2;
 
 static const int          FADE_IN_FRAMES  = 1024;
 static const int          FADE_OUT_FRAMES = 1024;
+static const int          STOP_FADE_FRAMES = 256;  // stopped / replaced mid-sound: short,
+                                                   // so a retrigger isn't held up
 static int                s_fadeInRemaining = 0;   // frames left to fade
 
 // Fades work in frames, not raw samples, so mono and stereo get the same
@@ -196,8 +201,11 @@ struct RamVoice {
     uint32_t age;       // frames rendered (drives the fade-in)
     int32_t  fadeRem;   // release fade countdown
     uint32_t seq;       // allocation order (steal the oldest)
+    bool     psola;     // KEEP LENGTH: s_psola[slot] renders it (step/pos unused)
 };
 static RamVoice     s_voice[RAM_VOICES] = {};
+// KEEP LENGTH grain state, one per voice slot (PSRAM — ~100 bytes each).
+static PsolaState*  s_psola = nullptr;
 static uint32_t     s_voiceSeq = 0;
 static portMUX_TYPE s_voiceMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -216,27 +224,50 @@ static void mixRamInto(int16_t* out, int frames) {
         if (!v.active) continue;
         const int16_t* d  = v.data;
         const int      ch = v.ch;
+        // Frames of input left before a one-shot's end, at which the fade-out
+        // starts: a trimmed end (or a cut-off take) otherwise stops dead and
+        // clicks.  RAM_FADE_FRAMES output frames' worth of input.
+        uint32_t tailIn = (uint32_t)(((uint64_t)RAM_FADE_FRAMES * v.stepQ16) >> 16) + 1;
         for (int i = 0; i < frames; i++) {
-            if (v.pos + 1 >= v.frames) {
-                if (!v.loop) { v.active = false; break; }
-                v.pos  = 0;                 // held key: wrap and keep singing
-                v.frac = 0;
-            }
+            int32_t sL, sR;
             int32_t g = v.gainQ15;
+            if (v.psola) {
+                if (!psolaNext(s_psola[vi], d, v.frames, ch, v.loop, sL, sR)) {
+                    v.active = false;
+                    break;
+                }
+            } else {
+                if (v.pos + 1 >= v.frames) {
+                    if (!v.loop) { v.active = false; break; }
+                    v.pos  = 0;                 // held key: wrap and keep singing
+                    v.frac = 0;
+                }
+                if (!v.loop) {                                // fade out into the end
+                    uint32_t left = v.frames - 1 - v.pos;
+                    if (left < tailIn) {
+                        uint32_t remOut = (uint32_t)((((uint64_t)left << 16) - v.frac) / v.stepQ16);
+                        if (remOut < RAM_FADE_FRAMES)
+                            g = (int32_t)((int64_t)g * remOut / RAM_FADE_FRAMES);
+                    }
+                }
+                const int16_t* fr0 = d + v.pos * ch;
+                int32_t aL = fr0[0], bL = fr0[ch];
+                sL = aL + (((bL - aL) * (int32_t)v.frac) >> 16);
+                sR = sL;
+                if (ch == 2) {
+                    int32_t aR = fr0[1], bR = fr0[3];
+                    sR = aR + (((bR - aR) * (int32_t)v.frac) >> 16);
+                }
+                v.frac += v.stepQ16;
+                v.pos  += v.frac >> 16;
+                v.frac &= 0xFFFF;
+            }
             if (v.age < RAM_FADE_FRAMES)                  // fade-in
                 g = (int32_t)((int64_t)g * v.age / RAM_FADE_FRAMES);
             if (v.releasing) {                            // fade-out then die
                 if (v.fadeRem <= 0) { v.active = false; break; }
                 g = (int32_t)((int64_t)g * v.fadeRem / RAM_FADE_FRAMES);
                 v.fadeRem--;
-            }
-            const int16_t* fr0 = d + v.pos * ch;
-            int32_t aL = fr0[0], bL = fr0[ch];
-            int32_t sL = aL + (((bL - aL) * (int32_t)v.frac) >> 16);
-            int32_t sR = sL;
-            if (ch == 2) {
-                int32_t aR = fr0[1], bR = fr0[3];
-                sR = aR + (((bR - aR) * (int32_t)v.frac) >> 16);
             }
             int32_t oL = out[i * 2 + 0] + ((sL * g) >> 15);
             int32_t oR = out[i * 2 + 1] + ((sR * g) >> 15);
@@ -246,20 +277,57 @@ static void mixRamInto(int16_t* out, int frames) {
             if (oR < -32768) oR = -32768;
             out[i * 2 + 0] = (int16_t)oL;
             out[i * 2 + 1] = (int16_t)oR;
-            v.frac += v.stepQ16;
-            v.pos  += v.frac >> 16;
-            v.frac &= 0xFFFF;
             v.age++;
         }
     }
 }
 
-int samplePlayRam(uint8_t sampleId, float pitchSemitones, uint8_t volume) {
-    if (!s_ram || sampleId == 0) return -1;
+// Start a RAM voice on `data` (inside s_voiceMux).  Free voice, else steal
+// the oldest.  Returns the handle.
+// keepPeriod >= 0: KEEP LENGTH — PSOLA at `pitchRatio` with grains on that
+// period (source frames; 0 = no clear pitch).  < 0: plain resampling.
+static int voiceStartLocked(const int16_t* data, uint32_t frames, uint32_t rate,
+                            uint8_t ch, uint8_t loop, double ratio, int32_t gain,
+                            float keepPeriod = -1.0f, float pitchRatio = 1.0f) {
+    uint32_t stepQ16 = (uint32_t)((double)rate * ratio + 0.5);
+    if (stepQ16 == 0) stepQ16 = 1;
+    int pick = -1;
+    uint32_t oldest = 0xFFFFFFFF;
+    for (int i = 0; i < RAM_VOICES; i++) {
+        if (!s_voice[i].active) { pick = i; break; }
+        if (s_voice[i].seq < oldest) { oldest = s_voice[i].seq; pick = i; }
+    }
+    RamVoice& v = s_voice[pick];
+    v.active    = false;          // renderer skips it while we rewrite fields
+    v.releasing = false;
+    v.data      = data;
+    v.frames    = frames;
+    v.ch        = ch;
+    v.loop      = loop;
+    v.pos       = 0;
+    v.frac      = 0;
+    v.stepQ16   = stepQ16;
+    v.gainQ15   = gain;
+    v.age       = 0;
+    v.fadeRem   = RAM_FADE_FRAMES;
+    v.seq       = ++s_voiceSeq;
+    v.psola     = keepPeriod >= 0.0f && s_psola;
+    if (v.psola) psolaStart(s_psola[pick], rate, keepPeriod, pitchRatio, AUDIO_CODEC_RATE_HZ);
+    v.active    = true;
+    // Handle = generation | slot: a stale handle (voice ended, slot reused)
+    // can never stop the slot's NEW occupant.
+    return (int)((v.seq << 3) | (uint32_t)pick);
+}
 
+static double pitchRatio(float pitchSemitones) {
     if (pitchSemitones < -48) pitchSemitones = -48;
     if (pitchSemitones >  48) pitchSemitones =  48;
-    double  ratio = exp2((double)pitchSemitones / 12.0) * 65536.0 / AUDIO_CODEC_RATE_HZ;
+    return exp2((double)pitchSemitones / 12.0) * 65536.0 / AUDIO_CODEC_RATE_HZ;
+}
+
+int samplePlayRam(uint8_t sampleId, float pitchSemitones, uint8_t volume) {
+    if (!s_ram || sampleId == 0) return -1;
+    double  ratio = pitchRatio(pitchSemitones);
     int32_t gain  = (int32_t)(volume * volume * 32767L) / (127 * 127);
 
     // Lookup and voice start in one critical section: the entry can't be half
@@ -271,37 +339,29 @@ int samplePlayRam(uint8_t sampleId, float pitchSemitones, uint8_t volume) {
     for (int i = 0; i < RAM_CACHE_MAX; i++)
         if (s_ram[i].id == sampleId) { rs = &s_ram[i]; break; }
     if (rs) {
-        uint32_t stepQ16 = (uint32_t)((double)rs->rate * ratio + 0.5);
-        if (stepQ16 == 0) stepQ16 = 1;
-        // Free voice, else steal the oldest.
-        int pick = -1;
-        uint32_t oldest = 0xFFFFFFFF;
-        for (int i = 0; i < RAM_VOICES; i++) {
-            if (!s_voice[i].active) { pick = i; break; }
-            if (s_voice[i].seq < oldest) { oldest = s_voice[i].seq; pick = i; }
-        }
-        RamVoice& v = s_voice[pick];
-        v.active    = false;          // renderer skips it while we rewrite fields
-        v.releasing = false;
-        v.data      = rs->data;
-        v.frames    = rs->frames;
-        v.ch        = rs->ch;
-        v.loop      = rs->loop;
-        v.pos       = 0;
-        v.frac      = 0;
-        v.stepQ16   = stepQ16;
-        v.gainQ15   = gain;
-        v.age       = 0;
-        v.fadeRem   = RAM_FADE_FRAMES;
-        v.seq       = ++s_voiceSeq;
-        v.active    = true;
-        // Handle = generation | slot: a stale handle (voice ended, slot reused)
-        // can never stop the slot's NEW occupant.
-        handle = (int)((v.seq << 3) | (uint32_t)pick);
+        // KEEP LENGTH (sample editor): change the pitch, not the length.
+        float keepPeriod = -1.0f;
+        const SampleTrim* tr = sampleTrimFor(sampleId);
+        if (tr && tr->keepLen)
+            keepPeriod = tr->pitchCHz > 100 ? (float)rs->rate * 100.0f / (float)tr->pitchCHz : 0.0f;
+        handle = voiceStartLocked(rs->data, rs->frames, rs->rate, rs->ch, rs->loop, ratio, gain,
+                                  keepPeriod, exp2f(pitchSemitones / 12.0f));
     }
     portEXIT_CRITICAL(&s_voiceMux);
 
     if (handle >= 0) xSemaphoreGive(s_trigger);    // wake the WAV task if it's idle
+    return handle;
+}
+
+int samplePlayBuffer(const int16_t* data, uint32_t frames, uint32_t rate,
+                     float pitchSemitones, uint8_t volume) {
+    if (!data || !frames || !rate) return -1;
+    double  ratio = pitchRatio(pitchSemitones);
+    int32_t gain  = (int32_t)(volume * volume * 32767L) / (127 * 127);
+    portENTER_CRITICAL(&s_voiceMux);
+    int handle = voiceStartLocked(data, frames, rate, 1, 0, ratio, gain);
+    portEXIT_CRITICAL(&s_voiceMux);
+    xSemaphoreGive(s_trigger);
     return handle;
 }
 
@@ -462,12 +522,16 @@ static void wavTaskFn(void*) {
 
         int curBytes = readChunk(inBuf);
 
-        while (curBytes > 0 && !s_stop) {
-            int nextBytes = readChunk(nextBuf);
+        while (curBytes > 0) {
+            // Stopped (or a new sample is waiting): play a few ms more, faded
+            // to nothing — cutting a sound dead mid-wave clicks.
+            bool stopping = s_stop;
+            int nextBytes = stopping ? 0 : readChunk(nextBuf);
 
             int frames = (curBytes / 2) / numCh; // resampler input frames
             applyFadeIn(inBuf, frames, numCh);
-            if (nextBytes == 0 || s_stop) {
+            if (stopping && frames > STOP_FADE_FRAMES) frames = STOP_FADE_FRAMES;
+            if (nextBytes == 0) {
                 applyFadeOut(inBuf, frames, numCh);
             }
 
@@ -477,7 +541,7 @@ static void wavTaskFn(void*) {
             // Phase + boundary samples carry correctly across calls via the
             // advanced pointer, so this keeps outBuf small (memory stays flat).
             int done = 0;                        // input frames consumed
-            while (done < frames && !s_stop) {
+            while (done < frames) {
                 int consumed = 0;
                 int outFrames = rs.process(inBuf + done * numCh, frames - done,
                                            outBuf, OUT_FRAMES_MAX, consumed);
@@ -535,6 +599,8 @@ void samplePlayerInit() {
     s_ram = (RamSample*)heap_caps_calloc(RAM_CACHE_MAX, sizeof(RamSample), MALLOC_CAP_SPIRAM);
     if (!s_ram) s_ram = (RamSample*)calloc(RAM_CACHE_MAX, sizeof(RamSample));
     if (!s_ram) Serial.println("[SP] no memory for the sample cache table — everything streams");
+    s_psola = (PsolaState*)heap_caps_calloc(RAM_VOICES, sizeof(PsolaState), MALLOC_CAP_SPIRAM);
+    if (!s_psola) Serial.println("[SP] no memory for KEEP LENGTH — those samples resample instead");
     s_trigger = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(wavTaskFn, "WAV", 4096, nullptr, 5, nullptr, 0);  // Core 0
 }
@@ -575,6 +641,8 @@ static volatile bool    s_wantPads = false;   // see samplePreloadSetPads
 
 void samplePreloadSetExtra(uint8_t sampleId) { s_extraId = sampleId; }
 void samplePreloadSetPads(bool on)           { s_wantPads = on; }
+static bool s_forgetAll = false;
+void samplePreloadForgetAll()                { s_forgetAll = true; }
 
 // One load in progress, fed a piece per samplePreloadSync call.
 static struct PreloadJob {
@@ -610,7 +678,27 @@ static void rawTrim(uint8_t id, uint32_t& st, uint32_t& en, uint8_t& lp) {
 
 // Remove entry i — unless a RAM voice is sounding (see the rules above), in
 // which case nothing happens and it returns false: try again later.
+// The cached sample KEEP LENGTH's pitch pass is reading (0 = none): not
+// evicted under it.
+static uint8_t  s_pitchPin   = 0;
+static uint32_t s_pitchJobNo = 0;
+
+// AUTO TUNE (sample editor): one sample asked for, answered once.
+static volatile uint8_t  s_tuneReq   = 0;     // asked for, not started
+static volatile uint32_t s_tuneReqMs = 0;
+static uint8_t           s_tuneJob   = 0;     // being analysed
+static bool              s_tuneDone  = false;
+static uint8_t           s_tuneDoneId = 0, s_tuneDoneRes = 0;
+static float             s_tuneDoneHz = 0;
+#define AUTOTUNE_WAIT_MS 6000                 // for the sample to reach the cache
+
+static void tuneAnswer(uint8_t id, uint8_t res, float hz) {
+    s_tuneDoneId = id; s_tuneDoneRes = res; s_tuneDoneHz = hz;
+    s_tuneDone = true;
+}
+
 static bool cacheEvict(int i) {
+    if (s_pitchPin && s_ram[i].id == s_pitchPin) return false;
     int16_t* d = nullptr;
     bool busy  = false;
     portENTER_CRITICAL(&s_voiceMux);
@@ -721,9 +809,31 @@ static void preloadStep(uint32_t stepBytes) {
 // is read PRELOAD_STEP_BYTES at a time — PRELOAD_STEP_GENTLE with `gentle`,
 // for use while a song is playing, so a sample the song streams is never kept
 // waiting for the card by more than a few milliseconds.
+bool samplePreloadDropAllNow() {
+    if (!s_ram) return true;
+    if (s_streaming) return false;
+    if (s_pitchPin) {                       // the pitch pass gives way (it retries later)
+        if (pitchJob() == s_pitchJobNo) pitchAbort();
+        if (s_tuneJob == s_pitchPin) { tuneAnswer(s_tuneJob, SAMPLE_TUNE_NOT_READY, 0); s_tuneJob = 0; }
+        s_pitchPin = 0;
+    }
+    if (s_job.active) jobAbort(false);
+    for (int i = 0; i < RAM_CACHE_MAX; i++)
+        if (s_ram[i].id != 0 && !cacheEvict(i)) return false;
+    return true;
+}
+
 bool samplePreloadSync(const Song* song, bool gentle) {
     if (!s_ram) return true;
     if (s_streaming) return false;                 // the stream has the card
+    if (s_forgetAll) {
+        if (s_job.active) jobAbort(false);
+        if (sampleRamVoicesActive()) return false;
+        for (int i = 0; i < RAM_CACHE_MAX; i++)
+            if (s_ram[i].id != 0 && !cacheEvict(i)) return false;
+        memset(s_failed, 0, sizeof(s_failed));
+        s_forgetAll = false;
+    }
     if (s_job.active) {
         preloadStep(gentle ? PRELOAD_STEP_GENTLE : PRELOAD_STEP_BYTES);
         return false;
@@ -841,4 +951,88 @@ bool samplePreloadSync(const Song* song, bool gentle) {
 
     memset(s_failed, 0, sizeof(s_failed));         // round complete
     return true;
+}
+
+// ── KEEP LENGTH: find the pitch of samples that need it (loop task) ──────────
+// PSOLA cuts its grains on the sample's waveform cycles, so it needs the
+// pitch.  A sample recorded with ADD SAMPLE has it already; any other gets it
+// here, the first time it is in the cache with KEEP LENGTH on.  One FFT per
+// call; the result goes into trim.txt (pitchCHz) so it's done once.
+void sampleAutoTuneRequest(uint8_t id) {
+    s_tuneReqMs = millis();
+    s_tuneReq   = id;
+}
+
+bool sampleAutoTuneTake(uint8_t& id, uint8_t& result, float& hz) {
+    if (!s_tuneDone) return false;
+    s_tuneDone = false;
+    id = s_tuneDoneId; result = s_tuneDoneRes; hz = s_tuneDoneHz;
+    return true;
+}
+
+bool samplePitchTick(bool mayStart) {
+    if (s_pitchPin) {
+        if (pitchJob() != s_pitchJobNo) {                    // replaced
+            if (s_tuneJob == s_pitchPin) { tuneAnswer(s_tuneJob, SAMPLE_TUNE_NOT_READY, 0); s_tuneJob = 0; }
+            s_pitchPin = 0;
+            return false;
+        }
+        if (!pitchStep()) return false;
+        PitchResult r = pitchResult();
+        if (s_tuneJob == s_pitchPin) {
+            tuneAnswer(s_tuneJob, r.found ? SAMPLE_TUNE_FOUND : SAMPLE_TUNE_UNCLEAR, r.hz);
+            s_tuneJob = 0;
+        }
+        uint32_t chz = 1;                                    // 1 = no clear pitch
+        if (r.found) {
+            chz = (uint32_t)lrintf(r.hz * 100.0f);
+            if (chz < 2) chz = 2;
+        }
+        sampleTrimSetPitch(s_pitchPin, chz);
+        sampleTrimSave();
+        Serial.printf("[SP] KEEP LENGTH: sample %u pitch %s%.2f Hz\n", (unsigned)s_pitchPin,
+                      r.found ? "" : "unclear, ", r.found ? r.hz : 0.0f);
+        s_pitchPin = 0;
+        return true;
+    }
+    if (!mayStart || !s_ram || pitchBusy()) return false;
+    uint8_t req = s_tuneReq;
+    if (req) {
+        int i = cacheFind(req);
+        if (i >= 0 && s_ram[i].data &&
+            pitchBegin(s_ram[i].data, s_ram[i].frames, s_ram[i].rate, s_ram[i].ch)) {
+            s_tuneReq    = 0;
+            s_tuneJob    = req;
+            s_pitchPin   = req;
+            s_pitchJobNo = pitchJob();
+            return false;
+        }
+        if (i >= 0) {                                        // too short to analyse
+            pitchStep();
+            s_tuneReq = 0;
+            tuneAnswer(req, SAMPLE_TUNE_UNCLEAR, 0);
+        } else if (millis() - s_tuneReqMs > AUTOTUNE_WAIT_MS) {
+            s_tuneReq = 0;
+            tuneAnswer(req, SAMPLE_TUNE_NOT_READY, 0);
+        }
+        return false;
+    }
+    static uint32_t lastScan = 0;
+    if (millis() - lastScan < 500) return false;
+    lastScan = millis();
+    for (int i = 0; i < RAM_CACHE_MAX; i++) {
+        const RamSample& rs = s_ram[i];
+        if (!rs.id || !rs.data) continue;
+        const SampleTrim* t = sampleTrimFor(rs.id);
+        if (!t || !t->keepLen || t->pitchCHz) continue;
+        if (pitchBegin(rs.data, rs.frames, rs.rate, rs.ch)) {
+            s_pitchPin   = rs.id;
+            s_pitchJobNo = pitchJob();
+        } else {
+            pitchStep();                                     // finishes the failed begin
+            sampleTrimSetPitch(rs.id, 1);                    // too short: unpitched grains
+        }
+        return false;
+    }
+    return false;
 }
