@@ -14,15 +14,13 @@
 #include "midi_player.h"
 #include "drawbar_organ.h"
 #include "pitch_detect.h"
+#include "take_fade.h"
 
 // The take waits here between STOP and SAVE.  Not in /samples, so a rescan
 // for the sample list doesn't pick it up.
 #define REC_TMP_PATH   "/rec_take.wav"
 #define REC_MIN_FRAMES (AUDIO_CODEC_RATE_HZ / 5)          // 0.2 s
 #define REC_MAX_FRAMES ((uint32_t)AUDIO_CODEC_RATE_HZ * SAMPLE_REC_MAX_SECONDS)
-#define REC_FADE       (AUDIO_CODEC_RATE_HZ / 200)        // 5 ms in
-#define REC_FADE_OUT   (AUDIO_CODEC_RATE_HZ * 25 / 1000)  // 25 ms out: the take is
-                                                          // cut mid-sound — 5 ms ticked
 #define REC_TAIL_DROP  (AUDIO_CODEC_RATE_HZ * 40 / 1000)  // the finger leaving the
                                                           // glass, heard by the mic
 #define REC_STATUS_MS  250
@@ -305,10 +303,7 @@ static void stopTake() {
     // Lose the last 40 ms (lifting the finger off the glass is right by the
     // mic), then fade the ends so it starts and stops without a click.
     if (frames > REC_MIN_FRAMES + REC_TAIL_DROP) frames -= REC_TAIL_DROP;
-    for (uint32_t i = 0; i < REC_FADE && i < frames / 2; i++)
-        sBuf[i] = (int16_t)((int32_t)sBuf[i] * (int32_t)i / REC_FADE);
-    for (uint32_t i = 0; i < REC_FADE_OUT && i < frames / 2; i++)
-        sBuf[frames - 1 - i] = (int16_t)((int32_t)sBuf[frames - 1 - i] * (int32_t)i / REC_FADE_OUT);
+    fadeTakeEnds(sBuf, frames, AUDIO_CODEC_RATE_HZ);
     uint32_t t0 = millis();
     bool ok = writeWav(sBuf, frames);
     Serial.printf("[REC] take %.2f s, peak %u%%%s - %s in %lu ms\n",
@@ -456,7 +451,7 @@ static bool saveTake(const char* name) {
     }
     if (id && (sTune || sPitchCHz)) {    // its TUNE: note 60 plays a middle C
         sampleTrimSet(id, 0, 0, 0, sTune, 0);
-        if (sPitchCHz) sampleTrimSetPitch(id, sPitchCHz);   // KEEP LENGTH needn't look again
+        if (sPitchCHz) sampleTrimSetPitch(id, sPitchCHz);   // kept for reference
         sampleTrimSave();
     }
     Serial.printf("[REC] saved as %s (id %u, tune %+d c)\n", path, (unsigned)id, (int)sTune);

@@ -58,7 +58,7 @@ bool sampleTrimSave() { return true; }
 
 // ── The code under test ──────────────────────────────────────────────────────
 #include "SamplePlayer.cpp"
-#include "psola.cpp"
+#include "timestretch.cpp"
 #undef free              // pitch_detect allocates with plain malloc on the host
 #include "pitch_detect.cpp"
 #define free(p) mockFree(p)
@@ -338,11 +338,6 @@ static void test_keep_length() {
 
     setTrim(9, 0, 0, 0);
     for (auto& t : gTrims) if (t.id == 9) t.keepLen = 1;
-    int steps = 0;
-    _mockMs += 1000;
-    while (steps < 200) { samplePitchTick(true); steps++; const SampleTrim* t = sampleTrimFor(9); if (t->pitchCHz) break; }
-    CHECK(sampleTrimFor(9)->pitchCHz != 0, "its pitch is found (or marked unclear) by the pitch pass");
-    CHECK(!s_pitchPin, "the pitch pass let go of the sample");
 
     uint32_t kUp   = framesPlayed(9, 12);
     uint32_t kDown = framesPlayed(9, -12);
@@ -363,13 +358,17 @@ static void test_keep_length() {
         CHECK(got && id == 8 && res == SAMPLE_TUNE_NOT_READY, "AUTO TUNE gives up on a sample that never arrives");
     }
 
-    // ADD SAMPLE drops the cache: the pass gives way rather than pinning it.
-    for (auto& t : gTrims) if (t.id == 9) t.pitchCHz = 0;
-    _mockMs += 1000;
-    samplePitchTick(true);
-    CHECK(s_pitchPin == 9, "a fresh pass pins the sample it is reading");
-    CHECK(samplePreloadDropAllNow() && !cached(9) && !s_pitchPin && !pitchBusy(),
-          "dropping the cache cancels the pass and frees the sample");
+    // ADD SAMPLE drops the cache: AUTO TUNE gives way rather than pinning it.
+    {
+        sampleAutoTuneRequest(9);
+        samplePitchTick(true);
+        CHECK(s_pitchPin == 9, "AUTO TUNE pins the sample it is reading");
+        CHECK(samplePreloadDropAllNow() && !cached(9) && !s_pitchPin && !pitchBusy(),
+              "dropping the cache cancels it and frees the sample");
+        uint8_t id = 0, res = 99; float hz = 0;
+        CHECK(sampleAutoTuneTake(id, res, hz) && id == 9 && res == SAMPLE_TUNE_NOT_READY,
+              "...and it answers NOT READY");
+    }
     emptyCache();
 }
 

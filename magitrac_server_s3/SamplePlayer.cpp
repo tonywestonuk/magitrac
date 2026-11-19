@@ -4,7 +4,7 @@
 #include "audio_codec.h"
 #include "crash_log.h"
 #include "TrackerData.h"
-#include "psola.h"
+#include "timestretch.h"
 #include "pitch_detect.h"
 #include "MagiMsg.h"
 #include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
@@ -201,11 +201,11 @@ struct RamVoice {
     uint32_t age;       // frames rendered (drives the fade-in)
     int32_t  fadeRem;   // release fade countdown
     uint32_t seq;       // allocation order (steal the oldest)
-    bool     psola;     // KEEP LENGTH: s_psola[slot] renders it (step/pos unused)
+    bool     stretch;   // KEEP LENGTH: s_ts[slot] renders it (step/pos unused)
 };
 static RamVoice     s_voice[RAM_VOICES] = {};
-// KEEP LENGTH grain state, one per voice slot (PSRAM — ~100 bytes each).
-static PsolaState*  s_psola = nullptr;
+// KEEP LENGTH grain state, one per voice slot (PSRAM — ~80 bytes each).
+static TsState*     s_ts = nullptr;
 static uint32_t     s_voiceSeq = 0;
 static portMUX_TYPE s_voiceMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -231,8 +231,8 @@ static void mixRamInto(int16_t* out, int frames) {
         for (int i = 0; i < frames; i++) {
             int32_t sL, sR;
             int32_t g = v.gainQ15;
-            if (v.psola) {
-                if (!psolaNext(s_psola[vi], d, v.frames, ch, v.loop, sL, sR)) {
+            if (v.stretch) {
+                if (!tsNext(s_ts[vi], d, v.frames, ch, v.loop, sL, sR)) {
                     v.active = false;
                     break;
                 }
@@ -284,11 +284,11 @@ static void mixRamInto(int16_t* out, int frames) {
 
 // Start a RAM voice on `data` (inside s_voiceMux).  Free voice, else steal
 // the oldest.  Returns the handle.
-// keepPeriod >= 0: KEEP LENGTH — PSOLA at `pitchRatio` with grains on that
-// period (source frames; 0 = no clear pitch).  < 0: plain resampling.
+// keepLen: KEEP LENGTH — stretched and played `pitchRatio` faster
+// (timestretch.cpp), so the length stays.  Otherwise plain resampling.
 static int voiceStartLocked(const int16_t* data, uint32_t frames, uint32_t rate,
                             uint8_t ch, uint8_t loop, double ratio, int32_t gain,
-                            float keepPeriod = -1.0f, float pitchRatio = 1.0f) {
+                            bool keepLen = false, float pitchRatio = 1.0f) {
     uint32_t stepQ16 = (uint32_t)((double)rate * ratio + 0.5);
     if (stepQ16 == 0) stepQ16 = 1;
     int pick = -1;
@@ -311,8 +311,8 @@ static int voiceStartLocked(const int16_t* data, uint32_t frames, uint32_t rate,
     v.age       = 0;
     v.fadeRem   = RAM_FADE_FRAMES;
     v.seq       = ++s_voiceSeq;
-    v.psola     = keepPeriod >= 0.0f && s_psola;
-    if (v.psola) psolaStart(s_psola[pick], rate, keepPeriod, pitchRatio, AUDIO_CODEC_RATE_HZ);
+    v.stretch   = keepLen && s_ts;
+    if (v.stretch) tsStart(s_ts[pick], rate, pitchRatio, AUDIO_CODEC_RATE_HZ);
     v.active    = true;
     // Handle = generation | slot: a stale handle (voice ended, slot reused)
     // can never stop the slot's NEW occupant.
@@ -340,12 +340,10 @@ int samplePlayRam(uint8_t sampleId, float pitchSemitones, uint8_t volume) {
         if (s_ram[i].id == sampleId) { rs = &s_ram[i]; break; }
     if (rs) {
         // KEEP LENGTH (sample editor): change the pitch, not the length.
-        float keepPeriod = -1.0f;
         const SampleTrim* tr = sampleTrimFor(sampleId);
-        if (tr && tr->keepLen)
-            keepPeriod = tr->pitchCHz > 100 ? (float)rs->rate * 100.0f / (float)tr->pitchCHz : 0.0f;
+        bool keepLen = tr && tr->keepLen;
         handle = voiceStartLocked(rs->data, rs->frames, rs->rate, rs->ch, rs->loop, ratio, gain,
-                                  keepPeriod, exp2f(pitchSemitones / 12.0f));
+                                  keepLen, exp2f(pitchSemitones / 12.0f));
     }
     portEXIT_CRITICAL(&s_voiceMux);
 
@@ -599,8 +597,8 @@ void samplePlayerInit() {
     s_ram = (RamSample*)heap_caps_calloc(RAM_CACHE_MAX, sizeof(RamSample), MALLOC_CAP_SPIRAM);
     if (!s_ram) s_ram = (RamSample*)calloc(RAM_CACHE_MAX, sizeof(RamSample));
     if (!s_ram) Serial.println("[SP] no memory for the sample cache table — everything streams");
-    s_psola = (PsolaState*)heap_caps_calloc(RAM_VOICES, sizeof(PsolaState), MALLOC_CAP_SPIRAM);
-    if (!s_psola) Serial.println("[SP] no memory for KEEP LENGTH — those samples resample instead");
+    s_ts = (TsState*)heap_caps_calloc(RAM_VOICES, sizeof(TsState), MALLOC_CAP_SPIRAM);
+    if (!s_ts) Serial.println("[SP] no memory for KEEP LENGTH — those samples resample instead");
     s_trigger = xSemaphoreCreateBinary();
     xTaskCreatePinnedToCore(wavTaskFn, "WAV", 4096, nullptr, 5, nullptr, 0);  // Core 0
 }
@@ -678,8 +676,7 @@ static void rawTrim(uint8_t id, uint32_t& st, uint32_t& en, uint8_t& lp) {
 
 // Remove entry i — unless a RAM voice is sounding (see the rules above), in
 // which case nothing happens and it returns false: try again later.
-// The cached sample KEEP LENGTH's pitch pass is reading (0 = none): not
-// evicted under it.
+// The cached sample AUTO TUNE is reading (0 = none): not evicted under it.
 static uint8_t  s_pitchPin   = 0;
 static uint32_t s_pitchJobNo = 0;
 
@@ -812,7 +809,7 @@ static void preloadStep(uint32_t stepBytes) {
 bool samplePreloadDropAllNow() {
     if (!s_ram) return true;
     if (s_streaming) return false;
-    if (s_pitchPin) {                       // the pitch pass gives way (it retries later)
+    if (s_pitchPin) {                       // AUTO TUNE gives way (answers NOT READY)
         if (pitchJob() == s_pitchJobNo) pitchAbort();
         if (s_tuneJob == s_pitchPin) { tuneAnswer(s_tuneJob, SAMPLE_TUNE_NOT_READY, 0); s_tuneJob = 0; }
         s_pitchPin = 0;
@@ -953,11 +950,9 @@ bool samplePreloadSync(const Song* song, bool gentle) {
     return true;
 }
 
-// ── KEEP LENGTH: find the pitch of samples that need it (loop task) ──────────
-// PSOLA cuts its grains on the sample's waveform cycles, so it needs the
-// pitch.  A sample recorded with ADD SAMPLE has it already; any other gets it
-// here, the first time it is in the cache with KEEP LENGTH on.  One FFT per
-// call; the result goes into trim.txt (pitchCHz) so it's done once.
+// ── AUTO TUNE: find a cached sample's pitch (loop task) ──────────────────────
+// One FFT per samplePitchTick; the sample is pinned in the cache meanwhile.
+// The pitch found is also kept in trim.txt (pitchCHz), as ADD SAMPLE does.
 void sampleAutoTuneRequest(uint8_t id) {
     s_tuneReqMs = millis();
     s_tuneReq   = id;
@@ -990,7 +985,7 @@ bool samplePitchTick(bool mayStart) {
         }
         sampleTrimSetPitch(s_pitchPin, chz);
         sampleTrimSave();
-        Serial.printf("[SP] KEEP LENGTH: sample %u pitch %s%.2f Hz\n", (unsigned)s_pitchPin,
+        Serial.printf("[SP] AUTO TUNE: sample %u pitch %s%.2f Hz\n", (unsigned)s_pitchPin,
                       r.found ? "" : "unclear, ", r.found ? r.hz : 0.0f);
         s_pitchPin = 0;
         return true;
@@ -1015,24 +1010,6 @@ bool samplePitchTick(bool mayStart) {
             s_tuneReq = 0;
             tuneAnswer(req, SAMPLE_TUNE_NOT_READY, 0);
         }
-        return false;
-    }
-    static uint32_t lastScan = 0;
-    if (millis() - lastScan < 500) return false;
-    lastScan = millis();
-    for (int i = 0; i < RAM_CACHE_MAX; i++) {
-        const RamSample& rs = s_ram[i];
-        if (!rs.id || !rs.data) continue;
-        const SampleTrim* t = sampleTrimFor(rs.id);
-        if (!t || !t->keepLen || t->pitchCHz) continue;
-        if (pitchBegin(rs.data, rs.frames, rs.rate, rs.ch)) {
-            s_pitchPin   = rs.id;
-            s_pitchJobNo = pitchJob();
-        } else {
-            pitchStep();                                     // finishes the failed begin
-            sampleTrimSetPitch(rs.id, 1);                    // too short: unpitched grains
-        }
-        return false;
     }
     return false;
 }

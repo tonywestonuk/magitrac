@@ -57,8 +57,8 @@ struct SampleTrim {
                            // hard it is struck (0 = louder/softer with velocity)
     uint8_t  keepLen;      // 1 = other pitches keep its length (PSOLA, psola.cpp)
                            // instead of playing faster / slower
-    uint32_t pitchCHz;     // its detected pitch in centi-Hz, for KEEP LENGTH's
-                           // grains: 0 = not analysed yet, 1 = no clear pitch.
+    uint32_t pitchCHz;     // its detected pitch in centi-Hz (ADD SAMPLE, AUTO
+                           // TUNE), for reference: 0 = not analysed, 1 = unclear.
                            // Set by sampleTrimSetPitch, never by sampleTrimSet.
 };
 

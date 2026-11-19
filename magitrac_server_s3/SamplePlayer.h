@@ -71,10 +71,9 @@ int  samplePlayBuffer(const int16_t* data, uint32_t frames, uint32_t rate,
 void sampleStopVoice(int voice);            // release one RAM voice (short fade)
 bool sampleRamVoicesActive();
 
-// KEEP LENGTH's pitch pass: finds (one FFT per call) the pitch of any cached
-// sample with KEEP LENGTH on and none recorded yet.  mayStart = false keeps it
-// from starting one (ADD SAMPLE is using the pitch detector).  Loop task.
-// True when a result was just stored.
+// AUTO TUNE's pitch pass: one FFT per call on the sample asked for.
+// mayStart = false keeps it from starting one (ADD SAMPLE is using the pitch
+// detector).  Loop task.  True when a result was just stored.
 bool samplePitchTick(bool mayStart);
 
 // AUTO TUNE (sample editor): find sampleId's pitch — from the cache, waiting
