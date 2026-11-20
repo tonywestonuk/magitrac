@@ -19,7 +19,7 @@
 // boot from harmonic tables measured off a reference recording, so a new
 // sound is usually just two rows of numbers + a registry entry.
 
-#define PROC_SOUND_COUNT 3
+#define PROC_SOUND_COUNT 4
 #define PROC_MAX_PARAMS  5       // PROC mode has no drawbars → room for 5 sliders
 #define PROC_WT          1024    // wavetable length (10-bit phase index)
 
@@ -56,6 +56,12 @@
 // A fixed soft attack (atkMs) and a short pitch scoop from slightly flat give
 // the reed "speaking"; no key click.  Not velocity-sensitive (no organ sound is).
 #define PROC_IDX_REED 0
+
+// SYNTH — a subtractive synth (synth_voice.cpp, its own render path in
+// drawbar_organ.cpp).  It has no sliders: its 14 settings come from
+// organSetSynthParam (OrganSynth.h), edited on the client's SYNTH page.
+// Songs store it as voice 8, not 4 + 3 (see ORGAN_VOICE_SYNTH).
+#define PROC_IDX_SYNTH 3
 
 // Slider index semantics are partly fixed by the render loop: [0] scales the
 // generator's noise (live), [2] is the global BRIGHT low-pass (live), [4] is

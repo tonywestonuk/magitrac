@@ -4,6 +4,8 @@
 #include "gt911_lite.h"
 #include "UIHelpers.h"
 #include "TrackerData.h"
+#include "OrganSynth.h"
+#include "SynthEditor.h"
 
 // ── OrganPage — drawbar organ control (960×540) ───────────────────────────────
 //
@@ -41,9 +43,10 @@ static const int OR_TYPE_PROC = 4;    // the procedural-sounds type
 
 // PROC type — the sound list replaces presets + drawbars.  Count and order
 // must mirror PROC_SOUNDS in the server's proc_sounds.h.
-static const int OR_PROC_N     = 3;
+static const int OR_PROC_N     = 4;
 static const int OR_PROC_REED  = 0;    // the REED sound (server: PROC_IDX_REED)
 static const int OR_PROC_VOC   = 2;    // the VOCODER sound (server: PROC_IDX_VOC)
+static const int OR_PROC_SYNTH = ORGAN_PROC_SYNTH;   // edited on its own screen (SynthEditor)
 // The sound buttons are a grid, two to a row, filled left to right then down
 // (OR_PRESET_N rows → room for 10).  Together they span the old single
 // column's 420 px, so the list still ends at 435.
@@ -123,6 +126,13 @@ private:
     uint8_t _knob[OR_TYPE_N][OR_NKNOB];   // per-type knob values 0..8
     int     _procSel;                     // selected procedural sound (PROC type)
     uint8_t _procKnob[OR_PROC_N][OR_NKNOB];   // per-sound slider values 0..8
+    uint8_t _synth[ORGAN_SYNTH_PARAMS];   // the SYNTH sound's settings
+    bool    _synthOpen = false;           // SynthEditor has the screen
+    SynthEditor _synthEd;
+
+    bool isSynth() const { return _type == OR_TYPE_PROC && _procSel == OR_PROC_SYNTH; }
+    void openSynth();
+    bool hitSynthEdit(int sx, int sy) const;
 
     void drawHeader();
     void drawFxButton(int slot, int id);   // one effect button on the top bar

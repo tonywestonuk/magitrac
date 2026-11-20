@@ -1,4 +1,5 @@
 #include "ColumnEditor.h"
+#include "OrganSynth.h"
 #include "SettingsPage.h"   // for gMaxBank, gMaxProgram
 #include "NoteGrid.h"
 #include "ServerPairing.h"  // for gServerPairing — sample list fetch
@@ -10,25 +11,30 @@ static inline bool isPxl(uint8_t ch) { return ch == PIXELPOST_CHANNEL; }
 static inline bool isDrums(uint8_t ch) { return ch == DRUM_MIDI_CHANNEL; }
 static inline bool isOrgan(uint8_t ch) { return ch == ORGAN_CHANNEL; }
 
-// ORGAN columns: the VOICE field picks the voice — the 4 synth types then the
-// procedural sounds.  Order mirrors the server's organ type numbering
-// (drawbar_organ.h) + its PROC_SOUNDS registry (0..3 = types, 4+k = proc
-// sound k).  The voice (and
+// ORGAN columns: the VOICE field picks the voice — the 4 organ types then the
+// procedural sounds, in the server's order (drawbar_organ.h, PROC_SOUNDS).
+// List position k is PROC sound k - 4 from 4 up; organVoiceFromProc gives
+// the number the song stores (SYNTH is 8, see OrganSynth.h).  The voice (and
 // the rest of the organ patch) lives ONCE per song in Song::organ.
 static const char* const ORGAN_VOICES[] =
-    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "REED", "CHOIR", "VOCODER" };   // 4.. = PROC sounds, server order
+    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "REED", "CHOIR", "VOCODER", "SYNTH" };
 #define ORGAN_VOICE_COUNT ((int)(sizeof(ORGAN_VOICES) / sizeof(ORGAN_VOICES[0])))
+
+static int organVoiceListPos(uint8_t voice) {
+    int proc = organProcFromVoice(voice);
+    int k = (proc < 0) ? voice : ORGAN_VOICE_PROC + proc;
+    return (k >= ORGAN_VOICE_COUNT) ? ORGAN_VOICE_COUNT - 1 : k;
+}
+static uint8_t organVoiceAtListPos(int k) {
+    return (k < ORGAN_VOICE_PROC) ? (uint8_t)k : organVoiceFromProc(k - ORGAN_VOICE_PROC);
+}
 
 // First ORGAN column creates the song's organ patch with playable defaults
 // (classic 888 registration); the organ page refines it from there.
 static void organPatchEnsure(Song& s) {
     if (s.organ.flags & 1) return;
     memset(&s.organ, 0, sizeof(s.organ));
-    s.organ.flags = 1;
-    static const uint8_t bars[ORGAN_PATCH_BARS]  = { 8, 8, 8, 0, 0, 0, 0, 0, 0 };
-    static const uint8_t sl[ORGAN_PATCH_SLIDERS] = { 4, 4, 8, 4, 4 };
-    memcpy(s.organ.bars,    bars, sizeof(bars));
-    memcpy(s.organ.sliders, sl,   sizeof(sl));
+    organPatchSetVoice(s.organ, 0);
 }
 
 // Strip ".wav" suffix and truncate to fit the column NAME field.
@@ -72,6 +78,7 @@ void ColumnEditor::open(uint8_t patternIdx, uint8_t col) {
     _col           = col;
     _wasDown       = false;
     _patchPending  = false;
+    _presetSyncMask = 0;
     _picking       = false;
     _pickingSample = false;
     _naming        = false;
@@ -149,9 +156,7 @@ void ColumnEditor::fieldValue(int field, char* out) const {
             } else if (isPxl(c.midiChannel)) {
                 strcpy(out, "--");
             } else if (isOrgan(c.midiChannel)) {
-                int v = _song.organ.voice;
-                if (v >= ORGAN_VOICE_COUNT) v = ORGAN_VOICE_COUNT - 1;
-                strcpy(out, ORGAN_VOICES[v]);
+                strcpy(out, ORGAN_VOICES[organVoiceListPos(_song.organ.voice)]);
             } else if (isDrums(c.midiChannel)) {
                 int k = drumKitIndexForProgram(c.program);
                 strcpy(out, DRUM_KITS[k < 0 ? 0 : k].name);
@@ -581,8 +586,9 @@ void ColumnEditor::adjustField(int field, int delta) {
                 // VOICE edits the song's single organ patch — every ORGAN
                 // column shows/plays the same voice by construction.
                 organPatchEnsure(_song);
-                int v = (int)_song.organ.voice + ((delta > 0) ? 1 : -1);
-                _song.organ.voice = (uint8_t)constrain(v, 0, ORGAN_VOICE_COUNT - 1);
+                int k = organVoiceListPos(_song.organ.voice) + ((delta > 0) ? 1 : -1);
+                k = constrain(k, 0, ORGAN_VOICE_COUNT - 1);
+                organPatchSetVoice(_song.organ, organVoiceAtListPos(k));
                 gServerPairing.sendSongPatch(_song, &_song.organ, (uint8_t)sizeof(OrganPatch));
                 break;
             }
@@ -640,7 +646,24 @@ void ColumnEditor::adjustField(int field, int delta) {
             break;
         }
     }
+    if (field == 1 || field == 2) syncSharedPreset();
     _patchPending = true;
+}
+
+// A MIDI channel plays one preset at a time, so every column on the edited
+// column's channel takes its bank and program.
+void ColumnEditor::syncSharedPreset() {
+    const ColumnSettings& c = _song.columns[_col];
+    if (c.midiChannel < 1 || c.midiChannel > 16) return;
+    for (uint8_t i = 1; i < MAX_COLUMNS; i++) {
+        if (i == _col) continue;
+        ColumnSettings& o = _song.columns[i];
+        if (o.midiChannel != c.midiChannel) continue;
+        if (o.bankMSB == c.bankMSB && o.program == c.program) continue;
+        o.bankMSB = c.bankMSB;
+        o.program = c.program;
+        _presetSyncMask |= (1UL << i);
+    }
 }
 
 void ColumnEditor::fireHeld() {
@@ -802,6 +825,7 @@ bool ColumnEditor::poll() {
                 c.transpose = inst.transpose;
                 strncpy(c.name, inst.name, INSTRUMENT_NAME_LEN - 1);
                 c.name[INSTRUMENT_NAME_LEN - 1] = '\0';
+                syncSharedPreset();
                 _patchPending = true;
             }
             _picking = false;

@@ -9,9 +9,10 @@
 // write reliably (the raw struct is a linked note pool).  The grammar is
 // documented for the model in claude_ai.cpp's system prompt — keep the two in
 // step.  The format is the COMPLETE song: blocks, columns and notes not in
-// the text are cleared.  The song-level settings it doesn't carry (organ
-// patch, perf pads, MIDI-in channel/range, performer mask, transpose mask,
-// flags) are taken from `base`.
+// the text are cleared.  The organ patch is written as ORGAN (+ SYNTH) lines;
+// a reply without them keeps the base song's patch.  The song-level settings
+// it doesn't carry (perf pads, MIDI-in channel/range, performer mask,
+// transpose mask, flags) are taken from `base`.
 
 struct TextBuf {
     char*  p;

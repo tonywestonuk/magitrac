@@ -1,5 +1,6 @@
 #include "song_text.h"
 #include "NoteGrid.h"
+#include "OrganSynth.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -40,6 +41,42 @@ static const char* chanText(uint8_t ch, char* buf) {
     if (ch == PIXELPOST_CHANNEL) return "LIGHTS";
     if (ch >= 1 && ch <= 16) { snprintf(buf, 4, "%u", (unsigned)ch); return buf; }
     return "OFF";
+}
+
+// The organ voices by OrganPatch.voice (8 = SYNTH; 7 reads as VOCODER).
+static const char* const ORGAN_VOICE_TEXT[9] =
+    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "REED", "CHOIR", "VOCODER", "VOCODER", "SYNTH" };
+static const char* const ORGAN_VIB_TEXT[7]    = { "OFF", "V1", "V2", "V3", "C1", "C2", "C3" };
+static const char* const ORGAN_LESLIE_TEXT[3] = { "STOP", "SLOW", "FAST" };
+static const char* const ORGAN_REVERB_TEXT[3] = { "OFF", "ROOM", "HALL" };
+
+static void writeOrgan(const OrganPatch& op, TextBuf& out) {
+    if (!(op.flags & 1)) return;
+    uint8_t voice = op.voice > ORGAN_VOICE_SYNTH ? ORGAN_VOICE_SYNTH : op.voice;
+    textPrintf(out, "ORGAN voice=%s vib=%s leslie=%s drive=%u reverb=%s",
+               ORGAN_VOICE_TEXT[voice], ORGAN_VIB_TEXT[op.vibChorus % 7],
+               ORGAN_LESLIE_TEXT[op.leslie % 3], (unsigned)(op.drive ? 1 : 0),
+               ORGAN_REVERB_TEXT[op.reverb % 3]);
+    if (organVoiceIsSynth(voice)) {
+        textPrintf(out, "\nSYNTH");
+        for (int i = 0; i < ORGAN_SYNTH_PARAMS; i++) {
+            int v = organSynthClamp(i, organSynthParam(op, i));
+            if (i == SYN_OSC1 || i == SYN_OSC2)
+                textPrintf(out, " %s=%s", ORGAN_SYNTH_KEYS[i], SYN_WAVE_NAMES[v]);
+            else if (i == SYN_PITCH)
+                textPrintf(out, " %s=%d", ORGAN_SYNTH_KEYS[i], v - 12);
+            else
+                textPrintf(out, " %s=%d", ORGAN_SYNTH_KEYS[i], v);
+        }
+    } else {
+        char bars[ORGAN_PATCH_BARS + 1];
+        for (int i = 0; i < ORGAN_PATCH_BARS; i++) bars[i] = (char)('0' + (op.bars[i] > 8 ? 8 : op.bars[i]));
+        bars[ORGAN_PATCH_BARS] = '\0';
+        textPrintf(out, " bars=%s sliders=", bars);
+        for (int i = 0; i < ORGAN_PATCH_SLIDERS; i++)
+            textPrintf(out, i ? ",%u" : "%u", (unsigned)(op.sliders[i] > 8 ? 8 : op.sliders[i]));
+    }
+    textPrintf(out, "\n");
 }
 
 static void noteText(uint8_t note, char* buf) {
@@ -113,6 +150,7 @@ bool songToText(const Song* s, TextBuf& out) {
                    (unsigned)cs.program, (unsigned)cs.volume, (int)cs.transpose,
                    (unsigned)(cs.mute ? 1 : 0), (int)cs.sfxTuneCents, nm);
     }
+    writeOrgan(s->organ, out);
     int np = s->numPatterns;
     if (np < 1) np = 1;
     if (np > MAX_PATTERNS) np = MAX_PATTERNS;
@@ -144,7 +182,7 @@ bool songToText(const Song* s, TextBuf& out) {
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 
-static const int TOK_MAX = 12;
+static const int TOK_MAX = 16;
 static const int TOK_LEN = 48;
 
 struct Line {
@@ -297,7 +335,7 @@ bool songFromText(const char* text, size_t len, const Song* base, Song* dst,
     bool inSong = false, ended = false;
     int  highest = -1;
     int  lineNo = 0;
-    Line L;
+    static Line L;   // ~770 bytes: off the caller's stack
     char b[TOK_LEN];
 
     size_t i = 0;
@@ -388,6 +426,61 @@ bool songFromText(const char* text, size_t len, const Song* base, Song* dst,
             if (kvInt(L, "mute", 0, 1, v))     cs.mute      = (uint8_t)v;
             if (kvInt(L, "tune", -4800, 4800, v)) cs.sfxTuneCents = (int16_t)v;
             if (kv(L, 2, "name", b, sizeof(b))) copyName(cs.name, sizeof(cs.name), b);
+            continue;
+        }
+
+        if (!strcmp(kw, "ORGAN")) {
+            OrganPatch& op = dst->organ;
+            long v;
+            int  voice = -1;
+            if (kv(L, 1, "voice", b, sizeof(b))) {
+                for (int k = 0; k <= ORGAN_VOICE_SYNTH; k++)
+                    if (k != 7 && !strcasecmp(b, ORGAN_VOICE_TEXT[k])) voice = k;
+                if (voice < 0) { fail(r, lineNo, "unknown organ voice"); r.skipped++; continue; }
+            }
+            if (voice >= 0) organPatchSetVoice(op, (uint8_t)voice);
+            else            op.flags |= 1;
+            if (kv(L, 1, "vib", b, sizeof(b)))
+                for (int k = 0; k < 7; k++) if (!strcasecmp(b, ORGAN_VIB_TEXT[k])) op.vibChorus = (uint8_t)k;
+            if (kv(L, 1, "leslie", b, sizeof(b)))
+                for (int k = 0; k < 3; k++) if (!strcasecmp(b, ORGAN_LESLIE_TEXT[k])) op.leslie = (uint8_t)k;
+            if (kv(L, 1, "reverb", b, sizeof(b)))
+                for (int k = 0; k < 3; k++) if (!strcasecmp(b, ORGAN_REVERB_TEXT[k])) op.reverb = (uint8_t)k;
+            if (toInt(kv(L, 1, "drive", b, sizeof(b)), 0, 1, v)) op.drive = (uint8_t)v;
+            if (!organVoiceIsSynth(op.voice)) {
+                if (kv(L, 1, "bars", b, sizeof(b)) && strlen(b) == ORGAN_PATCH_BARS) {
+                    for (int k = 0; k < ORGAN_PATCH_BARS; k++)
+                        if (b[k] >= '0' && b[k] <= '8') op.bars[k] = (uint8_t)(b[k] - '0');
+                }
+                if (kv(L, 1, "sliders", b, sizeof(b))) {
+                    const char* q = b;
+                    for (int k = 0; k < ORGAN_PATCH_SLIDERS && *q; k++) {
+                        long sv = strtol(q, (char**)&q, 10);
+                        if (sv >= 0 && sv <= 8) op.sliders[k] = (uint8_t)sv;
+                        if (*q == ',') q++;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (!strcmp(kw, "SYNTH")) {
+            OrganPatch& op = dst->organ;
+            organPatchSetVoice(op, ORGAN_VOICE_SYNTH);   // a SYNTH line implies the voice
+            for (int i = 0; i < ORGAN_SYNTH_PARAMS; i++) {
+                if (!kv(L, 1, ORGAN_SYNTH_KEYS[i], b, sizeof(b))) continue;
+                long v = -1;
+                if (i == SYN_OSC1 || i == SYN_OSC2) {
+                    for (int w = 0; w <= ORGAN_SYNTH_MAX[i]; w++)
+                        if (!strcasecmp(b, SYN_WAVE_NAMES[w])) v = w;
+                } else if (i == SYN_PITCH) {
+                    if (toInt(b, -12, 12, v)) v += 12; else v = -1;
+                } else if (!toInt(b, 0, ORGAN_SYNTH_MAX[i], v)) {
+                    v = -1;
+                }
+                if (v < 0) { fail(r, lineNo, "bad synth setting"); continue; }
+                organSynthParam(op, i) = (uint8_t)v;
+            }
             continue;
         }
 

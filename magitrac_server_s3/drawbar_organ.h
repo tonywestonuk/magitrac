@@ -81,3 +81,8 @@ int  organGetParam(int idx);
 // A change applies to notes played after it.
 void organSetProcSound(int i);
 int  organGetProcSound();
+
+// SYNTH (PROC_IDX_SYNTH) — its 14 settings, OrganSynthParam order and ranges
+// (OrganSynth.h).  Live: they apply to sounding notes from the next block.
+void organSetSynthParam(int idx, int value);
+int  organGetSynthParam(int idx);

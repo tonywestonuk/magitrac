@@ -6,6 +6,21 @@
 #include <stdio.h>
 
 extern ServerPairing gServerPairing;
+extern int  gSdCs;
+extern bool gSdAvailable;
+
+// The card mounts at boot but has been seen to stop answering later (backup
+// "can't create folder", restore empty) until a reboot.  Check it answers
+// each time the page opens and mount it again if not.
+static void sdEnsureMounted() {
+    File root = SD.open("/");
+    bool ok = root && root.isDirectory();
+    if (root) root.close();
+    if (ok) return;
+    SD.end();
+    gSdAvailable = (gSdCs >= 0) && SD.begin(gSdCs);
+    Serial.printf("[SD] not answering - remount %s\n", gSdAvailable ? "OK" : "FAILED");
+}
 
 // ── Layout constants ─────────────────────────────────────────────────────────
 static const int BR_HDR_H    = 50;
@@ -139,6 +154,7 @@ BackupRestorePage::BackupRestorePage(EPD_PainterAdafruit& display,
 // ── open / draw ───────────────────────────────────────────────────────────────
 
 void BackupRestorePage::open() {
+    sdEnsureMounted();
     _state   = BRState::MENU;
     _wasDown = _touch.isTouched;
     _bkCancelled = false;

@@ -9,16 +9,18 @@
 // One square per sample in the server's /samples folder (the same list the
 // SFX column picker uses), 6 × 3 to a page.
 //
-//   • Tap a square    → that sample goes ON THE KEYS: the MIDI keyboard plays
-//                       it at the played pitch (and, with a song running,
-//                       still cues the song).  Its square stays black with
-//                       white text.  Tapping it again takes it off; tapping
-//                       another square moves it.  A tap makes no sound itself.
+//   • Tap a square (on release)…
+//       song stopped: that sample goes ON THE KEYS: the MIDI keyboard plays
+//                     it at the played pitch.  Its square stays black with
+//                     white text.  Tapping it again takes it off; tapping
+//                     another square moves it.  The tap makes no sound.
+//       song playing: the sample PLAYS, once, at its own pitch.
 //   • Hold a square   → after SMP_HOLD_MS…
 //       song stopped: poll() returns EDIT — the sketch opens SampleEditPage
 //                     for that sample (trim, loop, tune, MIDI keys), and
 //                     calls reopen() when its BACK is tapped.
-//       song playing: the sample PLAYS, once, at its own pitch.
+//       song playing: ON or OFF THE KEYS, as a stopped tap (the keys still
+//                     cue the song as well).
 //   • STOP            → silences everything (the only way to end a sample
 //                       whose LOOP is on).  While a song is playing it stops
 //                       only what this page started.
@@ -101,6 +103,7 @@ private:
     void drawHeader();
     void drawCell(int cell, bool pressed);
     void redrawCellOf(uint8_t sampleId);  // if that sample's square is on this page
+    void toggleKeys(uint8_t id);          // put it on the keys, or take it off
     void sendLeases();                    // PADS always; KEYS if a sample is on the keys
     void resetTouch();
     int  pageCount() const;

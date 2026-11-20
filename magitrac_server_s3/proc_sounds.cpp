@@ -30,6 +30,10 @@ const ProcSoundInfo PROC_SOUNDS[PROC_SOUND_COUNT] = {
     // the organ's 12 ms.
     { "VOCODER",    5, { "WAVE", "PWM", "SSS", "GATE", "SMOOTH" },
                        { 0, 0, 4, 1, 3 }, 4, 0xFF, 60 },
+    // SYNTH — subtractive synth (synth_voice.cpp); its own envelope, so the
+    // envelope fields here are unused.  gain 3: one voice's saw about level
+    // with an 888 registration.  Not ear-tuned yet.
+    { "SYNTH",      0, { }, { }, 3, 0xFF, 0 },
 };
 
 // ── CHOIR — the Orchestron optical-disc choir ─────────────────────────────────
@@ -185,6 +189,7 @@ void procSoundsInit() {
     buildFormantStage(PROC_IDX_CHOIR, 1, 1050.0f, 3.0f, 2.00f, true);   // "ah" F2
     buildFormantStage(PROC_IDX_CHOIR, 2, 2800.0f, 3.0f, 2.00f, true);   // singer's formant
     gProcFormantNstage[PROC_IDX_VOC] = 0;                  // VOCODER: none (and bypassed)
+    gProcFormantNstage[PROC_IDX_SYNTH] = 0;                // SYNTH: none (and bypassed)
     gProcFormantNstage[PROC_IDX_REED] = 1;                 // REED: the chamber's nasal peak
     // REED: 1.4 kHz, Q 1.5, 3 dB a step (+24 dB at 8) — fitted to an oboe
     // recording, whose bore resonance sits there; CHAMBER 8 with WAVE 8,

@@ -7,6 +7,7 @@
 #include "MagiLink.h"
 #include "MagiMsg.h"
 #include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
+#include "SettingsPage.h"  // gMaxBank / gMaxProgram — the AI is told the synths' range
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <string.h>
@@ -666,6 +667,8 @@ bool ServerPairing::sendAiRequest(uint8_t op, const char* prompt) {
     msg.op = op;
     memset(msg.prompt, 0, sizeof(msg.prompt));
     if (prompt) strncpy(msg.prompt, prompt, sizeof(msg.prompt) - 1);
+    msg.maxBank    = gMaxBank;
+    msg.maxProgram = gMaxProgram;
     return _sendLocked(&msg, sizeof(msg));
 }
 

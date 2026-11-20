@@ -425,10 +425,11 @@ struct MsgSetWifiChannel {
 //  ORGAN_OP_REVERB    → stereo reverb: `value` 0=off,1=room,2=hall
 //  (10 was ORGAN_OP_VOCODER — the vocoder is now a procedural sound, chosen
 //   with ORGAN_OP_PROCSEL like the others.)
+//  ORGAN_OP_SYNTH     → SYNTH sound setting `index` (OrganSynthParam, 0..13) = `value`
 enum OrganOp : uint8_t {
     ORGAN_OP_EXIT = 0, ORGAN_OP_ENTER = 1, ORGAN_OP_SET = 2, ORGAN_OP_TYPE = 3,
     ORGAN_OP_VIBCHORUS = 4, ORGAN_OP_LESLIE = 5, ORGAN_OP_DRIVE = 6, ORGAN_OP_PARAM = 7,
-    ORGAN_OP_PROCSEL = 8, ORGAN_OP_REVERB = 9
+    ORGAN_OP_PROCSEL = 8, ORGAN_OP_REVERB = 9, ORGAN_OP_SYNTH = 11
 };
 struct MsgOrgan {
     uint8_t  id     = MSG_ORGAN;
@@ -983,6 +984,8 @@ struct MsgAiRequest {
     uint16_t length = sizeof(MsgAiRequest);
     uint8_t  op;                    // AiOp
     char     prompt[AI_PROMPT_LEN]; // START only, NUL-terminated
+    uint8_t  maxBank;               // START: the performer's MIDI range (Settings
+    uint8_t  maxProgram;            //   MAX BANK / MAX PROGRAM), 0-based
 };
 struct MsgAiStatus {
     uint8_t  id     = MSG_AI_STATUS;

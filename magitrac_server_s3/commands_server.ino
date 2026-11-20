@@ -324,6 +324,7 @@ static volatile bool     sAiCancelReq       = false;
 static volatile bool     sAiUndoReq         = false;
 static volatile bool     sAiStatusReq       = false;
 static char              sAiPrompt[AI_PROMPT_LEN];
+static uint8_t           sAiMaxBank = 127, sAiMaxProg = 127;   // the client's MIDI range for this request
 static uint8_t*          sAiUndo            = nullptr;   // PSRAM: header + the Song the last result replaced
 static bool              sAiUndoValid       = false;     // cleared by any load / new song
 static uint8_t           sAiOutcome         = AI_ST_IDLE;  // last DONE / FAILED / UNDONE, for a page opening
@@ -2843,7 +2844,7 @@ static void aiTick() {
         } else {
             strcpy(err, "Out of memory");
         }
-        if (cur && aiBegin(cur, prompt, err, sizeof(err))) {
+        if (cur && aiBegin(cur, prompt, err, sizeof(err), sAiMaxBank, sAiMaxProg)) {
             sAiSentState = 0xFF;      // progress statuses from here on
         } else {
             aiFinish(AI_ST_FAILED, err);
@@ -2930,6 +2931,29 @@ static void aiTick() {
 
     bool canUndo = srvHasActive && sAiUndo;
     if (canUndo) memcpy(sAiUndo, srvActiveBuf, sizeof(SongFileHeader) + sizeof(Song));
+    // The model is told the synths' range; anything still past it would select
+    // nothing (or the wrong bank) on the performer's synths.  Channel 10 is the
+    // drum kits, numbered their own way.
+    for (int c = 1; c < MAX_COLUMNS; c++) {
+        ColumnSettings& cs = fresh->columns[c];
+        if (cs.midiChannel < 1 || cs.midiChannel > 16 || cs.midiChannel == 10) continue;
+        if (cs.program > sAiMaxProg || cs.bankMSB > sAiMaxBank)
+            Serial.printf("[AI] column %d: bank %u prog %u is past the synths' range - clamped\n",
+                          c, (unsigned)cs.bankMSB, (unsigned)cs.program);
+        if (cs.program > sAiMaxProg) cs.program = sAiMaxProg;
+        if (cs.bankMSB > sAiMaxBank) cs.bankMSB = sAiMaxBank;
+    }
+    // A channel plays one preset: columns sharing one take the first's.
+    for (int c = 1; c < MAX_COLUMNS; c++) {
+        const ColumnSettings& first = fresh->columns[c];
+        if (first.midiChannel < 1 || first.midiChannel > 16) continue;
+        for (int o = c + 1; o < MAX_COLUMNS; o++) {
+            ColumnSettings& cs = fresh->columns[o];
+            if (cs.midiChannel != first.midiChannel) continue;
+            cs.bankMSB = first.bankMSB;
+            cs.program = first.program;
+        }
+    }
     aiReplaceActive(fresh);
     sAiUndoValid = canUndo;
     heap_caps_free(fresh);
@@ -3405,6 +3429,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 else if (m->op == ORGAN_OP_PARAM)     organSetParam(m->index, m->value);
                 else if (m->op == ORGAN_OP_PROCSEL)   organSetProcSound(m->value);
                 else if (m->op == ORGAN_OP_REVERB)    organSetReverb(m->value);
+                else if (m->op == ORGAN_OP_SYNTH)     organSetSynthParam(m->index, m->value);
             }
             break;
 
@@ -3568,6 +3593,8 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                     portENTER_CRITICAL(&sAiMux);
                     memcpy(sAiPrompt, m->prompt, sizeof(sAiPrompt));
                     sAiPrompt[sizeof(sAiPrompt) - 1] = '\0';
+                    sAiMaxBank = m->maxBank;
+                    sAiMaxProg = m->maxProgram;
                     sAiStartReq = true;
                     portEXIT_CRITICAL(&sAiMux);
                 } else if (m->op == AI_OP_CANCEL) {

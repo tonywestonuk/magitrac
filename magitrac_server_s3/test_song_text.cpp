@@ -15,6 +15,7 @@ HardwareSerial Serial;
 #include "TrackerData.cpp"
 #include "NoteGrid.cpp"
 #include "song_text.cpp"
+#include "OrganSynth.h"
 
 static int sPass = 0, sFail = 0;
 static void check(bool ok, const char* what) {
@@ -131,7 +132,7 @@ static void testRoundTrip() {
             }
     check(notes, "every cell identical");
     check(b->organ.flags == 1 && b->organ.bars[0] == 8 && !strcmp(b->perfPads[0].name, "GO"),
-          "organ + perf pads kept from base");
+          "organ patch round-trips, perf pads kept from base");
     free(a); free(b); free(base); free(t.p);
 }
 
@@ -235,10 +236,95 @@ static void testFailures() {
     free(base); free(out);
 }
 
+static bool parseText(const char* body, const Song* base, Song* out, SongTextResult& r) {
+    static char buf[2048];
+    snprintf(buf, sizeof(buf), "MAGITRAC SONG 1\nSONG name=\"X\" bpm=120\nBLOCK 0 len=16\n%sEND\n", body);
+    return songFromText(buf, strlen(buf), base, out, r);
+}
+
+static void testOrgan() {
+    printf("Organ patch\n");
+    Song* base = (Song*)calloc(1, sizeof(Song));
+    Song* out  = (Song*)calloc(1, sizeof(Song));
+    initSong(base);
+    SongTextResult r;
+
+    // A drawbar patch: every field there and back.
+    OrganPatch& op = base->organ;
+    organPatchSetVoice(op, 1);
+    const uint8_t bars[9] = { 8, 8, 8, 0, 0, 0, 0, 0, 8 };
+    memcpy(op.bars, bars, 9);
+    op.sliders[0] = 6; op.vibChorus = 6; op.leslie = 2; op.drive = 1; op.reverb = 2;
+    TextBuf t = makeBuf(64 * 1024);
+    songToText(base, t);
+    check(strstr(t.p, "ORGAN voice=TONEWHEEL vib=C3 leslie=FAST drive=1 reverb=HALL bars=888000008 sliders=6,4,8,4,4\n") != nullptr,
+          "drawbar patch written as an ORGAN line");
+    memset(&out->organ, 0, sizeof(OrganPatch));
+    Song* blank = (Song*)calloc(1, sizeof(Song));
+    initSong(blank);
+    check(songFromText(t.p, t.len, blank, out, r) && !memcmp(&out->organ, &op, sizeof(OrganPatch)),
+          "drawbar patch reads back exactly");
+
+    // A SYNTH patch.
+    organPatchSetVoice(op, ORGAN_VOICE_SYNTH);
+    organSynthParam(op, SYN_OSC2) = SYN_WAVE_NOISE;
+    organSynthParam(op, SYN_PITCH) = 0;
+    organSynthParam(op, SYN_RELEASE) = 16;
+    t.len = 0; t.p[0] = '\0';
+    songToText(base, t);
+    check(strstr(t.p, "ORGAN voice=SYNTH vib=C3 leslie=FAST drive=1 reverb=HALL\nSYNTH osc1=SAW osc2=NOISE mix=8 pitch=-12 detune=5 pw=0 sub=0 cutoff=10 reso=3 env=4 attack=2 decay=8 sustain=12 release=16\n") != nullptr,
+          "SYNTH patch written as ORGAN + SYNTH lines");
+    check(songFromText(t.p, t.len, blank, out, r) && !memcmp(&out->organ, &op, sizeof(OrganPatch)),
+          "SYNTH patch reads back exactly");
+    free(t.p);
+
+    // What the model would write: a new sound on a drawbar song.
+    initSong(base);
+    organPatchSetVoice(base->organ, 0);
+    check(parseText("ORGAN voice=SYNTH vib=C2 reverb=HALL\nSYNTH osc1=SQUARE cutoff=6 attack=9 pitch=-12\n",
+                    base, out, r) && !r.err[0], "model's SYNTH reply parses");
+    check(out->organ.voice == ORGAN_VOICE_SYNTH && out->organ.vibChorus == 5 && out->organ.reverb == 2,
+          "voice and effects set");
+    check(organSynthParam(out->organ, SYN_OSC1) == SYN_WAVE_SQUARE &&
+          organSynthParam(out->organ, SYN_CUTOFF) == 6 && organSynthParam(out->organ, SYN_ATTACK) == 9 &&
+          organSynthParam(out->organ, SYN_PITCH) == 0,
+          "named settings set");
+    check(organSynthParam(out->organ, SYN_DETUNE) == ORGAN_SYNTH_DEFAULT[SYN_DETUNE] &&
+          organSynthParam(out->organ, SYN_OSC2) == ORGAN_SYNTH_DEFAULT[SYN_OSC2],
+          "settings left out start from the defaults, not the old drawbars");
+
+    check(parseText("SYNTH cutoff=12\n", base, out, r) && out->organ.voice == ORGAN_VOICE_SYNTH &&
+          organSynthParam(out->organ, SYN_CUTOFF) == 12, "a SYNTH line alone selects SYNTH");
+
+    organPatchSetVoice(base->organ, ORGAN_VOICE_SYNTH);
+    check(parseText("ORGAN voice=DRAWBAR\n", base, out, r) &&
+          !memcmp(out->organ.bars, ORGAN_DEFAULT_BARS, 9) && out->organ.sliders[2] == 8,
+          "SYNTH back to DRAWBAR resets the drawbars");
+
+    check(parseText("ORGAN voice=DRAWBAR bars=008800000 sliders=1,2,3,4,5\n", base, out, r) &&
+          out->organ.bars[2] == 8 && out->organ.bars[0] == 0 && out->organ.sliders[4] == 5,
+          "model's drawbar registration parses");
+
+    check(parseText("SYNTH cutoff=40 reso=2\n", base, out, r) &&
+          organSynthParam(out->organ, SYN_CUTOFF) == ORGAN_SYNTH_DEFAULT[SYN_CUTOFF] &&
+          organSynthParam(out->organ, SYN_RESO) == 2,
+          "an out-of-range setting is ignored, the rest apply");
+    check(parseText("ORGAN voice=KAZOO\n", base, out, r) && r.err[0] && r.skipped == 1 &&
+          out->organ.voice == ORGAN_VOICE_SYNTH, "an unknown voice is skipped");
+
+    base->organ.voice = 7;
+    t = makeBuf(64 * 1024);
+    songToText(base, t);
+    check(strstr(t.p, "ORGAN voice=VOCODER") != nullptr, "old voice 7 still reads as VOCODER");
+    free(t.p);
+    free(base); free(out); free(blank);
+}
+
 int main() {
     testRoundTrip();
     testModelReply();
     testFailures();
+    testOrgan();
     printf("\n%d passed, %d failed\n", sPass, sFail);
     return sFail ? 1 : 0;
 }

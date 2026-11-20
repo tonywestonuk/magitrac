@@ -172,7 +172,9 @@ tracker and Block Settings go through `PageManager`).
   song catalog + 4 setlists, stored on the server), and two icon buttons
   that open the organ and samples pages and come back here afterwards.
 - **InstrumentsPage** (the instrument bank), **OrganPage** (drawbar organ
-  on the server), **SamplesPage** (the server's samples as tappable
+  on the server; with the PROC voice's SYNTH sound selected, EDIT SOUND or a
+  second tap on SYNTH hands the screen to **SynthEditor**: waveform buttons,
+  filter and envelope sliders, presets, BACK), **SamplesPage** (the server's samples as tappable
   squares; hold one to edit it), **SampleRecordPage** (ADD on the samples
   page: arms the server's hold-to-record screen, follows its KEEP / CANCEL /
   RESAMPLE review, then names / saves the take it hands back),

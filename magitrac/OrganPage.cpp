@@ -56,6 +56,9 @@ static const OrProcCfg OR_PROC[OR_PROC_N] = {
     // how slowly the bands let go.
     { "VOCODER",    { 5, { "WAVE", "PWM", "SSS", "GATE", "SMOOTH" } },
                     { 0, 0, 4, 1, 3 } },
+    // The subtractive synth: no sliders here — its EDIT SOUND button opens
+    // the SynthEditor screen.
+    { "SYNTH",      { 0, { "" } }, { 0 } },
 };
 
 // REED's STOPS slider, 0..8 — mirror of REED_STOPS in the server's
@@ -98,6 +101,7 @@ OrganPage::OrganPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song
     , _reverb(0)
     , _fxPage(0)
     , _procSel(0)
+    , _synthEd(display)
 {
     // Classic full-drawbar default: 16' 5 1/3' 8' pulled, rest in.
     const uint8_t init[OR_N] = { 8, 8, 8, 0, 0, 0, 0, 0, 0 };
@@ -109,6 +113,7 @@ OrganPage::OrganPage(EPD_PainterAdafruit& display, GT911_Lite& touch, Song& song
     _knob[3][0] = 4; _knob[3][1] = 5; _knob[3][2] = 6;   // NEBULA detune/glide/bright
     for (int p = 0; p < OR_PROC_N; p++)
         for (int k = 0; k < OR_NKNOB; k++) _procKnob[p][k] = OR_PROC[p].defs[k];
+    memcpy(_synth, ORGAN_SYNTH_DEFAULT, sizeof(_synth));
 }
 
 // The active slider set: the type's knobs, or the selected sound's in PROC.
@@ -134,12 +139,16 @@ void OrganPage::applyToSong() {
 
     OrganPatch& op = _song.organ;
     op.flags = 1;                        // bit0 = present (bit1 was the old vocoder toggle)
-    op.voice = (_type < OR_TYPE_PROC) ? (uint8_t)_type
-                                      : (uint8_t)(OR_TYPE_PROC + _procSel);
-    for (int b = 0; b < ORGAN_PATCH_BARS; b++) op.bars[b] = _bars[b];
-    const OrKnobCfg& cfg = orActiveCfg(_type, _procSel);
-    for (int k = 0; k < ORGAN_PATCH_SLIDERS; k++)
-        op.sliders[k] = (k < cfg.n) ? knobRef(k) : 0;
+    op.voice = (_type < OR_TYPE_PROC) ? (uint8_t)_type : organVoiceFromProc(_procSel);
+    if (isSynth()) {
+        // SYNTH's settings take the drawbars' and sliders' place (OrganSynth.h).
+        for (int i = 0; i < ORGAN_SYNTH_PARAMS; i++) organSynthParam(op, i) = _synth[i];
+    } else {
+        for (int b = 0; b < ORGAN_PATCH_BARS; b++) op.bars[b] = _bars[b];
+        const OrKnobCfg& cfg = orActiveCfg(_type, _procSel);
+        for (int k = 0; k < ORGAN_PATCH_SLIDERS; k++)
+            op.sliders[k] = (k < cfg.n) ? knobRef(k) : 0;
+    }
     op.vibChorus = (uint8_t)_vibChorus;
     op.leslie    = (uint8_t)_leslie;
     op.drive     = (uint8_t)_drive;
@@ -151,17 +160,21 @@ void OrganPage::applyToSong() {
 void OrganPage::adoptFromSong() {
     const OrganPatch& op = _song.organ;
     if (!(op.flags & 1)) return;
-    if (op.voice < OR_TYPE_PROC) {
+    int proc = organProcFromVoice(op.voice);
+    if (proc < 0) {
         _type = op.voice;
     } else {
         _type    = OR_TYPE_PROC;
-        _procSel = op.voice - OR_TYPE_PROC;
-        if (_procSel >= OR_PROC_N) _procSel = OR_PROC_N - 1;
+        _procSel = (proc >= OR_PROC_N) ? OR_PROC_N - 1 : proc;
     }
-    for (int b = 0; b < OR_N; b++) _bars[b] = (op.bars[b] > 8) ? 8 : op.bars[b];
-    const OrKnobCfg& cfg = orActiveCfg(_type, _procSel);
-    for (int k = 0; k < cfg.n; k++)
-        knobRef(k) = (op.sliders[k] > 8) ? 8 : op.sliders[k];
+    if (isSynth()) {
+        for (int i = 0; i < ORGAN_SYNTH_PARAMS; i++) _synth[i] = organSynthClamp(i, organSynthParam(op, i));
+    } else {
+        for (int b = 0; b < OR_N; b++) _bars[b] = (op.bars[b] > 8) ? 8 : op.bars[b];
+        const OrKnobCfg& cfg = orActiveCfg(_type, _procSel);
+        for (int k = 0; k < cfg.n; k++)
+            knobRef(k) = (op.sliders[k] > 8) ? 8 : op.sliders[k];
+    }
     _vibChorus    = op.vibChorus % OR_VC_N;
     _leslie       = op.leslie    % OR_LES_N;
     _drive        = op.drive     % OR_DRV_N;
@@ -176,6 +189,7 @@ void OrganPage::open(bool backLabel) {
     _dragCol  = -1;
     _dragKnob = -1;      // a drag cut short by leaving the page must not resume
     _tipShown = false;
+    _synthOpen = false;
     adoptFromSong();   // the song's OrganPatch (if present) overrides the page state
     _d.clear();
     draw();
@@ -195,6 +209,7 @@ void OrganPage::open(bool backLabel) {
 }
 
 void OrganPage::draw() {
+    if (_synthOpen) { _synthEd.draw(); return; }
     _d.fillRect(0, 0, 960, 540, COL_WHITE);
     _tipShown = false;   // full repaint took the tooltip with it
     drawHeader();
@@ -321,12 +336,34 @@ void OrganPage::drawHeader() {
              COL_WHITE, COL_BLACK, 3);
 }
 
+// SYNTH's slider column is one button that opens its own screen.
+static const int OR_SYNTH_EDIT_X = OR_KCOL_X0_PROC;
+static const int OR_SYNTH_EDIT_Y = 200;
+static const int OR_SYNTH_EDIT_W = 960 - 15 - OR_KCOL_X0_PROC;
+static const int OR_SYNTH_EDIT_H = 110;
+
 void OrganPage::drawKnobs() {
     // Clear the column, then draw the active type's knobs (if any).
     int x0 = (_type == OR_TYPE_PROC) ? OR_KCOL_X0_PROC : OR_KCOL_X0;
     _d.fillRect(x0 - 6, OR_HDR_H + 2, 960 - (x0 - 6),
                 (OR_LABEL_Y + 16) - (OR_HDR_H + 2), COL_WHITE);
+    if (isSynth()) {
+        uiButton(_d, OR_SYNTH_EDIT_X, OR_SYNTH_EDIT_Y, OR_SYNTH_EDIT_W, OR_SYNTH_EDIT_H,
+                 "EDIT SOUND", COL_BLACK, COL_WHITE, 3);
+        return;
+    }
     for (int k = 0; k < orActiveCfg(_type, _procSel).n; k++) drawKnob(k);
+}
+
+bool OrganPage::hitSynthEdit(int sx, int sy) const {
+    return isSynth() &&
+           sx >= OR_SYNTH_EDIT_X && sx < OR_SYNTH_EDIT_X + OR_SYNTH_EDIT_W &&
+           sy >= OR_SYNTH_EDIT_Y && sy < OR_SYNTH_EDIT_Y + OR_SYNTH_EDIT_H;
+}
+
+void OrganPage::openSynth() {
+    _synthOpen = true;
+    _synthEd.open(_synth);
 }
 
 void OrganPage::drawKnob(int k) {
@@ -412,6 +449,11 @@ void OrganPage::hideKnobTip() {
 }
 
 void OrganPage::syncKnobs() {
+    if (isSynth()) {
+        for (int i = 0; i < ORGAN_SYNTH_PARAMS; i++)
+            gServerPairing.sendOrgan(ORGAN_OP_SYNTH, (uint8_t)i, _synth[i]);
+        return;
+    }
     for (int k = 0; k < orActiveCfg(_type, _procSel).n; k++)
         gServerPairing.sendOrgan(ORGAN_OP_PARAM, (uint8_t)k, knobRef(k));
 }
@@ -490,6 +532,20 @@ OrganPage::Result OrganPage::poll() {
     int sx, sy;
     rawToScreen(_touch.x, _touch.y, sx, sy);
 
+    if (_synthOpen) {
+        SynthEditor::Result r = _synthEd.touch(down, sx, sy);
+        if (r == SynthEditor::Result::CHANGED) {
+            applyToSong();
+        } else if (r == SynthEditor::Result::BACK) {
+            _synthOpen = false;
+            _wasDown   = false;
+            _d.clear();
+            draw();
+            _d.paint();
+        }
+        return Result::NONE;
+    }
+
     if (down) {
         if (!_wasDown) {
             _wasDown = true;
@@ -541,7 +597,13 @@ OrganPage::Result OrganPage::poll() {
             }
             if (_type == OR_TYPE_PROC) {
                 int pi = hitProc(sx, sy);
-                if (pi >= 0) { selectProc(pi); return Result::NONE; }
+                if (pi >= 0) {
+                    // Tapping SYNTH again opens its editor.
+                    if (pi == OR_PROC_SYNTH && pi == _procSel) openSynth();
+                    else selectProc(pi);
+                    return Result::NONE;
+                }
+                if (hitSynthEdit(sx, sy)) { openSynth(); return Result::NONE; }
             } else {
                 int p = hitPreset(sx, sy);
                 if (p >= 0) { applyPreset(p); return Result::NONE; }

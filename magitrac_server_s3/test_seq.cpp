@@ -55,6 +55,9 @@ int  samplePlayRam(uint8_t id, float pitch, uint8_t vol) {
     return ++_mockRamPlays;                  // a distinct voice handle each time
 }
 void sampleStopVoice(int /*voice*/) { _mockVoiceStops++; }
+static bool    _mockSamplesBusy = false;   // the sample player still sounding
+bool samplePlayerIsPlaying()  { return false; }
+bool sampleRamVoicesActive()  { return _mockSamplesBusy; }
 bool sampleRecKeysNote(uint8_t, uint8_t) { return false; }   // no ADD SAMPLE review up
 const char* sampleManifestNameFor(uint8_t /*id*/) { return _mockHaveFiles ? "x.wav" : nullptr; }
 #include "SampleManifest.h"   // SampleTrim type for the stub below
@@ -97,6 +100,8 @@ int  organGetDrive() { return 0; }
 void organSetDrive(int) {}
 int  organGetReverb() { return 0; }
 void organSetReverb(int) {}
+int  organGetSynthParam(int) { return 0; }
+void organSetSynthParam(int, int) {}
 
 // ── External state required by midi_player.cpp ───────────────────────────────
 #include "TrackerData.h"
@@ -228,6 +233,26 @@ static void test_sequential_waits_not_skipped() {
     _test_onPerformerNote(60);
     CHECK(!_test_isWaiting(),  "row 2 WAIT resolved");
     CHECK(_test_getRow() == 3, "advanced to row 3 (NOT 4 or 6)");
+}
+
+// Key change in a TOP block right after a cue at row 0 (seen live
+// 2026-11-20): F jumped to the top, then snapped on to the WAIT at row 2
+// instead of playing row 0.
+static void test_key_change_after_row0_cue_plays_row0() {
+    printf("\ntest_key_change_after_row0_cue_plays_row0\n");
+    buildWaitPattern(true);                        // transpose follows the key
+    ((Song*)(srvActiveBuf + sizeof(SongFileHeader)))->patterns[0].keyChangeMode = (uint8_t)KeyChangeMode::TOP;
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();                               // halt at row 0
+    _mockMs += 100;
+    _test_onPerformerNote(60);                     // C plays row 0 → row 1
+    tickNextRow();                                 // row 1
+    tickNextRow();                                 // halt at row 2
+    CHECK(_test_isWaiting() && _test_getRow() == 2, "waiting at row 2");
+    _mockMs += 100;
+    _test_onPerformerNote(65);                     // F: key change → top
+    CHECK(_test_getRow() == 1,                     "F played row 0 (now at row 1), not row 2");
 }
 
 // Wrong pitch (D) does not resolve a C-4 WAIT when transpose is KEEP.
@@ -1160,6 +1185,45 @@ static void test_ffff_stop_defers_only_the_organ_release() {
     seqSetStateCallback(nullptr);
 }
 
+// ── Samples in an organ song ─────────────────────────────────────────────────
+// Col 2 ORGAN holds a note from row 0; col 3 SFX hits at row 1.  The organ
+// steps aside (from the MIDI-task loop, not the tick) for the sample, and is
+// taken back once the samples have been quiet a while.
+static void test_organ_steps_aside_for_samples() {
+    printf("\ntest_organ_steps_aside_for_samples\n");
+    Song* song = buildPlainSong();
+    song->columns[2].midiChannel = ORGAN_CHANNEL;
+    song->columns[3].midiChannel = SFX_CHANNEL;
+    song->columns[3].program     = 5;
+    putNote(song, 0, 0, 2, makeNote(0, 4));
+    putNote(song, 0, 1, 3, makeNote(0, 4));
+    _mockRamCached = true;
+    _mockMs = 0;
+    sequencerStart();
+    sequencerTick();                       // row 0: the organ note
+    CHECK(organActive() && sequencerOrganOwned(), "organ up for the ORGAN column");
+    int plays = _mockRamPlays;
+    tickNextRow();                         // row 1: the sample
+    CHECK(organActive() && _mockRamPlays == plays, "sample parked, organ not swapped inside the tick");
+    _mockSamplesBusy = true;
+    sequencerRawAuditionTick();
+    CHECK(!organActive() && _mockRamPlays == plays + 1, "organ off, then the sample plays");
+    _mockMs += 1000;
+    sequencerRawAuditionTick();
+    CHECK(!organActive(),                  "organ stays off while the sample sounds");
+    _mockSamplesBusy = false;
+    sequencerRawAuditionTick();
+    _mockMs += SEQ_ORGAN_BACK_MS - 10;
+    sequencerRawAuditionTick();
+    CHECK(!organActive(),                  "not back the moment the sample ends");
+    _mockMs += 20;
+    sequencerRawAuditionTick();
+    CHECK(organActive() && sequencerOrganOwned(), "organ back once the samples are quiet");
+    sequencerStop();
+    CHECK(!organActive(),                  "STOP releases it as usual");
+    _mockRamCached = false;
+}
+
 // A WAIT on the LAST row of a block: once the performer resolves it the block
 // has ended, so the next row to play is row 0 of the following block — with
 // its notes.  (The snap used to wrap the row number without re-seating the
@@ -1823,6 +1887,8 @@ int main() {
     test_noteset_while_stopped_then_resume();
     test_midi_note_zero_gets_note_off();
     test_ffff_stop_defers_only_the_organ_release();
+    test_key_change_after_row0_cue_plays_row0();
+    test_organ_steps_aside_for_samples();
     test_wait_on_last_row_then_next_pass_plays();
     test_block_switch_inside_cooldown_plays_new_block();
     test_same_block_restart_bounce_is_ignored();

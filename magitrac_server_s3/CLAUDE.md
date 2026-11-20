@@ -185,7 +185,8 @@ do not re-add any of it unless the owner asks.
 | `SampleManifest.cpp/.h` | `/samples/samples.txt` — stable sample ids (a `#hi=` line stops a deleted sample's id being reused straight away); trim/loop/tune/level metadata (`trim.txt`).  The id table is rebuilt to one side and swapped in, so lookups never see it empty; `trim.txt` is read once at boot |
 | `test_manifest.cpp` | Host tests for the manifest (mocks in `test_mocks/manifest/`); build line in the file |
 | `drawbar_organ.cpp/.h` | Additive drawbar organ synth (own task, takes the codec while active) |
-| `proc_sounds.cpp/.h` | Procedural sounds for the organ's PROC type |
+| `proc_sounds.cpp/.h` | Procedural sounds for the organ's PROC type (REED, CHOIR, VOCODER, SYNTH) |
+| `synth_voice.cpp/.h` | The SYNTH PROC sound's voice: two oscillators + sub, resonant low-pass, one ADSR.  Its 14 settings live in the song's OrganPatch in the drawbars' place, and SYNTH is stored as voice 8 (7 is VOCODER's old number) — see `magitrac_lib/src/OrganSynth.h` |
 | `audio_codec.cpp/.h` | Thin wrapper around the shared ES8388 (Module Audio v2.2) |
 | `mic_spectrum.cpp/.h` | Module Audio mic (LEFT input) → FFT bands + beat detect → pixel_post; feeds chord + scope screens |
 | `chord_detect.cpp/.h` | Chroma-based chord recognition (pure, no audio I/O) |
@@ -201,8 +202,9 @@ do not re-add any of it unless the owner asks.
 | `test_timestretch.cpp` | Host tests for `timestretch` (length, pitch, level, steadiness across ±2 octaves; pitch movement carried through; timbre = normal playback; attack, end, stereo, loop, matching cost); build line in the file |
 | `take_fade.h` / `test_take_fade.cpp` | ADD SAMPLE's 5 ms / 25 ms fades at a take's ends (all-signed arithmetic — an unsigned fade length once scrambled every negative sample there into a click) and its host test |
 | `claude_ai.cpp/.h` | AI (client MENU → AI, external-AP mode only): turns the active song into text, sends it with the typed prompt to the Claude API over HTTPS (own task on core 0, streamed SSE answer into PSRAM) and hands the reply back to `aiTick()` in `commands_server.ino`, which parses it and only then replaces the active song (unsaved; the old one kept for UNDO).  Key + optional `model=` / `effort=` in `/ai/key.txt` on the card — never sent to the client.  The system prompt that teaches the model the format lives here |
-| `song_text.cpp/.h` | The song ⇄ text form the AI reads and writes (`MAGITRAC SONG 1` … `END`, one line per column / block / key / note).  The parser is strict about structure (END, contiguous blocks, 4000 notes) and refuses a reply with more than a few bad lines |
+| `song_text.cpp/.h` | The song ⇄ text form the AI reads and writes (`MAGITRAC SONG 1` … `END`, one line per column / block / key / note, plus ORGAN and SYNTH lines for the organ patch).  The parser is strict about structure (END, contiguous blocks, 4000 notes) and refuses a reply with more than a few bad lines |
 | `ai_certs.h` | Root CAs for api.anthropic.com (GTS Root R4/R1, GlobalSign).  TLS failing with a certificate error → re-check the chain |
+| `test_synth_voice.cpp` | Host test for `synth_voice.cpp` (envelope times, pitch, filter, full-resonance stability); build line in the file |
 | `test_song_text.cpp`, `test_claude_ai.cpp` | Host tests for those two (the latter against a fake network in `test_mocks/ai/`); build lines in the files |
 | `mic_echo_test.cpp/.h` | Parked bench diagnostic (`MIC_ECHO_TEST`) |
 | `freq_resp_test.cpp/.h` | Bench diagnostic (`FREQ_RESP_TEST`): loops stepped sines out of the codec; record and analyse with `tools/freq_resp/` |

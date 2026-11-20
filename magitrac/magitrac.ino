@@ -1326,6 +1326,14 @@ void loop() {
                 gServerPairing.sendSongPatch(song, colStart + off, chunk);
                 off += chunk;
             }
+            uint32_t shared = columnEditor.presetSyncMask();
+            for (uint8_t i = 1; i < MAX_COLUMNS; i++) {
+                if (!(shared & (1UL << i))) continue;
+                static_assert(offsetof(ColumnSettings, program) == offsetof(ColumnSettings, bankMSB) + 1,
+                              "bank and program patched as one pair");
+                gServerPairing.sendSongPatch(song, &song.columns[i].bankMSB, 2);
+            }
+            columnEditor.clearPresetSync();
             columnEditor.clearPatch();
         }
         if (gServerPairing.isPaired() && columnEditor.pasteNotesPending()) {

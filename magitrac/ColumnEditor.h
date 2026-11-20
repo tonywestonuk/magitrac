@@ -99,6 +99,12 @@ public:
     bool patchPending() const { return _patchPending; }
     void clearPatch()         { _patchPending = false; }
 
+    // Other columns whose bank + program were just changed to follow the
+    // edited column (they share its MIDI channel, so share its preset).  The
+    // caller patches each one's bankMSB/program and calls clearPresetSync().
+    uint32_t presetSyncMask() const { return _presetSyncMask; }
+    void     clearPresetSync()      { _presetSyncMask = 0; }
+
     uint8_t editPattern() const { return _patIdx; }
     uint8_t editCol()     const { return _col; }
 
@@ -134,6 +140,8 @@ private:
     uint8_t _col;
     bool    _wasDown;
     bool    _patchPending;
+    uint32_t _presetSyncMask = 0;
+    void    syncSharedPreset();
     bool    _picking;       // true when instrument list overlay is shown
     bool    _pickingSample; // true when sample-picker overlay is shown
     bool    _naming;        // true when keyboard popup is open for NAME

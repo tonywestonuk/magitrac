@@ -16,6 +16,7 @@
 #include "SampleDebug.h"   // [SMPDBG] lines (off unless SAMPLE_DEBUG is 1)
 #include "drawbar_organ.h"
 #include "proc_sounds.h"   // PROC_SOUND_COUNT — organ-column program → voice map
+#include "OrganSynth.h"
 
 // Direct UART1 hardware FIFO access — bypasses Arduino's software ring buffer
 // to minimise performer-note latency (saves ~50-200 µs per byte).
@@ -414,6 +415,8 @@ void sequencerMidiClockTick() {
     }
 }
 
+static bool seqOrganOwned = false;   // see "Organ codec ownership" below
+
 // Chan sentinels marking a column as playing a sample (SFX) or the onboard
 // organ.  Distinct from any real 0..15 midi channel.
 #define SEQ_CHAN_SFX   0xFF
@@ -468,11 +471,33 @@ static struct { uint8_t note; int voice; } seqSfxAudPoly[SEQ_AUD_POLY] = {
     { 0, -1 }, { 0, -1 }, { 0, -1 }, { 0, -1 }, { 0, -1 }, { 0, -1 },
 };
 
+// Samples in a song that uses the organ: the organ steps aside while they
+// play.  An SFX note, a tapped square or a sample on the keys, due while the
+// sequencer owns the organ, is parked here; sequencerRawAuditionTick releases
+// the organ (outside the row walk and the key's cue — the swap takes ~60 ms),
+// fires what was parked, and once the sample player has been quiet for
+// SEQ_ORGAN_BACK_MS takes the organ back, restriking the ORGAN columns' held
+// notes.  ORGAN notes meanwhile are tracked but not heard.
+#define SEQ_ORGAN_BACK_MS 300
+#define SEQ_PAD_PARK      4
+static bool     seqOrganYielded  = false;     // released for samples, wanted back
+static uint8_t  seqSfxParkN      = 0;
+static uint8_t  seqSfxParkCol[MAX_COLUMNS];
+static uint8_t  seqSfxParkNote[MAX_COLUMNS];
+struct SeqPadPark { uint8_t id, note, volume; bool keyed; };
+static uint8_t    seqPadParkN = 0;
+static SeqPadPark seqPadPark[SEQ_PAD_PARK];
+static uint32_t   seqSfxQuietSince = 0;
+
 // Safe while a song runs: the poly table only ever holds voices a key started
 // (and a voice handle can't stop a slot that has since been reused), and
 // seqSfxAudNote is cleared the moment the song takes the SD stream for one of
 // its own samples (sfxStreamPlay), so a late key-up can't cut song SFX.
 static void seqSfxAudNoteOff(uint8_t note) {
+    // A key let go before its parked sample started: it never sounds.
+    for (uint8_t i = 0; i < seqPadParkN; )
+        if (seqPadPark[i].keyed && seqPadPark[i].note == note) seqPadPark[i] = seqPadPark[--seqPadParkN];
+        else i++;
     for (int i = 0; i < SEQ_AUD_POLY; i++) {
         if (seqSfxAudPoly[i].voice >= 0 && seqSfxAudPoly[i].note == note) {
             sampleStopVoice(seqSfxAudPoly[i].voice);
@@ -623,7 +648,13 @@ void sequencerSampleKeys(uint8_t sampleId) {
 // sample that was streaming.
 static void seqSamplePlayImpl(uint8_t sampleId, uint8_t note, bool keyed, uint8_t volume = 127) {
     if (sampleId == 0 || note > 127) return;
-    if (organActive()) return;     // organ owns the codec
+    if (organActive()) {
+        // Ours (a song with ORGAN columns): park it for the organ to step
+        // aside.  The organ screen's or page's: it keeps the codec.
+        if (seqOrganOwned && seqRunning && seqPadParkN < SEQ_PAD_PARK)
+            seqPadPark[seqPadParkN++] = { sampleId, note, volume, keyed };
+        return;
+    }
     float semis = (float)((int)note - 60)
                 + (float)sampleTuneCentsFor(sampleId) * 0.01f;
     sfxAudStart(sampleId, semis, volume, note, keyed);
@@ -667,8 +698,10 @@ static bool sfxTrigger(int col, const ColumnSettings& cs, uint8_t note) {
 // the sequencer grabs the organ only when a song/preview/audition needs it and
 // releases only what it grabbed — if the organ screen (or the client's organ
 // page) already owns the synth, seqOrganGrab is a no-op and release leaves it
-// alone.  While the organ is active, SFX columns stay silent.
-static bool seqOrganOwned = false;
+// alone.  A song's SFX notes make a sequencer-owned organ step aside while
+// they play (see seqOrganYielded); under a screen- or page-owned organ they
+// stay silent.
+
 // The FFFF row-stop fires inside the row walk, where the ~60 ms organ/codec
 // release must not run.  It parks the release here; sequencerRawAuditionTick
 // performs it on the same MIDI-task pass, outside the tick.  A grab or a
@@ -676,6 +709,9 @@ static bool seqOrganOwned = false;
 static bool seqOrganReleasePending = false;
 
 static void seqOrganGrab() {
+    seqOrganYielded = false;
+    seqSfxParkN     = 0;
+    seqPadParkN     = 0;
     seqOrganReleasePending = false;    // wanted again before the parked release ran
     if (organActive()) return;         // screen/page already owns it
     samplePlayerStop();                // codec must be idle before the DMA swap
@@ -688,6 +724,9 @@ static void seqOrganGrab() {
 bool sequencerOrganOwned() { return seqOrganOwned; }
 
 static void seqOrganRelease() {
+    seqOrganYielded = false;
+    seqSfxParkN     = 0;
+    seqPadParkN     = 0;
     seqOrganReleasePending = false;
     if (!seqOrganOwned) return;
     organSetActive(false);
@@ -707,23 +746,29 @@ static bool seqSongUsesOrgan() {
 // synth.  Deduped per setting, so reapplying every block transition is free —
 // and because the client writes the patch in the same gesture as any live
 // organ-page tweak, a reapply never fights the player's hands.
-// voice: 0..3 = the synth types, 4+k = procedural sound k (PROC type).
+// voice: see organProcFromVoice (OrganSynth.h).  A SYNTH patch keeps its
+// settings where the drawbars and sliders would be.
 static void seqOrganApplySongPatch() {
     const OrganPatch& op = seqSong()->organ;
     if (!(op.flags & 1)) return;             // pre-v20 song — keep current sound
-    uint8_t prog = op.voice;
-    if (prog < ORGAN_TYPE_COUNT - 1) {
-        if (organGetType() != prog) organSetType(prog);
+    int snd = organProcFromVoice(op.voice);
+    if (snd < 0) {
+        if (organGetType() != op.voice) organSetType(op.voice);
     } else {
-        int snd = prog - (ORGAN_TYPE_COUNT - 1);
         if (snd >= PROC_SOUND_COUNT) snd = PROC_SOUND_COUNT - 1;
         if (organGetType() != ORGAN_TYPE_COUNT - 1) organSetType(ORGAN_TYPE_COUNT - 1);
         if (organGetProcSound() != snd) organSetProcSound(snd);
     }
-    for (int k = 0; k < ORGAN_PATCH_SLIDERS; k++)
-        if (organGetParam(k) != op.sliders[k]) organSetParam(k, op.sliders[k]);
-    for (int b = 0; b < ORGAN_PATCH_BARS; b++)
-        if (organGetDrawbar(b) != op.bars[b]) organSetDrawbar(b, op.bars[b]);
+    if (snd == PROC_IDX_SYNTH) {
+        for (int k = 0; k < ORGAN_SYNTH_PARAMS; k++)
+            if (organGetSynthParam(k) != organSynthParam(op, k))
+                organSetSynthParam(k, organSynthParam(op, k));
+    } else {
+        for (int k = 0; k < ORGAN_PATCH_SLIDERS; k++)
+            if (organGetParam(k) != op.sliders[k]) organSetParam(k, op.sliders[k]);
+        for (int b = 0; b < ORGAN_PATCH_BARS; b++)
+            if (organGetDrawbar(b) != op.bars[b]) organSetDrawbar(b, op.bars[b]);
+    }
     if (organGetVibChorus() != op.vibChorus) organSetVibChorus(op.vibChorus);
     if (organGetLeslie()    != op.leslie)    organSetLeslie(op.leslie);
     if (organGetDrive()     != op.drive)     organSetDrive(op.drive);
@@ -948,7 +993,16 @@ static void seqPlayRow() {
             seqNoteOff(col);
 
             if (cs.midiChannel == SFX_CHANNEL) {
-                if (organActive()) continue;   // organ owns the codec — SFX silent
+                if (organActive()) {
+                    // Ours: park it for the organ to step aside.  The organ
+                    // screen's or page's: SFX stays silent.
+                    if (seqOrganOwned && seqSfxParkN < MAX_COLUMNS) {
+                        seqSfxParkCol[seqSfxParkN]  = (uint8_t)col;
+                        seqSfxParkNote[seqSfxParkN] = nn.note;
+                        seqSfxParkN++;
+                    }
+                    continue;
+                }
                 if (sfxTrigger(col, cs, nn.note)) {
                     seqSetActive(col, 1, SEQ_CHAN_SFX);   // route stop to SamplePlayer
                 }
@@ -956,7 +1010,7 @@ static void seqPlayRow() {
             }
 
             if (cs.midiChannel == ORGAN_CHANNEL) {
-                if (!organActive()) continue;   // codec not ours — stay silent
+                if (!organActive() && !seqOrganYielded) continue;   // codec not ours — stay silent
                 if (nn.note < 1 || nn.note > NOTE_MAX) continue;
                 // Same note transform as MIDI columns; performer transpose
                 // always applies (the organ is melodic, never drums).
@@ -1185,9 +1239,17 @@ enum { SEQ_NOTE_NONE = 0,   // the key means nothing here (no switch, no cue)
 // that is seqOnPerformerNote's job.  With `sameAs` given, the key is dropped
 // (SEQ_NOTE_SAME) at the point of decision — before any row is played — if it
 // would only repeat that decision.
+// [KEY] log: what each performer key did (key-change diagnosis).
+static uint8_t seqKeyDbgLast    = 0xFF;
+static bool    seqKeyDbgChanged = false;
+static bool    seqKeyDbgTop     = false;
+static const char* const SEQ_PC_NAMES[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+static const char* seqPcName(uint8_t pc) { return pc < 12 ? SEQ_PC_NAMES[pc] : "-"; }
+
 static uint8_t seqPerformerNoteCore(uint8_t midiNote, uint32_t now,
                                     const SeqDecision* sameAs, SeqDecision* decided) {
     bool    did        = false;   // the playhead was moved (block switch / key-change jump)
+    bool    toTop      = false;   // …back to row 0: a fresh pass, whatever row it was on
     uint8_t pitchClass = midiNote % 12;
     const Song* s      = seqSong();
     if (seqPattern >= seqNumPat(s)) return SEQ_NOTE_NONE;   // stale index from prior song
@@ -1207,7 +1269,7 @@ static uint8_t seqPerformerNoteCore(uint8_t midiNote, uint32_t now,
             did = true;
             if (target != seqPattern) seqReturnFrom = seqPattern;
             seqPattern = target;
-            if (entry.switchMode == BlockSwitch::TOP) seqRow = 0;
+            if (entry.switchMode == BlockSwitch::TOP) { seqRow = 0; toTop = true; }
             seqWaiting = false;
             seqSendColumnSetup(seqPattern);
             seqReposition(seqRow);
@@ -1233,6 +1295,9 @@ static uint8_t seqPerformerNoteCore(uint8_t midiNote, uint32_t now,
     // scan remaining rows of the (possibly block-switched) pattern for BLK+/BLK-
     // nav flags, follow navigation, then jump to row 0 of the resulting block.
     bool keyChanged = (seqLastPitchClass != 0xFF) && (pitchClass != seqLastPitchClass);
+    seqKeyDbgLast    = seqLastPitchClass;
+    seqKeyDbgChanged = keyChanged;
+    seqKeyDbgTop     = false;
     seqLastPitchClass = pitchClass;
 
     if (keyChanged) {
@@ -1242,7 +1307,9 @@ static uint8_t seqPerformerNoteCore(uint8_t midiNote, uint32_t now,
             uint8_t fromPattern = seqPattern;
             seqApplyBlockEndNav(s, kPat.blockEndNav);
             if (seqPattern != fromPattern) seqReturnFrom = fromPattern;
+            seqKeyDbgTop         = true;
             did                  = true;
+            toTop                = true;
             seqRow               = 0;
             seqWaiting           = false;
             seqSendColumnSetup(seqPattern);
@@ -1259,7 +1326,10 @@ static uint8_t seqPerformerNoteCore(uint8_t midiNote, uint32_t now,
     // jumped backwards, or the pattern has changed since the last performer
     // note.  The noise high-water mark and section anchor are only meaningful
     // within a single forward pass.
-    if (seqPattern != seqLastSeenPat ||
+    // A jump to the top always counts: the last snap may have been on row 0
+    // itself (lastSeen is the cue row), so "row went backwards" can't see it,
+    // and the walk would start after row 0 and snap on to a later WAIT.
+    if (toTop || seqPattern != seqLastSeenPat ||
         (seqLastSeenRow != 0xFF && seqRow < seqLastSeenRow)) {
         seqNoiseConsumedRow = 0xFF;
         seqLastSnapRow      = 0xFF;
@@ -1470,13 +1540,23 @@ static void seqOnPerformerNote(uint8_t midiNote) {
     uint32_t now = millis();
     uint8_t  pc  = midiNote % 12;
 
+    uint8_t dbgPat = seqPattern, dbgRow = seqRow;
     if (seqFumbleOn && seqFumbleHaveBase && (int32_t)(now - seqFumbleUntil) < 0) {
-        if (pc == seqFumblePc) return;                       // same key again
+        if (pc == seqFumblePc) {                             // same key again
+            debugPrintf("[KEY] %s: same key inside the fumble window - ignored\n", seqPcName(pc));
+            return;
+        }
         SeqPos after;
         seqPosSave(after);                                   // where the earlier key left us
         seqPosRestore(seqFumbleBase);                        // …as if it had not been pressed
         SeqDecision d;
-        if (seqPerformerNoteCore(midiNote, now, &seqFumbleDecision, &d) != SEQ_NOTE_DID) {
+        uint8_t r = seqPerformerNoteCore(midiNote, now, &seqFumbleDecision, &d);
+        debugPrintf("[KEY] %s (fumble, judged from blk %u row %u, last key %s): change=%d top=%d -> %s, blk %u row %u\n",
+                    seqPcName(pc), seqFumbleBase.pattern, seqFumbleBase.row, seqPcName(seqKeyDbgLast),
+                    seqKeyDbgChanged, seqKeyDbgTop,
+                    r == SEQ_NOTE_DID ? "TAKES OVER" : "earlier key stands",
+                    r == SEQ_NOTE_DID ? seqPattern : after.pattern, r == SEQ_NOTE_DID ? seqRow : after.row);
+        if (r != SEQ_NOTE_DID) {
             seqPosRestore(after);                            // earlier key stands
             return;
         }
@@ -1496,7 +1576,15 @@ static void seqOnPerformerNote(uint8_t midiNote) {
     SeqPos base;
     seqPosSave(base);
     SeqDecision d;
-    if (seqPerformerNoteCore(midiNote, now, nullptr, &d) == SEQ_NOTE_DID) {
+    uint8_t r = seqPerformerNoteCore(midiNote, now, nullptr, &d);
+    debugPrintf("[KEY] %s at blk %u row %u%s, last key %s: change=%d (block mode %s) top=%d cue=%d -> %s, blk %u row %u\n",
+                seqPcName(pc), dbgPat, dbgRow, base.waiting ? " (WAITING)" : "", seqPcName(seqKeyDbgLast),
+                seqKeyDbgChanged,
+                seqSong()->patterns[d.pattern].keyChangeMode == (uint8_t)KeyChangeMode::TOP ? "TOP" : "SAME",
+                seqKeyDbgTop, d.cueRow == 0xFF ? -1 : (int)d.cueRow,
+                r == SEQ_NOTE_DID ? "did" : r == SEQ_NOTE_SAME ? "same" : "nothing",
+                seqPattern, seqRow);
+    if (r == SEQ_NOTE_DID) {
         seqFumbleBase     = base;
         seqFumbleHaveBase = true;
         seqFumbleDecision = d;
@@ -1999,9 +2087,45 @@ void sequencerSendPatchesNow() {
     seqColSetupPending = true;
 }
 
+// Hand the codec between the organ and the samples (see seqOrganYielded).
+static void seqOrganSampleTick() {
+    if (!seqRunning) { seqSfxParkN = seqPadParkN = 0; return; }
+    if ((seqSfxParkN || seqPadParkN) && seqOrganOwned && organActive()) {
+        uint8_t n = seqSfxParkN, np = seqPadParkN;
+        SeqPadPark pads[SEQ_PAD_PARK];
+        memcpy(pads, seqPadPark, sizeof(pads));
+        seqOrganRelease();                 // also empties the parks — fire from copies
+        seqOrganYielded = true;
+        debugPrintf("[SEQ] organ off for %u sample(s)\n", n + np);
+        for (uint8_t i = 0; i < n; i++) {
+            int col = seqSfxParkCol[i];
+            const ColumnSettings& cs = seqSong()->columns[col];
+            if (cs.midiChannel != SFX_CHANNEL || cs.mute) continue;
+            if (sfxTrigger(col, cs, seqSfxParkNote[i])) seqSetActive(col, 1, SEQ_CHAN_SFX);
+        }
+        for (uint8_t i = 0; i < np; i++)
+            seqSamplePlayImpl(pads[i].id, pads[i].note, pads[i].keyed, pads[i].volume);
+        seqSfxQuietSince = millis();
+        return;
+    }
+    if (!seqOrganYielded) return;
+    if (organActive()) { seqOrganYielded = false; return; }   // the organ screen took it
+    if (samplePlayerIsPlaying() || sampleRamVoicesActive()) {
+        seqSfxQuietSince = millis();
+        return;
+    }
+    if ((uint32_t)(millis() - seqSfxQuietSince) < SEQ_ORGAN_BACK_MS) return;
+    seqOrganGrab();
+    for (int c = 1; c < MAX_COLUMNS; c++)
+        if (seqActiveOn[c] && seqActiveChan[c] == SEQ_CHAN_ORGAN)
+            organNoteOn(seqActiveNote[c], 100);
+    debugPrintf("[SEQ] organ back\n");
+}
+
 void sequencerRawAuditionTick() {
     // Organ release parked by an FFFF row-stop (see seqOrganReleasePending).
     if (seqOrganReleasePending) seqOrganRelease();
+    seqOrganSampleTick();
 
     // Song just loaded — put every channel on its column's bank/program/volume
     // now, so the performer's first notes (or a PLAY straight into a block)

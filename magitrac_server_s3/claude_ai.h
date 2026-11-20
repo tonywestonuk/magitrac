@@ -20,7 +20,10 @@ struct Song;
 
 // False (and why, in err) if it can't start: already busy, no key, not on an
 // external network, not enough memory.
-bool aiBegin(const Song* current, const char* prompt, char* err, size_t errLen);
+// maxBank / maxProgram: the performer's MIDI synths' range (0-based), told to
+// the model.
+bool aiBegin(const Song* current, const char* prompt, char* err, size_t errLen,
+             uint8_t maxBank = 127, uint8_t maxProgram = 127);
 
 void aiCancel();               // the task drops the connection; result = FAILED "Cancelled"
 bool aiBusy();                 // a request is in flight (or its reply not yet taken)

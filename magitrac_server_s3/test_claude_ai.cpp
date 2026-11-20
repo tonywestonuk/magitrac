@@ -268,7 +268,29 @@ static void testErrors() {
     check(!aiBusy(), "never left busy");
 }
 
+// The prompt's SYNTH examples must be the presets the device has, written
+// exactly as song_text.cpp writes them.
+static void testPromptPresets() {
+    printf("Prompt presets\n");
+    for (int k = 0; k < ORGAN_SYNTH_PRESET_N; k++) {
+        OrganPatch op = {};
+        organPatchSetVoice(op, ORGAN_VOICE_SYNTH);
+        for (int i = 0; i < ORGAN_SYNTH_PARAMS; i++) organSynthParam(op, i) = ORGAN_SYNTH_PRESETS[k].p[i];
+        static char buf[512];
+        TextBuf t = { buf, sizeof(buf), 0, false };
+        writeOrgan(op, t);
+        const char* line = strstr(buf, "\nSYNTH ") + 7;
+        std::string want = std::string(ORGAN_SYNTH_PRESETS[k].name);
+        want.resize(8, ' ');
+        want += std::string(line, strcspn(line, "\n"));
+        char what[64];
+        snprintf(what, sizeof(what), "%s matches the device", ORGAN_SYNTH_PRESETS[k].name);
+        check(strstr(AI_SYSTEM, want.c_str()) != nullptr, what);
+    }
+}
+
 int main() {
+    testPromptPresets();
     testRequest();
     testStreams();
     testErrors();

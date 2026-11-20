@@ -1,11 +1,14 @@
 #include "drawbar_organ.h"
 #include "audio_codec.h"
 #include "proc_sounds.h"
+#include "synth_voice.h"
+#include "OrganSynth.h"
 #include <Arduino.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "esp_timer.h"
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
 #define ORGAN_VOICES   12        // max simultaneous notes
@@ -353,6 +356,13 @@ static int16_t s_voiceScratch[ORGAN_VOICES][PROC_WT];   // current morphed wavet
 static int32_t s_procLp   = 0;    // BRIGHT one-pole state (global, PROC only)
 static volatile int s_procSel = 0;    // selected procedural sound
 
+// SYNTH's 14 settings (OrganSynth.h), written by the UI / sequencer, read once
+// per block into s_synthBlk.
+static volatile uint8_t s_synthParam[ORGAN_SYNTH_PARAMS];
+static SynthBlock s_synthBlk;
+static float      s_synthBuf[BLOCK_FRAMES];   // this block's SYNTH voices, summed
+static uint32_t   s_synthUs = 0;              // time spent rendering them (load log)
+
 // NEBULA: a sci-fi, THX-flavoured but playable voice.  Each footage is TWO
 // widely-detuned oscillators (thick chorused wall) read from a BRIGHT wheel
 // (extra harmonics → sparkle up high), and every note GLIDES up to pitch on
@@ -404,6 +414,7 @@ struct Voice {
     uint8_t  note;
     uint8_t  stage;       // EnvStage
     uint8_t  sustained;   // key released while the damper pedal was down
+    uint8_t  isSynth;     // started by SYNTH: `syn` is live, not `proc`
     int32_t  env;         // Q15, 0..32767
     int32_t  clickEnv;    // Q15 key-click transient (tonewheel only)
     uint32_t rng;         // per-voice noise state (key click)
@@ -415,8 +426,12 @@ struct Voice {
     uint32_t vocPhase, vocInc;      // VOCODER carrier oscillator at the note's pitch
     uint32_t vocLfoPh, vocLfoInc;   // its pulse-width LFO (advanced once per block)
     float    vocWidth;              // this block's pulse width
-    ProcVoiceState proc;            // PROC generator state
+    union {
+        ProcVoiceState proc;        // PROC generator state (CHOIR)
+        SynthVoice     syn;         // SYNTH
+    };
 };
+static_assert(sizeof(SynthVoice) <= sizeof(ProcVoiceState), "SYNTH would grow the voice table");
 static Voice voices[ORGAN_VOICES];
 static volatile int s_voiceCount = 0;   // for the header readout
 
@@ -429,10 +444,22 @@ static inline float midiHz(uint8_t note) {
     return 440.0f * powf(2.0f, (note - 69) / 12.0f);
 }
 
-static void voiceStart(Voice& v, uint8_t note) {
+static void voiceStart(Voice& v, uint8_t note, uint8_t vel) {
+    bool wasLive = (v.stage != ENV_IDLE);
     v.note      = note;
     v.stage     = ENV_ATTACK;
     v.sustained = 0;
+    if (s_type == ORGAN_PROC && s_procSel == PROC_IDX_SYNTH) {
+        // Retriggered or stolen: carry on from the level it was at (no click).
+        float from = (wasLive && v.isSynth) ? v.syn.env : 0.0f;
+        v.isSynth  = 1;
+        synthNoteOn(v.syn, midiHz(note), vel, from, AUDIO_CODEC_RATE_HZ);
+        v.env      = (int32_t)(v.syn.env * 32767.0f);
+        v.clickEnv = 0;
+        v.glideQ16 = 65536;
+        return;
+    }
+    v.isSynth   = 0;
     // VOCODER carrier oscillator: the note's own pitch, starting at a
     // note-dependent point in its cycle so a chord's notes don't all peak together.
     v.vocInc    = (uint32_t)((double)midiHz(note) * 4294967296.0 / AUDIO_CODEC_RATE_HZ);
@@ -512,24 +539,24 @@ static void voiceStart(Voice& v, uint8_t note) {
 }
 
 static void applyNoteOn(uint8_t note, uint8_t vel) {
-    (void)vel;   // organ is touch-insensitive; velocity only gates on/off
+    // The organ sounds ignore velocity (it only gates on/off); SYNTH uses it.
     // Retrigger if this note is already sounding.
     for (int i = 0; i < ORGAN_VOICES; i++) {
         if (voices[i].stage != ENV_IDLE && voices[i].note == note) {
-            voiceStart(voices[i], note);
+            voiceStart(voices[i], note, vel);
             return;
         }
     }
     // Grab an idle voice.
     for (int i = 0; i < ORGAN_VOICES; i++) {
-        if (voices[i].stage == ENV_IDLE) { voiceStart(voices[i], note); return; }
+        if (voices[i].stage == ENV_IDLE) { voiceStart(voices[i], note, vel); return; }
     }
     // Steal the quietest voice (lowest envelope).
     int best = 0; int32_t lo = voices[0].env;
     for (int i = 1; i < ORGAN_VOICES; i++) {
         if (voices[i].env < lo) { lo = voices[i].env; best = i; }
     }
-    voiceStart(voices[best], note);
+    voiceStart(voices[best], note, vel);
 }
 
 static void applyNoteOff(uint8_t note) {
@@ -665,6 +692,35 @@ static void renderBlock(int16_t* out) {
         if (smooth != lastSmooth) { lastSmooth = smooth; vocSetSmooth(smooth); }
     }
 
+    // SYNTH sound: its settings, once per block.  Level: ±1 from the voice
+    // × 8 drawbar units × the registry gain, as for the other PROC sounds.
+    // Each voice is rendered for the whole block here (much cheaper than a
+    // sample at a time); the sample loop below just mixes the sum in.
+    bool  synthSel   = proc && procSel == PROC_IDX_SYNTH;
+    float synthScale = 0.0f;
+    if (synthSel) {
+        int64_t t0 = esp_timer_get_time();
+        uint8_t sp[ORGAN_SYNTH_PARAMS];
+        for (int k = 0; k < ORGAN_SYNTH_PARAMS; k++) sp[k] = s_synthParam[k];
+        synthPrepare(s_synthBlk, sp, AUDIO_CODEC_RATE_HZ);
+        synthScale = 32767.0f * 8.0f * (float)procGain;
+        memset(s_synthBuf, 0, sizeof(s_synthBuf));
+        for (int i = 0; i < ORGAN_VOICES; i++) {
+            Voice& v = voices[i];
+            if (v.stage == ENV_IDLE) continue;
+            if (!v.isSynth) {                 // left over from the sound before: its state means nothing here
+                v.stage = ENV_IDLE; v.env = 0; v.sustained = 0;
+                continue;
+            }
+            synthRender(v.syn, s_synthBlk, v.stage != ENV_RELEASE, s_synthBuf, BLOCK_FRAMES);
+            if (v.syn.stage == SYN_ST_DONE) { v.stage = ENV_IDLE; v.env = 0; }
+            else v.env = (int32_t)(v.syn.env * 32767.0f);   // so stealing still picks the quietest
+        }
+        s_synthUs = (uint32_t)(esp_timer_get_time() - t0);
+    } else {
+        s_synthUs = 0;
+    }
+
     // REED sound: its stops, céleste, width and level, once per block.
     bool  reedSel  = proc && procSel == PROC_IDX_REED;
     const ReedStop* reedStop = &REED_STOPS[0];
@@ -703,10 +759,16 @@ static void renderBlock(int16_t* out) {
 
     for (int n = 0; n < BLOCK_FRAMES; n++) {
         int32_t mix = 0;
+        if (synthSel) mix = (int32_t)(s_synthBuf[n] * synthScale);
 
-        for (int i = 0; i < ORGAN_VOICES; i++) {
+        for (int i = 0; i < ORGAN_VOICES && !synthSel; i++) {
             Voice& v = voices[i];
             if (v.stage == ENV_IDLE) continue;
+            if (v.isSynth) {
+                // Left over from SYNTH: its state means nothing to this sound.
+                v.stage = ENV_IDLE; v.env = 0; v.sustained = 0;
+                continue;
+            }
 
             int32_t acc = 0;
             if (neb) {
@@ -824,7 +886,7 @@ static void renderBlock(int16_t* out) {
         // PROC BRIGHT slider — global one-pole low-pass tone control — then the
         // THROAT formant (boost can exceed int16, so re-clamp before the FX
         // chain writes int16 delay buffers).
-        if (proc && !vocSel) {                         // (VOCODER's sliders mean other things)
+        if (proc && !vocSel && !synthSel) {            // (VOCODER's sliders mean other things; SYNTH has its own filter)
             int alpha = 16 + s_param[2] * 30;          // 16 (dark) .. 256 (open)
             s_procLp += ((s - s_procLp) * alpha) >> 8;
             s = procFormant(s_procLp, procSel, s_param[4]);
@@ -957,8 +1019,20 @@ static void renderBlock(int16_t* out) {
 #define VOC_PRIME_BLOCKS  8       // 32 ms
 #define VOC_READ_WAIT_MS  6       // normally the block is already there
 
+// Render load, printed once a second while anything sounds: how long
+// renderBlock takes against the block's 4 ms, the most voices at once, and
+// "late" = passes where the codec write returned at once (its buffers had run
+// dry: the output fell behind and glitched).
+#define ORGAN_LOAD_LOG 1
+static const uint32_t BLOCK_US = BLOCK_FRAMES * 1000000UL / AUDIO_CODEC_RATE_HZ;
+
 static void organTaskFn(void*) {
     static int16_t block[BLOCK_FRAMES * 2];
+#if ORGAN_LOAD_LOG
+    uint32_t ldSum = 0, ldMax = 0, ldN = 0, ldLate = 0, ldSynth = 0;
+    int      ldVoices = 0;
+    uint32_t ldSince = millis();
+#endif
     bool vocWas   = false;
     int  vocPrime = 0;
     for (;;) {
@@ -990,9 +1064,35 @@ static void organTaskFn(void*) {
             }
         }
 
+#if ORGAN_LOAD_LOG
+        int64_t t0 = esp_timer_get_time();
+#endif
         renderBlock(block);
+#if ORGAN_LOAD_LOG
+        int64_t t1 = esp_timer_get_time();
+#endif
         if (!audioCodecPlay((const uint8_t*)block, sizeof(block)))  // blocks → paces us
             vTaskDelay(1);                  // no codec / reconfiguring — don't spin
+#if ORGAN_LOAD_LOG
+        uint32_t us   = (uint32_t)(t1 - t0);
+        uint32_t wait = (uint32_t)(esp_timer_get_time() - t1);
+        ldSum += us; ldN++; ldSynth += s_synthUs;
+        if (us > ldMax) ldMax = us;
+        if (wait < 100) ldLate++;
+        if (s_voiceCount > ldVoices) ldVoices = s_voiceCount;
+        if ((uint32_t)(millis() - ldSince) >= 1000) {
+            if (ldVoices > 0 || ldLate > 0)
+                Serial.printf("[ORGAN] render avg %lu%% (synth %lu%%) max %lu%% of %lu us, voices up to %d, late %lu/%lu, type %d sound %d\n",
+                              (unsigned long)(ldSum * 100 / (ldN * BLOCK_US)),
+                              (unsigned long)(ldSynth * 100 / (ldN * BLOCK_US)),
+                              (unsigned long)(ldMax * 100 / BLOCK_US), (unsigned long)BLOCK_US,
+                              ldVoices, (unsigned long)ldLate, (unsigned long)ldN,
+                              (int)s_type, (int)s_procSel);
+            ldSum = ldMax = ldN = ldLate = ldSynth = 0;
+            ldVoices = 0;
+            ldSince = millis();
+        }
+#endif
     }
 }
 
@@ -1029,6 +1129,7 @@ void organInit() {
                           + 0.05f*sinf(5*p) + 0.035f*sinf(6*p);
         nebTab[i] = (int16_t)lrintf(w * nbSc);
     }
+    for (int k = 0; k < ORGAN_SYNTH_PARAMS; k++) s_synthParam[k] = ORGAN_SYNTH_DEFAULT[k];
     for (int i = 0; i < ORGAN_VOICES; i++) {
         voices[i].stage = ENV_IDLE; voices[i].env = 0;
         voices[i].clickEnv = 0;     voices[i].rng = 0x2545F491u + i * 2654435761u;
@@ -1135,3 +1236,11 @@ void organSetProcSound(int i) {
     s_procSel = i;   // applies to notes played next
 }
 int organGetProcSound() { return s_procSel; }
+
+void organSetSynthParam(int idx, int value) {
+    if (idx < 0 || idx >= ORGAN_SYNTH_PARAMS) return;
+    s_synthParam[idx] = organSynthClamp(idx, value);   // read at the next block
+}
+int organGetSynthParam(int idx) {
+    return (idx >= 0 && idx < ORGAN_SYNTH_PARAMS) ? s_synthParam[idx] : 0;
+}

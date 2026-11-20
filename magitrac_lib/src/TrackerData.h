@@ -178,7 +178,9 @@ struct ColumnSettings {
 // sizeof(ColumnSettings) = 20
 
 // The song's organ patch — the full state of the organ page, stored once per
-// song (one organ per song; every ORGAN column plays this patch).  flags bit0
+// song (one organ per song; every ORGAN column plays this patch).  For the
+// SYNTH voice, bars + sliders hold its 14 settings instead (OrganSynth.h,
+// which also maps `voice` numbers).  flags bit0
 // set = patch present; songs saved before v20 read as absent and the synth
 // keeps its current settings.  Slider meaning depends on the voice (they map
 // to the synth's s_param in order).

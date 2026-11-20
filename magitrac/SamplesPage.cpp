@@ -243,11 +243,12 @@ SamplesPage::Result SamplesPage::poll() {
         _pressIdx = -1;
         if (e) {
             if (gServerPairing.serverPlaying()) {
-                // Song playing: the held square plays its sample, once.  (No
-                // editor here — it makes the server scan the WAV off the SD
-                // card, which would starve a sample the song is streaming.)
-                gServerPairing.sendSampleEdit(SAMPLE_EDIT_PLAY, e->id);
-                drawCell(cell, false);       // finger feedback off; the release does nothing more
+                // Song playing: a hold puts the sample on the keys (a tap
+                // plays it).  No editor here — it makes the server scan the
+                // WAV off the SD card, which would starve a sample the song
+                // is streaming.
+                toggleKeys(e->id);
+                drawCell(cell, false);       // shows where it now stands; the release does nothing more
                 _d.paintLater();
                 return Result::NONE;
             }
@@ -304,8 +305,8 @@ SamplesPage::Result SamplesPage::poll() {
         const SampleCacheEntry* e = gServerPairing.sampleListEntry(idx);
         if (!e) return Result::NONE;
 
-        // Nothing sounds on a press: a tap (decided on release) puts the
-        // sample on the keys, a hold edits or plays it.
+        // Nothing sounds on a press: what a tap (decided on release) or a
+        // hold does depends on whether the song is playing — see the header.
         _pressIdx = idx;
         _pressMs  = millis();
         drawCell(cell, true);
@@ -324,17 +325,14 @@ SamplesPage::Result SamplesPage::poll() {
         // ── Release ──────────────────────────────────────────────────────────
         _wasDown = false;
         if (_pressIdx >= 0) {
-            // A tap: this sample goes on the keys — or comes off, if it was
-            // already there.
+            // A tap.  Song playing: play the sample once.  Stopped: the
+            // sample goes on the keys — or comes off, if it was already there.
             int cell = _pressIdx - _page * SMP_PER_PAGE;
             const SampleCacheEntry* e = gServerPairing.sampleListEntry(_pressIdx);
             _pressIdx = -1;
             if (e) {
-                uint8_t was = _keysId;
-                _keysId = (was == e->id) ? 0 : e->id;
-                gServerPairing.sendSampleEdit(SAMPLE_EDIT_KEYS, _keysId);
-                _leaseMs = millis();
-                redrawCellOf(was);           // the square that had the keys goes white
+                if (gServerPairing.serverPlaying()) gServerPairing.sendSampleEdit(SAMPLE_EDIT_PLAY, e->id);
+                else                                toggleKeys(e->id);
             }
             drawCell(cell, false);           // this one shows where it now stands
             _d.paintLater();
@@ -354,4 +352,12 @@ SamplesPage::Result SamplesPage::poll() {
         }
     }
     return Result::NONE;
+}
+
+void SamplesPage::toggleKeys(uint8_t id) {
+    uint8_t was = _keysId;
+    _keysId = (was == id) ? 0 : id;
+    gServerPairing.sendSampleEdit(SAMPLE_EDIT_KEYS, _keysId);
+    _leaseMs = millis();
+    redrawCellOf(was);           // the square that had the keys goes white
 }

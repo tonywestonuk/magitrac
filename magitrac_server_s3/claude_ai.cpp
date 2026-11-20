@@ -69,12 +69,44 @@ Guidance: keep the existing cue lane unless asked to change it. For a new song, 
 Each block can say what happens when the performer plays each of the 12 pitch classes: switch to another block (`switch=TOP` restart it at row 0, `switch=SAME` keep the row position) and/or transpose the band (`tr=NOTE` follow the played note relative to the block's `ref` key, `tr=CUSTOM by=N` shift by N semitones). This is how a performer jumps to the chorus or changes key live. Leave keys out unless they help the request.
 
 ## Columns and instruments
-- `ch=1`..`16` sends MIDI to the performer's synths on that channel with `prog` (program 0-127, General MIDI numbering for a GM synth), `bank` (CC0) and `vol` (CC7). `tr` transposes the column in semitones.
+- `ch=1`..`16` sends MIDI to the performer's synths on that channel with `prog` (program number), `bank` (CC0) and `vol` (CC7). prog and bank count from 0 (the device shows them +1), and the message gives the range the performer's synths accept - never go past it. Their sounds are not General MIDI: reuse the prog/bank of an existing column whose name suits the part. A channel plays one sound at a time, so columns on the same channel must have the same prog and bank. `tr` transposes the column in semitones.
 - `ch=SFX` plays a WAV sample from the server's SD card; `prog` is the sample id from the sample list in the message. C-4 plays the sample at its own pitch.
-- `ch=ORGAN` plays the built-in drawbar organ (one organ sound per song, set up on the device).
+- `ch=ORGAN` plays the server's built-in organ / synth - see "The organ" below.
 - `ch=LIGHTS` drives the light show: note = light effect, velocity = intensity, FX:XXYY = position. Keep LIGHTS columns as they are unless asked.
 - `ch=OFF` is an unused column.
-- The existing columns are wired to the performer's real instruments. Reuse them (keep their ch/bank/prog/name) and only add new columns when the request needs an instrument the song doesn't have. Columns that are not in your reply are removed, so repeat every column you keep.
+- The existing columns are wired to the performer's real instruments. Keep them as they are (ch/bank/prog/name) unless asked to change them. Columns that are not in your reply are removed, so repeat every column you keep.
+
+## The organ (ch=ORGAN)
+The server has one built-in sound engine. A song has ONE organ sound, given by the ORGAN line (plus a SYNTH line when the voice is SYNTH); every ORGAN column plays it, one note at a time per column like any other column, and bank/prog are ignored on them.
+- For a new part, use the organ (ORGAN columns, with a SYNTH or organ voice designed for the part) rather than a MIDI channel. Only put a new part on MIDI when the request names a channel or one of the performer's instruments (e.g. "on channel 3", "use the Nord"); then do exactly that.
+- If the song's ORGAN columns already play a different sound that the request doesn't ask to change, don't change it: put the new part on MIDI instead, reusing a MIDI column's channel/bank/prog whose name suits the part.
+- Changing the organ sound changes every ORGAN column. Only change it when the request is about that sound or the song has no ORGAN column yet. Leave the ORGAN/SYNTH lines out (or repeat them unchanged) to keep the current sound.
+- While a song has an ORGAN column the organ takes over the audio output and ch=SFX columns go silent. Don't add ORGAN columns to a song that relies on SFX columns, or SFX columns to a song that uses the organ.
+Voices:
+- DRAWBAR: pure sine drawbars. With vib=OFF leslie=STOP reverb=HALL it is a pipe (flue) organ.
+- TONEWHEEL: a Hammond, with key click. Classic settings: vib=C3, leslie=SLOW or FAST, drive=1 for rock.
+- CLAUDE: a soft, slowly evolving sine pad (the drawbars set its voicing).
+- NEBULA: a thick, detuned sci-fi pad that glides up to pitch.
+- REED: harmonium / accordion. As an oboe: sliders=8,0,1,0,8.
+- CHOIR: a vintage tape/disc "ahh" choir.
+- VOCODER: only works with someone singing into the server's microphone - don't choose it unless asked.
+- SYNTH: a subtractive synth for pads, strings, brass, basses, leads and plucks - see the SYNTH line.
+`bars` is nine digits 0-8 for the footages 16', 5 1/3', 8', 4', 2 2/3', 2', 1 3/5', 1 1/3', 1' (8 = fully out). The device's presets: 888000000 jazz, 888800000 rock, 888800088 gospel, 008806000 flutes, 888888888 full. A church organ: 808806000 for principals, 808888008 for full organ.
+`sliders` is five values 0-8, the voice's own controls in this order (DRAWBAR and CLAUDE ignore them): TONEWHEEL click,-,-,-,- ; NEBULA detune,glide,bright,-,- ; REED wave(hollow..nasal),celeste,bright,stops,chamber ; CHOIR breath,ensemble,bright,attack,ahh ; VOCODER wave,pwm,sss,gate,smooth. Use 4 for anything you have no reason to change.
+Effects: vib=OFF|V1|V2|V3 (vibrato)|C1|C2|C3 (chorus), leslie=STOP|SLOW|FAST, drive=0|1, reverb=OFF|ROOM|HALL.
+
+The SYNTH line (every setting 0-16 unless shown; settings left out keep their default):
+- osc1=SAW|SQUARE|TRI|SINE, osc2=SAW|SQUARE|TRI|SINE|NOISE. mix: 0 = osc1 only, 8 = even, 16 = osc2 only. pitch: osc2's tuning in semitones, -12..12 (12 = an octave up, 7 = a fifth). detune: osc2 slightly sharp for thickness (4 = 3 cents, 6 = 7, 8 = 13, 12 = 29). pw: pulse width of a SQUARE, 0 = square .. 16 = thin and nasal. sub: a square one octave below osc1.
+- cutoff: the low-pass filter, 40 Hz x 2^(0.55 x cutoff): 4 = 180 Hz, 8 = 840 Hz, 10 = 1.8 kHz, 12 = 3.9 kHz, 16 = fully open; it follows the keyboard (half an octave per octave played). reso: resonance, 0 none .. 16 ringing. env: how far the envelope opens the filter, 0.4 octaves per step.
+- One envelope drives both the level and the filter. attack = 1 + attack^3 ms (0 instant, 4 = 65 ms, 8 = 0.5 s, 10 = 1 s, 12 = 1.7 s). decay = 10 + 1.5 x decay^3 ms (6 = 0.33 s, 8 = 0.8 s, 12 = 2.6 s). sustain: the level held while the key is down (16 = full). release = 5 + 2 x release^3 ms (4 = 0.13 s, 6 = 0.44 s, 8 = 1 s, 12 = 3.5 s).
+- Notes are velocity-sensitive. The organ's vib/leslie/drive/reverb apply to SYNTH too: chorus (C2/C3) and HALL suit pads and strings.
+- Starting points (the device's presets):
+  PAD     osc1=SAW osc2=SAW mix=8 pitch=0 detune=6 pw=0 sub=0 cutoff=9 reso=2 env=2 attack=9 decay=10 sustain=14 release=9
+  STRINGS osc1=SAW osc2=SAW mix=8 pitch=0 detune=5 pw=0 sub=0 cutoff=11 reso=1 env=1 attack=7 decay=8 sustain=14 release=8
+  BRASS   osc1=SAW osc2=SAW mix=8 pitch=0 detune=3 pw=0 sub=0 cutoff=7 reso=3 env=7 attack=4 decay=7 sustain=11 release=5
+  BASS    osc1=SAW osc2=SQUARE mix=6 pitch=-12 detune=2 pw=4 sub=6 cutoff=6 reso=5 env=6 attack=0 decay=6 sustain=6 release=3
+  LEAD    osc1=SQUARE osc2=SAW mix=8 pitch=0 detune=4 pw=6 sub=0 cutoff=10 reso=5 env=3 attack=0 decay=8 sustain=13 release=4
+  PLUCK   osc1=SAW osc2=SQUARE mix=6 pitch=12 detune=3 pw=4 sub=0 cutoff=5 reso=6 env=9 attack=0 decay=6 sustain=0 release=6
 
 ## The text format
 Your reply must contain exactly one song, written like this:
@@ -83,13 +115,15 @@ MAGITRAC SONG 1
 SUMMARY <one sentence, at most 90 characters, saying what you made or changed>
 SONG name="<song name>" bpm=<20-400> minbpm=<n> maxbpm=<n> speed=<1-31> start=<first block>
 COL <1-20> ch=<1-16|SFX|ORGAN|LIGHTS|OFF> bank=<0-127> prog=<0-127> vol=<0-127> tr=<-24..24> mute=<0|1> tune=<cents, SFX only> name="<up to 11 chars>"
+ORGAN voice=<DRAWBAR|TONEWHEEL|CLAUDE|NEBULA|REED|CHOIR|VOCODER|SYNTH> vib=<OFF|V1|V2|V3|C1|C2|C3> leslie=<STOP|SLOW|FAST> drive=<0|1> reverb=<OFF|ROOM|HALL> bars=<nine digits 0-8> sliders=<five values 0-8>
+SYNTH osc1=<wave> osc2=<wave> mix=<n> pitch=<-12..12> detune=<n> pw=<n> sub=<n> cutoff=<n> reso=<n> env=<n> attack=<n> decay=<n> sustain=<n> release=<n>
 BLOCK <n> len=<16|24|32|48|64> name="<up to 15 chars>" ref=<C..B> keymode=<SAME|TOP> end=<LOOP|NEXT:n|BACK:n|GOTO:n|RETURN>
 KEY <block> <C..B> switch=<STAY|SAME|TOP> target=<block> tr=<KEEP|NOTE|CUSTOM> by=<-24..24>
 N <block> <row> <column> <note> <velocity> <fx>
 END
 
 Rules:
-- One item per line. Blocks are numbered 0, 1, 2 ... with no gaps. Each block's BLOCK line comes before its KEY and N lines.
+- One item per line. ORGAN and SYNTH are optional (at most one of each; bars/sliders are left out when the voice is SYNTH). Blocks are numbered 0, 1, 2 ... with no gaps. Each block's BLOCK line comes before its KEY and N lines.
 - `end`: LOOP repeats the block, NEXT:n / BACK:n move n blocks forward / back, GOTO:n jumps to block n, RETURN goes back to the block that jumped here. minbpm/maxbpm clamp the performer-derived tempo.
 - N lines: row is 0 to len-1; note is C-0..B-7, OFF (end the note), ANY (cue lane only) or --- (no note, effect only); velocity is 0-127 or `-` for the default (100).
 - fx is `-` for none; in the cue lane WAIT, WAT1, WAT2, SYNC, AVRG or PASA; in columns 1-20 PAN:<0-127> (64 = centre), RTRG:<2-8> (retrigger the note that many times within the row), or FX:XXYY to keep an effect you don't recognise exactly as it was.
@@ -186,11 +220,15 @@ static void jsonEsc(TextBuf& t, const char* s, size_t n) {
     if (!t.overflow) t.p[t.len] = '\0';
 }
 
-static bool buildBody(const Song* song, const char* prompt, char* err, size_t errLen) {
+static bool buildBody(const Song* song, const char* prompt, uint8_t maxBank, uint8_t maxProg,
+                      char* err, size_t errLen) {
     TextBuf u = { (char*)heap_caps_malloc(AI_TEXT_CAP, MALLOC_CAP_SPIRAM), AI_TEXT_CAP, 0, false };
     if (!u.p) { snprintf(err, errLen, "Out of memory (song text)"); return false; }
     u.p[0] = '\0';
     textPrintf(u, "The performer's request: %s\n\n", prompt);
+    textPrintf(u, "The performer's MIDI synths accept prog 0-%u and bank 0-%u (shown on the device as 1-%u and 1-%u). "
+                  "Drum kits on channel 10 are numbered their own way.\n\n",
+               (unsigned)maxProg, (unsigned)maxBank, (unsigned)maxProg + 1, (unsigned)maxBank + 1);
     int nSamples = 0;
     for (int id = 1; id <= 127; id++) {
         const char* nm = sampleManifestNameFor((uint8_t)id);
@@ -460,7 +498,8 @@ static void aiTask(void*) {
 
 // ── Loop-task API ───────────────────────────────────────────────────────────
 
-bool aiBegin(const Song* current, const char* prompt, char* err, size_t errLen) {
+bool aiBegin(const Song* current, const char* prompt, char* err, size_t errLen,
+             uint8_t maxBank, uint8_t maxProgram) {
     if (sBusy) { snprintf(err, errLen, "Already working on a request"); return false; }
     if (!prompt || !*prompt) { snprintf(err, errLen, "Type what you want first"); return false; }
     if ((WiFi.getMode() & WIFI_STA) == 0 || WiFi.status() != WL_CONNECTED) {
@@ -480,7 +519,7 @@ bool aiBegin(const Song* current, const char* prompt, char* err, size_t errLen) 
     if (!sReply) { snprintf(err, errLen, "Out of memory (reply)"); return false; }
     sReply[0] = '\0';
     sReplyLen = 0;
-    if (!buildBody(current, prompt, err, errLen)) {
+    if (!buildBody(current, prompt, maxBank, maxProgram, err, errLen)) {
         heap_caps_free(sReply); sReply = nullptr;
         memset(sKey, 0, sizeof(sKey));
         return false;
