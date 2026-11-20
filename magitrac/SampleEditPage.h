@@ -4,6 +4,7 @@
 #include "gt911_lite.h"
 #include "MagiMsg.h"
 #include "HoldRepeat.h"
+#include "ConfirmDialog.h"
 
 // ── SampleEditPage — non-destructive sample trim/loop/tune editor ────────────
 //
@@ -12,7 +13,9 @@
 // store); LOOP makes a held key wrap the region; TUNE −/+ shifts the sample's
 // own pitch a cent at a time and −ST/+ST a semitone at a time (TRANSPOSE —
 // the same stored value, which is in cents); VEL ON/OFF says whether MIDI keys
-// play it louder/softer with velocity or always at its own level.  Metadata
+// play it louder/softer with velocity or always at its own level.  LEVEL is
+// its gain (dB), with AUTO LEVEL setting the loudest point to 80 %.  DELETE
+// (from the samples page only) removes it from the card, after a YES.  Metadata
 // lives on the server (/samples/trim.txt) — the WAV never changes — and
 // belongs to the SAMPLE, so it applies in every song.
 //
@@ -35,13 +38,15 @@
 static const int SE_HDR_H    = 70;
 static const int SE_BTN_H    = 54;
 static const int SE_BTN_Y    = 8;
-static const int SE_VEL_X    = 340;
-static const int SE_VEL_W    = 140;
+static const int SE_VEL_X    = 300;
+static const int SE_VEL_W    = 120;
 static const int SE_NAME_MAXW = SE_VEL_X - 12 - 12;   // name area left of VEL
-static const int SE_LOOP_X   = 500;
-static const int SE_LOOP_W   = 140;
-static const int SE_PLAY_X   = 660;
-static const int SE_PLAY_W   = 140;
+static const int SE_LOOP_X   = 430;
+static const int SE_LOOP_W   = 120;
+static const int SE_DEL_X    = 560;                   // DELETE (samples page only)
+static const int SE_DEL_W    = 120;
+static const int SE_PLAY_X   = 690;
+static const int SE_PLAY_W   = 120;
 static const int SE_BACK_X   = 820;
 static const int SE_BACK_W   = 125;
 
@@ -70,9 +75,12 @@ static const int SE_ZOUT_X   = 20;                    // [ZOOM −]
 static const int SE_ZIN_X    = 130;                   // [ZOOM +]
 static const int SE_ZBTN_W   = 100;
 // [TUNE +7.05] on the bottom row opens the TUNE dialog (full screen):
-// the value, [−ST] [−] [+] [+ST] [ZERO], and [AUTO TUNE].
-static const int SE_TUNE_X     = 330;
-static const int SE_TUNE_W     = 380;
+// the value, [−ST] [−] [+] [+ST] [ZERO], and [AUTO TUNE].  [LEVEL +6.2dB]
+// opens the same dialog for the LEVEL: [−1dB] [−] [+] [+1dB] [ZERO], [AUTO LEVEL].
+static const int SE_TUNE_X     = 312;
+static const int SE_TUNE_W     = 228;
+static const int SE_LVL_X      = 552;
+static const int SE_LVL_W      = 186;
 static const int SE_TD_VAL_Y   = 110;                 // big value
 static const int SE_TD_BTN_Y   = 250;                 // −ST − + +ST ZERO
 static const int SE_TD_BTN_H   = 80;
@@ -85,6 +93,8 @@ static const int SE_TD_AUTO_W  = 400;
 static const int SE_TD_AUTO_H  = 80;
 static const int SE_TD_MSG_Y   = 478;                 // AUTO TUNE's result line
 static const uint32_t SE_AUTO_TIMEOUT_MS = 12000;
+static const uint32_t SE_LEVEL_TIMEOUT_MS = 30000;    // a long sample is read whole
+static const uint32_t SE_DELETE_TIMEOUT_MS = 8000;
 
 static const uint8_t SE_NO_COL = 0xFF;                // opened without a column
 
@@ -94,7 +104,7 @@ static const uint32_t SE_MIN_VIEW_FRAMES = 1600;
 class SampleEditPage {
 public:
     SampleEditPage(EPD_PainterAdafruit& d, GT911_Lite& touch)
-        : _d(d), _touch(touch) {}
+        : _d(d), _touch(touch), _confirm(d, touch) {}
 
     // col: the SFX column the sample is being edited through, or SE_NO_COL.
     // tuneCents: that column's TUNE — playback speed shifts the audition's
@@ -102,6 +112,7 @@ public:
     void open(uint8_t sampleId, const char* name, uint8_t col = SE_NO_COL,
               int16_t tuneCents = 0);
     bool poll();        // returns true when BACK tapped (caller picks where to)
+    bool deleted() const { return _deleted; }   // ...or the sample was deleted
 
 private:
     void draw();
@@ -110,11 +121,16 @@ private:
     void drawKeepLen();
     void drawZoomRow();
     void drawTune();           // the TUNE button (zoom row) / the dialog's value
+    void drawLevel();          // the LEVEL button (zoom row) / the dialog's value
     void drawTuneDialog();     // the whole TUNE dialog
     void drawAutoStatus();     // the dialog's AUTO TUNE button + result line
     bool pollTuneDialog(bool down, int tx, int ty);   // its touches
     void startAudition();      // PLAY
     void stepTune(int cents);  // adjust + repaint; stored on release
+    void stepLevel(int db10);  // the same for LEVEL (tenths of a dB)
+    void stepValue(int dir, bool big);   // the dialog's −/+ : TUNE or LEVEL
+    void drawDeleting(const char* line);
+    void pollAnswers();        // AUTO TUNE / AUTO LEVEL / DELETE answers
     bool standalone() const { return _col == SE_NO_COL; }
     void drawHeader();
     void adopt();              // copy meta out of the arrived MsgSampleInfo
@@ -170,6 +186,16 @@ private:
     uint32_t _autoSentMs = 0;
     uint8_t  _autoNote   = 0;             // found: nearest note + its cents
     int8_t   _autoCents  = 0;
+    bool     _levelDlg   = false;         // the dialog up is LEVEL's, not TUNE's
+    int16_t  _level      = 0;             // the sample's LEVEL, tenths of a dB
+    uint8_t  _lvlState   = 0;             // AUTO LEVEL: 0 idle, 1 measuring, 2 set,
+                                          // 3 silent, 4 failed, 5 no answer
+    uint8_t  _lvlPeakPct = 0;             // its loudest point before, %
+    uint32_t _lvlSentMs  = 0;
+    ConfirmDialog _confirm;               // DELETE's YES / NO
+    bool     _deleting   = false;         // DELETE sent, waiting for the answer
+    bool     _deleted    = false;
+    uint32_t _delSentMs  = 0;
 };
 
 // Spectrogram popup: [SPECTRUM] button position (in the zoom row).

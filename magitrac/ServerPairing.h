@@ -76,7 +76,7 @@ public:
     // commits the pairing (NVS + WiFi switch).  If every attempt fails, nothing
     // is saved and the state stays PAIRING_CONFIRM, so Confirm can be tapped
     // again until the pair window times out.
-    void confirmPairCode();
+    bool confirmPairCode();   // false: the OFFER didn't get through, still waiting
     void cancelPairing();               // abort ceremony or auto-connect
     const uint8_t* pairCode() const { return _pairCode; }  // 4 bytes (ASCII digits)
 
@@ -141,7 +141,8 @@ public:
     bool sendSampleEdit(uint8_t op, uint8_t sampleId,
                         uint32_t startFrame = 0, uint32_t endFrame = 0,
                         uint8_t loop = 0, int16_t tuneCents = 0,
-                        uint8_t note = 60, uint8_t velOff = 0, uint8_t keepLen = 0);
+                        uint8_t note = 60, uint8_t velOff = 0, uint8_t keepLen = 0,
+                        int16_t levelDb10 = 0);
     bool sampleInfoPending() const   { return _sampleInfoPending; }
 
     // ADD SAMPLE: ask the server to record / play / save / discard a take
@@ -151,6 +152,13 @@ public:
     bool takeSampleRecStatus(MsgSampleRecStatus& out);
     // AUTO TUNE (SAMPLE_EDIT_AUTOTUNE): the server's answer, once.
     bool takeSampleTune(MsgSampleTune& out);
+    // DELETE / AUTO LEVEL (MSG_SAMPLE_RESULT): the server's answer, once.
+    bool takeSampleResult(MsgSampleResult& out);
+    // AI (MSG_AI_REQUEST): START with a prompt, CANCEL, UNDO, STATUS.  The
+    // server's progress / result arrives as statuses — takeAiStatus hands
+    // over the newest one not yet taken.
+    bool sendAiRequest(uint8_t op, const char* prompt = nullptr);
+    bool takeAiStatus(MsgAiStatus& out);
     void clearSampleInfo()           { _sampleInfoPending = false; }
     const MsgSampleInfo& sampleInfo() const { return _sampleInfo; }
 
@@ -227,7 +235,7 @@ public:
     bool sendControl(MagiMsgType type);
 
     // ── Scrub seek ────────────────────────────────────────────────────────────
-    bool sendSeek(uint8_t pattern, uint8_t row);
+    bool sendSeek(uint8_t pattern, uint8_t row, bool scrub = false);
     bool sendGoto(uint8_t pattern, uint8_t row);
 
     // ── Performance mode — block queueing ────────────────────────────────────
@@ -382,6 +390,10 @@ private:
     volatile bool      _recStatusPending = false;
     MsgSampleTune      _sampleTune = {};   // last MSG_SAMPLE_TUNE received
     volatile bool      _sampleTunePending = false;
+    MsgSampleResult    _sampleResult = {}; // last MSG_SAMPLE_RESULT received
+    volatile bool      _sampleResultPending = false;
+    MsgAiStatus        _aiStatus = {};     // last MSG_AI_STATUS received
+    volatile bool      _aiStatusPending = false;
     MsgSampleInfo _sampleInfo = {};        // last MSG_SAMPLE_INFO received
     volatile bool _sampleInfoPending = false;
     uint8_t*         _specData = nullptr;  // PSRAM, lazily allocated — internal

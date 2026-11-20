@@ -31,6 +31,10 @@ struct TouchResult {
     TouchAction action;
     int8_t      row;
     int8_t      col;
+    // CELL_SELECT: the row this step of the same drag / coast came from, so
+    // a scrub can sound every row passed over.  -1 = a jump (the drag's first
+    // step lands on the row under the finger, not next to the old cursor).
+    int8_t      fromRow;
 };
 
 enum class TouchState {
@@ -68,6 +72,7 @@ private:
     int     _dragStartX;
     int     _dragStartY;
     int8_t  _dragStartRow;
+    int8_t  _dragLastRow;      // last row this drag reported (-1 = none yet)
     int8_t  _dragStartCol;
     uint8_t _dragStartColOffset;
     bool    _wasDown;

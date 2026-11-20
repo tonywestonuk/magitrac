@@ -180,6 +180,28 @@ void ServerPairing::begin() {
             portEXIT_CRITICAL(&sRecStatusMux);
         }, this);
 
+    // MagiLink: DELETE / AUTO LEVEL's answer (sample editor).
+    gMagiLink.registerCallback(MSG_SAMPLE_RESULT,
+        [](const uint8_t* msg, size_t len, void* ctx) {
+            ServerPairing* sp = static_cast<ServerPairing*>(ctx);
+            if (len < sizeof(MsgSampleResult)) return;
+            portENTER_CRITICAL(&sRecStatusMux);
+            memcpy(&sp->_sampleResult, msg, sizeof(MsgSampleResult));
+            sp->_sampleResultPending = true;
+            portEXIT_CRITICAL(&sRecStatusMux);
+        }, this);
+
+    // MagiLink: AI progress / result (AiPage takes the newest).
+    gMagiLink.registerCallback(MSG_AI_STATUS,
+        [](const uint8_t* msg, size_t len, void* ctx) {
+            ServerPairing* sp = static_cast<ServerPairing*>(ctx);
+            if (len < sizeof(MsgAiStatus)) return;
+            portENTER_CRITICAL(&sRecStatusMux);
+            memcpy(&sp->_aiStatus, msg, sizeof(MsgAiStatus));
+            sp->_aiStatusPending = true;
+            portEXIT_CRITICAL(&sRecStatusMux);
+        }, this);
+
     // MagiLink: generic file list + load.  Load is a 3-part stream (HEADER,
     // N×BODY, EndOfData) so we route all three IDs into one dispatcher.
     gMagiLink.registerCallback(MSG_FILE_LIST_RESP,
@@ -243,6 +265,7 @@ void ServerPairing::_tryAutoConnect() {
 //      comes back on.  A changed server address needs a client reboot.
 void ServerPairing::startPairCeremony() {
     Serial.println("[SP] entering pair mode on ch1");
+    gMagiLink.holdReconnect(true);
     // STA may be in a tight retry loop trying to associate with a
     // non-existent or out-of-range AP (e.g. user just changed creds on
     // the WiFi page).  That hogs the radio and makes unicast ESP-NOW
@@ -263,8 +286,8 @@ void ServerPairing::startPairCeremony() {
     _setPairState(PairClientState::PAIRING_REQUEST);
 }
 
-void ServerPairing::confirmPairCode() {
-    if (_pairState != PairClientState::PAIRING_CONFIRM) return;
+bool ServerPairing::confirmPairCode() {
+    if (_pairState != PairClientState::PAIRING_CONFIRM) return false;
 
     // Load the user-configured WiFi creds + apMode.  If unset, fall back to
     // the SERVER_AP default below.
@@ -288,7 +311,7 @@ void ServerPairing::confirmPairCode() {
         if (_pairOfferedSsid[0] == '\0') {
             Serial.println("[SP] confirmPairCode: no SERVER_AP creds in challenge — abort");
             _leavePairMode();
-            return;
+            return true;
         }
         strncpy(ssid, _pairOfferedSsid, sizeof(ssid) - 1); ssid[sizeof(ssid) - 1] = '\0';
         strncpy(psk,  _pairOfferedPsk,  sizeof(psk)  - 1); psk [sizeof(psk)  - 1] = '\0';
@@ -321,7 +344,7 @@ void ServerPairing::confirmPairCode() {
     // from the CHALLENGE) so the user can tap Confirm again.
     if (!ok) {
         Serial.println("[SP] OFFER not delivered — nothing saved, still waiting for Confirm");
-        return;
+        return false;
     }
 
     // Offer is out: now commit.  SERVER_AP creds go to client NVS so the STA
@@ -341,20 +364,24 @@ void ServerPairing::confirmPairCode() {
     // Server is rebooting; reconnect our STA on top of the (possibly
     // new) AP creds.  WiFi.disconnect + WiFi.begin handles both
     // "same network as before" and "switched networks" cases.
-    // NB (review note, behaviour unchanged): the static MAGI_CLIENT_IP
-    // config below is applied whatever apMode is, whereas setup() in
-    // magitrac.ino leaves an EXTERNAL_AP client on DHCP — so an EXTERNAL_AP
-    // pairing runs on the static address until the next reboot.
+    // SERVER_AP uses the fixed addresses; an external network uses DHCP,
+    // as setup() in magitrac.ino does.
     WiFi.disconnect(false, false);
-    WiFi.config(IPAddress(MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1,
-                          MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3),
-                IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
-                          MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
-                IPAddress(255, 255, 255, 0));
+    if (apMode == MAGI_AP_MODE_SERVER) {
+        WiFi.config(IPAddress(MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1,
+                              MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3),
+                    IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                              MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                    IPAddress(255, 255, 255, 0));
+    } else {
+        WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0),
+                    IPAddress((uint32_t)0));
+    }
     WiFi.begin(ssid, psk);
     WiFi.setAutoReconnect(true);
 
     _tryAutoConnect();
+    return true;
 }
 
 void ServerPairing::cancelPairing() {
@@ -407,11 +434,12 @@ bool ServerPairing::sendControl(MagiMsgType type) {
     return _sendLocked(&msg, sizeof(msg));
 }
 
-bool ServerPairing::sendSeek(uint8_t pattern, uint8_t row) {
+bool ServerPairing::sendSeek(uint8_t pattern, uint8_t row, bool scrub) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgSeek msg;
     msg.pattern = pattern;
     msg.row     = row;
+    msg.scrub   = scrub ? 1 : 0;
     return _sendLocked(&msg, sizeof(msg));
 }
 
@@ -582,7 +610,8 @@ bool ServerPairing::sendAuditionRawNote(uint8_t channel, uint8_t note, uint8_t v
 bool ServerPairing::sendSampleEdit(uint8_t op, uint8_t sampleId,
                                    uint32_t startFrame, uint32_t endFrame,
                                    uint8_t loop, int16_t tuneCents,
-                                   uint8_t note, uint8_t velOff, uint8_t keepLen) {
+                                   uint8_t note, uint8_t velOff, uint8_t keepLen,
+                                   int16_t levelDb10) {
     if (_pairState != PairClientState::SUCCESS) return false;
     MsgSampleEdit msg;
     msg.op         = op;
@@ -594,6 +623,7 @@ bool ServerPairing::sendSampleEdit(uint8_t op, uint8_t sampleId,
     msg.note       = note;
     msg.velOff     = velOff;
     msg.keepLen    = keepLen;
+    msg.levelDb10  = levelDb10;
     return _sendLocked(&msg, sizeof(msg));
 }
 
@@ -606,12 +636,45 @@ bool ServerPairing::sendSampleRec(uint8_t op, const char* name) {
     return _sendLocked(&msg, sizeof(msg));
 }
 
+bool ServerPairing::takeSampleResult(MsgSampleResult& out) {
+    bool got = false;
+    portENTER_CRITICAL(&sRecStatusMux);
+    if (_sampleResultPending) {
+        out = _sampleResult;
+        _sampleResultPending = false;
+        got = true;
+    }
+    portEXIT_CRITICAL(&sRecStatusMux);
+    return got;
+}
+
 bool ServerPairing::takeSampleTune(MsgSampleTune& out) {
     bool got = false;
     portENTER_CRITICAL(&sRecStatusMux);
     if (_sampleTunePending) {
         out = _sampleTune;
         _sampleTunePending = false;
+        got = true;
+    }
+    portEXIT_CRITICAL(&sRecStatusMux);
+    return got;
+}
+
+bool ServerPairing::sendAiRequest(uint8_t op, const char* prompt) {
+    if (_pairState != PairClientState::SUCCESS) return false;
+    MsgAiRequest msg;
+    msg.op = op;
+    memset(msg.prompt, 0, sizeof(msg.prompt));
+    if (prompt) strncpy(msg.prompt, prompt, sizeof(msg.prompt) - 1);
+    return _sendLocked(&msg, sizeof(msg));
+}
+
+bool ServerPairing::takeAiStatus(MsgAiStatus& out) {
+    bool got = false;
+    portENTER_CRITICAL(&sRecStatusMux);
+    if (_aiStatusPending) {
+        out = _aiStatus;
+        _aiStatusPending = false;
         got = true;
     }
     portEXIT_CRITICAL(&sRecStatusMux);
@@ -1547,6 +1610,11 @@ void ServerPairing::_onMagiLinkInstrumentsMessage(const uint8_t* msg, size_t len
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 void ServerPairing::_setPairState(PairClientState s) {
+    // While pairing, MagiLink must not kick the STA (reconnect every 3 s,
+    // stale-association reset): a connecting STA makes esp_now_send refuse
+    // the unicast OFFER ("wifi:sta is connecting"), and CONFIRM fails.
+    gMagiLink.holdReconnect(s == PairClientState::PAIRING_REQUEST ||
+                            s == PairClientState::PAIRING_CONFIRM);
     _pairState   = s;
     _pairStateMs = millis();
 }

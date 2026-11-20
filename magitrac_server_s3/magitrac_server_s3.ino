@@ -1506,6 +1506,7 @@ void setup() {
     gMagiLink.registerCallback(MSG_AUDITION_PROGRAM,  controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SAMPLE_EDIT,       controlCb, nullptr);
     gMagiLink.registerCallback(MSG_SAMPLE_REC,        controlCb, nullptr);
+    gMagiLink.registerCallback(MSG_AI_REQUEST,        controlCb, nullptr);
     gMagiLink.registerCallback(MSG_PIXELPOST_SET_EFFECT,     controlCb, nullptr);
     gMagiLink.registerCallback(MSG_PIXELPOST_SET_SLIDER,     controlCb, nullptr);
     gMagiLink.registerCallback(MSG_PIXELPOST_SET_TOUCHPAD,   controlCb, nullptr);

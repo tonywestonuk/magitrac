@@ -36,8 +36,11 @@ void debugPrintf(const char* /*fmt*/, ...) {}
 // give one sample metadata.
 static int  _mockStreamPlays = 0, _mockStreamStops = 0, _mockStopAlls = 0;
 static bool _mockHaveFiles   = false;
-void samplePlayerPlay(const char* /*path*/, float /*pitch*/, uint8_t /*vol*/,
-                      uint32_t /*startFrame*/, uint32_t /*endFrame*/, bool /*loop*/) { _mockStreamPlays++; }
+static float _mockStreamPitch = 0;
+void samplePlayerPlay(const char* /*path*/, float pitch, uint8_t /*vol*/,
+                      uint32_t /*startFrame*/, uint32_t /*endFrame*/, bool /*loop*/, float /*level*/) {
+    _mockStreamPlays++; _mockStreamPitch = pitch;
+}
 void samplePlayerStop()       { _mockStopAlls++; }
 void samplePlayerStopStream() { _mockStreamStops++; }
 static bool    _mockRamCached   = false;
@@ -59,6 +62,7 @@ static SampleTrim _mockTrim = {};            // id 0 = no metadata for anything
 const SampleTrim* sampleTrimFor(uint8_t id) {
     return (_mockTrim.id && _mockTrim.id == id) ? &_mockTrim : nullptr;
 }
+float sampleLevelFor(uint8_t) { return 1.0f; }
 void pixelpostSetTouchpad(uint8_t, uint8_t, bool) {}
 void pixelpostSetSlider(uint8_t) {}
 void pixelpostSetEffect(uint8_t) {}
@@ -892,6 +896,56 @@ static void putNote(Song* song, uint8_t pat, uint8_t row, uint8_t col, uint8_t n
 // Tracker note → the MIDI note a column with no transpose sends.
 static uint8_t midiOf(uint8_t trackerNote) { return (uint8_t)(trackerNote + 11); }
 
+// ── Scrub (tracker grid scrolled while stopped / held) ───────────────────────
+
+// Each scrubbed row sounds at once; a plain seek (a pad, before PLAY) doesn't;
+// the notes stop 600 ms after the last scrub; STOP and tempo cells don't act.
+// (The CoreS3 rewrite had left scrolling silent.)
+static void test_scrub_sounds_each_row() {
+    printf("\ntest_scrub_sounds_each_row\n");
+    Song* song = buildPlainSong();
+    const uint8_t C = makeNote(0, 4), D = makeNote(2, 4), E = makeNote(4, 4), G = makeNote(7, 4);
+    putNote(song, 0, 1, 1, C);
+    putNote(song, 0, 2, 1, D);             // two notes one after the other
+    putNote(song, 0, 3, 1, E);
+    putNote(song, 0, 5, 1, G);
+    putNote(song, 0, 5, 2, 0, 0xFF, 0xFF); // STOP cell
+    putNote(song, 0, 6, 2, 0, 0xA0, 200);  // tempo cell
+    _mockMs = 0;
+    sequencerStop();
+    txReset();
+
+    sequencerSeek(0, 1, false);
+    CHECK(noteOns(0, midiOf(C)) == 0,                       "a plain seek (pad, before PLAY) is silent");
+    sequencerSeek(0, 2, true);
+    sequencerSeek(0, 3, true);
+    CHECK(noteOns(0, midiOf(D)) == 1 && noteOns(0, midiOf(E)) == 1,
+                                                            "stopped: both rows scrolled past sound");
+    CHECK(noteOffs(0, midiOf(D)) == 1,                      "...the second cuts the first, as playback would");
+
+    _mockMs += 300; sequencerTick();
+    CHECK(noteOffs(0, midiOf(E)) == 0,                      "the last note rings while scrolling pauses");
+    _mockMs += 400; sequencerTick();
+    CHECK(noteOffs(0, midiOf(E)) == 1,                      "...and stops 600 ms after the last scrub");
+
+    // Held while playing (paused): scrubbing over STOP / tempo cells.
+    sequencerStart();
+    sequencerTick();
+    uint32_t bpmBefore = seqCurrentBPM;
+    sequencerPause();
+    txReset();
+    sequencerSeek(0, 5, true);
+    sequencerSeek(0, 6, true);
+    CHECK(noteOns(0, midiOf(G)) == 1,                       "held: the scrubbed row sounds");
+    CHECK(seqRunning && seqPaused,                          "a STOP cell scrubbed over doesn't stop the song");
+    CHECK(seqCurrentBPM == bpmBefore,                       "a tempo cell scrubbed over doesn't change the tempo");
+    txReset();
+    sequencerUnpause();
+    CHECK(noteOffs(0, midiOf(G)) == 1,                      "letting go silences the scrub, then playback resumes");
+    CHECK(_test_getRow() == 6,                              "...from the row scrolled to");
+    sequencerStop();
+}
+
 // ── sequencerApplyNoteSet ────────────────────────────────────────────────────
 
 // A cell written ahead of the playhead sounds on this pass — including one at
@@ -1370,6 +1424,47 @@ static void test_key_release_does_not_cut_a_song_stream() {
     sampleMockDone();
 }
 
+// A streamed sample is mono, last-note priority: a second key takes over, and
+// letting go of it brings back the most recent key still held (from the top,
+// at its pitch).  Letting go of an older key changes nothing.
+static void test_streamed_keys_fall_back_to_a_held_key() {
+    printf("\ntest_streamed_keys_fall_back_to_a_held_key\n");
+    buildPlainSong();
+    sampleMockReset();
+    _mockRamCached = false;                      // too big for the cache: it streams
+    _mockHaveFiles = true;
+    _mockMs = 1000;
+    sequencerSampleKeys(9);
+
+    midiInNoteOn(60, 100);
+    midiInNoteOn(64, 100);
+    CHECK(_mockStreamPlays == 2 && near(_mockStreamPitch, 4.0f), "the second key takes the stream");
+    midiInNoteOff(64);
+    CHECK(_mockStreamPlays == 3 && near(_mockStreamPitch, 0.0f) && _mockStreamStops == 0,
+          "letting it go plays the first key again");
+    midiInNoteOff(60);
+    CHECK(_mockStreamPlays == 3 && _mockStreamStops == 1, "letting go of the last key stops it");
+
+    midiInNoteOn(60, 100);
+    midiInNoteOn(64, 100);
+    midiInNoteOn(67, 100);                       // 4, 5, 6
+    midiInNoteOff(60);
+    CHECK(_mockStreamPlays == 6 && _mockStreamStops == 1, "letting go of an older key changes nothing");
+    midiInNoteOff(67);
+    CHECK(_mockStreamPlays == 7 && near(_mockStreamPitch, 4.0f), "...the newest key still held comes back");
+    midiInNoteOn(64, 0);                         // velocity-0 note-off
+    CHECK(_mockStreamPlays == 7 && _mockStreamStops == 2, "and the last one's release stops it");
+
+    midiInNoteOn(60, 100);
+    midiInNoteOn(64, 100);
+    sequencerSamplePadsStop();                   // the page's STOP
+    int plays = _mockStreamPlays;
+    midiInNoteOff(64);
+    CHECK(_mockStreamPlays == plays, "after STOP no held key comes back");
+    midiInNoteOff(60);
+    sampleMockDone();
+}
+
 // An uncached pad sample takes the single SD stream.  The song column whose
 // streamed sample it replaced must not cut it with its own note-off, and the
 // pads' STOP must stop it; once the song takes the stream back, the pads' STOP
@@ -1743,9 +1838,11 @@ int main() {
     test_sample_keys_lease_expires();
     test_sample_keys_and_pads_over_a_running_song();
     test_key_release_does_not_cut_a_song_stream();
+    test_streamed_keys_fall_back_to_a_held_key();
     test_pad_on_the_stream_while_running();
     test_sample_tune_adds_to_pitch();
     test_sample_velocity_switch();
+    test_scrub_sounds_each_row();
     printf("\n%d passed, %d failed\n", gPassed, gFailed);
     return gFailed > 0 ? 1 : 0;
 }

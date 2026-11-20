@@ -23,7 +23,8 @@ void samplePlayerPlay(const char* path, float pitchSemitones = 0,   // 0 = nativ
                       uint8_t volume = 127,                         // squared taper (GM CC7-ish); 127 = unity, up to 255 boosts (and can clip)
                       uint32_t startFrame = 0,                      // trim: first frame to play
                       uint32_t endFrame = 0,                        // trim: stop here (0 = end of file)
-                      bool loop = false);                           // wrap start..end until stopped
+                      bool loop = false,                            // wrap start..end until stopped
+                      float level = 1.0f);                          // the sample's LEVEL, linear (sampleLevelFor)
 void samplePlayerStop();                    // signal stop (stream + all RAM voices), returns immediately
 void samplePlayerStopStream();              // stop only the SD stream; RAM voices keep ringing
 bool samplePlayerIsPlaying();
@@ -81,3 +82,15 @@ bool samplePitchTick(bool mayStart);
 // sampleAutoTuneTake (loop task) once: result is a SampleTuneResult.
 void sampleAutoTuneRequest(uint8_t sampleId);
 bool sampleAutoTuneTake(uint8_t& sampleId, uint8_t& result, float& hz);
+
+// DELETE (sample editor): let go of sampleId — a load, AUTO TUNE or AUTO
+// LEVEL on it stops, and its cache entry goes once no voice plays it.  Call
+// each loop pass until it returns true (then the WAV can be removed).  Loop task.
+bool samplePreloadForgetStep(uint8_t sampleId);
+
+// AUTO LEVEL (sample editor): the loudest point of sampleId's trimmed region,
+// read off the card a step per sampleLevelTick (loop task).  The answer comes
+// once from sampleAutoLevelTake: peak 0..32768, ok = false if unreadable.
+void sampleAutoLevelRequest(uint8_t sampleId);
+void sampleLevelTick();
+bool sampleAutoLevelTake(uint8_t& sampleId, bool& ok, uint32_t& peak);

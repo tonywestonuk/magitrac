@@ -176,8 +176,13 @@ tracker and Block Settings go through `PageManager`).
   squares; hold one to edit it), **SampleRecordPage** (ADD on the samples
   page: arms the server's hold-to-record screen, follows its KEEP / CANCEL /
   RESAMPLE review, then names / saves the take it hands back),
-  **SampleEditPage** (sample trim/loop/tune, opened from a square, from an
-  SFX column, or straight after a new sample is saved),
+  **SampleEditPage** (sample trim/loop/tune/level with AUTO TUNE and AUTO
+  LEVEL, and DELETE with a confirm when opened from the squares; opened from a
+  square, from an SFX column, or straight after a new sample is saved),
+  **AiPage** (MENU → AI, shown only on an external WiFi network: type a
+  request, the server asks the Claude API to rewrite the song and loads the
+  answer unsaved, UNDO puts the old song back — see the server's
+  `claude_ai.cpp`),
   **PixelPostManualPage** / **PixelPostSettingsPage** (lights),
   **SettingsPage** / **WiFiSettingsPage** (clock, MIDI limits, WiFi,
   pairing), **BackupRestorePage**, and **BootMenu** (the MENU popup that

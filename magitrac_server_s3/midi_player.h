@@ -9,7 +9,9 @@ void sequencerCancelQueue();                // cancel queued block
 void sequencerReset();    // snap to row 0 of current pattern without starting
 void sequencerPause();    // freeze position, keep all state — no state callback fired
 void sequencerUnpause();  // resume from frozen position
-void sequencerSeek(uint8_t pattern, uint8_t row);  // jump to position and play that row (scrub)
+// Jump to a position.  scrub: while stopped or held, also sound that row now
+// (silenced 600 ms after the last scrub).  Without it, PLAY / the tick plays it.
+void sequencerSeek(uint8_t pattern, uint8_t row, bool scrub = false);
 void sequencerGoto(uint8_t pattern, uint8_t row);  // position only; tick handles WAIT/play if running
 
 // Apply one client note edit (MSG_NOTE_SET) to the active song.  Runs on the

@@ -73,6 +73,7 @@ public:
     // decides where Result::HOME leads).  reopen() keeps it.
     void   open(bool backLabel = false);
     void   reopen();    // back from the editor or ADD: same page (list re-fetched after ADD)
+    void   refetchOnReopen() { _refetch = true; }   // the editor deleted a sample
     Result poll();
 
     // Valid after poll() returned EDIT.
@@ -93,7 +94,7 @@ private:
     uint8_t  _keysId    = 0;       // manifest id of the sample on the keys; 0 = none
     uint32_t _leaseMs   = 0;       // last lease renewal
     uint8_t  _editId    = 0;
-    bool     _refetch   = false;   // ADD was used: fetch the list again on reopen()
+    bool     _refetch   = false;   // ADD / DELETE was used: fetch the list again on reopen()
     char     _editName[SAMPLE_NAME_LEN] = {};
 
     void draw();

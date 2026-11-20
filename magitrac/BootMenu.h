@@ -11,11 +11,12 @@
 // currently on screen (no fillScreen).  The next tap closes it: on a button it
 // returns that button's result, anywhere else — inside the box or out —
 // DISMISSED.  SONG is greyed when no song is loaded; a tap on it then just
-// dismisses.
+// dismisses.  AI only appears on an external WiFi network (the server needs
+// the internet to reach the Claude API).
 //
 // Row 1: [SONG] [INSTRUMENTS] [SETTINGS]
 // Row 2: [BACKUP] [PERFORM] [POSTS]
-// Row 3:          [ORGAN] [SAMPLES]
+// Row 3: [AI]     [ORGAN] [SAMPLES]
 //
 // PAIR lives on SettingsPage (WIFI section) — it's a once-per-device action,
 // not worth a slot on the menu you hit mid-gig.
@@ -30,6 +31,7 @@ enum class BootMenuResult : uint8_t {
     PIXELPOST,
     DRAWBAR_ORGAN,
     SAMPLES,
+    AI,
     DISMISSED,
 };
 
@@ -61,12 +63,14 @@ static const int BM_ORGAN_X = BM_BOX_X + (BM_BOX_W - BM_BTN_W) / 2;   // = 375
 static const int BM_ORGAN_W = BM_BTN_W;
 static const int BM_SAMPLES_X = BM_SETT_X;                            // = 600
 static const int BM_SAMPLES_W = BM_BTN_W;
+static const int BM_AI_X      = BM_SONG_X;                            // = 150
+static const int BM_AI_W      = BM_BTN_W;
 
 class BootMenu {
 public:
     BootMenu(EPD_PainterAdafruit& display, GT911_Lite& touch);
 
-    void open(bool noSong = false);
+    void open(bool noSong = false, bool showAi = false);
     void draw();
 
     bool isOpen()  const { return _open; }
@@ -79,6 +83,7 @@ private:
     bool _open;
     bool _wasDown;
     bool _noSong;
+    bool _showAi;
 
     bool hitSong       (int sx, int sy) const;
     bool hitInstruments(int sx, int sy) const;
@@ -88,5 +93,6 @@ private:
     bool hitPixelpost  (int sx, int sy) const;
     bool hitOrgan      (int sx, int sy) const;
     bool hitSamples    (int sx, int sy) const;
+    bool hitAi         (int sx, int sy) const;
     void rawToScreen(int rx, int ry, int& sx, int& sy) const;
 };

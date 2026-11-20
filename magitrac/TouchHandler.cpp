@@ -13,6 +13,7 @@ TouchHandler::TouchHandler(GT911_Lite& touch, TrackerUI& ui,
     , _dragStartX(0)
     , _dragStartY(0)
     , _dragStartRow(0)
+    , _dragLastRow(-1)
     , _dragStartCol(0)
     , _dragStartColOffset(0)
     , _wasDown(false)
@@ -35,7 +36,7 @@ void TouchHandler::rawToScreen(int rawX, int rawY, int& screenX, int& screenY) c
 }
 
 TouchResult TouchHandler::poll() {
-    TouchResult result = { TouchAction::NONE, -1, -1 };
+    TouchResult result = { TouchAction::NONE, -1, -1, -1 };
 
     // ── Inertia — advances every frame without needing a touch event ──────────
     if (_inertiaActive && !_wasDown) {
@@ -57,9 +58,10 @@ TouchResult TouchHandler::poll() {
             if (newRow >= patLen) newRow = patLen - 1;
 
             if (newRow != (int)_ui.selectedRow()) {
-                result.action = TouchAction::CELL_SELECT;
-                result.row    = (int8_t)newRow;
-                result.col    = _dragStartCol;
+                result.action  = TouchAction::CELL_SELECT;
+                result.row     = (int8_t)newRow;
+                result.col     = _dragStartCol;
+                result.fromRow = _ui.selectedRow();   // coasting on from the drag
             }
 
             if (fabsf(_inertiaVel) < INERTIA_STOP_VEL) _inertiaActive = false;
@@ -190,6 +192,7 @@ TouchResult TouchHandler::poll() {
             _dragStartX         = tx;
             _dragStartY         = ty;
             _dragStartRow       = row;
+            _dragLastRow        = -1;
             _dragStartCol       = col;
             _dragStartColOffset = _ui.colOffset();
             _dragVel            = 0.0f;
@@ -287,9 +290,11 @@ TouchResult TouchHandler::poll() {
 
         if ((int8_t)newRow != _ui.selectedRow()) {
             DBG("[TOUCH] vert drag  row=%d\n", newRow);
-            result.action = TouchAction::CELL_SELECT;
-            result.row    = (int8_t)newRow;
-            result.col    = _dragStartCol;
+            result.action  = TouchAction::CELL_SELECT;
+            result.row     = (int8_t)newRow;
+            result.col     = _dragStartCol;
+            result.fromRow = _dragLastRow;
+            _dragLastRow   = (int8_t)newRow;
         }
     }
 

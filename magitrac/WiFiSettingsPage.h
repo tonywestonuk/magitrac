@@ -54,6 +54,7 @@ private:
     // Scan results overlay state.
     bool    _scanResultsOpen;
     int     _scanCount;
+    int     _scanErr;           // scanNetworks()'s error code, 0 if it ran
     char    _scanSsids[WP_SCAN_MAX][33];
     int8_t  _scanRssi[WP_SCAN_MAX];
     uint8_t _scanChan[WP_SCAN_MAX];

@@ -6,11 +6,13 @@ BootMenu::BootMenu(EPD_PainterAdafruit& display, GT911_Lite& touch)
     , _open(false)
     , _wasDown(false)
     , _noSong(false)
+    , _showAi(false)
 {}
 
-void BootMenu::open(bool noSong) {
+void BootMenu::open(bool noSong, bool showAi) {
     _open    = true;
     _noSong  = noSong;
+    _showAi  = showAi;
     _wasDown = _touch.isTouched;
     draw();
 }
@@ -37,6 +39,8 @@ void BootMenu::draw() {
     // Row 3: drawbar organ + sample pads
     uiButton(_d, BM_ORGAN_X,   BM_BTN3_Y, BM_ORGAN_W,   BM_BTN3_H, "ORGAN",   COL_WHITE, COL_BLACK, 3);
     uiButton(_d, BM_SAMPLES_X, BM_BTN3_Y, BM_SAMPLES_W, BM_BTN3_H, "SAMPLES", COL_WHITE, COL_BLACK, 3);
+    if (_showAi)
+        uiButton(_d, BM_AI_X, BM_BTN3_Y, BM_AI_W, BM_BTN3_H, "AI", COL_WHITE, COL_BLACK, 3);
 }
 
 BootMenuResult BootMenu::poll() {
@@ -58,6 +62,7 @@ BootMenuResult BootMenu::poll() {
         if (hitPixelpost  (sx, sy)) return BootMenuResult::PIXELPOST;
         if (hitOrgan      (sx, sy)) return BootMenuResult::DRAWBAR_ORGAN;
         if (hitSamples    (sx, sy)) return BootMenuResult::SAMPLES;
+        if (_showAi && hitAi(sx, sy)) return BootMenuResult::AI;
         return BootMenuResult::DISMISSED;
     }
 
@@ -103,6 +108,11 @@ bool BootMenu::hitOrgan(int sx, int sy) const {
 bool BootMenu::hitSamples(int sx, int sy) const {
     return (sx >= BM_SAMPLES_X && sx < BM_SAMPLES_X + BM_SAMPLES_W &&
             sy >= BM_BTN3_Y    && sy < BM_BTN3_Y    + BM_BTN3_H);
+}
+
+bool BootMenu::hitAi(int sx, int sy) const {
+    return (sx >= BM_AI_X   && sx < BM_AI_X   + BM_AI_W &&
+            sy >= BM_BTN3_Y && sy < BM_BTN3_Y + BM_BTN3_H);
 }
 
 void BootMenu::rawToScreen(int rx, int ry, int& sx, int& sy) const {

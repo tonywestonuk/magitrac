@@ -1,5 +1,7 @@
 #include "SampleManifest.h"
 #include "sd_mutex.h"
+#include "MagiMsg.h"         // SAMPLE_LEVEL_MIN/MAX_DB10
+#include <math.h>
 #include <Arduino.h>
 #include <SD.h>
 #include <string.h>
@@ -22,6 +24,7 @@ static const char* SM_PATH = "/samples/samples.txt";
 // nothing.
 struct SmTable {
     int     count;
+    uint8_t hiId;          // the highest id ever given out (#hi= line)
     SmEntry e[SM_MAX_ENTRIES];
 };
 static SmTable*    s_live  = nullptr;     // published — readers look only here
@@ -70,9 +73,15 @@ static int findByName(const SmTable* t, const char* name) {
     return -1;
 }
 
-static uint8_t nextFreeId(const SmTable* t) {
+// Past the highest id ever given out, so a deleted sample's id isn't reused
+// while there are fresh ones; after 127, the lowest free.
+static uint8_t nextFreeId(SmTable* t) {
     bool used[128] = {};
-    for (int i = 0; i < t->count; i++) used[t->e[i].id] = true;
+    for (int i = 0; i < t->count; i++) {
+        used[t->e[i].id] = true;
+        if (t->e[i].id > t->hiId) t->hiId = t->e[i].id;
+    }
+    for (int id = t->hiId + 1; id < 128; id++) if (!used[id]) { t->hiId = (uint8_t)id; return (uint8_t)id; }
     for (int id = 1; id < 128; id++) if (!used[id]) return (uint8_t)id;
     return 0;  // exhausted
 }
@@ -82,10 +91,16 @@ static uint8_t nextFreeId(const SmTable* t) {
 static void loadManifest(SmTable* t) {
     SdLock _;
     t->count = 0;
+    t->hiId  = 0;
     File f = SD.open(SM_PATH, FILE_READ);
     if (!f) return;
     char line[SM_NAME_LEN + 16];
     while (t->count < SM_MAX_ENTRIES && readLine(f, line, sizeof(line))) {
+        if (strncmp(line, "#hi=", 4) == 0) {
+            int hi = atoi(line + 4);
+            if (hi > 0 && hi < 128) t->hiId = (uint8_t)hi;
+            continue;
+        }
         uint8_t id;
         char    name[SM_NAME_LEN];
         if (!parseLine(line, id, name, SM_NAME_LEN)) continue;
@@ -99,6 +114,7 @@ static void loadManifest(SmTable* t) {
         if (dup) continue;
 
         SmEntry& e = t->e[t->count++];
+        if (id > t->hiId) t->hiId = id;
         e.id = id;
         strncpy(e.name, name, SM_NAME_LEN - 1);
         e.name[SM_NAME_LEN - 1] = '\0';
@@ -113,6 +129,10 @@ static bool writeManifest(const SmTable* t) {
     File f = SD.open(SM_PATH, FILE_WRITE);
     if (!f) return false;
     char line[SM_NAME_LEN + 16];
+    if (t->hiId) {
+        snprintf(line, sizeof(line), "#hi=%u\n", (unsigned)t->hiId);
+        f.print(line);
+    }
     for (int i = 0; i < t->count; i++) {
         snprintf(line, sizeof(line), "%u=%s\n", t->e[i].id, t->e[i].name);
         f.print(line);
@@ -206,17 +226,19 @@ static void loadTrims() {
     if (!f) return;
     char line[64];
     while (s_trimCount < SM_MAX_ENTRIES && readLine(f, line, sizeof(line))) {
-        // <id>=<startFrame>:<endFrame>:<loop>[:<tuneCents>[:<velOff>[:<keepLen>[:<pitchCHz>]]]]
+        // <id>=<startFrame>:<endFrame>:<loop>[:<tuneCents>[:<velOff>[:<keepLen>[:<pitchCHz>[:<levelDb10>]]]]]
         const char* eq = strchr(line, '=');
         if (!eq) continue;
         int id = atoi(line);
         if (id < 1 || id > 127) continue;
         unsigned long st = 0, en = 0;   // %lu's own type (64-bit on the host test)
-        int lp = 0, tune = 0, vo = 0, kl = 0;
+        int lp = 0, tune = 0, vo = 0, kl = 0, lv = 0;
         unsigned long pc = 0;
         // Fewer fields = a file written before TUNE / the velocity switch /
-        // KEEP LENGTH existed (they stay 0).
-        if (sscanf(eq + 1, "%lu:%lu:%d:%d:%d:%d:%lu", &st, &en, &lp, &tune, &vo, &kl, &pc) < 3) continue;
+        // KEEP LENGTH / LEVEL existed (they stay 0).
+        if (sscanf(eq + 1, "%lu:%lu:%d:%d:%d:%d:%lu:%d", &st, &en, &lp, &tune, &vo, &kl, &pc, &lv) < 3) continue;
+        if (lv < SAMPLE_LEVEL_MIN_DB10) lv = SAMPLE_LEVEL_MIN_DB10;
+        if (lv > SAMPLE_LEVEL_MAX_DB10) lv = SAMPLE_LEVEL_MAX_DB10;
         if (tune < -4800) tune = -4800;
         if (tune >  4800) tune =  4800;
         SampleTrim& t = s_trim[s_trimCount++];
@@ -225,6 +247,7 @@ static void loadTrims() {
         t.velOff    = (uint8_t)(vo != 0);
         t.keepLen   = (uint8_t)(kl != 0);
         t.pitchCHz  = (uint32_t)pc;
+        t.levelDb10 = (int16_t)lv;
     }
     f.close();
     Serial.printf("[SM] trim.txt: %d entr%s\n", s_trimCount, s_trimCount == 1 ? "y" : "ies");
@@ -236,15 +259,22 @@ const SampleTrim* sampleTrimFor(uint8_t id) {
     return nullptr;
 }
 
+float sampleLevelFor(uint8_t id) {
+    const SampleTrim* t = sampleTrimFor(id);
+    return (t && t->levelDb10) ? powf(10.0f, (float)t->levelDb10 / 200.0f) : 1.0f;
+}
+
 void sampleTrimSet(uint8_t id, uint32_t startFrame, uint32_t endFrame, uint8_t loop,
-                   int16_t tuneCents, uint8_t velOff, uint8_t keepLen) {
+                   int16_t tuneCents, uint8_t velOff, uint8_t keepLen, int16_t levelDb10) {
     velOff  = velOff ? 1 : 0;
     keepLen = keepLen ? 1 : 0;
     if (!tablesReady()) return;
     if (tuneCents < -4800) tuneCents = -4800;
     if (tuneCents >  4800) tuneCents =  4800;
+    if (levelDb10 < SAMPLE_LEVEL_MIN_DB10) levelDb10 = SAMPLE_LEVEL_MIN_DB10;
+    if (levelDb10 > SAMPLE_LEVEL_MAX_DB10) levelDb10 = SAMPLE_LEVEL_MAX_DB10;
     bool deflt = (startFrame == 0 && endFrame == 0 && !loop &&
-                  tuneCents == 0 && !velOff && !keepLen);      // back to defaults
+                  tuneCents == 0 && !velOff && !keepLen && levelDb10 == 0);   // back to defaults
     for (int i = 0; i < s_trimCount; i++) {
         if (s_trim[i].id != id) continue;
         if (deflt && s_trim[i].pitchCHz == 0) { s_trim[i] = s_trim[--s_trimCount]; }
@@ -253,7 +283,8 @@ void sampleTrimSet(uint8_t id, uint32_t startFrame, uint32_t endFrame, uint8_t l
                       s_trim[i].loop       = loop;
                       s_trim[i].tuneCents  = tuneCents;
                       s_trim[i].velOff     = velOff;
-                      s_trim[i].keepLen    = keepLen; }
+                      s_trim[i].keepLen    = keepLen;
+                      s_trim[i].levelDb10  = levelDb10; }
         return;
     }
     if (deflt || s_trimCount >= SM_MAX_ENTRIES) return;
@@ -263,6 +294,7 @@ void sampleTrimSet(uint8_t id, uint32_t startFrame, uint32_t endFrame, uint8_t l
     t.velOff    = velOff;
     t.keepLen   = keepLen;
     t.pitchCHz  = 0;
+    t.levelDb10 = levelDb10;
 }
 
 void sampleTrimSetPitch(uint8_t id, uint32_t pitchCHz) {
@@ -282,14 +314,15 @@ bool sampleTrimSave() {
     File f = SD.open(ST_PATH, FILE_WRITE);
     if (!f) return false;
     for (int i = 0; i < s_trimCount; i++)
-        f.printf("%u=%lu:%lu:%u:%d:%u:%u:%lu\n", (unsigned)s_trim[i].id,
+        f.printf("%u=%lu:%lu:%u:%d:%u:%u:%lu:%d\n", (unsigned)s_trim[i].id,
                  (unsigned long)s_trim[i].startFrame,
                  (unsigned long)s_trim[i].endFrame,
                  (unsigned)s_trim[i].loop,
                  (int)s_trim[i].tuneCents,
                  (unsigned)s_trim[i].velOff,
                  (unsigned)s_trim[i].keepLen,
-                 (unsigned long)s_trim[i].pitchCHz);
+                 (unsigned long)s_trim[i].pitchCHz,
+                 (int)s_trim[i].levelDb10);
     f.close();
     return true;
 }
@@ -330,6 +363,30 @@ bool sampleManifestSync() {
         loadTrims();
         s_trimLoaded = true;
     }
+    return true;
+}
+
+bool sampleManifestRemove(uint8_t id) {
+    const SmTable* live = liveTable();
+    if (!live || !tablesReady()) return false;
+    SmTable* t = s_build;
+    t->count = 0;
+    t->hiId  = live->hiId;
+    bool found = false;
+    for (int i = 0; i < live->count; i++) {
+        if (live->e[i].id > t->hiId) t->hiId = live->e[i].id;
+        if (live->e[i].id == id) { found = true; continue; }
+        t->e[t->count++] = live->e[i];
+    }
+    if (!found) return false;
+    writeManifest(t);
+    SmTable* old = s_live;
+    __atomic_store_n(&s_live, t, __ATOMIC_RELEASE);
+    s_build = old;
+
+    for (int i = 0; i < s_trimCount; i++)
+        if (s_trim[i].id == id) { s_trim[i] = s_trim[--s_trimCount]; break; }
+    sampleTrimSave();
     return true;
 }
 

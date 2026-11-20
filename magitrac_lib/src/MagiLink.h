@@ -38,6 +38,12 @@ public:
     // Updated from the worker task; safe to read from any task.
     bool isConnected() const { return _connected; }
 
+    // Connect role: while held, the worker stops kicking the WiFi STA
+    // (WiFi.reconnect() every 3 s until associated, the stale-association
+    // reset).  A STA that is busy connecting makes esp_wifi refuse a scan —
+    // the WiFi page's SCAN holds the link for the length of the scan.
+    void holdReconnect(bool hold) { _holdReconnect = hold; }
+
     // Monotonic counter, bumped every time a new connection is established —
     // including a preempt-swap to a fresh peer.  A session task can compare
     // this against the value it last handled to detect "this is a new
@@ -111,6 +117,7 @@ private:
 
     // Set by the worker on connect/disconnect; polled by other tasks.
     volatile bool     _connected  = false;
+    volatile bool     _holdReconnect = false;
     volatile uint32_t _generation = 0;   // ++ on each new established link
 
     // Registration table for per-id callbacks.  Worker task dispatches

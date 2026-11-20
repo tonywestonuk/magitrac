@@ -75,6 +75,7 @@ WiFiSettingsPage::WiFiSettingsPage(EPD_PainterAdafruit& display, GT911_Lite& tou
     , _dirty(false)
     , _scanResultsOpen(false)
     , _scanCount(0)
+    , _scanErr(0)
 {
     _ssid[0] = '\0';
     _psk[0]  = '\0';
@@ -282,7 +283,8 @@ void WiFiSettingsPage::drawScanResults() {
         _d.setTextSize(2);
         _d.setTextColor(COL_BLACK);
         _d.setCursor(40, 100);
-        _d.print("No networks found.");
+        if (_scanErr) _d.printf("The scan failed (error %d) - try SCAN again.", _scanErr);
+        else          _d.print("No networks found.");
         return;
     }
 
@@ -318,9 +320,30 @@ void WiFiSettingsPage::runScan() {
     _d.print("This may take a few seconds.");
     _d.paint();
 
-    // Bring up WIFI_STA so scan works (we're in AP_STA already).  Async
-    // mode false → blocks until done.  Returns count or negative on error.
+    // esp_wifi refuses to scan while the STA is busy connecting — and when
+    // the saved network isn't there it always is: MagiLink's connect loop
+    // kicks WiFi.reconnect() every 3 s.  So hold the link, stop the attempt,
+    // scan, and let it carry on afterwards.  (Connected, a scan just works.)
+    bool joining = (WiFi.status() != WL_CONNECTED);
+    gMagiLink.holdReconnect(true);
+    if (joining) {
+        WiFi.setAutoReconnect(false);
+        WiFi.disconnect(/*wifioff=*/false, /*eraseap=*/false);
+        delay(150);
+    }
+    // Async false → blocks until done.  Returns count or negative on error.
     int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+    if (n < 0) {
+        Serial.printf("[WIFI-SCAN] scan refused (%d) - retrying\n", n);
+        delay(500);
+        n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false);
+    }
+    _scanErr = (n < 0) ? n : 0;
+    if (joining) {
+        WiFi.setAutoReconnect(true);
+        WiFi.reconnect();
+    }
+    gMagiLink.holdReconnect(false);
     if (n < 0) n = 0;
     if (n > WP_SCAN_MAX) n = WP_SCAN_MAX;
     if (n > WP_SR_ROWS)  n = WP_SR_ROWS;    // rows past this would be off-screen
@@ -333,7 +356,7 @@ void WiFiSettingsPage::runScan() {
         _scanChan[i] = (uint8_t)WiFi.channel(i);
     }
     WiFi.scanDelete();
-    Serial.printf("[WIFI-SCAN] found %d networks\n", _scanCount);
+    Serial.printf("[WIFI-SCAN] found %d networks%s\n", _scanCount, _scanErr ? " (scan FAILED)" : "");
 }
 
 // ── Hit tests ────────────────────────────────────────────────────────────────
@@ -422,11 +445,18 @@ void WiFiSettingsPage::applyAndSave() {
     // re-associates automatically on the new association.
     if (_ssid[0] != '\0') {
         WiFi.disconnect(false, false);
-        WiFi.config(IPAddress(MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1,
-                              MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3),
-                    IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
-                              MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
-                    IPAddress(255, 255, 255, 0));
+        if (_apMode == MAGI_AP_MODE_SERVER) {
+            WiFi.config(IPAddress(MAGI_CLIENT_IP_0, MAGI_CLIENT_IP_1,
+                                  MAGI_CLIENT_IP_2, MAGI_CLIENT_IP_3),
+                        IPAddress(MAGI_SERVER_IP_0, MAGI_SERVER_IP_1,
+                                  MAGI_SERVER_IP_2, MAGI_SERVER_IP_3),
+                        IPAddress(255, 255, 255, 0));
+        } else {
+            // External network: DHCP, as at boot.  (The fixed server-AP
+            // address would leave the client on the wrong subnet.)
+            WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0),
+                        IPAddress((uint32_t)0));
+        }
         WiFi.begin(_ssid, _psk);
         Serial.println("[WIFI] STA reconnecting with new creds");
     }
@@ -547,9 +577,7 @@ bool WiFiSettingsPage::poll() {
 
     if (hitSave(sx, sy)) {
         applyAndSave();
-        drawActionsSection();
-        _d.paintLater();
-        return false;
+        return true;      // back to Settings: leaving the page is the confirmation
     }
 
     return false;

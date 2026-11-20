@@ -182,7 +182,7 @@ do not re-add any of it unless the owner asks.
 | `field_flash.ino` | Flash PixelPost units at a gig, firmware served from the SD card |
 | `SamplePlayer.cpp/.h` | WAV playback via the shared codec: one SD stream + 8 voices from the PSRAM sample cache (filled a step at a time) |
 | `test_sample_cache.cpp` | Host tests for that cache (mocks in `test_mocks/cache/`); build line in the file |
-| `SampleManifest.cpp/.h` | `/samples/samples.txt` — stable sample ids; trim/loop/tune metadata (`trim.txt`).  The id table is rebuilt to one side and swapped in, so lookups never see it empty; `trim.txt` is read once at boot |
+| `SampleManifest.cpp/.h` | `/samples/samples.txt` — stable sample ids (a `#hi=` line stops a deleted sample's id being reused straight away); trim/loop/tune/level metadata (`trim.txt`).  The id table is rebuilt to one side and swapped in, so lookups never see it empty; `trim.txt` is read once at boot |
 | `test_manifest.cpp` | Host tests for the manifest (mocks in `test_mocks/manifest/`); build line in the file |
 | `drawbar_organ.cpp/.h` | Additive drawbar organ synth (own task, takes the codec while active) |
 | `proc_sounds.cpp/.h` | Procedural sounds for the organ's PROC type |
@@ -200,6 +200,10 @@ do not re-add any of it unless the owner asks.
 | `timestretch.cpp/.h` | KEEP LENGTH (sample editor checkbox, `keepLen` in `trim.txt`): a cached sample's other notes change pitch, not length.  WSOLA time-stretch by the pitch ratio (32 ms Hann grains, 50 % overlap, each start nudged ±8 ms to best match the grain before), read that much faster with cubic interpolation — sounds like normal pitched playback at the original length, keeps vibrato/glides, no pitch detection.  Replaced PSOLA (one period per sample → monotone, robotic).  SD-streamed samples still resample |
 | `test_timestretch.cpp` | Host tests for `timestretch` (length, pitch, level, steadiness across ±2 octaves; pitch movement carried through; timbre = normal playback; attack, end, stereo, loop, matching cost); build line in the file |
 | `take_fade.h` / `test_take_fade.cpp` | ADD SAMPLE's 5 ms / 25 ms fades at a take's ends (all-signed arithmetic — an unsigned fade length once scrambled every negative sample there into a click) and its host test |
+| `claude_ai.cpp/.h` | AI (client MENU → AI, external-AP mode only): turns the active song into text, sends it with the typed prompt to the Claude API over HTTPS (own task on core 0, streamed SSE answer into PSRAM) and hands the reply back to `aiTick()` in `commands_server.ino`, which parses it and only then replaces the active song (unsaved; the old one kept for UNDO).  Key + optional `model=` / `effort=` in `/ai/key.txt` on the card — never sent to the client.  The system prompt that teaches the model the format lives here |
+| `song_text.cpp/.h` | The song ⇄ text form the AI reads and writes (`MAGITRAC SONG 1` … `END`, one line per column / block / key / note).  The parser is strict about structure (END, contiguous blocks, 4000 notes) and refuses a reply with more than a few bad lines |
+| `ai_certs.h` | Root CAs for api.anthropic.com (GTS Root R4/R1, GlobalSign).  TLS failing with a certificate error → re-check the chain |
+| `test_song_text.cpp`, `test_claude_ai.cpp` | Host tests for those two (the latter against a fake network in `test_mocks/ai/`); build lines in the files |
 | `mic_echo_test.cpp/.h` | Parked bench diagnostic (`MIC_ECHO_TEST`) |
 | `freq_resp_test.cpp/.h` | Bench diagnostic (`FREQ_RESP_TEST`): loops stepped sines out of the codec; record and analyse with `tools/freq_resp/` |
 | `test_seq.cpp`, `test_mocks/` | Sequencer host test (see above) |
@@ -261,7 +265,8 @@ Same as the client (`TrackerData.h` is shared):
 Arduino IDE targeting the M5Stack CoreS3 (ESP32-S3).  No
 PlatformIO config in tree.  `.ino` files are compiled together with
 the `.cpp/.h` files.  Needs the M5Unified, M5Module-Audio,
-pixelpost_proto libraries besides `magitrac_lib`.
+pixelpost_proto and ArduinoJson (7.x, for the AI's streamed answer)
+libraries besides `magitrac_lib`.
 
 ## Working here
 
@@ -274,7 +279,11 @@ pixelpost_proto libraries besides `magitrac_lib`.
   is the organ synth's audio-rate buffers (reverb lines, voice scratch,
   wavetables — about 69 KB), which need fast internal RAM.  Measured Nov
   2026 with the client connected: 77 KB free at idle, 59 KB at the lowest
-  point of a song load and play.  Don't link the core's `USB.h` classes
+  point of a song load and play.  The core's mbedTLS allocates internal-only
+  and a TLS session wants ~45 KB — more than is spare — so `claude_ai.cpp`
+  points mbedTLS at PSRAM (`mbedtls_platform_set_calloc_free`) for the length
+  of an AI request; the request itself needs 32 KB internal (12 KB stack +
+  sockets) and refuses to start below that.  Don't link the core's `USB.h` classes
   (USBMSC and friends): the TinyUSB stack they pull in reserves 32 KB.
 - The `.ino` files are concatenated into one unit (the main one first) and
   function prototypes are auto-generated ahead of the code, before the

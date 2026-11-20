@@ -14,6 +14,8 @@
 #include "pitch_detect.h"
 #include "SampleDebug.h"   // [SMPDBG] timing lines (off unless SAMPLE_DEBUG is 1)
 #include "esp32s3_dsp.h"   // ESP32S3_FFT — spectrogram (same engine as pixelpost bands)
+#include "claude_ai.h"
+#include "song_text.h"
 
 // ── Direct-from-Mac PixelPost OTA (client FW button) ──────────────────────────
 // The client's FW button triggers MSG_PIXELPOST_FIRMWARE_UPDATE; the server then
@@ -310,7 +312,24 @@ static volatile bool     sPadsLease         = false;
 static volatile uint32_t sPadsLeaseMs       = 0;
 static bool              sPadsWanted        = false;
 static volatile bool     sSampleSpecPending = false;   // spectrogram request
+static volatile uint8_t  sSampleDeleteReq   = 0;       // sample editor DELETE (worker → loop)
+static uint8_t           sDelId             = 0;       // being deleted (loop task)
+static uint32_t          sDelMs             = 0;
 static volatile uint8_t  sSampleSpecId      = 0;
+
+// AI (claude_ai.cpp): requests from the worker, run by aiTick on the loop.
+static portMUX_TYPE      sAiMux             = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool     sAiStartReq        = false;
+static volatile bool     sAiCancelReq       = false;
+static volatile bool     sAiUndoReq         = false;
+static volatile bool     sAiStatusReq       = false;
+static char              sAiPrompt[AI_PROMPT_LEN];
+static uint8_t*          sAiUndo            = nullptr;   // PSRAM: header + the Song the last result replaced
+static bool              sAiUndoValid       = false;     // cleared by any load / new song
+static uint8_t           sAiOutcome         = AI_ST_IDLE;  // last DONE / FAILED / UNDONE, for a page opening
+static char              sAiOutcomeText[AI_TEXT_LEN] = {};
+static uint8_t           sAiSentState       = 0xFF;
+static uint32_t          sAiSentMs          = 0;
 
 // ── Deferred active-song pull + song-list request ──────────────────────────────
 // Streaming the active song is ~35 KB (~750ms on a good link) and a list is an
@@ -877,6 +896,7 @@ static void commitActiveSong() {
     srvActiveBufLen     = (uint32_t)sizeof(SongFileHeader) + sizeof(Song);
     srvHasActive        = true;
     gSamplePreloadDirty = true;
+    sAiUndoValid        = false;   // a different song: the AI's UNDO no longer applies
 }
 
 // Queue one song operation (worker task).  Never blocks: these arrive at human
@@ -1300,6 +1320,7 @@ static void sendSampleInfo(uint8_t id, uint32_t vs, uint32_t ve) {
         info.tuneCents   = tr ? tr->tuneCents  : 0;
         info.velOff      = tr ? tr->velOff     : 0;
         info.keepLen     = tr ? tr->keepLen    : 0;
+        info.levelDb10   = tr ? tr->levelDb10  : 0;
 
         uint32_t dbgSend0 = millis();
         gMagiLink.acquireMutex();
@@ -2759,7 +2780,170 @@ static void runSongOp(uint8_t slot) {
 }
 
 // ── Tick — call from main loop() to run deferred operations ──────────────────
+// ── AI: rewrite the active song with the Claude API (claude_ai.cpp) ─────────
+// The request runs on its own task; everything that touches the song — the
+// text sent, installing the answer, UNDO — happens here on the loop task.
+
+static void aiSendStatus(uint8_t state, const char* text) {
+    if (!gMagiLink.isConnected()) return;
+    MsgAiStatus st;
+    st.state   = state;
+    st.canUndo = sAiUndoValid ? 1 : 0;
+    st.bytes   = aiBytes();
+    st.seconds = aiSeconds();
+    memset(st.text, 0, sizeof(st.text));
+    if (text) strlcpy(st.text, text, sizeof(st.text));
+    gMagiLink.acquireMutex();
+    gMagiLink.send(&st, sizeof(st));
+    gMagiLink.releaseMutex();
+}
+
+static void aiFinish(uint8_t state, const char* text) {
+    sAiOutcome = state;
+    strlcpy(sAiOutcomeText, text ? text : "", sizeof(sAiOutcomeText));
+    Serial.printf("[AI] %s: %s\n", state == AI_ST_DONE ? "DONE" : state == AI_ST_UNDONE ? "UNDONE"
+                                                                       : "FAILED", sAiOutcomeText);
+    aiSendStatus(state, sAiOutcomeText);
+}
+
+// Replace the active song wholesale (the AI's answer, or UNDO putting the
+// old one back) and tell the client to pull it.  The link mutex is held over
+// the copy so a song patch arriving on the worker can't land half-way.
+static void aiReplaceActive(const Song* s) {
+    quiesceSongReaders();
+    gMagiLink.acquireMutex();
+    memcpy(srvActiveBuf + sizeof(SongFileHeader), s, sizeof(Song));
+    commitActiveSong();
+    gMagiLink.releaseMutex();
+    sequencerReset();
+    sequencerSendPatchesNow();
+    if (pairingIsConnected()) {
+        MsgActiveSongChanged ev;
+        gMagiLink.postToPeer(&ev, sizeof(ev));
+    }
+}
+
+static void aiTick() {
+    if (sAiStartReq) {
+        char prompt[AI_PROMPT_LEN];
+        portENTER_CRITICAL(&sAiMux);
+        memcpy(prompt, sAiPrompt, sizeof(prompt));
+        sAiStartReq = false;
+        portEXIT_CRITICAL(&sAiMux);
+        char err[AI_TEXT_LEN] = "";
+        Song* blank = nullptr;
+        const Song* cur = nullptr;
+        if (sequencerIsRunning()) {
+            strcpy(err, "Stop the song first");
+        } else if (srvHasActive) {
+            cur = (const Song*)(srvActiveBuf + sizeof(SongFileHeader));
+        } else if ((blank = (Song*)heap_caps_malloc(sizeof(Song), MALLOC_CAP_SPIRAM)) != nullptr) {
+            initSong(blank);
+            cur = blank;
+        } else {
+            strcpy(err, "Out of memory");
+        }
+        if (cur && aiBegin(cur, prompt, err, sizeof(err))) {
+            sAiSentState = 0xFF;      // progress statuses from here on
+        } else {
+            aiFinish(AI_ST_FAILED, err);
+        }
+        if (blank) heap_caps_free(blank);
+    }
+    if (sAiCancelReq) {
+        sAiCancelReq = false;
+        aiCancel();
+    }
+    if (sAiStatusReq) {
+        sAiStatusReq = false;
+        if (aiBusy()) sAiSentState = 0xFF;          // the progress line below sends it
+        else          aiSendStatus(sAiOutcome, sAiOutcomeText);
+    }
+    if (sAiUndoReq) {
+        sAiUndoReq = false;
+        if (aiBusy()) {
+            aiSendStatus(aiState(), "Still working - CANCEL first");
+        } else if (!sAiUndoValid || !sAiUndo) {
+            aiFinish(AI_ST_FAILED, "Nothing to undo");
+        } else {
+            aiReplaceActive((const Song*)(sAiUndo + sizeof(SongFileHeader)));   // clears sAiUndoValid
+            aiFinish(AI_ST_UNDONE, "The song is back as it was");
+        }
+    }
+
+    if (!aiBusy()) return;
+
+    bool ok;
+    const char* reply;
+    size_t len;
+    char err[AI_TEXT_LEN];
+    if (!aiTakeReply(ok, reply, len, err, sizeof(err))) {
+        // Progress: on a change of state, and once a second for the clock.
+        uint8_t st = aiState();
+        if (st != sAiSentState || (uint32_t)(millis() - sAiSentMs) >= 1000) {
+            sAiSentState = st;
+            sAiSentMs    = millis();
+            aiSendStatus(st, nullptr);
+        }
+        return;
+    }
+    if (!ok) {
+        aiRelease();
+        aiFinish(AI_ST_FAILED, err);
+        return;
+    }
+
+    // Parse into a spare song; the active one is only touched if it all parses.
+    Song* fresh = (Song*)heap_caps_malloc(sizeof(Song), MALLOC_CAP_SPIRAM);
+    Song* blank = nullptr;
+    const Song* base = srvHasActive ? (const Song*)(srvActiveBuf + sizeof(SongFileHeader)) : nullptr;
+    if (!base && (blank = (Song*)heap_caps_malloc(sizeof(Song), MALLOC_CAP_SPIRAM)) != nullptr) {
+        initSong(blank);
+        base = blank;
+    }
+    if (!sAiUndo) sAiUndo = (uint8_t*)heap_caps_malloc(sizeof(SongFileHeader) + sizeof(Song),
+                                                       MALLOC_CAP_SPIRAM);
+    if (!fresh || !base) {
+        if (fresh) heap_caps_free(fresh);
+        if (blank) heap_caps_free(blank);
+        aiRelease();
+        aiFinish(AI_ST_FAILED, "Out of memory");
+        return;
+    }
+    SongTextResult r;
+    uint32_t t0 = millis();
+    bool parsed = songFromText(reply, len, base, fresh, r);
+    Serial.printf("[AI] parsed in %lu ms: %s, %d blocks, %d notes, %d lines skipped%s%s\n",
+                  (unsigned long)(millis() - t0), parsed ? "OK" : "FAILED", r.blocks, r.notes,
+                  r.skipped, r.err[0] ? " - " : "", r.err);
+    if (!parsed) {
+        Serial.printf("[AI] reply was:\n%.*s\n", (int)(len > 4000 ? 4000 : len), reply);
+        char why[AI_TEXT_LEN];
+        snprintf(why, sizeof(why), "Couldn't read the answer: %s", r.err);
+        heap_caps_free(fresh);
+        if (blank) heap_caps_free(blank);
+        aiRelease();
+        aiFinish(AI_ST_FAILED, why);
+        return;
+    }
+    aiRelease();
+
+    bool canUndo = srvHasActive && sAiUndo;
+    if (canUndo) memcpy(sAiUndo, srvActiveBuf, sizeof(SongFileHeader) + sizeof(Song));
+    aiReplaceActive(fresh);
+    sAiUndoValid = canUndo;
+    heap_caps_free(fresh);
+    if (blank) heap_caps_free(blank);
+
+    char done[AI_TEXT_LEN];
+    if (r.summary[0]) strlcpy(done, r.summary, sizeof(done));
+    else snprintf(done, sizeof(done), "New song: %d blocks, %d notes", r.blocks, r.notes);
+    aiFinish(AI_ST_DONE, done);
+}
+
 void commandsTick() {
+    aiTick();
+
     // Note edits and song operations, merged into the order they arrived.
     // An operation can take a second (SD read + 35 KB stream); anything that
     // arrives meanwhile simply queues behind it.
@@ -2853,7 +3037,80 @@ void commandsTick() {
             }
             Serial.printf("[SE] AUTO TUNE sample %u: result %u, %.2f Hz, tune %+d c\n",
                           (unsigned)id, (unsigned)res, (double)hz, (int)t.tuneCents);
+            // send() leaves the link mutex held: without the release the loop
+            // kept it, the link worker blocked on it, and the client hung
+            // ("LOADING", then no reconnect until the server was reset).
+            gMagiLink.acquireMutex();
             gMagiLink.send(&t, sizeof(t));
+            gMagiLink.releaseMutex();
+        }
+    }
+
+    sampleLevelTick();
+    {   // AUTO LEVEL's answer: the LEVEL that puts the loudest point at the target
+        uint8_t id; bool ok; uint32_t peak;
+        if (sampleAutoLevelTake(id, ok, peak)) {
+            MsgSampleResult r;
+            r.sampleId  = id;
+            r.op        = SAMPLE_EDIT_AUTOLEVEL;
+            r.peakPct   = (uint8_t)((peak * 100 + 16384) / 32768);
+            r.levelDb10 = 0;
+            if (!ok) {
+                r.result = SAMPLE_RES_FAILED;
+            } else if (peak < 33) {              // under -60 dBFS: nothing to level
+                r.result = SAMPLE_RES_SILENT;
+            } else {
+                float target = 32767.0f * SAMPLE_LEVEL_TARGET_PCT / 100.0f;
+                long  db10   = lrintf(200.0f * log10f(target / (float)peak));
+                if (db10 < SAMPLE_LEVEL_MIN_DB10) db10 = SAMPLE_LEVEL_MIN_DB10;
+                if (db10 > SAMPLE_LEVEL_MAX_DB10) db10 = SAMPLE_LEVEL_MAX_DB10;
+                r.result    = SAMPLE_RES_OK;
+                r.levelDb10 = (int16_t)db10;
+            }
+            Serial.printf("[SE] AUTO LEVEL sample %u: result %u, peak %lu (%u%%), level %+.1f dB\n",
+                          (unsigned)id, (unsigned)r.result, (unsigned long)peak,
+                          (unsigned)r.peakPct, r.levelDb10 / 10.0);
+            gMagiLink.acquireMutex();
+            gMagiLink.send(&r, sizeof(r));
+            gMagiLink.releaseMutex();
+        }
+    }
+
+    // DELETE (sample editor): silence it, let the cache go of it, then remove
+    // the WAV and its list entry.  The player is stopped first so the stream
+    // can't be reading the file as it goes; a voice still fading holds things
+    // up a pass or two (at most 2 s).
+    if (sSampleDeleteReq && !sDelId) {
+        sDelId = sSampleDeleteReq;
+        sSampleDeleteReq = 0;
+        sDelMs = millis();
+        samplePlayerStop();
+    }
+    if (sDelId) {
+        bool ready = samplePreloadForgetStep(sDelId) && !samplePlayerIsPlaying();
+        if (ready || (uint32_t)(millis() - sDelMs) > 2000) {
+            MsgSampleResult r;
+            r.sampleId  = sDelId;
+            r.op        = SAMPLE_EDIT_DELETE;
+            r.peakPct   = 0;
+            r.levelDb10 = 0;
+            const char* nm = sampleManifestNameFor(sDelId);
+            bool ok = nm != nullptr;
+            char path[64] = "";
+            if (ok) {
+                snprintf(path, sizeof(path), "/samples/%s", nm);
+                SdLock _;
+                ok = !SD.exists(path) || SD.remove(path);
+            }
+            if (ok) ok = sampleManifestRemove(sDelId);
+            r.result = ok ? SAMPLE_RES_OK : SAMPLE_RES_FAILED;
+            Serial.printf("[SE] DELETE sample %u %s: %s\n", (unsigned)sDelId, path,
+                          ok ? "deleted" : "FAILED");
+            sDelId = 0;
+            gSamplePreloadDirty = true;
+            gMagiLink.acquireMutex();
+            gMagiLink.send(&r, sizeof(r));
+            gMagiLink.releaseMutex();
         }
     }
 
@@ -3239,7 +3496,7 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             if (len < (int)sizeof(MsgSeek)) return;
             {
                 const MsgSeek* s = (const MsgSeek*)data;
-                sequencerSeek(s->pattern, s->row);
+                sequencerSeek(s->pattern, s->row, s->scrub != 0);
             }
             break;
 
@@ -3303,6 +3560,26 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
             }
             break;
 
+        case MSG_AI_REQUEST:
+            if (len < (int)sizeof(MsgAiRequest)) return;
+            {
+                const MsgAiRequest* m = (const MsgAiRequest*)data;
+                if (m->op == AI_OP_START) {
+                    portENTER_CRITICAL(&sAiMux);
+                    memcpy(sAiPrompt, m->prompt, sizeof(sAiPrompt));
+                    sAiPrompt[sizeof(sAiPrompt) - 1] = '\0';
+                    sAiStartReq = true;
+                    portEXIT_CRITICAL(&sAiMux);
+                } else if (m->op == AI_OP_CANCEL) {
+                    sAiCancelReq = true;
+                } else if (m->op == AI_OP_UNDO) {
+                    sAiUndoReq = true;
+                } else {
+                    sAiStatusReq = true;
+                }
+            }
+            break;
+
         case MSG_SAMPLE_REC:
             if (len < (int)sizeof(MsgSampleRec)) return;
             {
@@ -3344,12 +3621,16 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                     // RAM table updates inline (playback picks it up on the
                     // next trigger); the SD write + cache re-bake defer.
                     sampleTrimSet(m->sampleId, m->startFrame, m->endFrame, m->loop,
-                                  m->tuneCents, m->velOff, m->keepLen);
+                                  m->tuneCents, m->velOff, m->keepLen, m->levelDb10);
                     sTrimSaveStampMs    = millis();
                     sTrimSavePending    = true;
                     gSamplePreloadDirty = true;
                 } else if (m->op == SAMPLE_EDIT_AUTOTUNE) {
                     sampleAutoTuneRequest(m->sampleId);   // answered from commandsTick
+                } else if (m->op == SAMPLE_EDIT_AUTOLEVEL) {
+                    sampleAutoLevelRequest(m->sampleId);  // answered from commandsTick
+                } else if (m->op == SAMPLE_EDIT_DELETE) {
+                    sSampleDeleteReq = m->sampleId;       // SD work: commandsTick
                 } else if (m->op == SAMPLE_EDIT_STOP) {
                     // Ends a looping audition / silences the sample pads.
                     // While a song plays it stops only what the pads started

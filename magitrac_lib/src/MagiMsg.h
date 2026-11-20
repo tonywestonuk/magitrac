@@ -230,6 +230,13 @@ enum MagiMsgType : uint8_t {
     MSG_SAMPLE_REC        = 0xA3,   // client → server: START / STOP / PLAY / SAVE …
     MSG_SAMPLE_REC_STATUS = 0xA4,   // server → client: state, level, length, result
     MSG_SAMPLE_TUNE       = 0xA5,   // server → client: AUTO TUNE's answer
+    MSG_SAMPLE_RESULT     = 0xA6,   // server → client: DELETE / AUTO LEVEL's answer
+
+    // AI: the server asks the Claude API to rewrite the active song from a
+    // prompt typed on the client (external-AP mode only — it needs the
+    // internet).  See MsgAiRequest / MsgAiStatus.
+    MSG_AI_REQUEST        = 0xA7,   // client → server: START / CANCEL / UNDO
+    MSG_AI_STATUS         = 0xA8,   // server → client: progress, result, error
 
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
@@ -592,12 +599,15 @@ struct MsgSeqPos {
     uint8_t     row;     // current row within that pattern
 };
 
-// Client → Server: scrub to position and play
+// Client → Server: move to a position.  scrub = 1 (the tracker grid being
+// scrolled while stopped or held): sound the row now, as a scrub.  0 (a pad
+// press, followed by PLAY): just move — PLAY plays it.
 struct MsgSeek {
     uint8_t  id      = MSG_SEEK;
     uint16_t length  = sizeof(MsgSeek);
     uint8_t  pattern;
     uint8_t  row;
+    uint8_t  scrub   = 0;
 };
 
 // Client → Server: position only (no audible play).  When running, tick
@@ -740,8 +750,18 @@ enum SampleEditOp : uint8_t {
     SAMPLE_EDIT_AUTOTUNE = 7, // find sampleId's pitch and reply MsgSampleTune
                             // with the TUNE that puts it on middle C (as ADD
                             // SAMPLE does).  Analyses the cached (trimmed)
-                            // sample, so the editor's sample must be in memory.
+                            // sample (from memory, or its first seconds off
+                            // the card).
+    SAMPLE_EDIT_DELETE = 8, // delete sampleId: its WAV, its list entry and its
+                            // trim/tune/level.  Answered with MsgSampleResult.
+    SAMPLE_EDIT_AUTOLEVEL = 9, // measure the loudest point of sampleId's trimmed
+                            // region and reply MsgSampleResult with the LEVEL
+                            // that puts it at SAMPLE_LEVEL_TARGET_PCT.  The
+                            // client applies it (and stores it with SET).
 };
+#define SAMPLE_LEVEL_TARGET_PCT 80
+#define SAMPLE_LEVEL_MIN_DB10  (-400)   // LEVEL range, tenths of a dB
+#define SAMPLE_LEVEL_MAX_DB10  240
 #define SAMPLE_KEYS_RENEW_MS  2000
 #define SAMPLE_KEYS_LEASE_MS  6000
 
@@ -783,7 +803,24 @@ struct MsgSampleEdit {
     uint8_t  velOff;        // SET only; 1 = a key plays it at its own level
                             // however hard it is struck (0 = follows velocity)
     uint8_t  keepLen;       // SET only; 1 = KEEP LENGTH: other notes change its
-                            // pitch, not its length (cached samples — PSOLA)
+                            // pitch, not its length (cached samples)
+    int16_t  levelDb10;     // SET only; the sample's LEVEL, tenths of a dB
+};
+
+// DELETE / AUTO LEVEL's answer.
+enum SampleResultCode : uint8_t {
+    SAMPLE_RES_OK     = 0,  // deleted / levelDb10 is the AUTO LEVEL
+    SAMPLE_RES_SILENT = 1,  // AUTO LEVEL: nothing above silence — left as it was
+    SAMPLE_RES_FAILED = 2,  // no such sample / the card wouldn't read or write it
+};
+struct MsgSampleResult {
+    uint8_t  id     = MSG_SAMPLE_RESULT;
+    uint16_t length = sizeof(MsgSampleResult);
+    uint8_t  sampleId;
+    uint8_t  op;            // SAMPLE_EDIT_DELETE / SAMPLE_EDIT_AUTOLEVEL
+    uint8_t  result;        // SampleResultCode
+    uint8_t  peakPct;       // AUTO LEVEL: its loudest point as it stands, % of full
+    int16_t  levelDb10;     // AUTO LEVEL OK: the LEVEL for SAMPLE_LEVEL_TARGET_PCT
 };
 
 // Waveform overview: min/max peak pairs, int8 (-127..127), one pair per
@@ -806,6 +843,7 @@ struct MsgSampleInfo {
     int16_t  tuneCents;     // stored meta: the sample's own TUNE, ± cents
     uint8_t  velOff;        // stored meta: 1 = velocity sensitivity off
     uint8_t  keepLen;       // stored meta: 1 = KEEP LENGTH on
+    int16_t  levelDb10;     // stored meta: LEVEL, tenths of a dB
     int8_t   peaks[SAMPLE_OVERVIEW_N * 2];   // min,max per column of the window
 };
 
@@ -913,6 +951,47 @@ struct MsgSampleRecStatus {
     uint8_t  pitchNote;  // FOUND: the nearest MIDI note to it...
     int8_t   pitchCents; //   ...and how far off that it is
     int16_t  tuneCents;  // FOUND: the sample's TUNE (saved with it), else 0
+};
+
+// ── AI (Claude API) ─────────────────────────────────────────────────────────
+// START sends the prompt; the server serialises its active song as text,
+// streams Claude's answer, parses it into a spare Song and — only if it all
+// parses — makes it the active song (unsaved: SAVE writes it) and posts
+// MSG_ACTIVE_SONG_CHANGED so the client pulls it.  The song it replaced is
+// kept for UNDO until the next START or song load.  The API key is read from
+// the server's SD card (/ai/key.txt) and never crosses the link.
+#define AI_PROMPT_LEN  256
+#define AI_TEXT_LEN    96
+
+enum AiOp : uint8_t {
+    AI_OP_START  = 0,   // prompt[] = what to do
+    AI_OP_CANCEL = 1,   // abandon the request in flight (nothing changes)
+    AI_OP_UNDO   = 2,   // put back the song the last result replaced
+    AI_OP_STATUS = 3,   // just send the current status (page opened)
+};
+enum AiState : uint8_t {
+    AI_ST_IDLE      = 0,
+    AI_ST_SENDING   = 1,   // connecting, sending the song
+    AI_ST_THINKING  = 2,   // request sent, nothing written yet
+    AI_ST_WRITING   = 3,   // the song text is arriving (bytes = so far)
+    AI_ST_DONE      = 4,   // new song active; text = Claude's summary
+    AI_ST_FAILED    = 5,   // text = why; the song is as it was
+    AI_ST_UNDONE    = 6,   // the previous song is back
+};
+struct MsgAiRequest {
+    uint8_t  id     = MSG_AI_REQUEST;
+    uint16_t length = sizeof(MsgAiRequest);
+    uint8_t  op;                    // AiOp
+    char     prompt[AI_PROMPT_LEN]; // START only, NUL-terminated
+};
+struct MsgAiStatus {
+    uint8_t  id     = MSG_AI_STATUS;
+    uint16_t length = sizeof(MsgAiStatus);
+    uint8_t  state;                 // AiState
+    uint8_t  canUndo;               // 1 = UNDO would put a previous song back
+    uint32_t bytes;                 // WRITING: song text received so far
+    uint32_t seconds;               // since START
+    char     text[AI_TEXT_LEN];     // DONE: summary; FAILED: reason
 };
 
 // ── New struct-driven backup messages (v2 transport) ──────────────────────────

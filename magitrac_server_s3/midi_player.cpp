@@ -195,6 +195,16 @@ static void   (*seqPreviewRowCallback)(uint8_t row) = nullptr;
 static uint8_t  seqAuditionCol  = 0xFF;     // 0xFF = no audition active
 static uint32_t seqAuditionEndMs = 0;
 
+// Scrub: the tracker grid scrolled while stopped or held sounds each row it
+// passes (seqSeekImpl).  Those notes are silenced SCRUB_HOLD_MS after the last
+// one, so they don't hang once the finger stops.  seqScrubbing is set only
+// while a scrubbed row plays: STOP and tempo cells don't act then, and the
+// MIDI clock isn't restarted.
+#define SCRUB_HOLD_MS 600
+static bool     seqScrubbing   = false;
+static bool     seqScrubNotes  = false;
+static uint32_t seqScrubOffMs  = 0;
+
 // ── External references ───────────────────────────────────────────────────────
 extern uint8_t*       srvActiveBuf;    // PSRAM (commands_server allocates)
 extern bool           srvHasActive;
@@ -423,6 +433,33 @@ void sequencerMidiClockTick() {
 // fallback where a stalled hand-off runs the request on the calling task.
 static volatile uint8_t seqSfxAudNote = 0xFF;
 
+// The keys held on a streamed sample, oldest first (the last one is
+// seqSfxAudNote's).  The stream is mono, last-note priority: letting go of
+// the newest key starts the most recent key still held again, from the top
+// at its own pitch — as a mono synth would.  Cleared whenever something else
+// takes the stream.
+#define SEQ_STREAM_KEYS 8
+static struct StreamKey { uint8_t note, sampleId, volume; float semis; } seqStreamKeys[SEQ_STREAM_KEYS];
+static uint8_t seqStreamKeyCount = 0;
+
+static void seqStreamKeyRemove(uint8_t note) {
+    for (int i = 0; i < seqStreamKeyCount; i++) {
+        if (seqStreamKeys[i].note != note) continue;
+        for (int k = i + 1; k < seqStreamKeyCount; k++) seqStreamKeys[k - 1] = seqStreamKeys[k];
+        seqStreamKeyCount--;
+        return;
+    }
+}
+static void seqStreamKeyPush(uint8_t note, uint8_t sampleId, float semis, uint8_t volume) {
+    seqStreamKeyRemove(note);
+    if (seqStreamKeyCount == SEQ_STREAM_KEYS) {            // full: forget the oldest
+        for (int k = 1; k < SEQ_STREAM_KEYS; k++) seqStreamKeys[k - 1] = seqStreamKeys[k];
+        seqStreamKeyCount--;
+    }
+    seqStreamKeys[seqStreamKeyCount++] = { note, sampleId, volume, semis };
+}
+static bool sfxStreamPlayId(uint8_t sampleId, float semis, uint8_t volume);
+
 // Preloaded samples make tune-by-ear POLYPHONIC: each held key owns a RAM
 // voice, tracked here so its own note-off releases exactly that voice.
 // (Streamed samples stay mono and use seqSfxAudNote above.)
@@ -443,7 +480,17 @@ static void seqSfxAudNoteOff(uint8_t note) {
             return;
         }
     }
+    seqStreamKeyRemove(note);
     if (note == seqSfxAudNote) {
+        if (seqStreamKeyCount > 0) {
+            // Another key is still held: it plays again (last-note priority).
+            const StreamKey& k = seqStreamKeys[seqStreamKeyCount - 1];
+            if (sfxStreamPlayId(k.sampleId, k.semis, k.volume)) {
+                seqSfxAudNote = k.note;
+                return;
+            }
+            seqStreamKeyCount = 0;
+        }
         seqSfxAudNote = 0xFF;
         samplePlayerStopStream();   // fades out, no click
     }
@@ -471,7 +518,7 @@ static bool sfxStreamPlayId(uint8_t sampleId, float semis, uint8_t volume) {
     const SampleTrim* tr = sampleTrimFor(sampleId);
     samplePlayerPlay(path, semis, volume,
                      tr ? tr->startFrame : 0, tr ? tr->endFrame : 0,
-                     tr && tr->loop);
+                     tr && tr->loop, sampleLevelFor(sampleId));
     return true;
 }
 
@@ -487,8 +534,9 @@ static volatile bool seqPadOwnsStream = false;    // the SD stream is the page's
 
 static bool sfxStreamPlay(const ColumnSettings& cs, float semis) {
     if (!sfxStreamPlayId(cs.program, semis, cs.volume)) return false;
-    seqPadOwnsStream = false;      // the song has the stream now…
-    seqSfxAudNote    = 0xFF;       // …so no key's release may stop it
+    seqPadOwnsStream  = false;     // the song has the stream now…
+    seqSfxAudNote     = 0xFF;      // …so no key's release may stop it
+    seqStreamKeyCount = 0;         // (nor bring a held key back)
     return true;
 }
 
@@ -526,6 +574,8 @@ static void sfxAudStart(uint8_t sampleId, float semis, uint8_t volume,
     // key, or (while a song runs) one of the song's streamed samples.
     seqSfxAudNote    = keyed ? note : 0xFF;
     seqPadOwnsStream = true;
+    if (keyed) seqStreamKeyPush(note, sampleId, semis, volume);
+    else       seqStreamKeyCount = 0;     // a square tapped: no key owns it
 }
 
 // A key's velocity → the player's volume: velocity 100 is the sample at its own
@@ -592,8 +642,9 @@ static void seqSamplePadsStopImpl() {
     }
     for (int i = 0; i < SEQ_PAD_POLY; i++) seqPadVoice[i] = -1;
     for (int i = 0; i < SEQ_AUD_POLY; i++) seqSfxAudPoly[i].voice = -1;
-    seqSfxAudNote    = 0xFF;
-    seqPadOwnsStream = false;
+    seqSfxAudNote     = 0xFF;
+    seqStreamKeyCount = 0;
+    seqPadOwnsStream  = false;
 }
 
 // Trigger a column's sample: preloaded → polyphonic RAM voice; not cached →
@@ -768,7 +819,7 @@ static void seqPlayRow() {
     const Song*    s   = seqSong();
     const uint16_t head = s->patterns[seqPattern].noteHead;
 
-    seqClockOnRowPlayed();      // re-Start MIDI clock if a WAIT timeout halted it
+    if (!seqScrubbing) seqClockOnRowPlayed();   // re-Start MIDI clock if a WAIT timeout halted it
     seqA0RowOverride = false;   // fresh per row walk
 
     // Walk nodes at seqRow in list order (col 0 first, then col 1+).
@@ -790,7 +841,7 @@ static void seqPlayRow() {
         // Universal output-column effect 0xFF param 0xFF = "STOP".  Halts
         // playback and sends note-off on every active column.  Excludes
         // SFX/pixel-post columns (pixel-post uses effect/param for MOVE x/y).
-        if (nn.col != INPUT_COLUMN && nn.effect == 0xFF && nn.param == 0xFF) {
+        if (nn.col != INPUT_COLUMN && nn.effect == 0xFF && nn.param == 0xFF && !seqScrubbing) {
             const ColumnSettings& csF = s->columns[nn.col];
             if (csF.midiChannel >= 1 && csF.midiChannel <= 16) {
                 debugPrintf("[SEQ] FFFF stop pat=%u row=%u col=%u\n",
@@ -806,7 +857,7 @@ static void seqPlayRow() {
         // the BPM (clamped to song's min/maxBPM).  Excludes SFX/pixel-post
         // columns since they use effect/param for their own purposes.
         // Holds until the next performer snap (WAIT/SYNC) re-derives BPM.
-        if (nn.col != INPUT_COLUMN && nn.effect == 0xA0) {
+        if (nn.col != INPUT_COLUMN && nn.effect == 0xA0 && !seqScrubbing) {
             const ColumnSettings& csA = s->columns[nn.col];
             if (csA.midiChannel >= 1 && csA.midiChannel <= 16 && nn.param > 0) {
                 uint16_t newBpm  = (uint16_t)seqClampBpm(s, nn.param);
@@ -2065,7 +2116,7 @@ static void seqResetImpl() {
     if (seqRowCallback) seqRowCallback(seqPattern, seqRow);
 }
 
-static void seqSeekImpl(uint8_t pattern, uint8_t row) {
+static void seqSeekImpl(uint8_t pattern, uint8_t row, bool scrub) {
     seqFumbleOn = false;   // the saved "before the key" position is no longer valid
     if (!srvHasActive) return;
     const Song* s = seqSong();
@@ -2091,7 +2142,18 @@ static void seqSeekImpl(uint8_t pattern, uint8_t row) {
     if (seqRunning) seqNextRowMs = millis();
     seqHaveLastSnap = false;   // snap baseline meaningless across the jump
 
-    debugPrintf("[SEQ] seek t=%lu pat=%u row=%u\n", millis(), seqPattern, seqRow);
+    // A scrub while stopped or held: sound the row now (the tick isn't
+    // running).  Lost in the CoreS3 rewrite, which left scrolling silent.
+    if (scrub && (!seqRunning || seqPaused)) {
+        seqScrubbing = true;
+        seqPlayRow();
+        seqScrubbing  = false;
+        seqScrubNotes = true;
+        seqScrubOffMs = millis() + SCRUB_HOLD_MS;
+    }
+
+    debugPrintf("[SEQ] seek t=%lu pat=%u row=%u%s\n", millis(), seqPattern, seqRow,
+                scrub ? " scrub" : "");
     if (seqRowCallback) seqRowCallback(seqPattern, seqRow);
 }
 
@@ -2168,6 +2230,10 @@ static void seqPauseImpl() {
 
 static void seqUnpauseImpl() {
     if (!seqPaused) return;
+    if (seqScrubNotes) {                 // as the pause did: resume from silence
+        for (int c = 0; c < MAX_COLUMNS; c++) seqNoteOff(c);
+        seqScrubNotes = false;
+    }
     seqPaused    = false;
     seqNextRowMs = millis();  // don't play a burst of missed rows on resume
     debugPrintf("[SEQ] unpause t=%lu\n", millis());
@@ -2180,6 +2246,14 @@ static void sequencerTickBody() {
         seqNoteOff(seqAuditionCol);
         seqAuditionCol = 0xFF;
         seqOutStatus = 0;
+    }
+
+    // Scrubbed notes: silenced once the scrolling stops (playback owns them
+    // again once it runs).
+    if (seqScrubNotes && (int32_t)(millis() - seqScrubOffMs) >= 0) {
+        if (!seqRunning || seqPaused)
+            for (int c = 0; c < MAX_COLUMNS; c++) seqNoteOff(c);
+        seqScrubNotes = false;
     }
 
     // Retrigger rolls run off the row clock — service them every loop while the
@@ -2427,9 +2501,9 @@ void sequencerStartPreview(uint8_t pat, uint8_t col) {
     r.fn = [](const SeqReq& q) { seqStartPreviewImpl(q.a, q.b); };
     seqRun(r);
 }
-void sequencerSeek(uint8_t pattern, uint8_t row) {
-    SeqReq r{}; r.a = pattern; r.b = row;
-    r.fn = [](const SeqReq& q) { seqSeekImpl(q.a, q.b); };
+void sequencerSeek(uint8_t pattern, uint8_t row, bool scrub) {
+    SeqReq r{}; r.a = pattern; r.b = row; r.c = scrub ? 1 : 0;
+    r.fn = [](const SeqReq& q) { seqSeekImpl(q.a, q.b, q.c != 0); };
     seqRun(r);
 }
 void sequencerGoto(uint8_t pat, uint8_t row) {

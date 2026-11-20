@@ -37,6 +37,7 @@
 #include "OrganPage.h"
 #include "SamplesPage.h"
 #include "SampleRecordPage.h"
+#include "AiPage.h"
 #include "WiFiSettingsPage.h"
 #include "Battery.h"
 #include "BatteryGauge.h"
@@ -105,6 +106,7 @@ SetlistPage        setlistPage(display, touch, song);
 OrganPage          organPage(display, touch, song);
 SamplesPage        samplesPage(display, touch);
 SampleRecordPage   sampleRecordPage(display, touch);
+AiPage             aiPage(display, touch);
 I2C_BM8563*        rtc = nullptr;
 SettingsPage*      settingsPage = nullptr;
 WiFiSettingsPage   wifiSettingsPage(display, touch);
@@ -156,6 +158,7 @@ static void applyRowPaste(int8_t targetRow, int8_t targetCol) {
 // ── Pairing ceremony state (declared here so drawPairingScreen/pollPairingUi can use them)
 static bool            gPairingUiWasDown = false;
 static PairClientState gLastPairState    = PairClientState::IDLE;
+static bool            gPairConfirmFailed = false;
 
 // ── Pairing ceremony UI ───────────────────────────────────────────────────────
 
@@ -180,6 +183,9 @@ static void drawPairingScreen() {
         uiButton(display, 280, 240, 400, 120, codeStr, COL_LTGREY, COL_BLACK, 6);
         // Confirm button
         uiButton(display, 280, 390, 400, 100, "CONFIRM", COL_BLACK, COL_WHITE, 4);
+        if (gPairConfirmFailed)
+            uiButton(display, 240, 500, 700, 36, "Didn't reach the server - tap CONFIRM again",
+                     COL_WHITE, COL_BLACK, 2);
 
     } else {
         // SUCCESS or IDLE — close the UI from loop()
@@ -207,6 +213,7 @@ static bool pollPairingUi() {
     // be touching the screen at that exact moment.
     if (state != gLastPairState) {
         gLastPairState = state;
+        gPairConfirmFailed = false;
         drawPairingScreen();
     }
 
@@ -228,7 +235,7 @@ static bool pollPairingUi() {
         // CONFIRM button — only shown in PAIRING_CONFIRM state (x=280..680, y=390..490)
         if (state == PairClientState::PAIRING_CONFIRM &&
             sx >= 280 && sx < 680 && sy >= 390 && sy < 490) {
-            gServerPairing.confirmPairCode();
+            gPairConfirmFailed = !gServerPairing.confirmPairCode();
             drawPairingScreen();   // repaint for the state confirmPairCode() left us in
         }
     }
@@ -264,6 +271,15 @@ static bool     setlistPageOpen       = false;
 static bool     organPageOpen         = false;
 static bool     samplesPageOpen       = false;
 static bool     sampleRecordOpen      = false;   // ADD SAMPLE (from the samples page)
+static bool     aiPageOpen            = false;   // MENU → AI (external WiFi only)
+
+// The AI needs the internet, so MENU only offers it on an external network.
+static bool clientOnExternalAp() {
+    char    ssid[33] = {};
+    char    psk[64]  = {};
+    uint8_t mode     = MAGI_AP_MODE_SERVER;
+    return pairNvsLoadCreds("magitrac_cli", ssid, psk, &mode) && mode == MAGI_AP_MODE_EXTERNAL;
+}
 static bool     sampleEditFromPads    = false;   // sample editor opened from the
                                                  // samples page, not a column
 static bool     perfReturn            = false;   // organ / samples page was opened
@@ -758,7 +774,7 @@ void loop() {
         !wifiSettingsPageOpen && !backupRestorePageOpen &&
         !drumTrackImportOpen && !drumEditorOpen &&
         !performancePageOpen && !pixelpostManualPageOpen && !setlistPageOpen &&
-        !organPageOpen && !samplesPageOpen && !sampleRecordOpen && !pasteConfirmOpen &&
+        !organPageOpen && !samplesPageOpen && !sampleRecordOpen && !aiPageOpen && !pasteConfirmOpen &&
         !noteEditor.isOpen() &&
         pageManager.currentPage() == Page::TRACKER) {
         const char* srvName = songPage.srvLoadedName();
@@ -890,6 +906,10 @@ void loop() {
                 perfReturn      = false;
                 samplesPageOpen = true;
                 samplesPage.open();   // fetches the sample list + draws
+                break;
+            case BootMenuResult::AI:
+                aiPageOpen = true;
+                aiPage.open();        // draws + asks the server where any request is
                 break;
             case BootMenuResult::DISMISSED:
                 display.clear();
@@ -1064,6 +1084,20 @@ void loop() {
                 ui.drawAll();
                 display.paintLater();
             }
+        }
+        return;
+    }
+
+    // ── AI (MENU → AI): ask Claude to rewrite the song on the server ─────────
+    // The answer arrives as an ordinary server song push (handled above,
+    // whatever page is open), so BACK just shows the tracker with it.
+    if (aiPageOpen) {
+        { uint8_t n; gServerPairing.pollMidiNoteIn(&n); }
+        if (aiPage.poll() == AiPage::Result::BACK) {
+            aiPageOpen = false;
+            display.clear();
+            ui.drawAll();
+            display.paintLater();
         }
         return;
     }
@@ -1373,6 +1407,7 @@ void loop() {
             if (sampleEditFromPads) {
                 sampleEditFromPads = false;
                 samplesPageOpen    = true;     // back to the squares
+                if (sampleEditPage.deleted()) samplesPage.refetchOnReopen();
                 samplesPage.reopen();
             } else {
                 columnEditorOpen = true;    // back to the column that opened it
@@ -1749,10 +1784,24 @@ void loop() {
         case TouchAction::CELL_SELECT:
             ui.setSelected(t.row, t.col);
             needsGridRedraw = true;
-            // Scrub: send seek to server when paused (jammed) or stopped
+            // Scrub: sound the rows when paused (jammed) or stopped.  A drag
+            // can move several rows between touch reads — send every row it
+            // passed over, in order, or the notes on those rows are skipped.
+            // A jump (the drag's first step) or a long fling sends just the
+            // row it lands on.
             if (gServerPairing.isPaired() &&
                 (gGridPaused || !gServerPairing.serverPlaying())) {
-                gServerPairing.sendSeek(engine.currentPattern(), (uint8_t)t.row);
+                const int SCRUB_MAX_ROWS = 16;
+                uint8_t pat = engine.currentPattern();
+                int from = t.fromRow, to = t.row;
+                int span = from < 0 ? 0 : (to > from ? to - from : from - to);
+                if (span < 2 || span > SCRUB_MAX_ROWS) {
+                    gServerPairing.sendSeek(pat, (uint8_t)to, true);
+                } else {
+                    int dir = to > from ? 1 : -1;
+                    for (int r = from + dir; r != to + dir; r += dir)
+                        gServerPairing.sendSeek(pat, (uint8_t)r, true);
+                }
             }
             break;
 
@@ -1775,7 +1824,7 @@ void loop() {
             return;
 
         case TouchAction::MENU_TAP:
-            bootMenu.open(ui.noSong());
+            bootMenu.open(ui.noSong(), clientOnExternalAp());
             display.paintLater();
             return;
 

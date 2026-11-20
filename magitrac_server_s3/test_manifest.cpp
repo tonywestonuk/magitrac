@@ -20,6 +20,7 @@
 #include <string>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <math.h>
 
 #include "test_mocks/Arduino.h"
 uint32_t       millis() { return 0; }
@@ -185,6 +186,54 @@ static void test_three_field_trim_lines_still_parse() {
     CHECK(d && d->velOff == 1 && a->velOff == 0, "five fields: velocity switch read (default on)");
 }
 
+// DELETE: the entry leaves the table and samples.txt, its trim leaves
+// trim.txt, the others keep their ids — and the deleted id is not handed to
+// the next new sample (a song still pointing at it would play the wrong sound).
+static void test_remove_a_sample() {
+    printf("\ntest_remove_a_sample\n");
+    uint8_t k = idOf("kick.wav"), s = idOf("snare.wav"), h = idOf("hat.wav");
+    sampleTrimSet(h, 5, 50, 0, 120, 0, 0, -35);
+    sampleTrimSet(k, 1, 2, 0);
+    CHECK(sampleTrimSave(), "trims saved");
+
+    unlink((samplesDir() + "/hat.wav").c_str());       // the caller removes the WAV
+    CHECK(sampleManifestRemove(h), "remove succeeds");
+    CHECK(!sampleManifestRemove(h), "...and a second time there is nothing to remove");
+    CHECK(sampleManifestNameFor(h) == nullptr && idOf("hat.wav") == 0, "gone from the table");
+    CHECK(idOf("kick.wav") == k && idOf("snare.wav") == s, "the others keep their ids");
+    CHECK(readFile("/samples/samples.txt").find("hat.wav") == std::string::npos, "gone from samples.txt");
+    CHECK(sampleTrimFor(h) == nullptr && sampleTrimFor(k) != nullptr, "its trim is gone, the others stay");
+    char gone[16];
+    snprintf(gone, sizeof(gone), "\n%u=", (unsigned)h);
+    CHECK(("\n" + readFile("/samples/trim.txt")).find(gone) == std::string::npos, "gone from trim.txt");
+
+    addWav("clap.wav", 700);
+    CHECK(sampleManifestSync(), "a new sample arrives");
+    uint8_t c = idOf("clap.wav");
+    CHECK(c && c > h, "it gets a fresh id, not the deleted one");
+    CHECK(sampleManifestSync() && idOf("clap.wav") == c, "...which a rescan keeps");
+}
+
+// LEVEL rides in trim.txt as the eighth field; a level alone keeps an entry.
+static void test_level_round_trip() {
+    printf("\ntest_level_round_trip\n");
+    uint8_t k = idOf("kick.wav");
+    sampleTrimSet(k, 0, 0, 0, 0, 0, 0, 62);
+    const SampleTrim* t = sampleTrimFor(k);
+    CHECK(t && t->levelDb10 == 62, "a level alone keeps an entry");
+    CHECK(fabsf(sampleLevelFor(k) - 2.0417f) < 0.001f, "+6.2 dB = x2.04");
+    CHECK(sampleLevelFor(idOf("snare.wav")) == 1.0f, "no entry = unity");
+    sampleTrimSet(k, 0, 0, 0, 0, 0, 0, 9999);
+    CHECK(sampleTrimFor(k)->levelDb10 == SAMPLE_LEVEL_MAX_DB10, "clamped to the range");
+    sampleTrimSet(k, 0, 0, 0, 0, 0, 0, -123);
+    CHECK(sampleTrimSave(), "saved");
+    char want[64];
+    snprintf(want, sizeof(want), "%u=0:0:0:0:0:0:0:-123", (unsigned)k);
+    CHECK(readFile("/samples/trim.txt").find(want) != std::string::npos, "trim.txt has the level");
+    loadTrims();
+    CHECK(sampleTrimFor(k) && sampleTrimFor(k)->levelDb10 == -123, "and reads it back");
+}
+
 int main() {
     char tmpl[] = "/tmp/magitrac_manifest_XXXXXX";
     gMockSdRoot = mkdtemp(tmpl);
@@ -196,6 +245,8 @@ int main() {
     test_failed_sync_keeps_the_table();
     test_trims_load_once_and_memory_wins();
     test_three_field_trim_lines_still_parse();
+    test_remove_a_sample();
+    test_level_round_trip();
 
     std::string cmd = "rm -rf '" + gMockSdRoot + "'";
     system(cmd.c_str());

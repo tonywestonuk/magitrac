@@ -8,7 +8,10 @@
 // alphabetical order).  Format is ASCII, one entry per line:
 //     <id>=<filename.wav>\n
 // IDs are 1-based, unique, in [1, 127].  Entries for missing .wav files are
-// preserved (re-uploading the same name later re-links them).
+// preserved (re-uploading the same name later re-links them).  A `#hi=<id>`
+// line keeps the highest id ever given out, so a deleted sample's id isn't
+// handed straight to the next new one (a song still pointing at it would
+// suddenly play a different sound); ids are only reused once 127 is reached.
 
 #define SM_NAME_LEN     24    // includes .wav extension, null-terminated
 #define SM_MAX_ENTRIES  50    // soft cap chosen for BSS; PROG range allows 127
@@ -40,9 +43,15 @@ const char* sampleManifestNameFor(uint8_t id);
 // its file was not on the card.
 uint32_t sampleManifestSizeFor(uint8_t id);
 
+// Delete sample `id` (sample editor): its entry leaves samples.txt (written
+// back) and the table, and its trim/tune/level leave trim.txt.  The WAV
+// itself is the caller's to remove — before this, while the name is still
+// known.  Loop task only.  False if there is no such entry.
+bool sampleManifestRemove(uint8_t id);
+
 // ── /samples/trim.txt — non-destructive trim/loop/tune metadata ──────────────
 // The WAVs never change; playback (and the PSRAM preloader) applies these.
-// Format: <id>=<startFrame>:<endFrame>:<loop>[:<tuneCents>[:<velOff>[:<keepLen>[:<pitchCHz>]]]]\n
+// Format: <id>=<startFrame>:<endFrame>:<loop>[:<tuneCents>[:<velOff>[:<keepLen>[:<pitchCHz>[:<levelDb10>]]]]]\n
 //   endFrame 0 = end of file; the fields after loop are optional (older files
 //   have fewer) and default to 0.
 
@@ -55,11 +64,13 @@ struct SampleTrim {
                            // to an SFX column's TUNE wherever the sample plays.
     uint8_t  velOff;       // 1 = a MIDI key plays it at its own level, however
                            // hard it is struck (0 = louder/softer with velocity)
-    uint8_t  keepLen;      // 1 = other pitches keep its length (PSOLA, psola.cpp)
+    uint8_t  keepLen;      // 1 = other pitches keep its length (timestretch.cpp)
                            // instead of playing faster / slower
     uint32_t pitchCHz;     // its detected pitch in centi-Hz (ADD SAMPLE, AUTO
                            // TUNE), for reference: 0 = not analysed, 1 = unclear.
                            // Set by sampleTrimSetPitch, never by sampleTrimSet.
+    int16_t  levelDb10;    // LEVEL: gain applied wherever it plays, tenths of a
+                           // dB (AUTO LEVEL sets it; 0 = as recorded)
 };
 
 // Loaded alongside the manifest by sampleManifestSync().
@@ -78,6 +89,9 @@ static inline bool sampleKeepLenFor(uint8_t id) {
     return t && t->keepLen;
 }
 
+// LEVEL as a linear gain (1 = as recorded).  RAM lookup + a powf.
+float sampleLevelFor(uint8_t id);
+
 // True if the sample's velocity sensitivity is switched off.  RAM lookup only.
 static inline bool sampleVelOffFor(uint8_t id) {
     const SampleTrim* t = sampleTrimFor(id);
@@ -87,7 +101,8 @@ static inline bool sampleVelOffFor(uint8_t id) {
 // Update/insert in RAM (everything at its default removes the entry — unless
 // its pitch is known, which is kept).  Leaves pitchCHz alone.
 void sampleTrimSet(uint8_t id, uint32_t startFrame, uint32_t endFrame, uint8_t loop,
-                   int16_t tuneCents = 0, uint8_t velOff = 0, uint8_t keepLen = 0);
+                   int16_t tuneCents = 0, uint8_t velOff = 0, uint8_t keepLen = 0,
+                   int16_t levelDb10 = 0);
 // Record the sample's detected pitch (centi-Hz; 1 = no clear pitch).
 void sampleTrimSetPitch(uint8_t id, uint32_t pitchCHz);
 

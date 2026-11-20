@@ -319,6 +319,11 @@ void MagiLink::_runConnectLoop() {
         bool     waited        = false;
         while (WiFi.status() != WL_CONNECTED) {
             waited = true;
+            if (_holdReconnect) {               // a WiFi scan is running
+                vTaskDelay(pdMS_TO_TICKS(WIFI_WAIT_POLL_MS));
+                lastReconnect = millis();
+                continue;
+            }
             WiFi.setAutoReconnect(true);
             uint32_t now = millis();
             if (now - lastReconnect >= 3000) {
@@ -349,7 +354,7 @@ void MagiLink::_runConnectLoop() {
             // re-entered — the link wedges until a manual client reboot
             // (exactly the "client wouldn't reconnect" gig failure).  Force a
             // fresh association if connects keep failing despite "connected".
-            if (millis() - connectStartMs > STALE_ASSOC_MS) {
+            if (millis() - connectStartMs > STALE_ASSOC_MS && !_holdReconnect) {
                 Serial.println("[LINK-CON] connect stuck w/ WL_CONNECTED — forcing reassoc");
                 WiFi.disconnect();
                 vTaskDelay(pdMS_TO_TICKS(200));

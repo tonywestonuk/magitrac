@@ -32,6 +32,7 @@ static portMUX_TYPE              s_pathMux    = portMUX_INITIALIZER_UNLOCKED;
 static char                      s_pendingPath[64];
 static volatile float            s_pendingPitch = 0;   // semitones for the next play (fractional OK)
 static volatile uint8_t          s_pendingVol   = 127; // 0..127 for the next play
+static volatile float            s_pendingLevel = 1.0f;   // the sample's LEVEL, linear
 static volatile uint32_t         s_pendingStart = 0;   // trim, frames
 static volatile uint32_t         s_pendingEnd   = 0;   // 0 = end of file
 static volatile bool             s_pendingLoop  = false;
@@ -215,6 +216,15 @@ bool sampleRamVoicesActive() {
     return false;
 }
 
+// Squared taper (GM CC7-ish) on `volume` — perceived loudness tracks it, and
+// 127 is exactly unity — times the sample's LEVEL.  Above unity can clip, on
+// purpose; the mixers multiply in 64 bits, so a big boost can't wrap.
+static int32_t gainQ15(uint8_t volume, float level) {
+    double g = (double)volume * volume * 32767.0 / (127.0 * 127.0) * level;
+    if (g > 16777215.0) g = 16777215.0;
+    return (int32_t)g;
+}
+
 // Sum every active RAM voice into `out` (stereo int16 frames, already holding
 // the SD stream or silence).  Per-voice linear interp + gain + fades; int32
 // accumulate with clamp.  Runs on the WAV task only.
@@ -269,8 +279,8 @@ static void mixRamInto(int16_t* out, int frames) {
                 g = (int32_t)((int64_t)g * v.fadeRem / RAM_FADE_FRAMES);
                 v.fadeRem--;
             }
-            int32_t oL = out[i * 2 + 0] + ((sL * g) >> 15);
-            int32_t oR = out[i * 2 + 1] + ((sR * g) >> 15);
+            int32_t oL = out[i * 2 + 0] + (int32_t)(((int64_t)sL * g) >> 15);
+            int32_t oR = out[i * 2 + 1] + (int32_t)(((int64_t)sR * g) >> 15);
             if (oL >  32767) oL =  32767;
             if (oL < -32768) oL = -32768;
             if (oR >  32767) oR =  32767;
@@ -328,7 +338,7 @@ static double pitchRatio(float pitchSemitones) {
 int samplePlayRam(uint8_t sampleId, float pitchSemitones, uint8_t volume) {
     if (!s_ram || sampleId == 0) return -1;
     double  ratio = pitchRatio(pitchSemitones);
-    int32_t gain  = (int32_t)(volume * volume * 32767L) / (127 * 127);
+    int32_t gain  = gainQ15(volume, sampleLevelFor(sampleId));
 
     // Lookup and voice start in one critical section: the entry can't be half
     // written, and it can't be removed in between (removal needs an idle WAV
@@ -355,7 +365,7 @@ int samplePlayBuffer(const int16_t* data, uint32_t frames, uint32_t rate,
                      float pitchSemitones, uint8_t volume) {
     if (!data || !frames || !rate) return -1;
     double  ratio = pitchRatio(pitchSemitones);
-    int32_t gain  = (int32_t)(volume * volume * 32767L) / (127 * 127);
+    int32_t gain  = gainQ15(volume, 1.0f);
     portENTER_CRITICAL(&s_voiceMux);
     int handle = voiceStartLocked(data, frames, rate, 1, 0, ratio, gain);
     portEXIT_CRITICAL(&s_voiceMux);
@@ -387,10 +397,7 @@ static void wavTaskFn(void*) {
         if (havePath) {
             memcpy(activePath, s_pendingPath, sizeof(activePath));
             activePitch = s_pendingPitch;
-            // Squared taper (GM CC7-ish): perceived loudness tracks the value
-            // better than linear, and 127 stays exactly unity.
-            int v = s_pendingVol;
-            activeGainQ15 = (int32_t)(v * v * 32767L) / (127 * 127);
+            activeGainQ15 = gainQ15(s_pendingVol, s_pendingLevel);
             activeStart = s_pendingStart;
             activeEnd   = s_pendingEnd;
             activeLoop  = s_pendingLoop;
@@ -546,7 +553,7 @@ static void wavTaskFn(void*) {
                 if (outFrames > 0) {
                     if (activeGainQ15 != 32767) {          // (above unity it can clip — on purpose)
                         for (int k = 0; k < outFrames * 2; k++) {
-                            int32_t s = ((int32_t)outBuf[k] * activeGainQ15) >> 15;
+                            int32_t s = (int32_t)(((int64_t)outBuf[k] * activeGainQ15) >> 15);
                             if (s >  32767) s =  32767;
                             if (s < -32768) s = -32768;
                             outBuf[k] = (int16_t)s;
@@ -604,12 +611,13 @@ void samplePlayerInit() {
 }
 
 void samplePlayerPlay(const char* path, float pitchSemitones, uint8_t volume,
-                      uint32_t startFrame, uint32_t endFrame, bool loop) {
+                      uint32_t startFrame, uint32_t endFrame, bool loop, float level) {
     portENTER_CRITICAL(&s_pathMux);
     strncpy(s_pendingPath, path, sizeof(s_pendingPath) - 1);
     s_pendingPath[sizeof(s_pendingPath) - 1] = '\0';
     s_pendingPitch = pitchSemitones;
     s_pendingVol   = volume;
+    s_pendingLevel = level;
     s_pendingStart = startFrame;
     s_pendingEnd   = endFrame;
     s_pendingLoop  = loop;
@@ -687,11 +695,119 @@ static uint8_t           s_tuneJob   = 0;     // being analysed
 static bool              s_tuneDone  = false;
 static uint8_t           s_tuneDoneId = 0, s_tuneDoneRes = 0;
 static float             s_tuneDoneHz = 0;
-#define AUTOTUNE_WAIT_MS 6000                 // for the sample to reach the cache
+#define AUTOTUNE_WAIT_MS 6000                 // for a sample being loaded right now
 
 static void tuneAnswer(uint8_t id, uint8_t res, float hz) {
     s_tuneDoneId = id; s_tuneDoneRes = res; s_tuneDoneHz = hz;
     s_tuneDone = true;
+}
+
+// AUTO TUNE on a sample that isn't in the cache (too big for it, or simply
+// not wanted there): up to AUTOTUNE_READ_SECS from its trim start, read off
+// the card a step per tick, left channel only (a stereo sample is analysed on
+// its left anyway) — at most 480 KB of PSRAM, freed once it's analysed.
+#define AUTOTUNE_READ_SECS 5
+#define AUTOTUNE_READ_STEP 16384
+static struct TuneRead {
+    uint8_t  id;              // 0 = not reading
+    File     f;
+    int16_t* buf;             // mono, PSRAM
+    uint8_t* stage;           // one step's raw frames, PSRAM
+    uint32_t frames, got;
+    uint32_t rate;
+    uint8_t  ch;
+} s_tuneRd;
+static int16_t* s_tuneBuf      = nullptr;  // read from the card, waiting for / under analysis
+static uint8_t  s_tuneBufId    = 0;
+static uint32_t s_tuneBufFrames = 0, s_tuneBufRate = 0;
+
+static void tuneReadEnd() {
+    { SdLock _; if (s_tuneRd.f) s_tuneRd.f.close(); }
+    free(s_tuneRd.stage);
+    free(s_tuneRd.buf);
+    s_tuneRd.stage = nullptr;
+    s_tuneRd.buf   = nullptr;
+    s_tuneRd.id    = 0;
+}
+
+// Open sample id's WAV at its trim start: the trimmed region's length in
+// frames, its rate and channels.  (Same canonical-WAV assumptions as the
+// streamer and the preloader.)  On false nothing is left open.
+static bool openTrimmed(uint8_t id, File& f, uint32_t& rate, uint8_t& ch, uint32_t& frames) {
+    const char* fname = sampleManifestNameFor(id);
+    uint32_t    fsize = sampleManifestSizeFor(id);
+    if (!fname || fsize <= 44 + 8) return false;
+    char path[64];
+    snprintf(path, sizeof(path), "/samples/%s", fname);
+    uint8_t hdr[44];
+    bool ok;
+    {
+        SdLock _;
+        f  = SD.open(path);
+        ok = f && f.read(hdr, sizeof(hdr)) == sizeof(hdr);
+    }
+    rate = (uint32_t)hdr[24] | ((uint32_t)hdr[25] << 8)
+         | ((uint32_t)hdr[26] << 16) | ((uint32_t)hdr[27] << 24);
+    uint16_t numCh   = (uint16_t)hdr[22] | ((uint16_t)hdr[23] << 8);
+    uint16_t bitsPer = (uint16_t)hdr[34] | ((uint16_t)hdr[35] << 8);
+    if (ok) ok = (numCh == 1 || numCh == 2) && bitsPer == 16 && rate >= 8000 && rate <= 48000;
+    uint32_t frameBytes = (uint32_t)(numCh ? numCh : 1) * 2, stF = 0;
+    frames = 0;
+    if (ok) {
+        uint32_t st, en; uint8_t lp;
+        rawTrim(id, st, en, lp);
+        uint32_t total = (fsize - 44) / frameBytes;
+        uint32_t enF = en ? en : total;
+        stF = st < total ? st : 0;
+        if (enF > total || enF <= stF) enF = total;
+        frames = enF - stF;
+        ok = frames > 0;
+    }
+    if (ok) { SdLock _; ok = f.seek(44 + stF * frameBytes); }
+    if (!ok) { SdLock _; if (f) f.close(); return false; }
+    ch = (uint8_t)numCh;
+    return true;
+}
+
+static bool tuneReadStart(uint8_t id) {
+    uint32_t rate, frames;
+    uint8_t  ch;
+    if (!openTrimmed(id, s_tuneRd.f, rate, ch, frames)) return false;
+    if (frames > rate * AUTOTUNE_READ_SECS) frames = rate * AUTOTUNE_READ_SECS;
+    s_tuneRd.id    = id;                    // (so tuneReadEnd tidies a failure)
+    s_tuneRd.buf   = (int16_t*)heap_caps_malloc(frames * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    s_tuneRd.stage = (uint8_t*)heap_caps_malloc(AUTOTUNE_READ_STEP, MALLOC_CAP_SPIRAM);
+    if (!s_tuneRd.buf || !s_tuneRd.stage) { tuneReadEnd(); return false; }
+    s_tuneRd.frames = frames;
+    s_tuneRd.got    = 0;
+    s_tuneRd.rate   = rate;
+    s_tuneRd.ch     = ch;
+    return true;
+}
+
+// One step: 1 = all read, 0 = more to come, -1 = the card failed us.
+static int tuneReadStep() {
+    TuneRead& r = s_tuneRd;
+    uint32_t frameBytes = (uint32_t)r.ch * 2;
+    uint32_t want = (r.frames - r.got) * frameBytes;
+    if (want > AUTOTUNE_READ_STEP) want = AUTOTUNE_READ_STEP - AUTOTUNE_READ_STEP % frameBytes;
+    int n;
+    { SdLock _; n = r.f.read(r.stage, want); }
+    uint32_t nf = n > 0 ? (uint32_t)n / frameBytes : 0;
+    if (nf == 0) return r.got > 0 ? 1 : -1;  // a short file: analyse what there is
+    const int16_t* in = (const int16_t*)r.stage;
+    for (uint32_t i = 0; i < nf; i++) r.buf[r.got + i] = in[i * r.ch];
+    r.got += nf;
+    return r.got >= r.frames ? 1 : 0;
+}
+
+// The analysis is over (answered or cancelled): let the sample go.
+static void tuneFinish() {
+    s_tuneJob  = 0;
+    s_pitchPin = 0;
+    free(s_tuneBuf);
+    s_tuneBuf   = nullptr;
+    s_tuneBufId = 0;
 }
 
 static bool cacheEvict(int i) {
@@ -811,8 +927,8 @@ bool samplePreloadDropAllNow() {
     if (s_streaming) return false;
     if (s_pitchPin) {                       // AUTO TUNE gives way (answers NOT READY)
         if (pitchJob() == s_pitchJobNo) pitchAbort();
-        if (s_tuneJob == s_pitchPin) { tuneAnswer(s_tuneJob, SAMPLE_TUNE_NOT_READY, 0); s_tuneJob = 0; }
-        s_pitchPin = 0;
+        tuneAnswer(s_tuneJob, SAMPLE_TUNE_NOT_READY, 0);
+        tuneFinish();
     }
     if (s_job.active) jobAbort(false);
     for (int i = 0; i < RAM_CACHE_MAX; i++)
@@ -965,51 +1081,177 @@ bool sampleAutoTuneTake(uint8_t& id, uint8_t& result, float& hz) {
     return true;
 }
 
+// ── AUTO LEVEL: the loudest point of a sample's trimmed region ───────────────
+// Read off the card a step per tick, cached or not (the file is the truth, and
+// the cache may drop the sample meanwhile); both channels.
+#define AUTOLEVEL_READ_STEP 16384
+static volatile uint8_t s_levelReq = 0;
+static struct LevelScan {
+    uint8_t  id;              // 0 = not scanning
+    File     f;
+    uint8_t* stage;           // PSRAM
+    uint32_t left;            // bytes of the region still to read
+    uint32_t peak;
+} s_lv;
+static bool     s_levelDone = false, s_levelDoneOk = false;
+static uint8_t  s_levelDoneId = 0;
+static uint32_t s_levelDonePeak = 0;
+
+void sampleAutoLevelRequest(uint8_t id) { s_levelReq = id; }
+
+static void levelEnd(bool ok) {
+    { SdLock _; if (s_lv.f) s_lv.f.close(); }
+    free(s_lv.stage);
+    s_lv.stage      = nullptr;
+    s_levelDoneId   = s_lv.id;
+    s_levelDoneOk   = ok;
+    s_levelDonePeak = s_lv.peak;
+    s_levelDone     = true;
+    s_lv.id         = 0;
+}
+
+void sampleLevelTick() {
+    if (!s_lv.id) {
+        uint8_t id = s_levelReq;
+        if (!id) return;
+        s_levelReq = 0;
+        uint32_t rate, frames;
+        uint8_t  ch;
+        s_lv.id   = id;
+        s_lv.peak = 0;
+        s_lv.stage = nullptr;
+        if (!openTrimmed(id, s_lv.f, rate, ch, frames)) { levelEnd(false); return; }
+        s_lv.left  = frames * ch * 2;
+        s_lv.stage = (uint8_t*)heap_caps_malloc(AUTOLEVEL_READ_STEP, MALLOC_CAP_SPIRAM);
+        if (!s_lv.stage) levelEnd(false);
+        return;
+    }
+    uint32_t want = s_lv.left < AUTOLEVEL_READ_STEP ? s_lv.left : AUTOLEVEL_READ_STEP;
+    int n;
+    { SdLock _; n = s_lv.f.read(s_lv.stage, want); }
+    if (n <= 0) { levelEnd(false); return; }
+    const int16_t* p = (const int16_t*)s_lv.stage;
+    uint32_t peak = s_lv.peak;
+    for (int k = 0; k < n / 2; k++) {
+        int32_t v = p[k];
+        if (v < 0) v = -v;                   // -32768 → 32768
+        if ((uint32_t)v > peak) peak = (uint32_t)v;
+    }
+    s_lv.peak = peak;
+    s_lv.left -= (uint32_t)n < s_lv.left ? (uint32_t)n : s_lv.left;
+    if (s_lv.left == 0) levelEnd(true);
+}
+
+bool sampleAutoLevelTake(uint8_t& id, bool& ok, uint32_t& peak) {
+    if (!s_levelDone) return false;
+    s_levelDone = false;
+    id   = s_levelDoneId;
+    ok   = s_levelDoneOk;
+    peak = s_levelDonePeak;
+    return true;
+}
+
+// ── DELETE: let go of a sample ───────────────────────────────────────────────
+bool samplePreloadForgetStep(uint8_t id) {
+    if (!id) return true;
+    if (s_job.active && s_job.id == id) jobAbort(false);
+    if (s_tuneReq == id) s_tuneReq = 0;
+    if (s_tuneJob == id) {
+        if (pitchJob() == s_pitchJobNo) pitchAbort();
+        tuneAnswer(id, SAMPLE_TUNE_NOT_READY, 0);
+        tuneFinish();
+    }
+    if (s_tuneRd.id == id) {
+        tuneReadEnd();
+        tuneAnswer(id, SAMPLE_TUNE_NOT_READY, 0);
+    }
+    if (s_tuneBufId == id) {                 // read, not yet being analysed
+        tuneAnswer(id, SAMPLE_TUNE_NOT_READY, 0);
+        tuneFinish();
+    }
+    if (s_levelReq == id) s_levelReq = 0;
+    if (s_lv.id == id) { levelEnd(false); s_levelDone = false; }
+    int i = s_ram ? cacheFind(id) : -1;
+    return i < 0 || cacheEvict(i);           // false: a voice still on it — next pass
+}
+
 bool samplePitchTick(bool mayStart) {
-    if (s_pitchPin) {
-        if (pitchJob() != s_pitchJobNo) {                    // replaced
-            if (s_tuneJob == s_pitchPin) { tuneAnswer(s_tuneJob, SAMPLE_TUNE_NOT_READY, 0); s_tuneJob = 0; }
-            s_pitchPin = 0;
+    // An analysis running: a cached sample (pinned) or one read off the card.
+    if (s_tuneJob) {
+        if (pitchJob() != s_pitchJobNo) {                    // replaced (ADD SAMPLE)
+            tuneAnswer(s_tuneJob, SAMPLE_TUNE_NOT_READY, 0);
+            tuneFinish();
             return false;
         }
         if (!pitchStep()) return false;
         PitchResult r = pitchResult();
-        if (s_tuneJob == s_pitchPin) {
-            tuneAnswer(s_tuneJob, r.found ? SAMPLE_TUNE_FOUND : SAMPLE_TUNE_UNCLEAR, r.hz);
-            s_tuneJob = 0;
-        }
+        tuneAnswer(s_tuneJob, r.found ? SAMPLE_TUNE_FOUND : SAMPLE_TUNE_UNCLEAR, r.hz);
         uint32_t chz = 1;                                    // 1 = no clear pitch
         if (r.found) {
             chz = (uint32_t)lrintf(r.hz * 100.0f);
             if (chz < 2) chz = 2;
         }
-        sampleTrimSetPitch(s_pitchPin, chz);
+        sampleTrimSetPitch(s_tuneJob, chz);
         sampleTrimSave();
-        Serial.printf("[SP] AUTO TUNE: sample %u pitch %s%.2f Hz\n", (unsigned)s_pitchPin,
-                      r.found ? "" : "unclear, ", r.found ? r.hz : 0.0f);
-        s_pitchPin = 0;
+        Serial.printf("[SP] AUTO TUNE: sample %u pitch %s%.2f Hz%s\n", (unsigned)s_tuneJob,
+                      r.found ? "" : "unclear, ", r.found ? r.hz : 0.0f,
+                      s_tuneBuf ? " (first seconds, from the card)" : "");
+        tuneFinish();
         return true;
     }
-    if (!mayStart || !s_ram || pitchBusy()) return false;
+
+    // Reading one off the card, a step per tick.
+    if (s_tuneRd.id) {
+        int st = tuneReadStep();
+        if (st == 0) return false;
+        uint8_t id = s_tuneRd.id;
+        if (st > 0) {
+            s_tuneBuf       = s_tuneRd.buf;                  // hand the buffer over
+            s_tuneBufId     = id;
+            s_tuneBufFrames = s_tuneRd.got;
+            s_tuneBufRate   = s_tuneRd.rate;
+            s_tuneRd.buf    = nullptr;
+        }
+        tuneReadEnd();
+        if (st < 0) tuneAnswer(id, SAMPLE_TUNE_NOT_READY, 0);
+        return false;
+    }
+
+    if (!mayStart || pitchBusy()) return false;
+
+    // Read off the card: analyse it.
+    if (s_tuneBuf) {
+        uint8_t id = s_tuneBufId;
+        if (pitchBegin(s_tuneBuf, s_tuneBufFrames, s_tuneBufRate, 1)) {
+            s_tuneJob    = id;
+            s_pitchJobNo = pitchJob();
+        } else {                                             // too short to analyse
+            pitchStep();
+            tuneAnswer(id, SAMPLE_TUNE_UNCLEAR, 0);
+            tuneFinish();
+        }
+        return false;
+    }
+
     uint8_t req = s_tuneReq;
-    if (req) {
-        int i = cacheFind(req);
-        if (i >= 0 && s_ram[i].data &&
-            pitchBegin(s_ram[i].data, s_ram[i].frames, s_ram[i].rate, s_ram[i].ch)) {
-            s_tuneReq    = 0;
+    if (!req) return false;
+    int i = s_ram ? cacheFind(req) : -1;
+    if (i >= 0 && s_ram[i].data) {                           // in the cache: use that
+        s_tuneReq = 0;
+        if (pitchBegin(s_ram[i].data, s_ram[i].frames, s_ram[i].rate, s_ram[i].ch)) {
             s_tuneJob    = req;
             s_pitchPin   = req;
             s_pitchJobNo = pitchJob();
-            return false;
-        }
-        if (i >= 0) {                                        // too short to analyse
+        } else {                                             // too short to analyse
             pitchStep();
-            s_tuneReq = 0;
             tuneAnswer(req, SAMPLE_TUNE_UNCLEAR, 0);
-        } else if (millis() - s_tuneReqMs > AUTOTUNE_WAIT_MS) {
-            s_tuneReq = 0;
-            tuneAnswer(req, SAMPLE_TUNE_NOT_READY, 0);
         }
+        return false;
     }
+    // Being loaded into the cache right now: wait for that (briefly).
+    if (s_job.active && s_job.id == req && millis() - s_tuneReqMs < AUTOTUNE_WAIT_MS) return false;
+    // Otherwise read its first seconds off the card.
+    s_tuneReq = 0;
+    if (!tuneReadStart(req)) tuneAnswer(req, SAMPLE_TUNE_NOT_READY, 0);   // no file / unreadable
     return false;
 }

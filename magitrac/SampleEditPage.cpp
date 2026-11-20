@@ -31,6 +31,11 @@ void SampleEditPage::open(uint8_t sampleId, const char* name, uint8_t col,
     _tuneMode   = false;
     _doneArmed  = false;
     _autoState  = 0;
+    _levelDlg   = false;
+    _lvlState   = 0;
+    _level      = 0;       // until the server's meta arrives
+    _deleting   = false;
+    _deleted    = false;
     _viewStart  = 0;
     _viewEnd    = 0;   // whole file
     _sampleTune = 0;       // until the server's meta arrives
@@ -71,6 +76,7 @@ void SampleEditPage::adopt() {
     _velOff = _info.velOff != 0;
     _keepLen = _info.keepLen != 0;
     _sampleTune = _info.tuneCents;
+    _level      = _info.levelDb10;
     if (_start >= _info.totalFrames) _start = 0;
     if (_end > _info.totalFrames)    _end   = 0;
     _loading = false;
@@ -79,7 +85,7 @@ void SampleEditPage::adopt() {
 void SampleEditPage::sendMeta() {
     gServerPairing.sendSampleEdit(SAMPLE_EDIT_SET, _sampleId,
                                   _start, _end, _loop ? 1 : 0, _sampleTune,
-                                  60, _velOff ? 1 : 0, _keepLen ? 1 : 0);
+                                  60, _velOff ? 1 : 0, _keepLen ? 1 : 0, _level);
 }
 
 void SampleEditPage::fetchView() {
@@ -98,13 +104,14 @@ void SampleEditPage::formatTime(uint32_t frame, char* out, int outLen) const {
 void SampleEditPage::drawHeader() {
     _d.fillRect(0, 0, 960, SE_HDR_H, COL_BLACK);
     if (_tuneMode) {
+        const char* title = _levelDlg ? "LEVEL" : "TUNE";
         _d.setTextSize(3);
         _d.setTextColor(COL_WHITE);
         _d.setCursor(12, (SE_HDR_H - 24) / 2);
-        _d.print("TUNE");
+        _d.print(title);
         _d.setTextSize(2);
         _d.setTextColor(COL_LTGREY);
-        _d.setCursor(12 + 4 * 18 + 18, (SE_HDR_H - 16) / 2);
+        _d.setCursor(12 + (int)strlen(title) * 18 + 18, (SE_HDR_H - 16) / 2);
         _d.print(_name);
         uiButton(_d, SE_PLAY_X, SE_BTN_Y, SE_PLAY_W, SE_BTN_H,
                  _playing ? "STOP" : "PLAY",
@@ -132,6 +139,9 @@ void SampleEditPage::drawHeader() {
                  _loop ? "LOOP ON" : "LOOP OFF",
                  _loop ? COL_BLACK : COL_WHITE,
                  _loop ? COL_WHITE : COL_BLACK, 2);
+        if (standalone())          // (from a column, the column still points at it)
+            uiButton(_d, SE_DEL_X, SE_BTN_Y, SE_DEL_W, SE_BTN_H, "DELETE",
+                     COL_WHITE, COL_BLACK, 2);
         uiButton(_d, SE_PLAY_X, SE_BTN_Y, SE_PLAY_W, SE_BTN_H,
                  _playing ? "STOP" : "PLAY",
                  _playing ? COL_BLACK : COL_WHITE,
@@ -271,6 +281,7 @@ void SampleEditPage::drawZoomRow() {
     _d.print(z);
 
     drawTune();
+    drawLevel();
 
     uiButton(_d, SE_SPEC_X, btnY, SE_SPEC_W, SE_BTN_H, "SPECTRUM",
              COL_WHITE, COL_BLACK, 2);
@@ -280,6 +291,12 @@ void SampleEditPage::drawZoomRow() {
 static void fmtTune(int16_t t, char* v, int n) {
     int a = (t < 0) ? -t : t;
     snprintf(v, n, "%c%d.%02d", (t < 0) ? '-' : '+', a / 100, a % 100);
+}
+
+// LEVEL in dB, tenths shown: "+6.2".
+static void fmtLevel(int16_t l, char* v, int n) {
+    int a = (l < 0) ? -l : l;
+    snprintf(v, n, "%c%d.%d", (l < 0) ? '-' : '+', a / 10, a % 10);
 }
 
 static void noteName(uint8_t note, char* out, int n) {
@@ -296,9 +313,10 @@ void SampleEditPage::drawTune() {
         int btnY = SE_ZOOM_Y + (SE_ZOOM_H - SE_BTN_H) / 2;
         char l[24];
         snprintf(l, sizeof(l), "TUNE %s", v);
-        uiButton(_d, SE_TUNE_X, btnY, SE_TUNE_W, SE_BTN_H, l, COL_WHITE, COL_BLACK, 3);
+        uiButton(_d, SE_TUNE_X, btnY, SE_TUNE_W, SE_BTN_H, l, COL_WHITE, COL_BLACK, 2);
         return;
     }
+    if (_levelDlg) return;
     _d.fillRect(0, SE_TD_VAL_Y - 10, 960, 130, COL_WHITE);
     _d.setTextSize(8);
     _d.setTextColor(COL_BLACK);
@@ -311,7 +329,60 @@ void SampleEditPage::drawTune() {
     _d.print(cap);
 }
 
+// The zoom row's [LEVEL +6.2dB] button, or — in the LEVEL dialog — the big value.
+void SampleEditPage::drawLevel() {
+    char v[16];
+    fmtLevel(_level, v, sizeof(v));
+    if (!_tuneMode) {
+        int btnY = SE_ZOOM_Y + (SE_ZOOM_H - SE_BTN_H) / 2;
+        char l[24];
+        snprintf(l, sizeof(l), "LEVEL %sdB", v);
+        uiButton(_d, SE_LVL_X, btnY, SE_LVL_W, SE_BTN_H, l, COL_WHITE, COL_BLACK, 2);
+        return;
+    }
+    if (!_levelDlg) return;
+    strncat(v, " dB", sizeof(v) - strlen(v) - 1);
+    _d.fillRect(0, SE_TD_VAL_Y - 10, 960, 130, COL_WHITE);
+    _d.setTextSize(8);
+    _d.setTextColor(COL_BLACK);
+    _d.setCursor(480 - (int)strlen(v) * 48 / 2, SE_TD_VAL_Y);
+    _d.print(v);
+    _d.setTextSize(2);
+    _d.setTextColor(COL_DKGREY);
+    const char* cap = "LOUDER / QUIETER, IN DECIBELS   (0 = as recorded)";
+    _d.setCursor(480 - (int)strlen(cap) * 6, SE_TD_VAL_Y + 84);
+    _d.print(cap);
+}
+
 void SampleEditPage::drawAutoStatus() {
+    if (_levelDlg) {
+        bool busy = _lvlState == 1;
+        uiButton(_d, SE_TD_AUTO_X, SE_TD_AUTO_Y, SE_TD_AUTO_W, SE_TD_AUTO_H,
+                 busy ? "MEASURING..." : "AUTO LEVEL",
+                 COL_WHITE, busy ? COL_DKGREY : COL_BLACK, 3);
+        char m[96];
+        switch (_lvlState) {
+            case 1:  snprintf(m, sizeof(m), "Finding its loudest point..."); break;
+            case 2:  if (_level >= SAMPLE_LEVEL_MAX_DB10)
+                         snprintf(m, sizeof(m), "Very quiet (loudest %u%%) - boosted the most it can",
+                                  (unsigned)_lvlPeakPct);
+                     else
+                         snprintf(m, sizeof(m), "Loudest point was %u%% - now %d%%",
+                                  (unsigned)_lvlPeakPct, SAMPLE_LEVEL_TARGET_PCT);
+                     break;
+            case 3:  snprintf(m, sizeof(m), "It's silent - level left as it was"); break;
+            case 4:  snprintf(m, sizeof(m), "Couldn't read the sample - try again"); break;
+            case 5:  snprintf(m, sizeof(m), "No answer from the server"); break;
+            default: snprintf(m, sizeof(m), "AUTO LEVEL sets its loudest point to %d%%",
+                              SAMPLE_LEVEL_TARGET_PCT); break;
+        }
+        _d.fillRect(0, SE_TD_MSG_Y - 8, 960, 40, COL_WHITE);
+        _d.setTextSize(2);
+        _d.setTextColor(_lvlState == 0 ? COL_DKGREY : COL_BLACK);
+        _d.setCursor(480 - (int)strlen(m) * 6, SE_TD_MSG_Y);
+        _d.print(m);
+        return;
+    }
     bool asking = _autoState == 1;
     uiButton(_d, SE_TD_AUTO_X, SE_TD_AUTO_Y, SE_TD_AUTO_W, SE_TD_AUTO_H,
              asking ? "LISTENING..." : "AUTO TUNE",
@@ -323,7 +394,7 @@ void SampleEditPage::drawAutoStatus() {
                  snprintf(m, sizeof(m), "It is %s %+d cents - tuned so C4 plays middle C",
                           nn, (int)_autoCents); break;
         case 3:  snprintf(m, sizeof(m), "No clear pitch - tuning left as it was"); break;
-        case 4:  snprintf(m, sizeof(m), "Not in memory (still loading, or too big) - try again"); break;
+        case 4:  snprintf(m, sizeof(m), "Couldn't read the sample - try again"); break;
         case 5:  snprintf(m, sizeof(m), "No answer from the server"); break;
         default: snprintf(m, sizeof(m), "AUTO TUNE finds its pitch and tunes it to middle C"); break;
     }
@@ -338,10 +409,13 @@ void SampleEditPage::drawTuneDialog() {
     _d.fillScreen(COL_WHITE);
     drawHeader();
     drawTune();
-    static const char* LBL[5] = { "-ST", "-", "+", "+ST", "ZERO" };
+    drawLevel();
+    static const char* TLBL[5] = { "-ST", "-", "+", "+ST", "ZERO" };
+    static const char* LLBL[5] = { "-1dB", "-", "+", "+1dB", "ZERO" };
+    const char* const* lbl = _levelDlg ? LLBL : TLBL;
     for (int i = 0; i < 5; i++)
         uiButton(_d, SE_TD_BTN_X0 + i * SE_TD_BTN_STEP, SE_TD_BTN_Y, SE_TD_BTN_W, SE_TD_BTN_H,
-                 LBL[i], COL_WHITE, COL_BLACK, (i == 1 || i == 2) ? 4 : 3);
+                 lbl[i], COL_WHITE, COL_BLACK, (i == 1 || i == 2) ? 4 : 3);
     drawAutoStatus();
 }
 
@@ -354,6 +428,32 @@ void SampleEditPage::stepTune(int cents) {
     if (v == _sampleTune) return;
     _sampleTune = (int16_t)v;
     drawTune();
+    _d.paintLater();
+}
+
+void SampleEditPage::stepLevel(int db10) {
+    int v = (int)_level + db10;
+    if (v < SAMPLE_LEVEL_MIN_DB10) v = SAMPLE_LEVEL_MIN_DB10;
+    if (v > SAMPLE_LEVEL_MAX_DB10) v = SAMPLE_LEVEL_MAX_DB10;
+    if (v == _level) return;
+    _level = (int16_t)v;
+    drawLevel();
+    _d.paintLater();
+}
+
+// The dialog's −/+: `big` = a semitone / a dB, else _tuneStep cents / tenths.
+void SampleEditPage::stepValue(int dir, bool big) {
+    if (_levelDlg) stepLevel(dir * (big ? 10 : _tuneStep));
+    else           stepTune(dir * (big ? 100 : _tuneStep));
+}
+
+void SampleEditPage::drawDeleting(const char* line) {
+    _d.fillScreen(COL_WHITE);
+    drawHeader();
+    _d.setTextSize(3);
+    _d.setTextColor(COL_BLACK);
+    _d.setCursor(480 - (int)strlen(line) * 9, 260);
+    _d.print(line);
     _d.paintLater();
 }
 
@@ -543,24 +643,35 @@ bool SampleEditPage::pollTuneDialog(bool down, int tx, int ty) {
             int i   = (tx - SE_TD_BTN_X0) / SE_TD_BTN_STEP;
             int off = (tx - SE_TD_BTN_X0) % SE_TD_BTN_STEP;
             if (i > 4 || off >= SE_TD_BTN_W) return false;
+            _tuneStep = 1;
             switch (i) {
-                case 0: stepTune(-100); _tuneHold.start(1, -1); break;          // a semitone
-                case 1: _tuneStep = 1; stepTune(-1); _tuneHold.start(0, -1); break;   // a cent,
-                case 2: _tuneStep = 1; stepTune(+1); _tuneHold.start(0, +1); break;   // faster held
-                case 3: stepTune(+100); _tuneHold.start(1, +1); break;
+                case 0: stepValue(-1, true);  _tuneHold.start(1, -1); break;   // a semitone / dB
+                case 1: stepValue(-1, false); _tuneHold.start(0, -1); break;   // a cent / tenth,
+                case 2: stepValue(+1, false); _tuneHold.start(0, +1); break;   // faster held
+                case 3: stepValue(+1, true);  _tuneHold.start(1, +1); break;
                 case 4:
-                    if (_sampleTune) {
-                        _sampleTune = 0;
+                    if (_levelDlg ? _level != 0 : _sampleTune != 0) {
+                        if (_levelDlg) _level = 0; else _sampleTune = 0;
                         sendMeta();
                         drawTune();
+                        drawLevel();
                         _d.paintLater();
                     }
                     break;
             }
             return false;
         }
-        if (tx >= SE_TD_AUTO_X && tx < SE_TD_AUTO_X + SE_TD_AUTO_W &&
-            ty >= SE_TD_AUTO_Y && ty < SE_TD_AUTO_Y + SE_TD_AUTO_H && _autoState != 1) {
+        bool onAuto = tx >= SE_TD_AUTO_X && tx < SE_TD_AUTO_X + SE_TD_AUTO_W &&
+                      ty >= SE_TD_AUTO_Y && ty < SE_TD_AUTO_Y + SE_TD_AUTO_H;
+        if (onAuto && _levelDlg && _lvlState != 1) {
+            MsgSampleResult stale;
+            gServerPairing.takeSampleResult(stale);
+            _lvlState  = 1;
+            _lvlSentMs = millis();
+            gServerPairing.sendSampleEdit(SAMPLE_EDIT_AUTOLEVEL, _sampleId);
+            drawAutoStatus();
+            _d.paintLater();
+        } else if (onAuto && !_levelDlg && _autoState != 1) {
             MsgSampleTune stale;
             gServerPairing.takeSampleTune(stale);
             _autoState  = 1;
@@ -578,12 +689,70 @@ bool SampleEditPage::pollTuneDialog(bool down, int tx, int ty) {
         if (_doneArmed) {
             _doneArmed = false;
             _tuneMode  = false;
+            _levelDlg  = false;
             _d.clear();
             draw();
             _d.paintLater();
         }
     }
     return false;
+}
+
+// AUTO TUNE's and AUTO LEVEL's answers: applied (and stored) even if the
+// dialog was left.
+void SampleEditPage::pollAnswers() {
+    if (_autoState == 1) {
+        MsgSampleTune at;
+        bool got = gServerPairing.takeSampleTune(at) && at.sampleId == _sampleId;
+        if (got || (uint32_t)(millis() - _autoSentMs) > SE_AUTO_TIMEOUT_MS) {
+            if (!got) {
+                _autoState = 5;
+            } else if (at.result == SAMPLE_TUNE_FOUND) {
+                _autoState  = 2;
+                _autoNote   = at.note;
+                _autoCents  = at.cents;
+                _sampleTune = at.tuneCents;
+                sendMeta();
+            } else {
+                _autoState = (at.result == SAMPLE_TUNE_UNCLEAR) ? 3 : 4;
+            }
+            if (_tuneMode) {
+                drawTune();
+                drawAutoStatus();
+                _d.paintLater();
+            } else if (_specMode == 0 && !_loading) {
+                drawTune();
+                _d.paintLater();
+            }
+        }
+    }
+
+
+    if (_lvlState == 1 && !_deleting) {
+        MsgSampleResult r;
+        bool got = gServerPairing.takeSampleResult(r) && r.sampleId == _sampleId &&
+                   r.op == SAMPLE_EDIT_AUTOLEVEL;
+        if (got || (uint32_t)(millis() - _lvlSentMs) > SE_LEVEL_TIMEOUT_MS) {
+            if (!got) {
+                _lvlState = 5;
+            } else if (r.result == SAMPLE_RES_OK) {
+                _lvlState   = 2;
+                _lvlPeakPct = r.peakPct;
+                _level      = r.levelDb10;
+                sendMeta();
+            } else {
+                _lvlState = (r.result == SAMPLE_RES_SILENT) ? 3 : 4;
+            }
+            if (_tuneMode && _levelDlg) {
+                drawLevel();
+                drawAutoStatus();
+                _d.paintLater();
+            } else if (!_tuneMode && _specMode == 0 && !_loading) {
+                drawLevel();
+                _d.paintLater();
+            }
+        }
+    }
 }
 
 void SampleEditPage::auditionStop() {
@@ -630,31 +799,34 @@ bool SampleEditPage::poll() {
         }
     }
 
-    // AUTO TUNE's answer: apply it (and store it) even if the dialog was left.
-    if (_autoState == 1) {
-        MsgSampleTune at;
-        bool got = gServerPairing.takeSampleTune(at) && at.sampleId == _sampleId;
-        if (got || (uint32_t)(millis() - _autoSentMs) > SE_AUTO_TIMEOUT_MS) {
-            if (!got) {
-                _autoState = 5;
-            } else if (at.result == SAMPLE_TUNE_FOUND) {
-                _autoState  = 2;
-                _autoNote   = at.note;
-                _autoCents  = at.cents;
-                _sampleTune = at.tuneCents;
-                sendMeta();
-            } else {
-                _autoState = (at.result == SAMPLE_TUNE_UNCLEAR) ? 3 : 4;
-            }
-            if (_tuneMode) {
-                drawTune();
-                drawAutoStatus();
-                _d.paintLater();
-            } else if (_specMode == 0 && !_loading) {
-                drawTune();
-                _d.paintLater();
-            }
+    pollAnswers();
+
+    // DELETE's answer: done = back to the squares (which fetch the list again).
+    if (_deleting) {
+        MsgSampleResult r;
+        bool got = gServerPairing.takeSampleResult(r) && r.sampleId == _sampleId &&
+                   r.op == SAMPLE_EDIT_DELETE;
+        if (got && r.result == SAMPLE_RES_OK) {
+            _deleting = false;
+            _deleted  = true;
+            gServerPairing.sendSampleEdit(SAMPLE_EDIT_KEYS, 0);   // (standalone only)
+            return true;
         }
+        if (got || (uint32_t)(millis() - _delSentMs) > SE_DELETE_TIMEOUT_MS) {
+            _deleting = false;
+            _d.clear();
+            draw();
+            _d.fillRect(SE_WAVE_X, SE_TIME_Y, SE_TIME_W, 22, COL_WHITE);
+            _d.setTextSize(2);
+            _d.setTextColor(COL_BLACK);
+            _d.setCursor(SE_WAVE_X, SE_TIME_Y);
+            _d.print(got ? "Couldn't delete it - the card wouldn't let go"
+                         : "No answer from the server - not deleted");
+            _d.paintLater();
+        }
+        _touch.read();                  // touches wait until it's answered
+        _wasDown = _touch.isTouched;
+        return false;
     }
 
     // Spectrogram popup: render when the pages have all arrived; any touch
@@ -674,6 +846,29 @@ bool SampleEditPage::poll() {
             gServerPairing.sendSampleEdit(SAMPLE_EDIT_KEYS, _sampleId);
     }
 
+    // DELETE's YES / NO owns the touches while it's up.
+    if (_confirm.isOpen()) {
+        if (_confirm.poll()) {
+            if (_confirm.confirmed()) {
+                MsgSampleResult stale;
+                gServerPairing.takeSampleResult(stale);
+                _lvlState  = 0;          // (an AUTO LEVEL in flight is moot)
+                _deleting  = true;
+                _delSentMs = millis();
+                gServerPairing.sendSampleEdit(SAMPLE_EDIT_DELETE, _sampleId);
+                char l[48];
+                snprintf(l, sizeof(l), "DELETING %s...", _name);
+                drawDeleting(l);
+            } else {
+                _d.clear();
+                draw();
+                _d.paintLater();
+            }
+            _wasDown = _touch.isTouched;
+        }
+        return false;
+    }
+
     // read() is true only on a state change; isTouched holds the last-seen
     // state either way, which is what the hold-repeat needs.
     bool ev   = _touch.read();
@@ -684,11 +879,12 @@ bool SampleEditPage::poll() {
     // stalled loop can't run on after it.
     if (down && _tuneHold.active() && _tuneHold.tickFast()) {
         if (_tuneHold.field() == 1) {
-            stepTune(_tuneHold.delta() * 100);
+            stepValue(_tuneHold.delta(), true);
         } else {
+            int cap = _levelDlg ? 10 : 100;
             _tuneStep += _tuneStep / 4 + 1;
-            if (_tuneStep > 100) _tuneStep = 100;
-            stepTune(_tuneHold.delta() * _tuneStep);
+            if (_tuneStep > cap) _tuneStep = cap;
+            stepValue(_tuneHold.delta(), false);
         }
     }
 
@@ -801,6 +997,14 @@ bool SampleEditPage::poll() {
                 else          startAudition();
                 drawHeader();
                 _d.paintLater();
+            } else if (standalone() && tx >= SE_DEL_X && tx < SE_DEL_X + SE_DEL_W) {
+                auditionStop();
+                char m[64];
+                if (strlen(_name) <= 20) snprintf(m, sizeof(m), "Delete %s?", _name);
+                else                     snprintf(m, sizeof(m), "Delete this sample?");
+                _confirm.open(m);        // (it swallows this press's lift)
+                _confirm.draw();
+                _d.paintLater();
             }
             return false;
         }
@@ -846,10 +1050,13 @@ bool SampleEditPage::poll() {
         if (ty >= btnY && ty < btnY + SE_BTN_H) {
             if (tx >= SE_ZOUT_X && tx < SE_ZOUT_X + SE_ZBTN_W)     zoom(-1);
             else if (tx >= SE_ZIN_X && tx < SE_ZIN_X + SE_ZBTN_W)  zoom(+1);
-            else if (tx >= SE_TUNE_X && tx < SE_TUNE_X + SE_TUNE_W) {
-                _tuneMode  = true;              // the TUNE dialog
+            else if ((tx >= SE_TUNE_X && tx < SE_TUNE_X + SE_TUNE_W) ||
+                     (tx >= SE_LVL_X && tx < SE_LVL_X + SE_LVL_W)) {
+                _levelDlg  = tx >= SE_LVL_X;    // the LEVEL dialog, or TUNE's
+                _tuneMode  = true;
                 _doneArmed = false;
                 if (_autoState != 1) _autoState = 0;
+                if (_lvlState != 1) _lvlState = 0;
                 _d.clear();
                 drawTuneDialog();
                 _d.paintLater();

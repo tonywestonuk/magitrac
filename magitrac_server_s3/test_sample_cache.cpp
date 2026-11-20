@@ -55,6 +55,10 @@ uint32_t       sampleManifestSizeFor(uint8_t id) { for (auto& e : gManifest) if 
 const SampleTrim* sampleTrimFor(uint8_t id)      { for (auto& t : gTrims) if (t.id == id) return &t; return nullptr; }
 void sampleTrimSetPitch(uint8_t id, uint32_t chz) { for (auto& t : gTrims) if (t.id == id) t.pitchCHz = chz; }
 bool sampleTrimSave() { return true; }
+float sampleLevelFor(uint8_t id) {
+    const SampleTrim* t = sampleTrimFor(id);
+    return (t && t->levelDb10) ? powf(10.0f, t->levelDb10 / 200.0f) : 1.0f;
+}
 
 // ── The code under test ──────────────────────────────────────────────────────
 #include "SamplePlayer.cpp"
@@ -352,10 +356,57 @@ static void test_keep_length() {
         CHECK(got && id == 9 && (res == SAMPLE_TUNE_FOUND || res == SAMPLE_TUNE_UNCLEAR),
               "AUTO TUNE answers for a cached sample");
         CHECK(!sampleAutoTuneTake(id, res, hz), "...once");
-        sampleAutoTuneRequest(8);                           // not in the cache
+        sampleAutoTuneRequest(99);                          // no such sample
         got = false;
         for (int n = 0; n < 50 && !got; n++) { _mockMs += 200; samplePitchTick(true); got = sampleAutoTuneTake(id, res, hz); }
-        CHECK(got && id == 8 && res == SAMPLE_TUNE_NOT_READY, "AUTO TUNE gives up on a sample that never arrives");
+        CHECK(got && id == 99 && res == SAMPLE_TUNE_NOT_READY, "AUTO TUNE answers NOT READY for a sample with no file");
+    }
+
+    // Too big for the cache: AUTO TUNE reads its first 5 s off the card, from
+    // the trim start, left channel.  (1 s of noise before the trim start, a
+    // 220 Hz tone after it on the left, noise on the right.)
+    {
+        const uint32_t RATE = 44100, FR = RATE * 30;         // 30 s stereo, 5.3 MB
+        std::string path = gMockSdRoot + "/samples/bigtone.wav";
+        FILE* f = fopen(path.c_str(), "wb");
+        uint8_t h[44] = {};
+        memcpy(h, "RIFF", 4); memcpy(h + 8, "WAVEfmt ", 8);
+        h[16] = 16; h[20] = 1; h[22] = 2;
+        h[24] = (uint8_t)RATE; h[25] = (uint8_t)(RATE >> 8); h[26] = (uint8_t)(RATE >> 16);
+        h[34] = 16; memcpy(h + 36, "data", 4);
+        fwrite(h, 1, 44, f);
+        std::vector<int16_t> d(FR * 2);
+        srand(5);
+        for (uint32_t i = 0; i < FR; i++) {
+            double t = (double)i / RATE, tone = 0;
+            for (int k = 1; k <= 5; k++) tone += sin(2 * M_PI * 220.0 * k * t + k) / k;
+            int16_t noise = (int16_t)((rand() % 20001) - 10000);
+            d[2 * i]     = i < RATE ? noise : (int16_t)(tone * 8000);
+            d[2 * i + 1] = noise;
+        }
+        fwrite(d.data(), 2, d.size(), f);
+        fclose(f);
+        SmEntry e = {}; e.id = 30; strncpy(e.name, "bigtone.wav", SM_NAME_LEN - 1); e.size = 44 + FR * 4;
+        gManifest.push_back(e);
+        setTrim(30, RATE, 0, 0);
+
+        long heapBefore = gMockHeapBytes;
+        sampleAutoTuneRequest(30);
+        uint8_t id = 0, res = 99; float hz = 0; bool got = false;
+        int ticks = 0, maxReads = 0;
+        for (; ticks < 2000 && !got; ticks++) {
+            samplePitchTick(true);
+            if (s_tuneRd.id) maxReads++;
+            got = sampleAutoTuneTake(id, res, hz);
+        }
+        CHECK(!cached(30), "the big sample isn't in the cache");
+        CHECK(got && id == 30 && res == SAMPLE_TUNE_FOUND && fabsf(hz - 220.0f) < 2.0f,
+              "AUTO TUNE finds a too-big sample's pitch from its first seconds");
+        CHECK(maxReads > 20, "...read off the card a step at a time, not in one go");
+        CHECK(gMockHeapBytes == heapBefore && !s_tuneBuf && !s_tuneRd.id, "...and the read buffer is freed");
+        printf("  info  %.2f Hz in %d ticks\n", hz, ticks);
+        unlink(path.c_str());
+        gManifest.pop_back();
     }
 
     // ADD SAMPLE drops the cache: AUTO TUNE gives way rather than pinning it.
@@ -369,6 +420,102 @@ static void test_keep_length() {
         CHECK(sampleAutoTuneTake(id, res, hz) && id == 9 && res == SAMPLE_TUNE_NOT_READY,
               "...and it answers NOT READY");
     }
+    emptyCache();
+}
+
+// LEVEL: a sample's gain wherever it plays.  A big boost clips — it must
+// never wrap round to the opposite sign (the mixer used to multiply in 32 bits).
+static void test_level_gain() {
+    printf("\ntest_level_gain\n");
+    emptyCache();
+    songUses({});
+    samplePreloadSetExtra(9);
+    syncAll(gSong);
+    CHECK(cached(9), "sample 9 is cached");
+
+    int h = samplePlayRam(9, 0, 127);
+    CHECK(h >= 0 && s_voice[h & 7].gainQ15 == 32767, "no LEVEL: unity");
+    renderUntilQuiet();
+    setTrim(9, 0, 0, 0);
+    for (auto& t : gTrims) if (t.id == 9) t.levelDb10 = 60;
+    h = samplePlayRam(9, 0, 127);
+    CHECK(h >= 0 && abs(s_voice[h & 7].gainQ15 - 65379) < 40, "LEVEL +6.0 dB doubles it");
+    CHECK(cached(9), "a LEVEL change doesn't reload the sample");
+    renderUntilQuiet();
+
+    for (auto& t : gTrims) if (t.id == 9) t.levelDb10 = SAMPLE_LEVEL_MAX_DB10;
+    h = samplePlayRam(9, 0, 161);                   // and the hardest key on top
+    int16_t out[2 * 256] = {};
+    mixRamInto(out, 256);
+    int wrong = 0, loud = 0;
+    for (int i = 32; i < 256; i++) {                // (past the fade-in)
+        int16_t src = s_ram[cacheFind(9)].data[i];
+        if (src > 0 && out[2 * i] < 0) wrong++;
+        if (src < 0 && out[2 * i] > 0) wrong++;
+        if (out[2 * i] == 32767 || out[2 * i] == -32768) loud++;
+    }
+    CHECK(wrong == 0 && loud > 100, "+24 dB on a hard key clips, never wraps");
+    sampleStopVoice(h);
+    emptyCache();
+}
+
+// AUTO LEVEL: the loudest point of the trimmed region, off the card in steps.
+static void test_auto_level() {
+    printf("\ntest_auto_level\n");
+    emptyCache();
+    uint8_t id; bool ok; uint32_t peak;
+    long readsBefore = gMockSdOpens;
+    sampleAutoLevelRequest(3);
+    int ticks = 0;
+    bool got = false;
+    for (; ticks < 5000 && !got; ticks++) { sampleLevelTick(); got = sampleAutoLevelTake(id, ok, peak); }
+    CHECK(got && id == 3 && ok && peak == 16384, "the whole sample: its loudest point");
+    CHECK(ticks > 10, "...read a step at a time");
+    CHECK(gMockSdOpens == readsBefore + 1 && gMockSdOpenNow == 0, "...one open, closed afterwards");
+
+    setTrim(3, 100, 110, 0);
+    uint32_t want = 0;
+    for (uint32_t i = 100; i < 110; i++) { int v = abs(pcmAt(3, i)); if ((uint32_t)v > want) want = v; }
+    sampleAutoLevelRequest(3);
+    got = false;
+    for (int n = 0; n < 100 && !got; n++) { sampleLevelTick(); got = sampleAutoLevelTake(id, ok, peak); }
+    CHECK(got && ok && peak == want, "only the trimmed region counts");
+
+    sampleAutoLevelRequest(99);
+    got = false;
+    for (int n = 0; n < 100 && !got; n++) { sampleLevelTick(); got = sampleAutoLevelTake(id, ok, peak); }
+    CHECK(got && id == 99 && !ok, "no such sample: a failed answer, not silence");
+    CHECK(!sampleAutoLevelTake(id, ok, peak), "...answered once");
+    emptyCache();
+}
+
+// DELETE: the player lets go of a sample — not while a voice is still on it.
+static void test_forget_for_delete() {
+    printf("\ntest_forget_for_delete\n");
+    emptyCache();
+    songUses({});
+    samplePreloadSetExtra(9);
+    syncAll(gSong);
+    int h = samplePlayRam(9, 0, 127);
+    CHECK(cached(9) && h >= 0, "sample 9 cached and playing");
+    CHECK(!samplePreloadForgetStep(9), "not while its voice sounds");
+    sampleStopVoice(h);
+    renderUntilQuiet();
+    CHECK(samplePreloadForgetStep(9) && !cached(9), "then it leaves the cache");
+    CHECK(samplePreloadForgetStep(9), "...and asking again is harmless");
+
+    samplePreloadSetExtra(1);                        // start loading another
+    samplePreloadSync(gSong);
+    CHECK(s_job.active && s_job.id == 1, "sample 1 is loading");
+    CHECK(samplePreloadForgetStep(1) && !s_job.active && gMockSdOpenNow == 0,
+          "deleting it stops the load and closes the file");
+
+    sampleAutoLevelRequest(3);
+    sampleLevelTick();
+    CHECK(s_lv.id == 3, "AUTO LEVEL reading sample 3");
+    uint8_t id; bool ok; uint32_t peak;
+    CHECK(samplePreloadForgetStep(3) && !s_lv.id && gMockSdOpenNow == 0 && !sampleAutoLevelTake(id, ok, peak),
+          "deleting it stops AUTO LEVEL quietly");
     emptyCache();
 }
 
@@ -407,6 +554,9 @@ int main() {
     test_trim_edited_during_a_load();
     test_failures_do_not_loop_or_leak();
     test_keep_length();
+    test_level_gain();
+    test_auto_level();
+    test_forget_for_delete();
 
     printf("\nfinal checks\n");
     emptyCache();
