@@ -43,10 +43,12 @@ static const int OR_TYPE_PROC = 4;    // the procedural-sounds type
 
 // PROC type — the sound list replaces presets + drawbars.  Count and order
 // must mirror PROC_SOUNDS in the server's proc_sounds.h.
-static const int OR_PROC_N     = 4;
+static const int OR_PROC_N     = 6;
 static const int OR_PROC_REED  = 0;    // the REED sound (server: PROC_IDX_REED)
 static const int OR_PROC_VOC   = 2;    // the VOCODER sound (server: PROC_IDX_VOC)
 static const int OR_PROC_SYNTH = ORGAN_PROC_SYNTH;   // edited on its own screen (SynthEditor)
+static const int OR_PROC_808   = ORGAN_PROC_808;     // drums on the GM drum map
+static const int OR_PROC_CR78  = ORGAN_PROC_CR78;    // the same, a CR-78
 // The sound buttons are a grid, two to a row, filled left to right then down
 // (OR_PRESET_N rows → room for 10).  Together they span the old single
 // column's 420 px, so the list still ends at 435.
@@ -74,7 +76,12 @@ static const int OR_LABEL_Y  = 484;    // footage label row
 
 // Per-type knob column on the right edge (vertical sliders 0..8).
 // PROC mode has no drawbars, so its column starts further left and fits 5.
-static const int OR_NKNOB        = 5;    // max sliders a type/sound can show
+// The drum machines have 14 (OrganSynth.h): narrower, from just right of the
+// sound list, with their names in two staggered rows.
+static const int OR_NKNOB        = ORGAN_DRUM_PARAMS;   // max sliders a type/sound can show
+static const int OR_KFIT         = 5;    // more than this → the narrow layout
+static const int OR_KCOL_W_NARROW = 32;
+static const int OR_KCOL_GAP_NARROW = 4;
 static const int OR_KCOL_X0      = 812;  // drawbar types (3 sliders max)
 static const int OR_KCOL_X0_PROC = 720;
 static const int OR_KCOL_W       = 40;
@@ -86,7 +93,8 @@ static const int OR_KCOL_GAP     = 5;
 // wiped on release, and whatever it covered is redrawn.
 // Width is bounded by PROC mode: its slider column starts at 720 and the sound
 // list ends at OR_PRESET_X + 420 (435), so 270 is the widest that
-// still clears the buttons.
+// still clears the buttons.  A drum machine's wider column puts it over the
+// sound buttons, which are redrawn when it goes.
 static const int OR_TIP_W = 270;
 static const int OR_TIP_H = 62;
 static const int OR_TIP_Y = 264;      // roughly centred on the groove (120..470)
@@ -131,6 +139,16 @@ private:
     SynthEditor _synthEd;
 
     bool isSynth() const { return _type == OR_TYPE_PROC && _procSel == OR_PROC_SYNTH; }
+    bool isDrums() const {
+        return _type == OR_TYPE_PROC && (_procSel == OR_PROC_808 || _procSel == OR_PROC_CR78);
+    }
+    void sendKnob(int k);
+    void drawKnobLabel(int k);
+    // The sliders belong to the song; swapping sound has the server save the
+    // old one's and bring back the new one's last (MsgOrganSound).
+    void swapOnServer();
+    void syncBars();
+    void pollOrganSound();          // one slider to the server (a drum machine's 6th+ ride the drawbars)
     void openSynth();
     bool hitSynthEdit(int sx, int sy) const;
 

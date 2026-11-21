@@ -6,8 +6,9 @@
 // SD, no samples.  The registry (name + param sliders) is mirrored by the
 // client's OrganPage list; keep the two in the same order.
 //
-// The order is also what songs store: OrganPatch.voice = 4 + the index, and a
-// number past the end plays the last sound.  REED took over index 0 when TWO
+// The order is also what songs store: OrganPatch.voice = 4 + the index (SYNTH
+// and the 808 are 8 and 9, see OrganSynth.h), and a number past the end plays
+// the last sound.  REED took over index 0 when TWO
 // TRIBES and THX were removed (16 Nov 2026), so CHOIR kept its number and the
 // old VOCODER number (7) still lands on VOCODER.  Append new sounds at the end.
 //
@@ -19,7 +20,7 @@
 // boot from harmonic tables measured off a reference recording, so a new
 // sound is usually just two rows of numbers + a registry entry.
 
-#define PROC_SOUND_COUNT 4
+#define PROC_SOUND_COUNT 6
 #define PROC_MAX_PARAMS  5       // PROC mode has no drawbars → room for 5 sliders
 #define PROC_WT          1024    // wavetable length (10-bit phase index)
 
@@ -62,6 +63,24 @@
 // organSetSynthParam (OrganSynth.h), edited on the client's SYNTH page.
 // Songs store it as voice 8, not 4 + 3 (see ORGAN_VOICE_SYNTH).
 #define PROC_IDX_SYNTH 3
+
+// 808 — an analogue drum machine played on the General MIDI drum map
+// (drum808.cpp, its own render path in drawbar_organ.cpp).  Each drum has its
+// own envelopes; note-offs do nothing.  Sliders (meanings in OrganSynth.h):
+//   [0] BD DEC  kick decay      [1] BD TONE  kick low-pass
+//   [2] SNAPPY  snare noise     [3] OH DEC   open hat decay
+//   [4] TUNE    toms and congas
+// Songs store it as voice 9 (ORGAN_VOICE_808).
+#define PROC_IDX_808 4
+
+// CR78 — Roland's CR-78 CompuRhythm on the General MIDI drum map (cr78.cpp,
+// a port of CW-78; the 808's render path).  Note-offs do nothing.  Sliders
+// (meanings in OrganSynth.h; 4 = Roland's factory alignment):
+//   [0] BD DEC  kick decay      [1] SNAPPY  snare snap: 0 CW-78, 4 the record
+//   [2] HH DEC  hi-hat decay    [3] CY DEC  cymbal decay
+//   [4] TUNE    kick, snare, conga, bongos ±6 semitones
+// Songs store it as voice 10 (ORGAN_VOICE_CR78).
+#define PROC_IDX_CR78 5
 
 // Slider index semantics are partly fixed by the render loop: [0] scales the
 // generator's noise (live), [2] is the global BRIGHT low-pass (live), [4] is

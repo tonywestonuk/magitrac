@@ -43,16 +43,16 @@ static const char* chanText(uint8_t ch, char* buf) {
     return "OFF";
 }
 
-// The organ voices by OrganPatch.voice (8 = SYNTH; 7 reads as VOCODER).
-static const char* const ORGAN_VOICE_TEXT[9] =
-    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "REED", "CHOIR", "VOCODER", "VOCODER", "SYNTH" };
+// The organ voices by OrganPatch.voice (8 = SYNTH, 9 = 808; 7 reads as VOCODER).
+static const char* const ORGAN_VOICE_TEXT[ORGAN_VOICE_LAST + 1] =
+    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "REED", "CHOIR", "VOCODER", "VOCODER", "SYNTH", "808", "CR78" };
 static const char* const ORGAN_VIB_TEXT[7]    = { "OFF", "V1", "V2", "V3", "C1", "C2", "C3" };
 static const char* const ORGAN_LESLIE_TEXT[3] = { "STOP", "SLOW", "FAST" };
 static const char* const ORGAN_REVERB_TEXT[3] = { "OFF", "ROOM", "HALL" };
 
 static void writeOrgan(const OrganPatch& op, TextBuf& out) {
     if (!(op.flags & 1)) return;
-    uint8_t voice = op.voice > ORGAN_VOICE_SYNTH ? ORGAN_VOICE_SYNTH : op.voice;
+    uint8_t voice = op.voice > ORGAN_VOICE_LAST ? ORGAN_VOICE_LAST : op.voice;
     textPrintf(out, "ORGAN voice=%s vib=%s leslie=%s drive=%u reverb=%s",
                ORGAN_VOICE_TEXT[voice], ORGAN_VIB_TEXT[op.vibChorus % 7],
                ORGAN_LESLIE_TEXT[op.leslie % 3], (unsigned)(op.drive ? 1 : 0),
@@ -434,7 +434,7 @@ bool songFromText(const char* text, size_t len, const Song* base, Song* dst,
             long v;
             int  voice = -1;
             if (kv(L, 1, "voice", b, sizeof(b))) {
-                for (int k = 0; k <= ORGAN_VOICE_SYNTH; k++)
+                for (int k = 0; k <= ORGAN_VOICE_LAST; k++)
                     if (k != 7 && !strcasecmp(b, ORGAN_VOICE_TEXT[k])) voice = k;
                 if (voice < 0) { fail(r, lineNo, "unknown organ voice"); r.skipped++; continue; }
             }
@@ -460,6 +460,7 @@ bool songFromText(const char* text, size_t len, const Song* base, Song* dst,
                         if (*q == ',') q++;
                     }
                 }
+                organDrumBarsRepair(op);
             }
             continue;
         }

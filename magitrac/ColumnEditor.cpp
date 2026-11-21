@@ -14,10 +14,10 @@ static inline bool isOrgan(uint8_t ch) { return ch == ORGAN_CHANNEL; }
 // ORGAN columns: the VOICE field picks the voice — the 4 organ types then the
 // procedural sounds, in the server's order (drawbar_organ.h, PROC_SOUNDS).
 // List position k is PROC sound k - 4 from 4 up; organVoiceFromProc gives
-// the number the song stores (SYNTH is 8, see OrganSynth.h).  The voice (and
+// the number the song stores (SYNTH is 8, the 808 9, see OrganSynth.h).  The voice (and
 // the rest of the organ patch) lives ONCE per song in Song::organ.
 static const char* const ORGAN_VOICES[] =
-    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "REED", "CHOIR", "VOCODER", "SYNTH" };
+    { "DRAWBAR", "TONEWHEEL", "CLAUDE", "NEBULA", "REED", "CHOIR", "VOCODER", "SYNTH", "808", "CR78" };
 #define ORGAN_VOICE_COUNT ((int)(sizeof(ORGAN_VOICES) / sizeof(ORGAN_VOICES[0])))
 
 static int organVoiceListPos(uint8_t voice) {

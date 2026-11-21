@@ -184,8 +184,12 @@ do not re-add any of it unless the owner asks.
 | `test_sample_cache.cpp` | Host tests for that cache (mocks in `test_mocks/cache/`); build line in the file |
 | `SampleManifest.cpp/.h` | `/samples/samples.txt` — stable sample ids (a `#hi=` line stops a deleted sample's id being reused straight away); trim/loop/tune/level metadata (`trim.txt`).  The id table is rebuilt to one side and swapped in, so lookups never see it empty; `trim.txt` is read once at boot |
 | `test_manifest.cpp` | Host tests for the manifest (mocks in `test_mocks/manifest/`); build line in the file |
-| `drawbar_organ.cpp/.h` | Additive drawbar organ synth (own task, takes the codec while active) |
-| `proc_sounds.cpp/.h` | Procedural sounds for the organ's PROC type (REED, CHOIR, VOCODER, SYNTH) |
+| `drawbar_organ.cpp/.h` | Additive drawbar organ synth (own task, takes the codec while active).  Only one organ sound plays at a time, so they share one 24 KB **organ scratch area** in internal RAM (`OrganScratch`, a union with a member per sound that needs working space: CHOIR's wavetables, the 808's and CR78's state).  When the playing sound changes, `scratchClaim` runs that sound's `scratchSetup` before any of its notes start; a sound that needs space adds a member and a setup case.  The audio task reads the selected sound once per pass (`s_passType`/`s_passSel`) so the scratch area always belongs to the sound reading it.  **Swap store**: the sliders belong to the song, but each drawbar type and PROC sound keeps its last settings in `s_store` for when the performer swaps sound.  Only `organSwapSound` touches it: ORGAN_OP_SWAP saves the playing sound's settings into its slot, selects the new sound and loads its slot; ORGAN_OP_RECALL just loads (a song with no organ patch).  Both answer with `MsgOrganSound`, sent from `commandsTick`.  Plain TYPE/PROCSEL (songs, sequencer) never touch the store.  Saved to NVS `organsnd` key `slots` by `organStoreTick` 3 s after a swap and only while the sequencer is stopped (flash writes stall the other core) |
+| `proc_sounds.cpp/.h` | Procedural sounds for the organ's PROC type (REED, CHOIR, VOCODER, SYNTH, 808, CR78) |
+| `drum808.cpp/.h` | The 808 PROC sound: an analogue drum machine on the GM drum map, each drum built the way io-808 (a Web Audio TR-808 model) builds it.  What every voice shares (the six-square metal bank, noise, the filters before each drum's VCA) is worked out once per block; voices overlay `ProcVoiceState`, and its shared state and buffers live in the organ scratch area.  Note-offs do nothing, a closed hat chokes an open one, the performer's transpose skips it.  14 settings (`OrganSynth.h`): the five sliders plus nine more carried in the drawbar bytes (`organDrumParam`; the audio task reads them from `s_drawbar`) — snare and cymbal tone, cymbal decay, accent, and five group levels.  Stored as voice 9 |
+| `test_drum808.cpp` | Host test for `drum808.cpp` (every drum, the sliders, velocity, choke, the GM map, a two-bar beat); with a directory argument it writes each drum as a WAV to listen to.  Build line in the file |
+| `cr78.cpp/.h` | The CR78 PROC sound: Roland's CR-78 on the GM drum map, a modified port of CW-78 by A Thousand Details (https://github.com/athousanddetails/schwung-cw-78, GPL-3.0) — keep that credit.  Circuit models from the service notes: struck phase-shift loops (kick, conga, bongos, snare shell), LC tanks (rim, claves), the one shared noise source through capacitor envelopes (hats, cymbal, maracas, snare snap), free-running oscillators (cowbell, metallic beat), guiro, tambourine.  No toms or clap: GM toms play conga/bongos, open hat and crashes the cymbal.  Same render path and limiter as the 808; voices overlay `ProcVoiceState`, shared state in the organ scratch area.  Our changes from CW-78: the snare's snap level and decay, and the conga/bongos 9 dB lower in the mix, both fitted to the real CR-78 on OMD's Enola Gay intro (the comparison scripts lived in a session scratchpad; not in the repo).  `RAW_PEAK` comes from `test_cr78 --fit` — refit after changing any voice.  14 settings like the 808's: the five sliders plus kick click and tuning, snare tuning and ring, hat tone, conga/bongo decay, and three group levels.  A drum patch saved before the extras still holds the organ's default registration there; `organDrumBarsStale` reads that as all 4.  Stored as voice 10 |
+| `test_cr78.cpp` | Host test for `cr78.cpp` (Roland's factory frequencies and decays, the sliders, velocity, the GM map, kit balance, a beat); `--fit` prints `RAW_PEAK`; with a directory it writes WAVs.  Build line in the file |
 | `synth_voice.cpp/.h` | The SYNTH PROC sound's voice: two oscillators + sub, resonant low-pass, one ADSR.  Its 14 settings live in the song's OrganPatch in the drawbars' place, and SYNTH is stored as voice 8 (7 is VOCODER's old number) — see `magitrac_lib/src/OrganSynth.h` |
 | `audio_codec.cpp/.h` | Thin wrapper around the shared ES8388 (Module Audio v2.2) |
 | `mic_spectrum.cpp/.h` | Module Audio mic (LEFT input) → FFT bands + beat detect → pixel_post; feeds chord + scope screens |
@@ -272,13 +276,14 @@ libraries besides `magitrac_lib`.
 
 ## Working here
 
-- The owner builds and flashes from the Arduino IDE.  Don't compile after
-  an edit, and never run `arduino-cli` in the background.
+- Compiling and flashing from the command line is fine (foreground,
+  separate `--build-path`).  Never run `arduino-cli` in the background: it
+  collides with the Arduino IDE's build cache.
 - Client and server are always flashed together.  The wire format may
   change freely, but both ends must change in the same commit.
 - Internal RAM is the radios' budget on the ESP32-S3: anything over ~1 KB
   (buffers, queues, big statics) goes in PSRAM.  The deliberate exception
-  is the organ synth's audio-rate buffers (reverb lines, voice scratch,
+  is the organ synth's audio-rate buffers (reverb lines, the organ scratch area,
   wavetables — about 69 KB), which need fast internal RAM.  Measured Nov
   2026 with the client connected: 77 KB free at idle, 59 KB at the lowest
   point of a song load and play.  The core's mbedTLS allocates internal-only

@@ -238,6 +238,10 @@ enum MagiMsgType : uint8_t {
     MSG_AI_REQUEST        = 0xA7,   // client → server: START / CANCEL / UNDO
     MSG_AI_STATUS         = 0xA8,   // server → client: progress, result, error
 
+    // Server → client: the organ sound's settings after a MsgOrgan SWAP or
+    // RECALL (MsgOrganSound).
+    MSG_ORGAN_SOUND       = 0xA9,
+
     // Server → client: server set to OFF (no song loaded)
     MSG_NO_SONG  = 0x60,
 
@@ -426,10 +430,19 @@ struct MsgSetWifiChannel {
 //  (10 was ORGAN_OP_VOCODER — the vocoder is now a procedural sound, chosen
 //   with ORGAN_OP_PROCSEL like the others.)
 //  ORGAN_OP_SYNTH     → SYNTH sound setting `index` (OrganSynthParam, 0..13) = `value`
+// The sliders belong to the song; the server also keeps each type's / PROC
+// sound's last settings (saved to its NVS) for when the performer swaps sound:
+//  ORGAN_OP_SWAP   → `index` = type, `value` = PROC sound: put the playing
+//                    sound's settings away, select this one, bring its back
+//  ORGAN_OP_RECALL → the same without putting anything away (a song with no
+//                    organ patch yet)
+// Both answer with a MsgOrganSound.  TYPE / PROCSEL just select (the song's
+// own settings follow).
 enum OrganOp : uint8_t {
     ORGAN_OP_EXIT = 0, ORGAN_OP_ENTER = 1, ORGAN_OP_SET = 2, ORGAN_OP_TYPE = 3,
     ORGAN_OP_VIBCHORUS = 4, ORGAN_OP_LESLIE = 5, ORGAN_OP_DRIVE = 6, ORGAN_OP_PARAM = 7,
-    ORGAN_OP_PROCSEL = 8, ORGAN_OP_REVERB = 9, ORGAN_OP_SYNTH = 11
+    ORGAN_OP_PROCSEL = 8, ORGAN_OP_REVERB = 9, ORGAN_OP_SYNTH = 11,
+    ORGAN_OP_SWAP = 12, ORGAN_OP_RECALL = 13
 };
 struct MsgOrgan {
     uint8_t  id     = MSG_ORGAN;
@@ -437,6 +450,16 @@ struct MsgOrgan {
     uint8_t  op;      // OrganOp
     uint8_t  index;   // drawbar 0..8 (ORGAN_OP_SET only)
     uint8_t  value;   // 0..8        (ORGAN_OP_SET only)
+};
+// What the server keeps for one sound: a drawbar type's or PROC sound's
+// sliders, a drum machine's 14 (OrganSynth.h), or SYNTH's settings.
+#define ORGAN_SOUND_VALUES 14
+struct MsgOrganSound {
+    uint8_t  id     = MSG_ORGAN_SOUND;
+    uint16_t length = sizeof(MsgOrganSound);
+    uint8_t  type;                         // organ type (4 = PROC)
+    uint8_t  procSel;                      // PROC sound, when type is PROC
+    uint8_t  values[ORGAN_SOUND_VALUES];
 };
 
 // Map a channel index (0..2) to the WiFi channel number (1, 6, or 11).

@@ -1617,6 +1617,7 @@ void setup() {
     crashSetBootStep(BS_SPECTRUM);
     spectrumInit();
     organInit();
+    organStoreBegin();
     crashSetBootStep(BS_SONGLIST);
     loadSongList();
 

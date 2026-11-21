@@ -203,6 +203,17 @@ void ServerPairing::begin() {
             portEXIT_CRITICAL(&sRecStatusMux);
         }, this);
 
+    // MagiLink: the server's settings for the organ sound just selected.
+    gMagiLink.registerCallback(MSG_ORGAN_SOUND,
+        [](const uint8_t* msg, size_t len, void* ctx) {
+            ServerPairing* sp = static_cast<ServerPairing*>(ctx);
+            if (len < sizeof(MsgOrganSound)) return;
+            portENTER_CRITICAL(&sRecStatusMux);
+            memcpy(&sp->_organSound, msg, sizeof(MsgOrganSound));
+            sp->_organSoundPending = true;
+            portEXIT_CRITICAL(&sRecStatusMux);
+        }, this);
+
     // MagiLink: generic file list + load.  Load is a 3-part stream (HEADER,
     // N×BODY, EndOfData) so we route all three IDs into one dispatcher.
     gMagiLink.registerCallback(MSG_FILE_LIST_RESP,
@@ -670,6 +681,18 @@ bool ServerPairing::sendAiRequest(uint8_t op, const char* prompt) {
     msg.maxBank    = gMaxBank;
     msg.maxProgram = gMaxProgram;
     return _sendLocked(&msg, sizeof(msg));
+}
+
+bool ServerPairing::takeOrganSound(MsgOrganSound& out) {
+    bool got = false;
+    portENTER_CRITICAL(&sRecStatusMux);
+    if (_organSoundPending) {
+        out = _organSound;
+        _organSoundPending = false;
+        got = true;
+    }
+    portEXIT_CRITICAL(&sRecStatusMux);
+    return got;
 }
 
 bool ServerPairing::takeAiStatus(MsgAiStatus& out) {

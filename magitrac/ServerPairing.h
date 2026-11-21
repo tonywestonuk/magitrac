@@ -159,6 +159,8 @@ public:
     // over the newest one not yet taken.
     bool sendAiRequest(uint8_t op, const char* prompt = nullptr);
     bool takeAiStatus(MsgAiStatus& out);
+    // The server's settings for the organ sound just selected (OrganPage).
+    bool takeOrganSound(MsgOrganSound& out);
     void clearSampleInfo()           { _sampleInfoPending = false; }
     const MsgSampleInfo& sampleInfo() const { return _sampleInfo; }
 
@@ -394,6 +396,8 @@ private:
     volatile bool      _sampleResultPending = false;
     MsgAiStatus        _aiStatus = {};     // last MSG_AI_STATUS received
     volatile bool      _aiStatusPending = false;
+    MsgOrganSound      _organSound = {};
+    volatile bool      _organSoundPending = false;
     MsgSampleInfo _sampleInfo = {};        // last MSG_SAMPLE_INFO received
     volatile bool _sampleInfoPending = false;
     uint8_t*         _specData = nullptr;  // PSRAM, lazily allocated — internal

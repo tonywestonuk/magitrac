@@ -311,7 +311,8 @@ void DrumTrackImportPage::drawBlockChoose() {
         snprintf(allocLine, sizeof(allocLine), "(empty block - nothing to import)");
     } else if (drumMode) {
         snprintf(allocLine, sizeof(allocLine),
-                 "Imports into this block's drum (ch%d) columns", DRUM_MIDI_CHANNEL);
+                 songOrganIsDrums(_song) ? "Imports into this block's organ drum columns"
+                                         : "Imports into this block's drum (ch10) columns");
     } else {
         int endCol = (int)_startCol + activeN - 1;
         if (endCol >= MAX_COLUMNS) {
@@ -352,7 +353,7 @@ void DrumTrackImportPage::drawBlockChoose() {
         const uint8_t patLen = _song.patterns[_patIdx].length;
         if (drumMode) {
             for (int c = 1; c < MAX_COLUMNS && !hasExisting; c++) {
-                if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+                if (!isDrumColumn(_song, c)) continue;
                 for (uint8_t r = 0; r < patLen; r++) {
                     if (g.has(r, (uint8_t)c)) { hasExisting = true; break; }
                 }
@@ -678,6 +679,7 @@ bool DrumTrackImportPage::poll() {
 void DrumTrackImportPage::sendDrumProgram() {
     // Routed through the server's MIDI task (not a raw MidiData write) so the
     // program change stays coherent with the sequencer's running-status cache.
+    if (songDrumChannel(_song) != DRUM_MIDI_CHANNEL) return;   // the organ's drum machine has no kits
     gServerPairing.sendAuditionProgram(DRUM_MIDI_CHANNEL, DRUM_KITS[_kitIdx].program);
 }
 
@@ -710,7 +712,7 @@ void DrumTrackImportPage::auditionTick() {
         if (!instr.hits[_audStep]) continue;
         const DrumGmEntry* m = sGmMap.find(instr.code);
         if (!m) continue;
-        gServerPairing.sendAuditionRawNote(DRUM_MIDI_CHANNEL, m->midiNote, m->velocity);
+        gServerPairing.sendAuditionRawNote(songDrumChannel(_song), m->midiNote, m->velocity);
     }
 
     _audStep = (_audStep + 1) % DRUM_PATTERN_STEPS;
@@ -768,8 +770,8 @@ bool DrumTrackImportPage::applyImport() {
 
         ColumnSettings& cs = _song.columns[col];
         memset(&cs, 0, sizeof(cs));
-        cs.midiChannel = DRUM_MIDI_CHANNEL;
-        cs.program     = DRUM_KITS[_kitIdx].program;    // playback matches audition
+        cs.midiChannel = songDrumChannel(_song);
+        cs.program     = DRUM_KITS[_kitIdx].program;    // playback matches audition (ch10)
         cs.volume      = 100;
         strncpy(cs.name, m->name, INSTRUMENT_NAME_LEN - 1);
         cs.name[INSTRUMENT_NAME_LEN - 1] = '\0';

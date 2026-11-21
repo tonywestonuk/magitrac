@@ -312,6 +312,62 @@ static void testOrgan() {
     check(parseText("ORGAN voice=KAZOO\n", base, out, r) && r.err[0] && r.skipped == 1 &&
           out->organ.voice == ORGAN_VOICE_SYNTH, "an unknown voice is skipped");
 
+    // The 808: written and read by name, its sliders start at 4.
+    check(parseText("ORGAN voice=808 reverb=ROOM\n", base, out, r) && !r.err[0] &&
+          out->organ.voice == ORGAN_VOICE_808 && out->organ.sliders[2] == 4 && out->organ.sliders[0] == 4,
+          "voice=808 parses, its sliders at 4");
+    check(parseText("ORGAN voice=808 sliders=8,2,6,1,3\n", base, out, r) &&
+          out->organ.sliders[0] == 8 && out->organ.sliders[4] == 3, "808 sliders set");
+    organPatchSetVoice(base->organ, ORGAN_VOICE_808);
+    t = makeBuf(64 * 1024);
+    songToText(base, t);
+    check(strstr(t.p, "ORGAN voice=808 ") != nullptr && strstr(t.p, "sliders=4,4,4,4,4") != nullptr,
+          "808 patch written as an ORGAN line");
+    free(t.p);
+    check(organProcFromVoice(ORGAN_VOICE_808) == ORGAN_PROC_808 &&
+          organVoiceFromProc(ORGAN_PROC_808) == ORGAN_VOICE_808 &&
+          organVoiceFromProc(ORGAN_PROC_SYNTH) == ORGAN_VOICE_SYNTH &&
+          organProcFromVoice(ORGAN_VOICE_SYNTH) == ORGAN_PROC_SYNTH &&
+          organProcFromVoice(200) == ORGAN_PROC_CR78, "voice numbers: SYNTH 8, 808 9, past the end = the last");
+
+    // The CR78: the same, voice 10; moving from the 808 resets the sliders.
+    check(parseText("ORGAN voice=CR78\n", base, out, r) && !r.err[0] &&
+          out->organ.voice == ORGAN_VOICE_CR78 && out->organ.sliders[0] == 4 && out->organ.sliders[4] == 4,
+          "voice=CR78 parses, its sliders at 4");
+    {
+        OrganPatch op = base->organ;
+        op.sliders[0] = 8;
+        organPatchSetVoice(op, ORGAN_VOICE_CR78);
+        check(op.sliders[0] == 4, "808 -> CR78 puts the sliders back to 4");
+        op.sliders[0] = 7;
+        organPatchSetVoice(op, ORGAN_VOICE_CR78);
+        check(op.sliders[0] == 7, "CR78 -> CR78 keeps them");
+        check(op.bars[0] == 4 && op.bars[8] == 4, "a drum machine's nine extra settings (in bars) start at 4");
+        op.bars[8] = 6;
+        organPatchSetVoice(op, ORGAN_VOICE_CR78);
+        check(op.bars[8] == 6, "CR78 -> CR78 keeps the extras too");
+        organPatchSetVoice(op, 4);   // REED
+        check(op.bars[0] == ORGAN_DEFAULT_BARS[0] && op.sliders[2] == ORGAN_DEFAULT_SLIDERS[2],
+              "drums -> an organ sound restores the registration");
+        organPatchSetVoice(op, 5);   // CHOIR
+        op.bars[3] = 7;
+        organPatchSetVoice(op, 4);
+        check(op.bars[3] == 7, "organ -> organ keeps it");
+    }
+    check(parseText("ORGAN voice=CR78 bars=888000000\n", base, out, r) && out->organ.bars[0] == 4 &&
+          out->organ.bars[8] == 4, "an old drum patch's organ registration reads as the extras at 4");
+    check(parseText("ORGAN voice=808 bars=123456780\n", base, out, r) && out->organ.bars[0] == 1 &&
+          out->organ.bars[8] == 0, "808 bars= sets the extras");
+    organPatchSetVoice(base->organ, ORGAN_VOICE_CR78);
+    t = makeBuf(64 * 1024);
+    songToText(base, t);
+    check(strstr(t.p, "ORGAN voice=CR78 ") != nullptr, "CR78 patch written as an ORGAN line");
+    free(t.p);
+    check(organProcFromVoice(ORGAN_VOICE_CR78) == ORGAN_PROC_CR78 &&
+          organVoiceFromProc(ORGAN_PROC_CR78) == ORGAN_VOICE_CR78 &&
+          organVoiceIsDrums(ORGAN_VOICE_CR78) && organVoiceIsDrums(ORGAN_VOICE_808) &&
+          !organVoiceIsDrums(ORGAN_VOICE_SYNTH), "CR78 is voice 10 and plays drums");
+
     base->organ.voice = 7;
     t = makeBuf(64 * 1024);
     songToText(base, t);

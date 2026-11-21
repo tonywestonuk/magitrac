@@ -742,6 +742,12 @@ static bool seqSongUsesOrgan() {
     return false;
 }
 
+// The song's organ is a drum machine (808, CR78): its notes are drums on the GM map.
+static bool seqOrganIsDrums() {
+    const OrganPatch& op = seqSong()->organ;
+    return (op.flags & 1) && organVoiceIsDrums(op.voice);
+}
+
 // Apply the song's OrganPatch (voice, sliders, drawbars, effects) to the
 // synth.  Deduped per setting, so reapplying every block transition is free —
 // and because the client writes the patch in the same gesture as any live
@@ -766,8 +772,11 @@ static void seqOrganApplySongPatch() {
     } else {
         for (int k = 0; k < ORGAN_PATCH_SLIDERS; k++)
             if (organGetParam(k) != op.sliders[k]) organSetParam(k, op.sliders[k]);
-        for (int b = 0; b < ORGAN_PATCH_BARS; b++)
-            if (organGetDrawbar(b) != op.bars[b]) organSetDrawbar(b, op.bars[b]);
+        bool stale = organDrumBarsStale(op);   // a drum machine's extra settings ride the drawbars
+        for (int b = 0; b < ORGAN_PATCH_BARS; b++) {
+            uint8_t v = stale ? 4 : op.bars[b];
+            if (organGetDrawbar(b) != v) organSetDrawbar(b, v);
+        }
     }
     if (organGetVibChorus() != op.vibChorus) organSetVibChorus(op.vibChorus);
     if (organGetLeslie()    != op.leslie)    organSetLeslie(op.leslie);
@@ -1013,9 +1022,9 @@ static void seqPlayRow() {
                 if (!organActive() && !seqOrganYielded) continue;   // codec not ours — stay silent
                 if (nn.note < 1 || nn.note > NOTE_MAX) continue;
                 // Same note transform as MIDI columns; performer transpose
-                // always applies (the organ is melodic, never drums).
-                int raw = (int)nn.note + TRACKER_TO_MIDI_OFFSET + seqTranspose
-                        + (int)cs.transpose;
+                // applies unless the organ is a drum machine (drums, like ch 10).
+                int raw = (int)nn.note + TRACKER_TO_MIDI_OFFSET
+                        + (seqOrganIsDrums() ? 0 : seqTranspose) + (int)cs.transpose;
                 if (raw < 0)   raw = 0;
                 if (raw > 127) raw = 127;
                 uint8_t vel = (nn.velocity & 0x80) ? 100 : nn.velocity;
@@ -2065,6 +2074,18 @@ static void seqAuditionRawNoteImpl(uint8_t channel, uint8_t note, uint8_t veloci
         sfxAudStart(cs.program, semis, cs.volume, note, true);
         return;
     }
+    // ORGAN while it's a drum machine (808, CR78): the drum editor's hits.
+    // Drums need no note-off (velocity 0 is one — ignored), so nothing hangs;
+    // any other organ sound would, so it stays silent.
+    if (channel == ORGAN_CHANNEL) {
+        if (note > 127 || velocity == 0 || velocity > 127) return;
+        if (!srvHasActive || !seqOrganIsDrums()) return;
+        seqOrganGrab();                    // as a tapped ORGAN cell does
+        if (!organActive()) return;
+        seqOrganApplySongPatch();
+        organNoteOn(note, velocity);
+        return;
+    }
     if (channel < 1 || channel > 16) return;
     if (note > 127 || velocity == 0 || velocity > 127) return;
     if (seqRawAudCount >= SEQ_RAW_AUD_Q_MAX) return;
@@ -2116,7 +2137,8 @@ static void seqOrganSampleTick() {
     }
     if ((uint32_t)(millis() - seqSfxQuietSince) < SEQ_ORGAN_BACK_MS) return;
     seqOrganGrab();
-    for (int c = 1; c < MAX_COLUMNS; c++)
+    // Held notes sound again — but not the 808's: they'd be fresh hits.
+    for (int c = 1; c < MAX_COLUMNS && !seqOrganIsDrums(); c++)
         if (seqActiveOn[c] && seqActiveChan[c] == SEQ_CHAN_ORGAN)
             organNoteOn(seqActiveNote[c], 100);
     debugPrintf("[SEQ] organ back\n");

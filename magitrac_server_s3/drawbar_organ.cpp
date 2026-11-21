@@ -2,6 +2,8 @@
 #include "audio_codec.h"
 #include "proc_sounds.h"
 #include "synth_voice.h"
+#include "drum808.h"
+#include "cr78.h"
 #include "OrganSynth.h"
 #include <Arduino.h>
 #include <math.h>
@@ -9,6 +11,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_timer.h"
+#include <Preferences.h>
+#include "MagiMsg.h"   // ORGAN_SOUND_VALUES
 
 // ── Tunables ──────────────────────────────────────────────────────────────────
 #define ORGAN_VOICES   12        // max simultaneous notes
@@ -352,15 +356,80 @@ static volatile int s_type = ORGAN_DRAWBAR;
 // PROC type: hand-written procedural generators (see proc_sounds.cpp) — no
 // drawbars; the client picks a sound from a list and its param sliders map to
 // s_param.  A CHOIR voice reads a per-voice morphed wavetable rebuilt per block.
-static int16_t s_voiceScratch[ORGAN_VOICES][PROC_WT];   // current morphed wavetable per voice
 static int32_t s_procLp   = 0;    // BRIGHT one-pole state (global, PROC only)
 static volatile int s_procSel = 0;    // selected procedural sound
+
+// The sound the audio task plays this pass: s_type / s_procSel copied once at
+// the top of each pass (scratchClaim), so a change made from another task
+// can't land halfway through one — the scratch area must belong to the sound
+// that reads it.  The audio task's code uses these, never s_type / s_procSel.
+static int s_passType = ORGAN_DRAWBAR, s_passSel = 0;
+
+// ── Organ scratch area ────────────────────────────────────────────────────────
+// Only one organ sound plays at a time, so the sounds share one block of fast
+// internal RAM for their working state, each in its own member below.  It
+// holds whatever the last sound left in it: when a sound becomes the one
+// playing, scratchClaim runs that sound's scratchSetup before any of its
+// notes start.  A sound that needs working space adds a member here and its
+// setup there.
+union OrganScratch {
+    int16_t choir[ORGAN_VOICES][PROC_WT];   // CHOIR: each voice's morphed wavetable
+    struct {
+        DrumShared shared;                  // 808: what every voice shares
+        float      work[DRUM_WORK_FLOATS];  //      and its per-block buffers
+    } drum;
+    struct {
+        Cr78Shared shared;                  // CR78: the same
+        float      work[CR78_WORK_FLOATS];
+    } cr78;
+};
+static OrganScratch s_scratch;
+static_assert(sizeof(OrganScratch) == sizeof(int16_t) * ORGAN_VOICES * PROC_WT,
+              "a sound's scratch outgrew CHOIR's wavetables: the organ would take more internal RAM");
+static int s_scratchOwner = -1;   // scratchSound() of the sound set up in it; -1 = none yet
+
+static int scratchSound(int type, int sel) {
+    return (type == ORGAN_PROC) ? ORGAN_TYPE_COUNT + sel : type;
+}
+
+// Each organ sound's setup for its part of the scratch area.
+static void scratchSetup(int type, int sel) {
+    if (type != ORGAN_PROC) return;          // DRAWBAR, TONEWHEEL, CLAUDE, NEBULA: none used
+    switch (sel) {
+        case PROC_IDX_CHOIR:                 // rebuilt every block once a note plays; start silent
+            memset(s_scratch.choir, 0, sizeof(s_scratch.choir));
+            break;
+        case PROC_IDX_808:
+            drumInit(s_scratch.drum.shared, AUDIO_CODEC_RATE_HZ, s_scratch.drum.work);
+            break;
+        case PROC_IDX_CR78:
+            cr78Init(s_scratch.cr78.shared, AUDIO_CODEC_RATE_HZ, s_scratch.cr78.work);
+            break;
+        case PROC_IDX_REED:                  // none used: state lives in the voice table
+        case PROC_IDX_VOC:
+        case PROC_IDX_SYNTH:
+        default:
+            break;
+    }
+}
+
+// Top of every audio pass, before its notes: take this pass's sound and, if
+// it isn't the one set up in the scratch area, set it up.  Voices left over
+// from the sound before are dropped by each render path (Voice.kind).
+static void scratchClaim() {
+    s_passType = s_type;
+    s_passSel  = s_procSel;
+    int snd = scratchSound(s_passType, s_passSel);
+    if (snd == s_scratchOwner) return;
+    scratchSetup(s_passType, s_passSel);
+    s_scratchOwner = snd;
+}
 
 // SYNTH's 14 settings (OrganSynth.h), written by the UI / sequencer, read once
 // per block into s_synthBlk.
 static volatile uint8_t s_synthParam[ORGAN_SYNTH_PARAMS];
 static SynthBlock s_synthBlk;
-static float      s_synthBuf[BLOCK_FRAMES];   // this block's SYNTH voices, summed
+static float      s_synthBuf[BLOCK_FRAMES];   // this block's SYNTH (or 808) voices, summed
 static uint32_t   s_synthUs = 0;              // time spent rendering them (load log)
 
 // NEBULA: a sci-fi, THX-flavoured but playable voice.  Each footage is TWO
@@ -409,12 +478,13 @@ static const float TW_H2 = 0.15f, TW_H3 = 0.08f, TW_H4 = 0.04f;
 static volatile int s_drawbar[ORGAN_DRAWBARS] = { 8, 8, 8, 0, 0, 0, 0, 0, 0 };
 
 enum EnvStage { ENV_IDLE = 0, ENV_ATTACK, ENV_SUSTAIN, ENV_RELEASE };
+enum VoiceKind : uint8_t { VK_ORGAN = 0, VK_SYNTH, VK_DRUM, VK_CR78 };   // `proc` / `syn` / `drum` / `cr`
 
 struct Voice {
     uint8_t  note;
     uint8_t  stage;       // EnvStage
     uint8_t  sustained;   // key released while the damper pedal was down
-    uint8_t  isSynth;     // started by SYNTH: `syn` is live, not `proc`
+    uint8_t  kind;        // VK_*: which sound's state the union below holds
     int32_t  env;         // Q15, 0..32767
     int32_t  clickEnv;    // Q15 key-click transient (tonewheel only)
     uint32_t rng;         // per-voice noise state (key click)
@@ -429,9 +499,13 @@ struct Voice {
     union {
         ProcVoiceState proc;        // PROC generator state (CHOIR)
         SynthVoice     syn;         // SYNTH
+        DrumVoice      drum;        // 808
+        Cr78Voice      cr;          // CR78
     };
 };
 static_assert(sizeof(SynthVoice) <= sizeof(ProcVoiceState), "SYNTH would grow the voice table");
+static_assert(sizeof(DrumVoice) <= sizeof(ProcVoiceState), "the 808 would grow the voice table");
+static_assert(sizeof(Cr78Voice) <= sizeof(ProcVoiceState), "the CR78 would grow the voice table");
 static Voice voices[ORGAN_VOICES];
 static volatile int s_voiceCount = 0;   // for the header readout
 
@@ -449,17 +523,33 @@ static void voiceStart(Voice& v, uint8_t note, uint8_t vel) {
     v.note      = note;
     v.stage     = ENV_ATTACK;
     v.sustained = 0;
-    if (s_type == ORGAN_PROC && s_procSel == PROC_IDX_SYNTH) {
+    if (s_passType == ORGAN_PROC && s_passSel == PROC_IDX_808) {
+        v.kind     = VK_DRUM;
+        drumNoteOn(v.drum, drumInstForNote(note), vel, s_scratch.drum.shared);
+        v.env      = (int32_t)(drumLevel(v.drum) * 32767.0f);
+        v.clickEnv = 0;
+        v.glideQ16 = 65536;
+        return;
+    }
+    if (s_passType == ORGAN_PROC && s_passSel == PROC_IDX_CR78) {
+        v.kind     = VK_CR78;
+        cr78NoteOn(v.cr, cr78InstForNote(note), note, vel, s_scratch.cr78.shared);
+        v.env      = (int32_t)(cr78Level(v.cr) * 32767.0f);
+        v.clickEnv = 0;
+        v.glideQ16 = 65536;
+        return;
+    }
+    if (s_passType == ORGAN_PROC && s_passSel == PROC_IDX_SYNTH) {
         // Retriggered or stolen: carry on from the level it was at (no click).
-        float from = (wasLive && v.isSynth) ? v.syn.env : 0.0f;
-        v.isSynth  = 1;
+        float from = (wasLive && v.kind == VK_SYNTH) ? v.syn.env : 0.0f;
+        v.kind     = VK_SYNTH;
         synthNoteOn(v.syn, midiHz(note), vel, from, AUDIO_CODEC_RATE_HZ);
         v.env      = (int32_t)(v.syn.env * 32767.0f);
         v.clickEnv = 0;
         v.glideQ16 = 65536;
         return;
     }
-    v.isSynth   = 0;
+    v.kind      = VK_ORGAN;
     // VOCODER carrier oscillator: the note's own pitch, starting at a
     // note-dependent point in its cycle so a chord's notes don't all peak together.
     v.vocInc    = (uint32_t)((double)midiHz(note) * 4294967296.0 / AUDIO_CODEC_RATE_HZ);
@@ -473,10 +563,10 @@ static void voiceStart(Voice& v, uint8_t note, uint8_t vel) {
     float lfoHz = VOC_PWM_HZ * (0.8f + 0.4f * (float)(v.rng >> 16) / 65536.0f);
     v.vocLfoInc = (uint32_t)((double)lfoHz * BLOCK_FRAMES / AUDIO_CODEC_RATE_HZ * 4294967296.0);
     v.vocWidth  = 0.5f;
-    if (s_type == ORGAN_PROC) {
-        if (s_procSel == PROC_IDX_VOC) {
+    if (s_passType == ORGAN_PROC) {
+        if (s_passSel == PROC_IDX_VOC) {
             // just the carrier oscillator set up above
-        } else if (s_procSel == PROC_IDX_REED) {
+        } else if (s_passSel == PROC_IDX_REED) {
             // Ranks start at scattered points in their cycles (no phase-locked
             // click as a chord lands); increments are set per block.
             for (int k = 0; k <= REED_MAX_RANKS; k++) {
@@ -489,15 +579,15 @@ static void voiceStart(Voice& v, uint8_t note, uint8_t vel) {
             return;
         } else {
             if (v.proc.rng == 0) v.proc.rng = 0x1234567u ^ (note * 2654435761u);
-            procNoteOn(s_procSel, v.proc, midiHz(note), s_param);
+            procNoteOn(s_passSel, v.proc, midiHz(note), s_param);
         }
         v.clickEnv = 0;
         v.glideQ16 = 65536;
         return;
     }
-    bool tw     = (s_type == ORGAN_TONEWHEEL);
-    bool claude = (s_type == ORGAN_CLAUDE);
-    bool neb    = (s_type == ORGAN_NEBULA);
+    bool tw     = (s_passType == ORGAN_TONEWHEEL);
+    bool claude = (s_passType == ORGAN_CLAUDE);
+    bool neb    = (s_passType == ORGAN_NEBULA);
     const float* ratio = tw ? RATIO_TW : RATIO_DB;   // CLAUDE/NEBULA use pure ratios + detune
     float f0 = midiHz(note);
     const float nyq = AUDIO_CODEC_RATE_HZ * 0.5f;
@@ -539,9 +629,25 @@ static void voiceStart(Voice& v, uint8_t note, uint8_t vel) {
 }
 
 static void applyNoteOn(uint8_t note, uint8_t vel) {
-    // The organ sounds ignore velocity (it only gates on/off); SYNTH uses it.
+    // The organ sounds ignore velocity (it only gates on/off); SYNTH and the
+    // drum machines use it.
+    // The 808: notes off the GM drum map do nothing, a closed hat cuts off an
+    // open one, and a drum hit again takes a fresh voice so the last hit's
+    // tail rings on instead of clicking off.  The CR78 the same, but nothing
+    // on a CR-78 chokes anything (its open hat is the cymbal).
+    bool cr78  = (s_passType == ORGAN_PROC && s_passSel == PROC_IDX_CR78);
+    bool drums = cr78 || (s_passType == ORGAN_PROC && s_passSel == PROC_IDX_808);
+    if (cr78 && cr78InstForNote(note) < 0) return;
+    if (drums && !cr78) {
+        int inst = drumInstForNote(note);
+        if (inst < 0) return;
+        if (inst == DR_CH)
+            for (int i = 0; i < ORGAN_VOICES; i++)
+                if (voices[i].stage != ENV_IDLE && voices[i].kind == VK_DRUM && voices[i].drum.inst == DR_OH)
+                    drumChoke(voices[i].drum);
+    }
     // Retrigger if this note is already sounding.
-    for (int i = 0; i < ORGAN_VOICES; i++) {
+    for (int i = 0; i < ORGAN_VOICES && !drums; i++) {
         if (voices[i].stage != ENV_IDLE && voices[i].note == note) {
             voiceStart(voices[i], note, vel);
             return;
@@ -607,16 +713,16 @@ static void nebRetuneVoice(Voice& v) {
 // Render BLOCK_FRAMES stereo frames into `out` (interleaved L,R int16).
 static void renderBlock(int16_t* out) {
     // DRAWBAR/CLAUDE use pure sines; TONEWHEEL uses the richer quasi-sine wheel.
-    bool tw     = (s_type == ORGAN_TONEWHEEL);
-    bool claude = (s_type == ORGAN_CLAUDE);
-    bool neb  = (s_type == ORGAN_NEBULA);
-    bool proc = (s_type == ORGAN_PROC);
+    bool tw     = (s_passType == ORGAN_TONEWHEEL);
+    bool claude = (s_passType == ORGAN_CLAUDE);
+    bool neb  = (s_passType == ORGAN_NEBULA);
+    bool proc = (s_passType == ORGAN_PROC);
     const int16_t* wtab = neb ? nebTab : (tw ? twTab : sineTab);
 
     // PROC: snapshot the sound selection + noise slider once per block, and
     // let the sound override the organ's near-instant envelope (CHOIR swells
     // over an ATTACK-slider time and releases slowly).
-    int procSel  = s_procSel;
+    int procSel  = s_passSel;
     int procAtk  = s_param[0];
     int procGain = PROC_SOUNDS[procSel].gain;
     int32_t envAtkInc = ENV_ATTACK_INC;
@@ -708,7 +814,7 @@ static void renderBlock(int16_t* out) {
         for (int i = 0; i < ORGAN_VOICES; i++) {
             Voice& v = voices[i];
             if (v.stage == ENV_IDLE) continue;
-            if (!v.isSynth) {                 // left over from the sound before: its state means nothing here
+            if (v.kind != VK_SYNTH) {         // left over from the sound before: its state means nothing here
                 v.stage = ENV_IDLE; v.env = 0; v.sustained = 0;
                 continue;
             }
@@ -719,6 +825,59 @@ static void renderBlock(int16_t* out) {
         s_synthUs = (uint32_t)(esp_timer_get_time() - t0);
     } else {
         s_synthUs = 0;
+    }
+
+    // The 808: the same, a whole block per voice, then its limiter.
+    bool  drumSel   = proc && procSel == PROC_IDX_808;
+    if (drumSel) {
+        int64_t t0 = esp_timer_get_time();
+        int sp[ORGAN_DRUM_PARAMS];           // the sliders, then the drawbar bytes (OrganSynth.h)
+        for (int k = 0; k < ORGAN_DRUM_PARAMS; k++)
+            sp[k] = (k < 5) ? s_param[k] : s_drawbar[k - 5];
+        uint32_t mask = 0;
+        for (int i = 0; i < ORGAN_VOICES; i++) {
+            Voice& v = voices[i];
+            if (v.stage == ENV_IDLE) continue;
+            if (v.kind != VK_DRUM) { v.stage = ENV_IDLE; v.env = 0; v.sustained = 0; continue; }
+            if (v.drum.inst < DR_COUNT) mask |= 1u << v.drum.inst;
+        }
+        drumPrepare(s_scratch.drum.shared, sp, mask, BLOCK_FRAMES, ORGAN_DRUM_PARAMS);
+        synthScale = 32767.0f * 8.0f * (float)procGain;
+        memset(s_synthBuf, 0, sizeof(s_synthBuf));
+        for (int i = 0; i < ORGAN_VOICES; i++) {
+            Voice& v = voices[i];
+            if (v.stage == ENV_IDLE) continue;
+            if (!drumRender(v.drum, s_scratch.drum.shared, s_synthBuf, BLOCK_FRAMES)) { v.stage = ENV_IDLE; v.env = 0; }
+            else v.env = (int32_t)(drumLevel(v.drum) * 32767.0f);
+        }
+        drumBus(s_synthBuf, BLOCK_FRAMES);
+        s_synthUs = (uint32_t)(esp_timer_get_time() - t0);
+    }
+    // The CR78: the same again, through the same limiter.
+    if (proc && procSel == PROC_IDX_CR78) {
+        drumSel = true;
+        int64_t t0 = esp_timer_get_time();
+        int sp[ORGAN_DRUM_PARAMS];           // the sliders, then the drawbar bytes (OrganSynth.h)
+        for (int k = 0; k < ORGAN_DRUM_PARAMS; k++)
+            sp[k] = (k < 5) ? s_param[k] : s_drawbar[k - 5];
+        uint32_t mask = 0;
+        for (int i = 0; i < ORGAN_VOICES; i++) {
+            Voice& v = voices[i];
+            if (v.stage == ENV_IDLE) continue;
+            if (v.kind != VK_CR78) { v.stage = ENV_IDLE; v.env = 0; v.sustained = 0; continue; }
+            if (v.cr.inst < CR_COUNT) mask |= 1u << v.cr.inst;
+        }
+        cr78Prepare(s_scratch.cr78.shared, sp, mask, BLOCK_FRAMES, ORGAN_DRUM_PARAMS);
+        synthScale = 32767.0f * 8.0f * (float)procGain;
+        memset(s_synthBuf, 0, sizeof(s_synthBuf));
+        for (int i = 0; i < ORGAN_VOICES; i++) {
+            Voice& v = voices[i];
+            if (v.stage == ENV_IDLE) continue;
+            if (!cr78Render(v.cr, s_scratch.cr78.shared, s_synthBuf, BLOCK_FRAMES)) { v.stage = ENV_IDLE; v.env = 0; }
+            else v.env = (int32_t)(cr78Level(v.cr) * 32767.0f);
+        }
+        drumBus(s_synthBuf, BLOCK_FRAMES);
+        s_synthUs = (uint32_t)(esp_timer_get_time() - t0);
     }
 
     // REED sound: its stops, céleste, width and level, once per block.
@@ -759,13 +918,13 @@ static void renderBlock(int16_t* out) {
 
     for (int n = 0; n < BLOCK_FRAMES; n++) {
         int32_t mix = 0;
-        if (synthSel) mix = (int32_t)(s_synthBuf[n] * synthScale);
+        if (synthSel || drumSel) mix = (int32_t)(s_synthBuf[n] * synthScale);
 
-        for (int i = 0; i < ORGAN_VOICES && !synthSel; i++) {
+        for (int i = 0; i < ORGAN_VOICES && !synthSel && !drumSel; i++) {
             Voice& v = voices[i];
             if (v.stage == ENV_IDLE) continue;
-            if (v.isSynth) {
-                // Left over from SYNTH: its state means nothing to this sound.
+            if (v.kind != VK_ORGAN) {
+                // Left over from SYNTH or a drum machine: its state means nothing to this sound.
                 v.stage = ENV_IDLE; v.env = 0; v.sustained = 0;
                 continue;
             }
@@ -839,8 +998,8 @@ static void renderBlock(int16_t* out) {
                 // PROC: rebuild this voice's morphed wavetable once per block,
                 // then the generator's oscillators read it.  Gain comes from
                 // the sound's registry entry (RMS-matched to the drawbars).
-                if (n == 0) procBlockPrep(procSel, v.proc, s_voiceScratch[i], s_param);
-                acc = procSample(procSel, v.proc, s_voiceScratch[i], procAtk) * procGain;
+                if (n == 0) procBlockPrep(procSel, v.proc, s_scratch.choir[i], s_param);
+                acc = procSample(procSel, v.proc, s_scratch.choir[i], procAtk) * procGain;
             } else {
                 for (int h = 0; h < ORGAN_DRAWBARS; h++) {
                     if (v.inc[h] == 0 || db[h] == 0) continue;
@@ -886,7 +1045,7 @@ static void renderBlock(int16_t* out) {
         // PROC BRIGHT slider — global one-pole low-pass tone control — then the
         // THROAT formant (boost can exceed int16, so re-clamp before the FX
         // chain writes int16 delay buffers).
-        if (proc && !vocSel && !synthSel) {            // (VOCODER's sliders mean other things; SYNTH has its own filter)
+        if (proc && !vocSel && !synthSel && !drumSel) {   // (VOCODER's and the drum machines' sliders mean other things; SYNTH has its own filter)
             int alpha = 16 + s_param[2] * 30;          // 16 (dark) .. 256 (open)
             s_procLp += ((s - s_procLp) * alpha) >> 8;
             s = procFormant(s_procLp, procSel, s_param[4]);
@@ -1037,10 +1196,11 @@ static void organTaskFn(void*) {
     int  vocPrime = 0;
     for (;;) {
         if (!s_active) { vocWas = false; vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        scratchClaim();
         drainEvents();
 
         // Full-duplex: the mic block is the vocoder's modulator for this pass.
-        bool voc = (s_type == ORGAN_PROC && s_procSel == PROC_IDX_VOC);
+        bool voc = (s_passType == ORGAN_PROC && s_passSel == PROC_IDX_VOC);
         if (voc && !vocWas) {
             vocPrime = VOC_PRIME_BLOCKS;
             vocoderReset();              // stale filter state → a click (this task owns it)
@@ -1241,6 +1401,106 @@ void organSetSynthParam(int idx, int value) {
     if (idx < 0 || idx >= ORGAN_SYNTH_PARAMS) return;
     s_synthParam[idx] = organSynthClamp(idx, value);   // read at the next block
 }
+
+// ── Each sound's last settings, for when the performer swaps sound ──────────
+// The sliders belong to the song, but a song holds only the sound it uses, so
+// each drawbar type and PROC sound has a slot here: a SWAP puts the playing
+// sound's settings in its slot and brings the new sound's back (the client
+// then writes them into the song).  Nothing else touches the slots — a song
+// selecting its sound brings its own settings.  Saved to NVS ("organsnd") a
+// few seconds after a swap, never while the song plays (a flash write stalls
+// the other core).
+//   drawbar type / PROC sound: its sliders [0..4]
+//   a drum machine:            the sliders, then the drawbars (OrganSynth.h)
+//   SYNTH:                     its 14 settings
+#define STORE_SLOTS (ORGAN_TYPE_COUNT - 1 + PROC_SOUND_COUNT)
+static uint8_t  s_store[STORE_SLOTS][ORGAN_SOUND_VALUES];
+static uint8_t  s_storeSaved[STORE_SLOTS][ORGAN_SOUND_VALUES];   // what NVS holds
+static volatile uint32_t s_storeTouched = 0;   // millis() of the last swap not yet saved, 0 = none
+
+static const char* STORE_NS = "organsnd";
+
+static int storeSlot() {
+    return (s_type < ORGAN_TYPE_COUNT - 1) ? s_type : ORGAN_TYPE_COUNT - 1 + s_procSel;
+}
+static bool slotIsSynth(int slot) { return slot == ORGAN_TYPE_COUNT - 1 + PROC_IDX_SYNTH; }
+static bool slotIsDrums(int slot) {
+    return slot >= ORGAN_TYPE_COUNT - 1 &&
+           organVoiceIsDrums(organVoiceFromProc(slot - (ORGAN_TYPE_COUNT - 1)));
+}
+
+static void storeRead(int slot, uint8_t* d) {   // the live settings, as that slot holds them
+    for (int k = 0; k < ORGAN_SOUND_VALUES; k++) {
+        if (slotIsSynth(slot))   d[k] = (uint8_t)s_synthParam[k];
+        else if (k < ORGAN_PARAMS) d[k] = (uint8_t)s_param[k];
+        else if (slotIsDrums(slot)) d[k] = (uint8_t)s_drawbar[k - ORGAN_PARAMS];
+        else d[k] = 0;
+    }
+}
+static void storeGive(int slot) {        // slot → live
+    const uint8_t* d = s_store[slot];
+    for (int k = 0; k < ORGAN_SOUND_VALUES; k++) {
+        if (slotIsSynth(slot))      s_synthParam[k] = organSynthClamp(k, d[k]);
+        else if (k < ORGAN_PARAMS)  s_param[k] = d[k] > 8 ? 8 : d[k];
+        else if (slotIsDrums(slot)) s_drawbar[k - ORGAN_PARAMS] = d[k] > 8 ? 8 : d[k];
+    }
+    if (s_type == ORGAN_NEBULA) s_nebRetune = true;
+}
+
+void organSwapSound(int type, int procSel, bool stash) {
+    if (type < 0 || type >= ORGAN_TYPE_COUNT) return;
+    if (type == ORGAN_TYPE_COUNT - 1 && (procSel < 0 || procSel >= PROC_SOUND_COUNT)) return;
+    int from = storeSlot();
+    organSetType(type);
+    if (type == ORGAN_TYPE_COUNT - 1) organSetProcSound(procSel);
+    int to = storeSlot();
+    if (stash) {
+        if (to == from) return;              // no swap: the song's settings stay
+        storeRead(from, s_store[from]);
+        uint32_t now = millis();
+        s_storeTouched = now ? now : 1;
+    }
+    storeGive(to);
+}
+
+void organStoreBegin() {
+    // Defaults: what each sound starts at on the client (OrganPage).
+    memset(s_store, 0, sizeof(s_store));
+    s_store[ORGAN_TONEWHEEL][0] = 4;
+    s_store[ORGAN_NEBULA][0] = 4; s_store[ORGAN_NEBULA][1] = 5; s_store[ORGAN_NEBULA][2] = 6;
+    for (int p = 0; p < PROC_SOUND_COUNT; p++) {
+        int slot = ORGAN_TYPE_COUNT - 1 + p;
+        if (slotIsSynth(slot)) {
+            memcpy(s_store[slot], ORGAN_SYNTH_DEFAULT, ORGAN_SOUND_VALUES);
+            continue;
+        }
+        for (int k = 0; k < ORGAN_PARAMS; k++) s_store[slot][k] = PROC_SOUNDS[p].pdef[k];
+        if (slotIsDrums(slot))
+            for (int k = ORGAN_PARAMS; k < ORGAN_SOUND_VALUES; k++) s_store[slot][k] = 4;
+    }
+    Preferences prefs;
+    if (prefs.begin(STORE_NS, true)) {
+        if (prefs.getBytesLength("slots") == sizeof(s_store))
+            prefs.getBytes("slots", s_store, sizeof(s_store));
+        prefs.end();
+    }
+    memcpy(s_storeSaved, s_store, sizeof(s_store));
+}
+
+void organStoreTick(bool playing) {
+    uint32_t t = s_storeTouched;
+    if (!t || playing || millis() - t < 3000) return;
+    s_storeTouched = 0;
+    if (!memcmp(s_store, s_storeSaved, sizeof(s_store))) return;
+    Preferences prefs;
+    if (!prefs.begin(STORE_NS, false)) return;
+    prefs.putBytes("slots", s_store, sizeof(s_store));
+    prefs.end();
+    memcpy(s_storeSaved, s_store, sizeof(s_store));
+    Serial.printf("[ORGAN] sound settings saved\n");
+}
+
+void organStoreCurrent(uint8_t* out) { storeRead(storeSlot(), out); }
 int organGetSynthParam(int idx) {
     return (idx >= 0 && idx < ORGAN_SYNTH_PARAMS) ? s_synthParam[idx] : 0;
 }

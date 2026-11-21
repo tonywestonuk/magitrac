@@ -159,8 +159,10 @@ tracker and Block Settings go through `PageManager`).
 - **BlockSettingsPage** — blocks: new / duplicate / split / delete, length,
   the per-pitch-class input-note actions (block switch, transpose),
   key-change mode, block-end navigation.  Opened by tapping the block label.
-- **DrumEditorPage** — step grid over a block's channel-10 columns, reached
-  from Block Settings.  **DrumTrackImportPage** imports a block from the
+- **DrumEditorPage** — step grid over a block's drum columns (channel 10,
+  plus ORGAN columns while the organ is the 808 or CR78 — new drum columns
+  then go to the organ; `isDrumColumn` / `songDrumChannel` in `DrumKits.h`),
+  reached from Block Settings.  **DrumTrackImportPage** imports a block from the
   server's `/drumtracks/*.txt` (from here or from ColumnEditor).
 - **SongConfigPage** — song-level config: initial / min / max BPM, MIDI-in
   channel and note range, performer slot enables (`performerMask`), which
@@ -174,7 +176,15 @@ tracker and Block Settings go through `PageManager`).
 - **InstrumentsPage** (the instrument bank), **OrganPage** (drawbar organ
   on the server; with the PROC voice's SYNTH sound selected, EDIT SOUND or a
   second tap on SYNTH hands the screen to **SynthEditor**: waveform buttons,
-  filter and envelope sliders, presets, BACK), **SamplesPage** (the server's samples as tappable
+  filter and envelope sliders, presets, BACK; the 808 and CR78 sounds turn ORGAN
+  columns into drums on the GM drum map, and show 14 narrow sliders from the
+  sound list to the right edge — the 6th to 14th go to the server as drawbars
+  and are saved in the patch's bar bytes; their readout box overlays the sound
+  buttons, which are redrawn on release; the sliders belong to the song;
+  swapping sound or type sends ORGAN_OP_SWAP, the server saves the old
+  sound's sliders and answers with the new one's last (`MsgOrganSound`), which
+  the page writes into the song; opening a song with no organ patch sends
+  ORGAN_OP_RECALL, with one it sends the song's values), **SamplesPage** (the server's samples as tappable
   squares; hold one to edit it), **SampleRecordPage** (ADD on the samples
   page: arms the server's hold-to-record screen, follows its KEEP / CANCEL /
   RESAMPLE review, then names / saves the take it hands back),
@@ -192,7 +202,9 @@ tracker and Block Settings go through `PageManager`).
 
 `UIHelpers.h` provides `uiButton()`.  `HoldRepeat` powers ±value
 buttons.  `ConfirmDialog`, `KeyboardPopup`, `NumpadPopup` and
-`ScrollViewport` (inertia drag-scroll lists) are the other shared pieces.
+`ScrollViewport` (inertia drag-scroll lists) are the other shared pieces;
+`InlineKeyboard` is a keyboard drawn under a page's own text box (AiPage
+uses it, with a cursor you place by tapping the box).
 `HexpadPopup` is a full-screen hex byte editor —
 `open(hi, lo, numDigits, title, fingerDown=true, showChoose=false)`;
 `numDigits=2` for a
@@ -245,8 +257,9 @@ compiled together — `.ino` is the entry point.
 
 ## Working here
 
-- The owner builds and flashes from the Arduino IDE.  Don't compile after
-  an edit, and never run `arduino-cli` in the background.
+- Compiling and flashing from the command line is fine (foreground,
+  separate `--build-path`).  Never run `arduino-cli` in the background: it
+  collides with the Arduino IDE's build cache.
 - Client and server are always flashed together.  The wire format may
   change freely, but both ends must change in the same commit.
 - Internal RAM is the radios' budget on the ESP32-S3: anything over ~1 KB

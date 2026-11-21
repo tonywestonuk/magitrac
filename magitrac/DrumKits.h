@@ -10,6 +10,21 @@
 
 #define DRUM_MIDI_CHANNEL 10   // GM percussion (1-based)
 
+// The song's drum columns: GM channel 10, plus the ORGAN columns while the
+// organ is a drum machine (808, CR78) — they play the same GM drum map.  New
+// drum parts go to the organ then (songDrumChannel).
+#include "OrganSynth.h"
+static inline bool songOrganIsDrums(const Song& s) {
+    return (s.organ.flags & 1) && organVoiceIsDrums(s.organ.voice);
+}
+static inline bool isDrumColumn(const Song& s, int c) {
+    uint8_t ch = s.columns[c].midiChannel;
+    return ch == DRUM_MIDI_CHANNEL || (ch == ORGAN_CHANNEL && songOrganIsDrums(s));
+}
+static inline uint8_t songDrumChannel(const Song& s) {
+    return songOrganIsDrums(s) ? ORGAN_CHANNEL : DRUM_MIDI_CHANNEL;
+}
+
 struct DrumKit { uint8_t program; const char* name; };
 
 static const DrumKit DRUM_KITS[] = {

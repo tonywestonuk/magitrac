@@ -80,6 +80,16 @@ int  organGetParam(int idx);
 // PROC type — which procedural sound the voices play (0..PROC_SOUND_COUNT-1).
 // A change applies to notes played after it.
 void organSetProcSound(int i);
+
+// The performer swapping sound: the sliders belong to the song, but each
+// type / PROC sound's last settings are kept here (and in NVS) so a swap
+// brings them back.  `stash`: put the playing sound's away first (a SWAP; a
+// RECALL doesn't).  Begin after organInit; tick from the loop (it writes NVS
+// only while stopped).
+void organSwapSound(int type, int procSel, bool stash);
+void organStoreBegin();
+void organStoreTick(bool playing);
+void organStoreCurrent(uint8_t* out);         // the live settings, ORGAN_SOUND_VALUES bytes
 int  organGetProcSound();
 
 // SYNTH (PROC_IDX_SYNTH) — its 14 settings, OrganSynthParam order and ranges

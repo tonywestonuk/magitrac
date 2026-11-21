@@ -34,6 +34,15 @@ const ProcSoundInfo PROC_SOUNDS[PROC_SOUND_COUNT] = {
     // envelope fields here are unused.  gain 3: one voice's saw about level
     // with an 888 registration.  Not ear-tuned yet.
     { "SYNTH",      0, { }, { }, 3, 0xFF, 0 },
+    // 808 — drum machine (drum808.cpp); its own envelopes too.  gain 16:
+    // its limiter's ±1 lands at -6 dBFS (a lone kick ~-10 dBFS, an 888
+    // registration sits ~-20).  Not ear-tuned yet.
+    { "808",        5, { "BD DEC", "BD TONE", "SNAPPY", "OH DEC", "TUNE" },
+                       { 4, 4, 4, 4, 4 }, 16, 0xFF, 0 },
+    // CR78 — CR-78 drum machine (cr78.cpp).  gain 16 as for the 808: its
+    // kick peaks about where the 808's does.  Not ear-tuned yet.
+    { "CR78",       5, { "BD DEC", "SNAPPY", "HH DEC", "CY DEC", "TUNE" },
+                       { 4, 4, 4, 4, 4 }, 16, 0xFF, 0 },
 };
 
 // ── CHOIR — the Orchestron optical-disc choir ─────────────────────────────────
@@ -190,6 +199,8 @@ void procSoundsInit() {
     buildFormantStage(PROC_IDX_CHOIR, 2, 2800.0f, 3.0f, 2.00f, true);   // singer's formant
     gProcFormantNstage[PROC_IDX_VOC] = 0;                  // VOCODER: none (and bypassed)
     gProcFormantNstage[PROC_IDX_SYNTH] = 0;                // SYNTH: none (and bypassed)
+    gProcFormantNstage[PROC_IDX_808] = 0;                  // 808: none (and bypassed)
+    gProcFormantNstage[PROC_IDX_CR78] = 0;                 // CR78: none (and bypassed)
     gProcFormantNstage[PROC_IDX_REED] = 1;                 // REED: the chamber's nasal peak
     // REED: 1.4 kHz, Q 1.5, 3 dB a step (+24 dB at 8) — fitted to an oboe
     // recording, whose bore resonance sits there; CHAMBER 8 with WAVE 8,

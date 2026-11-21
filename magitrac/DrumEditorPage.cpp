@@ -183,7 +183,7 @@ void DrumEditorPage::rebuildLanes() {
     _laneCount = 0;
     NoteGrid g(_song.notePool, &pat().noteHead);
     for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+        if (!isDrumColumn(_song, c)) continue;
         for (uint8_t r = 0; r < pat().length; r++) {
             Note n = g.get(r, c);
             if (n.note == 0 || n.note == NOTE_OFF) continue;
@@ -252,7 +252,7 @@ void DrumEditorPage::rebuildCellOn() {
     memset(_cellOn, 0, sizeof(_cellOn));
     NoteGrid g(_song.notePool, &pat().noteHead);
     for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+        if (!isDrumColumn(_song, c)) continue;
         for (int s = 0; s < _pageCols; s++) {
             int row = _pageStartRow + s;
             if (row >= pat().length) break;
@@ -514,7 +514,7 @@ int DrumEditorPage::findColumnHoldingNote(uint8_t row, uint8_t trackerNote) cons
     NoteGrid g(_song.notePool,
                &_song.patterns[_patIdx].noteHead);
     for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+        if (!isDrumColumn(_song, c)) continue;
         Note n = g.get(row, (uint8_t)c);
         if (n.note == trackerNote) return c;
     }
@@ -524,9 +524,11 @@ int DrumEditorPage::findColumnHoldingNote(uint8_t row, uint8_t trackerNote) cons
 int DrumEditorPage::findColumnForPlace(uint8_t row, uint8_t trackerNote) {
     NoteGrid g(_song.notePool, &pat().noteHead);
 
-    // Pass 1: ch10 col that already carries this drum elsewhere, with row free
+    // Pass 1: a drum col (on the song's drum channel: ch10, or the organ when
+    // it's a drum machine) that already carries this drum elsewhere, row free
+    const uint8_t drumCh = songDrumChannel(_song);
     for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+        if (_song.columns[c].midiChannel != drumCh) continue;
         bool hasDrumElsewhere = false;
         bool rowFree = (g.get(row, (uint8_t)c).note == 0);
         for (uint8_t r = 0; r < pat().length; r++) {
@@ -538,9 +540,9 @@ int DrumEditorPage::findColumnForPlace(uint8_t row, uint8_t trackerNote) {
         }
         if (hasDrumElsewhere && rowFree) return c;
     }
-    // Pass 2: any ch10 col with this row free
+    // Pass 2: any such col with this row free
     for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+        if (_song.columns[c].midiChannel != drumCh) continue;
         if (g.get(row, (uint8_t)c).note == 0) return c;
     }
     // Pass 3: allocate a fresh column
@@ -564,7 +566,7 @@ int DrumEditorPage::allocateNewDrumColumn() {
         if (_song.columns[c].midiChannel == 0 && !(used & (1u << c))) {
             ColumnSettings& cs = _song.columns[c];
             memset(&cs, 0, sizeof(cs));
-            cs.midiChannel = DRUM_MIDI_CHANNEL;
+            cs.midiChannel = songDrumChannel(_song);
             cs.program     = 0;
             cs.volume      = 100;
             strncpy(cs.name, "DRUMS", INSTRUMENT_NAME_LEN - 1);
@@ -637,7 +639,7 @@ void DrumEditorPage::openPicker() {
 
 void DrumEditorPage::closePicker(bool redraw) {
     if (_pickerAudActive && gServerPairing.isPaired()) {
-        gServerPairing.sendAuditionRawNote(DRUM_MIDI_CHANNEL, _pickerAudMidi, 0);
+        gServerPairing.sendAuditionRawNote(songDrumChannel(_song), _pickerAudMidi, 0);
     }
     _pickerAudActive = false;
     _pickerActive    = false;
@@ -725,13 +727,13 @@ bool DrumEditorPage::hitPickerPlay(int sx, int sy, int& visIdx) const {
 
 void DrumEditorPage::pickerAuditionStart(uint8_t midiNote) {
     if (_pickerAudActive && gServerPairing.isPaired()) {
-        gServerPairing.sendAuditionRawNote(DRUM_MIDI_CHANNEL, _pickerAudMidi, 0);
+        gServerPairing.sendAuditionRawNote(songDrumChannel(_song), _pickerAudMidi, 0);
     }
     _pickerAudMidi   = midiNote;
     _pickerAudOffMs  = millis() + DEP_PCK_PLAY_OFF_MS;
     _pickerAudActive = true;
     if (gServerPairing.isPaired()) {
-        gServerPairing.sendAuditionRawNote(DRUM_MIDI_CHANNEL, midiNote, 100);
+        gServerPairing.sendAuditionRawNote(songDrumChannel(_song), midiNote, 100);
     }
 }
 
@@ -739,7 +741,7 @@ void DrumEditorPage::pickerAuditionTick() {
     if (!_pickerAudActive) return;
     if ((int32_t)(millis() - _pickerAudOffMs) < 0) return;
     if (gServerPairing.isPaired()) {
-        gServerPairing.sendAuditionRawNote(DRUM_MIDI_CHANNEL, _pickerAudMidi, 0);
+        gServerPairing.sendAuditionRawNote(songDrumChannel(_song), _pickerAudMidi, 0);
     }
     _pickerAudActive = false;
 }
@@ -938,13 +940,13 @@ void DrumEditorPage::auditionTick() {
     // Fire all drums at the current row.
     NoteGrid g(_song.notePool, &pat().noteHead);
     for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+        if (!isDrumColumn(_song, c)) continue;
         Note n = g.get(_audStep, (uint8_t)c);
         if (n.note == 0 || n.note == NOTE_OFF) continue;
         uint8_t midi = (uint8_t)(n.note + TRACKER_TO_MIDI_OFFSET);
         uint8_t vel  = (n.velocity & 0x80) ? 100 : n.velocity;
         if (gServerPairing.isPaired()) {
-            gServerPairing.sendAuditionRawNote(DRUM_MIDI_CHANNEL, midi, vel);
+            gServerPairing.sendAuditionRawNote(_song.columns[c].midiChannel, midi, vel);
         }
     }
 
@@ -1081,7 +1083,7 @@ void DrumEditorPage::importBlock(const DrumPatternFile& file, int blockIdx,
 
     // 1) Clear all ch10 notes in this pattern.
     for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+        if (!isDrumColumn(_song, c)) continue;
         for (uint8_t r = 0; r < pp.length; r++) g.clear(r, (uint8_t)c);
         _resyncMask |= (1u << c);
     }
@@ -1092,7 +1094,7 @@ void DrumEditorPage::importBlock(const DrumPatternFile& file, int blockIdx,
     uint8_t kitProgram = (kitIdx >= 0 && kitIdx < DRUM_KIT_COUNT)
                         ? DRUM_KITS[kitIdx].program : 0;
     for (int c = 1; c < MAX_COLUMNS; c++) {
-        if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;
+        if (_song.columns[c].midiChannel != DRUM_MIDI_CHANNEL) continue;   // the organ has no kits
         if (_song.columns[c].program == kitProgram) continue;
         _song.columns[c].program = kitProgram;
         if (gServerPairing.isPaired()) {

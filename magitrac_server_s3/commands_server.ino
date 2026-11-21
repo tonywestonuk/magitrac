@@ -2965,8 +2965,23 @@ static void aiTick() {
     aiFinish(AI_ST_DONE, done);
 }
 
+// A client swapped organ sound and wants its settings.
+static volatile bool sOrganSoundReply = false;
+
 void commandsTick() {
     aiTick();
+
+    organStoreTick(sequencerIsRunning());
+    if (sOrganSoundReply) {
+        sOrganSoundReply = false;
+        MsgOrganSound m;
+        m.type    = (uint8_t)organGetType();
+        m.procSel = (uint8_t)organGetProcSound();
+        organStoreCurrent(m.values);
+        gMagiLink.acquireMutex();          // send() leaves it held (see AUTO TUNE below)
+        gMagiLink.send(&m, sizeof(m));
+        gMagiLink.releaseMutex();
+    }
 
     // Note edits and song operations, merged into the order they arrived.
     // An operation can take a second (SD read + 35 KB stream); anything that
@@ -3428,6 +3443,10 @@ void handleCommand(MagiMsgType type, const uint8_t* data, int len) {
                 else if (m->op == ORGAN_OP_DRIVE)     organSetDrive(m->value);
                 else if (m->op == ORGAN_OP_PARAM)     organSetParam(m->index, m->value);
                 else if (m->op == ORGAN_OP_PROCSEL)   organSetProcSound(m->value);
+                else if (m->op == ORGAN_OP_SWAP || m->op == ORGAN_OP_RECALL) {
+                    organSwapSound(m->index, m->value, m->op == ORGAN_OP_SWAP);
+                    sOrganSoundReply = true;
+                }
                 else if (m->op == ORGAN_OP_REVERB)    organSetReverb(m->value);
                 else if (m->op == ORGAN_OP_SYNTH)     organSetSynthParam(m->index, m->value);
             }

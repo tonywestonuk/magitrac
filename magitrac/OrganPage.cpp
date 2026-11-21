@@ -2,6 +2,7 @@
 #include "ServerPairing.h"
 #include "MagiMsg.h"   // OrganOp constants
 
+
 // Footage labels, low harmonic → high (matches the Hammond panel order).
 static const char* const OR_FOOTAGE[OR_N] =
     { "16", "5 1/3", "8", "4", "2 2/3", "2", "1 3/5", "1 1/3", "1" };
@@ -59,6 +60,20 @@ static const OrProcCfg OR_PROC[OR_PROC_N] = {
     // The subtractive synth: no sliders here — its EDIT SOUND button opens
     // the SynthEditor screen.
     { "SYNTH",      { 0, { "" } }, { 0 } },
+    // The drum machine: notes play drums on the GM drum map.  Kick decay and
+    // tone, the snare's noise, the open hat's decay, the toms' tuning.
+    // Nine more: snare and cymbal tone, cymbal decay, accent, five levels.
+    { "808",        { 14, { "BD DEC", "BD TONE", "SNAPPY", "OH DEC", "TUNE",
+                            "SD TONE", "CY TONE", "CY DEC", "ACCENT",
+                            "KICK", "SNARE", "HATS", "TOMS", "PERC" } },
+                    { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 } },
+    // Roland's CR-78, also on the GM drum map; 4 is its factory alignment.
+    // Nine more of ours: kick click and pitch, snare pitch and ring, hat
+    // tone, conga/bongo decay, three levels.
+    { "CR78",       { 14, { "BD DEC", "SNAPPY", "HH DEC", "CY DEC", "TUNE",
+                            "BD TONE", "BD TUNE", "SD TUNE", "SD RING", "HAT TN",
+                            "PRC DEC", "KICK", "SNARE", "PERC" } },
+                    { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 } },
 };
 
 // REED's STOPS slider, 0..8 — mirror of REED_STOPS in the server's
@@ -68,8 +83,14 @@ static const char* const OR_REED_STOPS[9] = {
     "16' 8' 4' 2'", "8' 2 2/3'", "16' 8' 2 2/3'", "16' 8' 4' 2 2/3'",
 };
 
-// PROC's 5-slider column starts further left (no drawbars in that mode).
-static int orKnobX(int type, int k) {
+// PROC's 5-slider column starts further left (no drawbars in that mode); a
+// drum machine's 14 run narrower from the sound list to the right edge.
+static int orKnobW(int n) { return (n > OR_KFIT) ? OR_KCOL_W_NARROW : OR_KCOL_W; }
+static int orKnobX(int type, int n, int k) {
+    if (n > OR_KFIT) {
+        int pitch = OR_KCOL_W_NARROW + OR_KCOL_GAP_NARROW;
+        return 945 - n * pitch + OR_KCOL_GAP_NARROW + k * pitch;
+    }
     int x0 = (type == OR_TYPE_PROC) ? OR_KCOL_X0_PROC : OR_KCOL_X0;
     return x0 + k * (OR_KCOL_W + OR_KCOL_GAP);
 }
@@ -143,6 +164,9 @@ void OrganPage::applyToSong() {
     if (isSynth()) {
         // SYNTH's settings take the drawbars' and sliders' place (OrganSynth.h).
         for (int i = 0; i < ORGAN_SYNTH_PARAMS; i++) organSynthParam(op, i) = _synth[i];
+    } else if (isDrums()) {
+        // So do a drum machine's 14 (the page keeps its registration for later).
+        for (int k = 0; k < ORGAN_DRUM_PARAMS; k++) organDrumParam(op, k) = knobRef(k);
     } else {
         for (int b = 0; b < ORGAN_PATCH_BARS; b++) op.bars[b] = _bars[b];
         const OrKnobCfg& cfg = orActiveCfg(_type, _procSel);
@@ -169,6 +193,12 @@ void OrganPage::adoptFromSong() {
     }
     if (isSynth()) {
         for (int i = 0; i < ORGAN_SYNTH_PARAMS; i++) _synth[i] = organSynthClamp(i, organSynthParam(op, i));
+    } else if (isDrums()) {
+        bool stale = organDrumBarsStale(op);
+        for (int k = 0; k < ORGAN_DRUM_PARAMS; k++) {
+            uint8_t v = (stale && k >= ORGAN_PATCH_SLIDERS) ? 4 : organDrumParam(op, k);
+            knobRef(k) = (v > 8) ? 8 : v;
+        }
     } else {
         for (int b = 0; b < OR_N; b++) _bars[b] = (op.bars[b] > 8) ? 8 : op.bars[b];
         const OrKnobCfg& cfg = orActiveCfg(_type, _procSel);
@@ -190,6 +220,7 @@ void OrganPage::open(bool backLabel) {
     _dragKnob = -1;      // a drag cut short by leaving the page must not resume
     _tipShown = false;
     _synthOpen = false;
+    bool fromSong = (_song.organ.flags & 1) != 0;
     adoptFromSong();   // the song's OrganPatch (if present) overrides the page state
     _d.clear();
     draw();
@@ -197,15 +228,52 @@ void OrganPage::open(bool backLabel) {
 
     // Flip the server into organ mode and sync type, effects + registration.
     gServerPairing.sendOrgan(ORGAN_OP_ENTER);
-    gServerPairing.sendOrgan(ORGAN_OP_TYPE,      0, (uint8_t)_type);
-    if (_type == OR_TYPE_PROC)
-        gServerPairing.sendOrgan(ORGAN_OP_PROCSEL, 0, (uint8_t)_procSel);
+    // The song's patch is sent as it stands; without one, the sound's last
+    // settings come back from the server (pollOrganSound).
+    if (fromSong) {
+        gServerPairing.sendOrgan(ORGAN_OP_TYPE, 0, (uint8_t)_type);
+        if (_type == OR_TYPE_PROC) gServerPairing.sendOrgan(ORGAN_OP_PROCSEL, 0, (uint8_t)_procSel);
+    } else {
+        gServerPairing.sendOrgan(ORGAN_OP_RECALL, (uint8_t)_type, (uint8_t)_procSel);
+    }
     gServerPairing.sendOrgan(ORGAN_OP_VIBCHORUS, 0, (uint8_t)_vibChorus);
     gServerPairing.sendOrgan(ORGAN_OP_LESLIE,    0, (uint8_t)_leslie);
     gServerPairing.sendOrgan(ORGAN_OP_DRIVE,     0, (uint8_t)_drive);
     gServerPairing.sendOrgan(ORGAN_OP_REVERB,    0, (uint8_t)_reverb);
-    syncKnobs();
-    for (int i = 0; i < OR_N; i++) gServerPairing.sendOrgan(ORGAN_OP_SET, i, _bars[i]);
+    if (fromSong) syncKnobs();   // (and the registration, unless a drum machine's settings ride the drawbars)
+    else          syncBars();
+}
+
+// The performer swapped type / sound: the server saves the old sound's
+// settings and answers with the new one's last, which go in the song.
+void OrganPage::swapOnServer() {
+    gServerPairing.sendOrgan(ORGAN_OP_SWAP, (uint8_t)_type, (uint8_t)_procSel);
+}
+
+// The registration belongs to the song, not to a sound: resend it whenever a
+// drum machine (whose settings ride the drawbars) isn't playing.
+void OrganPage::syncBars() {
+    if (isDrums() || isSynth()) return;
+    for (int i = 0; i < OR_N; i++) gServerPairing.sendOrgan(ORGAN_OP_SET, (uint8_t)i, _bars[i]);
+}
+
+// The settings the server brought back for the sound just swapped in.
+void OrganPage::pollOrganSound() {
+    MsgOrganSound m;
+    if (!gServerPairing.takeOrganSound(m)) return;
+    if (m.type != _type || (_type == OR_TYPE_PROC && m.procSel != _procSel)) return;   // superseded
+    if (isSynth()) {
+        for (int i = 0; i < ORGAN_SYNTH_PARAMS; i++) _synth[i] = organSynthClamp(i, m.values[i]);
+    } else {
+        int n = orActiveCfg(_type, _procSel).n;
+        for (int k = 0; k < n && k < ORGAN_SOUND_VALUES; k++)
+            knobRef(k) = m.values[k] > 8 ? 8 : m.values[k];
+    }
+    applyToSong();
+    syncBars();
+    if (_synthOpen) { _synthEd.open(_synth); return; }
+    drawKnobs();
+    _d.paintLater();
 }
 
 void OrganPage::draw() {
@@ -250,9 +318,7 @@ int OrganPage::hitProc(int sx, int sy) const {
 void OrganPage::selectProc(int idx) {
     if (idx < 0 || idx >= OR_PROC_N || idx == _procSel) return;
     _procSel = idx;
-    gServerPairing.sendOrgan(ORGAN_OP_PROCSEL, 0, (uint8_t)_procSel);
-    syncKnobs();          // push the new sound's slider values
-    applyToSong();
+    swapOnServer();       // its settings come back from the server, then go in the song
     drawProcList();
     drawKnobs();
     _d.paintLater();
@@ -343,10 +409,12 @@ static const int OR_SYNTH_EDIT_W = 960 - 15 - OR_KCOL_X0_PROC;
 static const int OR_SYNTH_EDIT_H = 110;
 
 void OrganPage::drawKnobs() {
-    // Clear the column, then draw the active type's knobs (if any).
-    int x0 = (_type == OR_TYPE_PROC) ? OR_KCOL_X0_PROC : OR_KCOL_X0;
+    // Clear the column, then draw the active type's knobs (if any).  In PROC
+    // mode that's everything right of the sound list: a drum machine's wide
+    // column may be there from the sound before.
+    int x0 = (_type == OR_TYPE_PROC) ? OR_PRESET_X + 424 + 6 : OR_KCOL_X0;
     _d.fillRect(x0 - 6, OR_HDR_H + 2, 960 - (x0 - 6),
-                (OR_LABEL_Y + 16) - (OR_HDR_H + 2), COL_WHITE);
+                (OR_LABEL_Y + 24) - (OR_HDR_H + 2), COL_WHITE);
     if (isSynth()) {
         uiButton(_d, OR_SYNTH_EDIT_X, OR_SYNTH_EDIT_Y, OR_SYNTH_EDIT_W, OR_SYNTH_EDIT_H,
                  "EDIT SOUND", COL_BLACK, COL_WHITE, 3);
@@ -367,13 +435,15 @@ void OrganPage::openSynth() {
 }
 
 void OrganPage::drawKnob(int k) {
-    int x  = orKnobX(_type, k);
-    int cx = x + OR_KCOL_W / 2;
+    const int n = orActiveCfg(_type, _procSel).n;
+    const int w = orKnobW(n);
+    int x  = orKnobX(_type, n, k);
+    int cx = x + w / 2;
     int v  = knobRef(k);
     char b[4]; snprintf(b, sizeof(b), "%d", v);
 
     // Wipe this knob's slot first, else the old tab/number ghosts (e-paper).
-    _d.fillRect(x, OR_HDR_H + 2, OR_KCOL_W, (OR_LABEL_Y + 16) - (OR_HDR_H + 2), COL_WHITE);
+    _d.fillRect(x, OR_HDR_H + 2, w, (OR_LABEL_Y + 24) - (OR_HDR_H + 2), COL_WHITE);
 
     _d.setTextSize(3); _d.setTextColor(COL_BLACK);
     int nw = (int)strlen(b) * 18;
@@ -383,27 +453,46 @@ void OrganPage::drawKnob(int k) {
     int tabY = OR_TOP + v * (OR_BOT - OR_TOP) / 8;
     if (tabY > OR_TOP) _d.fillRect(cx - 3, OR_TOP, 6, tabY - OR_TOP, COL_DKGREY);
     int ky = tabY - OR_KNOB_H / 2;
-    _d.fillRect(x + 2, ky, OR_KCOL_W - 4, OR_KNOB_H, COL_DKGREY);    // grey tab (≠ drawbars)
-    _d.drawRect(x + 2, ky, OR_KCOL_W - 4, OR_KNOB_H, COL_BLACK);
+    _d.fillRect(x + 2, ky, w - 4, OR_KNOB_H, COL_DKGREY);    // grey tab (≠ drawbars)
+    _d.drawRect(x + 2, ky, w - 4, OR_KNOB_H, COL_BLACK);
     _d.setTextSize(2); _d.setTextColor(COL_WHITE);
     int kw = (int)strlen(b) * 12;
     _d.setCursor(cx - kw / 2, ky + (OR_KNOB_H - 16) / 2); _d.print(b);
 
-    const char* lab = orActiveCfg(_type, _procSel).names[k];
+    drawKnobLabel(k);
+    // A narrow column's names overhang their slots, so the wipe above nicked
+    // the neighbours'.
+    if (n > OR_KFIT) {
+        if (k > 0)     drawKnobLabel(k - 1);
+        if (k < n - 1) drawKnobLabel(k + 1);
+    }
+}
+
+void OrganPage::drawKnobLabel(int k) {
+    const OrKnobCfg& cfg = orActiveCfg(_type, _procSel);
+    int cx  = orKnobX(_type, cfg.n, k) + orKnobW(cfg.n) / 2;
+    const char* lab = cfg.names[k];
     _d.setTextSize(1); _d.setTextColor(COL_BLACK);
     int lw = (int)strlen(lab) * 6;
-    _d.setCursor(cx - lw / 2, OR_LABEL_Y + 2); _d.print(lab);
+    int ly = OR_LABEL_Y + 2 + ((cfg.n > OR_KFIT && (k & 1)) ? 11 : 0);   // narrow: two rows so names don't touch
+    _d.setCursor(cx - lw / 2, ly); _d.print(lab);
+}
+
+// A drum machine's level slider, in dB (0 = off).
+static void orLevelTip(char* buf, size_t n, const char* name, int v) {
+    if (v == 0) snprintf(buf, n, "%s OFF", name);
+    else        snprintf(buf, n, "%s %+d dB", name, (v - 4) * 3);
 }
 
 // Left edge of the tooltip box — always just clear of the slider column, which
 // itself shifts left in PROC mode.
-static int orTipX(int type) { return orKnobX(type, 0) - 10 - OR_TIP_W; }
+static int orTipX(int type, int n) { return orKnobX(type, n, 0) - 10 - OR_TIP_W; }
 
 void OrganPage::drawKnobTip(int k) {
     const OrKnobCfg& cfg = orActiveCfg(_type, _procSel);
     if (k < 0 || k >= cfg.n) return;
 
-    int x = orTipX(_type);
+    int x = orTipX(_type, cfg.n);
     _d.fillRect(x, OR_TIP_Y, OR_TIP_W, OR_TIP_H, COL_WHITE);
     _d.drawRect(x,     OR_TIP_Y,     OR_TIP_W,     OR_TIP_H,     COL_BLACK);
     _d.drawRect(x + 2, OR_TIP_Y + 2, OR_TIP_W - 4, OR_TIP_H - 4, COL_BLACK);
@@ -417,6 +506,30 @@ void OrganPage::drawKnobTip(int k) {
     } else if (_type == OR_TYPE_PROC && _procSel == OR_PROC_REED && k == 3) {
         // REED's STOPS slider picks ranks: name them by footage.
         snprintf(buf, sizeof(buf), "%s", OR_REED_STOPS[(v >= 0 && v <= 8) ? v : 0]);
+    } else if (_type == OR_TYPE_PROC && _procSel == OR_PROC_808 && k != 2) {
+        // The 808's sliders in what they set (OrganSynth.h).
+        if (k == 0)      snprintf(buf, sizeof(buf), "KICK %d ms", (int)drum808KickDecayMs(v));
+        else if (k == 1) snprintf(buf, sizeof(buf), "TONE %d Hz", (int)drum808KickToneHz(v));
+        else if (k == 3) snprintf(buf, sizeof(buf), "OPEN HAT %d ms", (int)drum808OpenHatMs(v));
+        else if (k == 4) snprintf(buf, sizeof(buf), "TOMS %s", v < 3 ? "LOW" : v > 5 ? "HIGH" : "MID");
+        else if (k == 5) snprintf(buf, sizeof(buf), "SNARE %.1f kHz", drum808SnareToneHz(v) * 0.001f);
+        else if (k == 6) snprintf(buf, sizeof(buf), "CYMBAL %s", v < 3 ? "DARK" : v > 5 ? "BRIGHT" : "MID");
+        else if (k == 7) snprintf(buf, sizeof(buf), "CYMBAL %d ms", (int)(1125.0f * drum808CymbalDecay(v)));
+        else if (k == 8) snprintf(buf, sizeof(buf), v == 0 ? "ACCENT OFF" : "ACCENT %d%%", v * 25);
+        else             orLevelTip(buf, sizeof(buf), cfg.names[k], v);
+    } else if (_type == OR_TYPE_PROC && _procSel == OR_PROC_CR78) {
+        if (k == 0)      snprintf(buf, sizeof(buf), "KICK %d ms", (int)cr78KickDecayMs(v));
+        else if (k == 1) snprintf(buf, sizeof(buf), v == 0 ? "SNAP CW-78" : v == 4 ? "SNAP 1980" : "SNAP %+d dB", (int)cr78SnapDb(v));
+        else if (k == 2) snprintf(buf, sizeof(buf), "HI-HAT %d ms", (int)cr78HatDecayMs(v));
+        else if (k == 3) snprintf(buf, sizeof(buf), "CYMBAL %d ms", (int)cr78CymbalDecayMs(v));
+        else if (k == 4) snprintf(buf, sizeof(buf), "TUNE %+.1f", cr78TuneSemis(v));
+        else if (k == 5) snprintf(buf, sizeof(buf), v == 0 ? "CLICK OFF" : "CLICK %+d dB", (v - 4) * 3);
+        else if (k == 6) snprintf(buf, sizeof(buf), "KICK %+.1f", cr78TuneSemis(v));
+        else if (k == 7) snprintf(buf, sizeof(buf), "SNARE %+.1f", cr78TuneSemis(v));
+        else if (k == 8) snprintf(buf, sizeof(buf), "RING %d ms", (int)cr78SnareRingMs(v));
+        else if (k == 9) snprintf(buf, sizeof(buf), "HATS %s", v < 3 ? "DARK" : v > 5 ? "BRIGHT" : "MID");
+        else if (k == 10) snprintf(buf, sizeof(buf), "CONGA %d ms", (int)(150.0f * cr78PercDecay(v)));
+        else             orLevelTip(buf, sizeof(buf), cfg.names[k], v);
     } else {
         snprintf(buf, sizeof(buf), "%s  %d", cfg.names[k], v);
     }
@@ -434,13 +547,15 @@ void OrganPage::hideKnobTip() {
     if (!_tipShown) return;
     _tipShown = false;
 
-    int x = orTipX(_type);
+    int x = orTipX(_type, orActiveCfg(_type, _procSel).n);
     _d.fillRect(x, OR_TIP_Y, OR_TIP_W, OR_TIP_H, COL_WHITE);
 
-    // Repaint whatever the box sat on top of.  PROC mode's sound list is above
-    // it, so there's nothing to restore there; otherwise redraw the drawbars
-    // whose columns the box overlapped (drawBar wipes + rebuilds its own slot).
-    if (_type != OR_TYPE_PROC) {
+    // Repaint whatever the box sat on top of: the sound buttons, under a drum
+    // machine's wide column; otherwise the drawbars whose columns the box
+    // overlapped (drawBar wipes + rebuilds its own slot).
+    if (_type == OR_TYPE_PROC) {
+        if (x < OR_PRESET_X + 424) drawProcList();
+    } else {
         for (int i = 0; i < OR_N; i++) {
             int bx = OR_MARGIN + i * OR_COL_W;
             if (bx + OR_COL_W > x && bx < x + OR_TIP_W) drawBar(i);
@@ -454,15 +569,25 @@ void OrganPage::syncKnobs() {
             gServerPairing.sendOrgan(ORGAN_OP_SYNTH, (uint8_t)i, _synth[i]);
         return;
     }
-    for (int k = 0; k < orActiveCfg(_type, _procSel).n; k++)
+    for (int k = 0; k < orActiveCfg(_type, _procSel).n; k++) sendKnob(k);
+    // The registration — which a drum machine's settings replace while it plays.
+    if (!isDrums())
+        for (int i = 0; i < OR_N; i++) gServerPairing.sendOrgan(ORGAN_OP_SET, (uint8_t)i, _bars[i]);
+}
+
+void OrganPage::sendKnob(int k) {
+    if (isDrums() && k >= ORGAN_PATCH_SLIDERS)
+        gServerPairing.sendOrgan(ORGAN_OP_SET, (uint8_t)(k - ORGAN_PATCH_SLIDERS), knobRef(k));
+    else
         gServerPairing.sendOrgan(ORGAN_OP_PARAM, (uint8_t)k, knobRef(k));
 }
 
 int OrganPage::hitKnob(int sx, int sy) const {
     if (sy < OR_HDR_H || sy >= OR_LABEL_Y) return -1;
-    for (int k = 0; k < orActiveCfg(_type, _procSel).n; k++) {
-        int x = orKnobX(_type, k);
-        if (sx >= x && sx < x + OR_KCOL_W) return k;
+    const int n = orActiveCfg(_type, _procSel).n;
+    for (int k = 0; k < n; k++) {
+        int x = orKnobX(_type, n, k);
+        if (sx >= x && sx < x + orKnobW(n)) return k;
     }
     return -1;
 }
@@ -526,7 +651,9 @@ void OrganPage::drawBar(int i) {
 }
 
 OrganPage::Result OrganPage::poll() {
-    if (!_open || !_touch.read()) return Result::NONE;
+    if (!_open) return Result::NONE;
+    pollOrganSound();
+    if (!_touch.read()) return Result::NONE;
 
     bool down = _touch.isTouched;
     int sx, sy;
@@ -577,7 +704,7 @@ OrganPage::Result OrganPage::poll() {
         } else if (_dragKnob >= 0) {
             if (v != knobRef(_dragKnob)) {
                 knobRef(_dragKnob) = (uint8_t)v;
-                gServerPairing.sendOrgan(ORGAN_OP_PARAM, (uint8_t)_dragKnob, (uint8_t)v);
+                sendKnob(_dragKnob);
                 applyToSong();
                 drawKnob(_dragKnob);
                 drawKnobTip(_dragKnob);   // keep the big readout in step
@@ -615,11 +742,7 @@ OrganPage::Result OrganPage::poll() {
                 if (fx == 0) {                       // slot 0: cycle voice TYPE
                     bool wasProc = (_type == OR_TYPE_PROC);
                     _type = (_type + 1) % OR_TYPE_N;
-                    gServerPairing.sendOrgan(ORGAN_OP_TYPE, 0, (uint8_t)_type);
-                    if (_type == OR_TYPE_PROC)
-                        gServerPairing.sendOrgan(ORGAN_OP_PROCSEL, 0, (uint8_t)_procSel);
-                    syncKnobs();          // push the new type's knob values
-                    applyToSong();
+                    swapOnServer();       // its settings come back from the server, then go in the song
                     if (wasProc || _type == OR_TYPE_PROC) draw();   // body layout swaps
                     else drawKnobs();     // its knob column differs
                 } else if (fx == OR_FX_N - 1) {      // last slot: cycle effect page

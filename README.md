@@ -35,6 +35,19 @@ Client and server pair over a dedicated softAP network; the client is the editor
 
 Sketches build from the Arduino IDE with the ESP32 board package. `magitrac_lib` must be available as a library (symlink or copy into your Arduino libraries folder). See [Getting Started](docs/getting-started.md) for the full library list and board settings.
 
+## Acknowledgements
+
+- **CR78 drum machine** — the server's CR78 organ sound
+  (`magitrac_server_s3/cr78.cpp`) is a modified port of
+  [CW-78](https://github.com/athousanddetails/schwung-cw-78) by A Thousand
+  Details (GPL-3.0), a circuit model of Roland's CR-78.  Our changes: the
+  snare's snap and the conga/bongo levels refitted to a recorded CR-78, and
+  extra settings (kick click and tuning, snare tuning and ring, hat tone,
+  conga decay, group levels).
+- **808 drum machine** — the 808 organ sound (`magitrac_server_s3/drum808.cpp`)
+  builds each drum the way [io-808](https://github.com/vincentriemer/io-808)
+  by Vincent Riemer, a Web Audio TR-808, builds it.
+
 ## License
 
 Copyright (C) 2026 Tony Weston
